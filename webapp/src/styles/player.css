@@ -1,0 +1,43 @@
+.player { position: fixed; left: 0; right: 0; bottom: 0; height: var(--player-height); padding: 0 24px; background: var(--black); display: grid; grid-template-columns: minmax(220px, 1fr) minmax(400px, 1.5fr) minmax(220px, 1fr); align-items: center; gap: 20px; z-index: 20; backdrop-filter: blur(12px) }
+.player-right { display: flex; align-items: center; justify-content: flex-end; gap: 18px; min-width: 0; }
+.now-playing { display: flex; align-items: center; min-width: 0; }
+.now-cover { width: 56px; height: 56px; flex-shrink: 0; overflow: hidden; border-radius: 5px; }
+.now-cover img { width: 100%; height: 100%; object-fit: cover; }
+.now-info { min-width: 0; margin-left: 12px; }
+.now-title { font-size: 13px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.now-artist { margin-top: 4px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.heart { margin-left: 14px; flex-shrink: 0; border: none; background: transparent; color: var(--text-muted); font-size: 18px; cursor: pointer; transition: color 0.15s ease; }
+.heart:hover { color: var(--text); }
+.controls { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-width: 0; }
+.control-buttons { display: flex; align-items: center; justify-content: center; gap: 20px; }
+.control { border: none; background: transparent; color: #737985; font-size: 17px; cursor: pointer; transition: color 0.15s ease; }
+.control:hover { color: var(--text); }
+.play-button { width: 34px; height: 34px; display: grid; place-items: center; border: none; border-radius: 50%; background: white; color: black; font-size: 14px; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease; }
+.play-button:hover { background: #e8e9ed; transform: scale(1.05); }
+.progress-container { display: flex; align-items: center; gap: 9px; width: 100%; }
+.time { width: 30px; flex-shrink: 0; color: var(--text-muted); font-size: 10px; }
+.time:last-child { text-align: right; }
+.progress { height: 4px; flex: 1; min-width: 0; overflow: hidden; background: #252936; border-radius: 10px; cursor: pointer; }
+.progress-bar { width: 0%; height: 100%; background: var(--accent); border-radius: inherit; }
+.player-queue { position: relative; display: flex; align-items: center; }
+.player-queue-button { border: none; padding: 8px 0; background: transparent; color: var(--text-secondary); font-size: 13px; white-space: nowrap; cursor: pointer; transition: color 0.15s ease; }
+.player-queue-button:hover { color: var(--text); }
+.player-queue-panel { position: absolute; right: 0; bottom: calc(100% + 12px); width: 320px; max-height: 420px; display: flex; flex-direction: column; overflow: hidden; background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35); z-index: 1000; }
+.player-queue-tabs { display: flex; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+.player-queue-tabs button { flex: 1; padding: 12px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); font-size: 12px; cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease; }
+.player-queue-tabs button:hover { color: var(--text); }
+.player-queue-tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.player-queue-list { padding: 6px; overflow-y: auto; min-height: 0; }
+.player-queue-song { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: none; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; transition: background 0.15s ease; }
+.player-queue-song:hover { background: var(--card-hover); }
+.player-queue-song.playing { color: var(--accent); }
+.player-queue-number { width: 22px; flex-shrink: 0; color: var(--text-muted); font-size: 12px; text-align: center; }
+.player-queue-info { min-width: 0; display: flex; flex-direction: column; }
+.player-queue-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+.player-queue-artist { margin-top: 2px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.player-queue-empty { padding: 20px; color: var(--text-muted); font-size: 13px; text-align: center; }
+.volume { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-muted); }
+.volume input { width: 100px; max-width: 100%; accent-color: var(--accent); cursor: pointer; }
+.player-volume { width: 100px; accent-color: var(--accent); cursor: pointer; }
+.now-artist { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 12px; text-decoration: none; }
+.now-artist:hover { color: var(--text); }

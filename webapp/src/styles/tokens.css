@@ -1,0 +1,19 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --black: #000000; --background: #05070c;
+  --surface: #090d14; --card: #0d121b; --card-hover: #141a25;
+  --text: #f5f7fa; --text-secondary: #969eac; --text-muted: #606977;
+  --border: #181e29; --border-hover: #252d3a;
+  --accent: #6d8cff; --accent-hover: #82a0ff;
+  --nav-background: #0d121b; --nav-hover: #121925; --nav-active: #182131;
+  --sidebar-width: 280px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
+
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
+  --font-xs: 11px; --font-sm: 12px; --font-md: 13px; --font-base: 14px; --font-lg: 16px; --font-title: 21px;
+  --weight-semibold: 600; --weight-bold: 700;
+  --radius-sm: 6px; --radius-md: 8px; --radius-lg: 12px; --radius-pill: 999px;
+  --control-sm: 32px; --control-md: 40px;
+  --content-max: 1100px; --content-wide: 1200px;
+  --focus-ring: 2px solid var(--accent);
+  --transition-fast: 0.15s ease; --transition-base: 0.2s ease;
+}

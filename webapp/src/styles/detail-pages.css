@@ -1,0 +1,91 @@
+.album-cover { position: relative; }
+.album-card-play { position: absolute; right: 10px; bottom: 10px; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border: none; border-radius: 50%; background: var(--accent); color: #000; font-size: 15px; cursor: pointer; opacity: 0; transform: translateY(6px); transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease; }
+.album:hover .album-card-play { opacity: 1; transform: translateY(0); }
+.album-card-play:hover { background: var(--accent-hover); transform: scale(1.05); }
+.album-page, .playlist-page, .artist-page, .liked-page { max-width: 1100px; margin: 0 auto; }
+.album-back, .playlist-back, .artist-back { display: inline-block; margin-bottom: 28px; color: var(--text-secondary); font-size: 13px; text-decoration: none; }
+.album-back:hover, .playlist-back:hover, .artist-back:hover { color: var(--text); }
+.album-header, .playlist-header, .artist-header { display: flex; align-items: flex-end; gap: 30px; margin-bottom: 42px; }
+.album-page-cover, .playlist-page-cover { width: 230px; height: 230px; flex-shrink: 0; overflow: hidden; border-radius: 10px; background: #171b24; box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35); }
+.album-page-cover img, .playlist-page-cover img { width: 100%; height: 100%; object-fit: cover; }
+.album-page-info, .playlist-page-info, .artist-page-info { min-width: 0; }
+.album-type, .playlist-type, .artist-type { margin-bottom: 8px; color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; }
+.album-page-info h1, .playlist-page-info h1 { color: var(--text); font-size: 38px; font-weight: 750; letter-spacing: -1.2px; line-height: 1.1; }
+.album-page-artist { display: inline-block; margin-top: 12px; color: #b8a7ff; font-size: 16px; font-weight: 600; text-decoration: none; }
+.album-page-artist:hover { color: var(--text); }
+.album-meta { margin-top: 7px; color: var(--text-secondary); font-size: 13px; }
+.album-actions, .playlist-actions, .artist-actions { display: flex; align-items: center; gap: 10px; margin-top: 22px; }
+.album-play, .playlist-play, .artist-play, .liked-play { display: flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 20px; background: var(--accent); color: #08090c; font-size: 13px; font-weight: 700; transition: background 0.15s ease, transform 0.15s ease; }
+.album-play:hover, .playlist-play:hover, .artist-play:hover, .liked-play:hover { background: var(--accent-hover); transform: scale(1.03); }
+.album-action, .playlist-action, .artist-action, .liked-action { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; background: var(--card); border: 1px solid var(--border); color: var(--text-secondary); font-size: 18px; transition: background 0.15s ease, color 0.15s ease; }
+.album-action:hover, .playlist-action:hover, .artist-action:hover, .liked-action:hover { background: var(--card-hover); color: var(--text); }
+.playlist-description { max-width: 500px; margin: 12px 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.5; }
+.playlist-meta { margin-top: 7px; color: var(--text-muted); font-size: 13px; }
+.artist-page { max-width: 1100px; }
+.artist-header { margin-bottom: 42px; }
+.artist-page-cover { width: 210px; height: 210px; flex-shrink: 0; overflow: hidden; border-radius: 50%; background: #171b24; box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35); }
+.artist-page-cover img { width: 100%; height: 100%; object-fit: cover; }
+.artist-page-info h1 { font-size: 40px; font-weight: 750; letter-spacing: -1px; }
+.artist-meta { margin-top: 10px; color: var(--text-secondary); font-size: 13px; }
+.artist-section { margin-bottom: 45px; }
+.artist-section-header { margin-bottom: 15px; }
+.artist-section-header h2 { font-size: 21px; }
+.liked-header { display: flex; align-items: center; gap: 22px; margin-bottom: 22px; }
+.liked-icon { width: 110px; height: 110px; display: grid; place-items: center; border-radius: 10px; background: linear-gradient(135deg, #5b8cff, #8b6cff); color: white; font-size: 42px; }
+.liked-label { color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; margin-bottom: 6px; }
+.liked-header h1 { margin: 0; color: var(--text); font-size: 32px; font-weight: 750; letter-spacing: -0.8px; }
+.liked-meta { margin-top: 7px; color: var(--text-secondary); font-size: 13px; }
+.liked-actions { display: flex; gap: 10px; margin-bottom: 25px; }
+.liked-play:hover { background: var(--accent-hover); }
+.liked-action { font-size: 17px; }
+.liked-action:hover { background: var(--card-hover); color: var(--text); }
+.album-link { color: inherit; text-decoration: none; }
+.album-year { margin-top: 5px; color: var(--text-muted); font-size: 12px; }
+.library-page { max-width: 1200px; margin: 0 auto; }
+.library-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 30px; margin-bottom: 38px; }
+.library-label { margin-bottom: 7px; color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; }
+.library-header h1 { font-size: 32px; font-weight: 750; letter-spacing: -0.8px; }
+.library-actions { display: flex; align-items: center; gap: 4px; padding: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+.library-action { padding: 7px 13px; border-radius: 7px; background: transparent; color: var(--text-secondary); font-size: 12px; transition: background 0.15s ease, color 0.15s ease; }
+.library-action:hover { color: var(--text); }
+.library-action.active { background: var(--nav-active); color: var(--text); }
+.library-section { margin-bottom: 45px; }
+.library-section-header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; }
+.library-section-header h2 { font-size: 20px; letter-spacing: -0.3px; }
+.library-section-header span { color: var(--text-muted); font-size: 12px; }
+.account-page, .admin-page { max-width: 1100px; margin: 0 auto; }
+.account-header { display: flex; align-items: center; gap: 22px; margin-bottom: 28px; }
+.account-avatar { width: 96px; height: 96px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #08090c; font-size: 32px; font-weight: 800; }
+.account-label { color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; margin-bottom: 6px; }
+.account-header h1 { margin: 0; color: var(--text); font-size: 32px; font-weight: 750; letter-spacing: -0.8px; }
+.account-meta { margin-top: 7px; color: var(--text-secondary); font-size: 13px; }
+.account-form, .admin-form { display: grid; gap: 14px; margin-bottom: 28px; padding: 18px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+.account-form h2, .admin-section h2 { font-size: 20px; letter-spacing: -0.3px; }
+.account-form label, .admin-form label { display: grid; gap: 7px; color: var(--text-secondary); font-size: 12px; }
+.account-form input, .admin-form input, .admin-form select, .admin-row select { width: 100%; padding: 10px 12px; background: #080b12; border: 1px solid var(--border); border-radius: 7px; color: var(--text); }
+.account-form input:focus, .admin-form input:focus, .admin-form select:focus, .admin-row select:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.account-form input:disabled { color: var(--text-muted); }
+.account-primary, .admin-danger { width: fit-content; padding: 10px 16px; border-radius: 18px; background: var(--accent); color: #08090c; font-size: 13px; font-weight: 700; }
+.account-primary:disabled, .admin-danger:disabled { opacity: 0.55; cursor: not-allowed; }
+.admin-danger { background: #ff6b6b; }
+.success { padding: 10px 12px; border-radius: 7px; background: rgba(109, 140, 255, 0.12); color: var(--accent-hover); font-size: 13px; }
+.account-checkbox { display: flex !important; grid-template-columns: none; flex-direction: row; align-items: center; gap: 8px; color: var(--text); }
+.account-checkbox input { width: auto; }
+.admin-section { margin-bottom: 34px; }
+.admin-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.plugin-install-form { margin: 14px 0; }
+.plugin-install-preview { display: grid; gap: 8px; padding: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; }
+.plugin-install-preview .hint { color: var(--text-secondary); font-size: 12px; }
+.admin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
+.admin-card { display: grid; gap: 6px; padding: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
+.admin-card span, .admin-card small { color: var(--text-secondary); font-size: 12px; }
+.admin-card strong { color: var(--text); font-size: 18px; }
+.admin-table { display: grid; gap: 8px; margin-top: 14px; }
+.admin-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px 120px auto; align-items: center; gap: 12px; padding: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 9px; }
+.admin-row div { display: grid; gap: 4px; min-width: 0; }
+.admin-row span { color: var(--text-secondary); font-size: 12px; }
+.admin-provider-row { grid-template-columns: minmax(0, 1fr) 100px 110px minmax(100px, 150px); }
+.admin-provider-kind { text-transform: capitalize; }
+.admin-provider-config { display: grid; gap: 5px; color: var(--text-secondary); font-size: 12px; }
+.admin-provider-config input { width: 100%; padding: 8px 10px; background: #080b12; border: 1px solid var(--border); border-radius: 7px; color: var(--text); }
+.admin-provider-config input:focus { outline: var(--focus-ring); outline-offset: 2px; }

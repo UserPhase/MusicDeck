@@ -1,0 +1,46 @@
+# === Dependencies ===
+node_modules/
+**/node_modules/
+
+# === Environment / secrets ===
+.env
+.env.local
+.env.*.local
+!.env.example
+**/.env
+!**/.env.example
+
+# === Build output ===
+build/
+dist/
+**/build/
+**/dist/
+
+# === Local runtime data (SQLite DB, downloaded music, temp acquisitions) ===
+data/
+**/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+music/
+
+# === Leftover test artifacts (temp dirs created by test runs) ===
+**/test/tmp-test-*/
+
+# === Logs ===
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# === OS / editor cruft ===
+.DS_Store
+Thumbs.db
+*.code-workspace
+
+# === Reference-only project (reverb integration reference, not part of this app) ===
+reverb/
+
+# === Misc local scratch files (not needed in the repo) ===
+music_copy.txt
+Android App/

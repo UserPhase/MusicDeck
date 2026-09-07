@@ -1,0 +1,16 @@
+{
+  "name": "musicdeck",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Root convenience scripts for running the MusicDeck webapp and server together during local development.",
+  "scripts": {
+    "start": "concurrently -n server,webapp -c blue,green \"npm run dev --prefix server\" \"npm start --prefix webapp\"",
+    "dev": "npm run start",
+    "install:all": "npm install --prefix server && npm install --prefix webapp",
+    "build": "npm run build --prefix server && npm run build --prefix webapp",
+    "test": "npm test --prefix server && npm test --prefix webapp"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

@@ -1,0 +1,74 @@
+services:
+  musicdeck-web:
+    build:
+      context: ./webapp
+    container_name: musicdeck-web
+    depends_on:
+      musicdeck-server:
+        condition: service_healthy
+    ports:
+      - "${MUSICDECK_WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  musicdeck-server:
+    build:
+      context: ./server
+    container_name: musicdeck-server
+    environment:
+      NODE_ENV: production
+      MUSICDECK_HOST: 0.0.0.0
+      MUSICDECK_PORT: 4534
+      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:-http://localhost:8080}
+      MUSICDECK_CORS_ORIGIN: ${MUSICDECK_CORS_ORIGIN:-http://localhost:8080}
+      MUSICDECK_DB_PATH: /app/data/musicdeck.sqlite
+      MUSICDECK_SESSION_SECRET: ${MUSICDECK_SESSION_SECRET:?Set MUSICDECK_SESSION_SECRET in .env}
+      MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-false}
+      MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
+      MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:-}
+      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_USERNAME: ${NAVIDROME_USERNAME:?Set NAVIDROME_USERNAME in .env}
+      NAVIDROME_PASSWORD: ${NAVIDROME_PASSWORD:?Set NAVIDROME_PASSWORD in .env}
+      # MusicDeck Server must write acquired/downloaded music into the SAME
+      # host folder Navidrome scans (mounted below), otherwise downloads via
+      # spotDL/On-Demand Library will succeed but never appear in the library.
+      MUSICDECK_MUSIC_ROOT: /music
+    volumes:
+      - musicdeck-data:/app/data
+      - musicdeck-config:/app/config
+      - musicdeck-cache:/app/cache
+      # Same host folder as navidrome's /music mount below, read-write so
+      # downloaded tracks land exactly where Navidrome scans from.
+      - /media/music:/music
+    depends_on:
+      navidrome:
+        condition: service_started
+    expose:
+      - "4534"
+    restart: unless-stopped
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    environment:
+      ND_LOGLEVEL: info
+      ND_SCANSCHEDULE: 1h
+      ND_SESSIONTIMEOUT: 24h
+    volumes:
+      - /opt/navidrome/data:/data
+      - /media/music:/music:ro
+    expose:
+      - "4533"
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4533/app/ >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  musicdeck-data:
+  musicdeck-config:
+  musicdeck-cache:

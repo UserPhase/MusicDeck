@@ -1,0 +1,67 @@
+.track-list { width: 100%; }
+.track { display: grid; grid-template-columns: 40px minmax(0, 1fr) minmax(120px, 220px) 36px 70px 80px; align-items: center; min-height: 58px; padding: 0 12px; border-radius: 7px; transition: background 0.15s ease; }
+.track:hover { background: var(--card-hover); }
+.track-number { position: relative; width: 40px; min-width: 40px; display: flex; align-items: center; justify-content: center; }
+.track-number-text { color: var(--text-muted); font-size: 13px; transition: color 0.15s ease; }
+.track-play { position: absolute; display: none; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%; background: var(--accent); color: #000; font-size: 12px; cursor: pointer; transition: background 0.15s ease, transform 0.15s ease; }
+.track:hover .track-number-text { color: var(--accent); }
+.track:hover .track-play { display: flex; }
+.track-play:hover { transform: scale(1.05); }
+.track-info { min-width: 0; overflow: hidden; }
+.track-title { color: var(--text); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.track-artist { display: inline-block; max-width: 100%; margin-top: 3px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }
+.track-artist:hover { color: var(--text); }
+.track-album { display: block; min-width: 0; margin-left: 20px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }
+a.track-album:hover { color: var(--text); }
+.track-duration { color: var(--text-muted); font-size: 12px; text-align: right; white-space: nowrap; }
+.track-menu-container { position: relative; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-1); width: 80px; height: 40px; }
+.track-menu { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--text-muted); font-size: 18px; line-height: 1; opacity: 0; cursor: pointer; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease; }
+.track:hover .track-menu, .track-menu-container:has(.playlist-menu) .track-menu { opacity: 1; }
+.track-menu:hover { background: var(--card-hover); color: var(--text); }
+.playlist-menu { position: absolute; right: 0; top: calc(100% + 8px); z-index: 1000; min-width: 190px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 25px rgba(0, 0, 0, 0.35); }
+.playlist-menu-title { padding: 8px 10px; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.playlist-menu-item { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: none; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.playlist-menu-item:hover { background: var(--card-hover); }
+.playlist-menu-empty { padding: 10px; color: var(--text-secondary); font-size: 13px; }
+.source-menu-container { position: relative; display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; }
+.source-menu-toggle { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--text-muted); font-size: 16px; line-height: 1; opacity: 0; cursor: pointer; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease; }
+.track:hover .source-menu-toggle, .source-menu-container:has(.source-menu) .source-menu-toggle, .source-menu-toggle:focus-visible { opacity: 1; }
+.source-menu-toggle:hover { background: var(--card-hover); color: var(--text); }
+.source-menu-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.source-menu { position: absolute; right: 0; top: calc(100% + 8px); z-index: 1000; min-width: 170px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 25px rgba(0, 0, 0, 0.35); }
+.source-menu-title { padding: 8px 10px; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.source-menu-item { width: 100%; display: block; padding: 9px 10px; border: none; border-radius: 6px; background: transparent; color: var(--text); font-size: 13px; text-align: left; cursor: pointer; }
+.source-menu-item:hover, .source-menu-item:focus-visible { background: var(--card-hover); }
+.source-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.source-menu-status { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: 9px 10px; color: var(--text-secondary); font-size: var(--font-md); }
+.source-menu-retry { padding: var(--space-1) var(--space-2); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text); cursor: pointer; }
+.source-menu-retry:hover, .source-menu-retry:focus-visible { background: var(--card-hover); outline: none; }
+.ui-icon-button { display: inline-flex; align-items: center; justify-content: center; width: var(--control-sm); height: var(--control-sm); padding: 0; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); line-height: 1; cursor: pointer; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast), transform var(--transition-fast); }
+.ui-icon-button:hover { background: var(--card-hover); color: var(--text); }
+.ui-icon-button:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.ui-icon-button:disabled { cursor: not-allowed; opacity: 0.45; }
+.ui-menu { position: relative; display: inline-flex; align-items: center; justify-content: center; }
+.ui-menu-popover { position: absolute; right: 0; top: calc(100% + var(--space-2)); z-index: 1000; min-width: 170px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: 0 8px 25px rgba(0, 0, 0, 0.35); }
+.ui-menu-title { padding: 8px 10px; color: var(--text-secondary); font-size: var(--font-sm); font-weight: var(--weight-semibold); }
+.ui-menu-item { width: 100%; display: block; padding: 9px 10px; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text); font-size: var(--font-md); text-align: left; cursor: pointer; }
+.ui-menu-item:hover, .ui-menu-item:focus-visible { background: var(--card-hover); }
+.ui-menu-item:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.track-album-page { grid-template-columns: 40px minmax(0, 1fr) 36px 70px 80px; }
+.track-download-container { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; }
+.track-download-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%; background: transparent; color: var(--text-muted); font-size: 14px; opacity: 0; cursor: pointer; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease; }
+.track:hover .track-download-btn, .track-download-btn:focus-visible, .track-download-btn.active, .track-download-btn.completed, .track-download-btn.failed { opacity: 1; }
+.track-download-btn:hover:not(:disabled) { background: var(--card-hover); color: var(--text); transform: scale(1.08); }
+.track-download-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.track-download-btn.completed { color: var(--accent); opacity: 0.85; }
+.track-download-btn.failed { color: #e55353; }
+.track-download-btn:disabled { cursor: default; }
+.track-download-spinner { animation: track-download-spin 1s linear infinite; }
+@keyframes track-download-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+@media (hover: none), (pointer: coarse) {
+	.track-menu,
+	.source-menu-toggle,
+	.track-download-btn {
+		opacity: 1;
+	}
+}
