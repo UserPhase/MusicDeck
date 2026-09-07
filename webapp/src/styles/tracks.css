@@ -49,12 +49,14 @@ a.track-album:hover { color: var(--text); }
 .track-album-page { grid-template-columns: 40px minmax(0, 1fr) 36px 70px 80px; }
 .track-download-container { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; }
 .track-download-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%; background: transparent; color: var(--text-muted); font-size: 14px; opacity: 0; cursor: pointer; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease; }
-.track:hover .track-download-btn, .track-download-btn:focus-visible, .track-download-btn.active, .track-download-btn.completed, .track-download-btn.failed { opacity: 1; }
+.track:hover .track-download-btn, .track-download-btn:focus-visible, .track-download-btn.active, .track-download-btn.completed, .track-download-btn.failed, .track-download-btn.already-downloaded { opacity: 1; }
 .track-download-btn:hover:not(:disabled) { background: var(--card-hover); color: var(--text); transform: scale(1.08); }
 .track-download-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .track-download-btn.completed { color: var(--accent); opacity: 0.85; }
 .track-download-btn.failed { color: #e55353; }
 .track-download-btn:disabled { cursor: default; }
+.track-download-btn.already-downloaded { color: var(--text-muted); opacity: 0.55; cursor: default; }
+.track:hover .track-download-btn.already-downloaded { opacity: 0.85; }
 .track-download-spinner { animation: track-download-spin 1s linear infinite; }
 @keyframes track-download-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 

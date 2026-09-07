@@ -41,6 +41,26 @@ describe("TrackDownloadButton", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  test("shows a static checkmark (not a clickable download button) when already available in the library", () => {
+    render(
+      <TrackDownloadButton
+        song={{ ...mockSong, availability: { libraryAvailable: true } }}
+      />
+    );
+    expect(screen.getByRole("img", { name: "Bohemian Rhapsody already downloaded" })).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  test("shows a static checkmark when the track's source kind is library", () => {
+    render(
+      <TrackDownloadButton
+        song={{ ...mockSong, source: { kind: "library", count: 1 } }}
+      />
+    );
+    expect(screen.getByRole("img", { name: "Bohemian Rhapsody already downloaded" })).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
   test("clicking button calls createAcquisition with spotDL provider and song metadata", async () => {
     createAcquisition.mockResolvedValueOnce({
       status: "completed",
