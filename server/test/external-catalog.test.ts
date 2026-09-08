@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { closeTestServer, createTestServer, login } from "./helpers.js";
+import { closeTestServer, createFakeBackend, createTestServer, login } from "./helpers.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;
 
@@ -181,6 +181,68 @@ describe("External catalog", () => {
         source: { kind: "external", count: 0 },
       }),
     ]);
+  });
+
+  test("uses the playable local track ID after a downloaded external album is refreshed", async () => {
+    const localAlbum = {
+      id: "local-album-10",
+      providerId: "local-album-10",
+      name: "External Album",
+      artistId: "local-artist-20",
+      artistName: "External Artist",
+      year: 2025,
+      artworkId: null,
+      artworkUrl: null,
+      songCount: 1,
+    };
+    const localTrack = {
+      id: "local-track-30",
+      providerId: "local-track-30",
+      title: "External Song",
+      artistId: "local-artist-20",
+      artistName: "External Artist",
+      albumId: "local-album-10",
+      albumName: "External Album",
+      durationSeconds: 180,
+      trackNumber: 1,
+      artworkId: null,
+      artworkUrl: null,
+      streamUrl: "/api/tracks/local-track-30/stream",
+    };
+    const backend = createFakeBackend({
+      listAlbums: vi.fn(async () => [localAlbum]),
+      getAlbumTracks: vi.fn(async () => [localTrack]),
+    });
+    current = await createTestServer(backend, {}, undefined, catalogFetch as typeof fetch);
+    current.externalCatalog.configure(true);
+    const { cookie } = await login(current.app);
+
+    const tracks = await current.app.inject({
+      method: "GET",
+      url: "/api/albums/external_itunes_album_10/tracks",
+      headers: { cookie },
+    });
+
+    expect(tracks.statusCode).toBe(200);
+    expect(tracks.json().tracks).toEqual([
+      expect.objectContaining({
+        title: "External Song",
+        provider: "library",
+        source: { kind: "library", count: 1 },
+        availability: expect.objectContaining({ libraryAvailable: true }),
+      }),
+    ]);
+    const playableTrackId = tracks.json().tracks[0].id;
+    expect(playableTrackId).not.toBe("external_itunes_30");
+
+    const stream = await current.app.inject({
+      method: "GET",
+      url: `/api/tracks/${encodeURIComponent(playableTrackId)}/stream`,
+      headers: { cookie },
+    });
+
+    expect(stream.statusCode).toBe(206);
+    expect(backend.fetchStream).toHaveBeenCalledWith("local-track-30", undefined);
   });
 
   test("serves external artist detail, albums, and popular tracks", async () => {

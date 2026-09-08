@@ -371,6 +371,51 @@ export async function registerMusicRoutes(
     }
   }
 
+  async function resolveExternalAlbumTracks(
+    externalAlbum: {
+      title: string;
+      artist: string;
+      tracks: UnifiedSearchResult[];
+    }
+  ) {
+    try {
+      const localAlbums = await catalog.listAlbums(500);
+      const localAlbumResults = localAlbums.items.map((album) =>
+        toAlbumSearchResult(album)
+      );
+      const localMatch = findMatchingExternalAlbum(
+        localAlbumResults,
+        externalAlbum.title,
+        externalAlbum.artist
+      );
+
+      if (!localMatch) {
+        return { tracks: externalAlbum.tracks, localCount: 0 };
+      }
+
+      const localTracks = await catalog.getAlbumTracks(localMatch.id);
+      const stampedLocal = localTracks.map((track) =>
+        toTrackSearchResult({
+          ...track,
+          availability: {
+            state: "available",
+            connectionId: "library",
+            sourceCount: 1,
+            availableSourceCount: 1,
+            libraryAvailable: true,
+          },
+        })
+      );
+
+      return {
+        tracks: mergeAlbumTracks(stampedLocal, externalAlbum.tracks),
+        localCount: stampedLocal.length,
+      };
+    } catch {
+      return { tracks: externalAlbum.tracks, localCount: 0 };
+    }
+  }
+
   app.get("/api/albums/:albumId", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -383,7 +428,19 @@ export async function registerMusicRoutes(
       }
 
       const album = await externalCatalog.getAlbum(albumId);
-      return album ? { album } : sendError(reply, 404, "Album not found");
+      if (!album) {
+        return sendError(reply, 404, "Album not found");
+      }
+
+      const { tracks, localCount } = await resolveExternalAlbumTracks(album);
+      return {
+        album: {
+          ...album,
+          tracks,
+          trackCount: tracks.length,
+          localTrackCount: localCount,
+        },
+      };
     }
 
     const album = await catalog.getAlbum(albumId);
@@ -406,7 +463,12 @@ export async function registerMusicRoutes(
       }
 
       const album = await externalCatalog.getAlbum(albumId);
-      return album ? { tracks: album.tracks } : sendError(reply, 404, "Album not found");
+      if (!album) {
+        return sendError(reply, 404, "Album not found");
+      }
+
+      const { tracks } = await resolveExternalAlbumTracks(album);
+      return { tracks };
     }
 
     const album = await catalog.getAlbum(albumId);
