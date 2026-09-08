@@ -1,16 +1,22 @@
 # MusicDeck Self-Hosting Guide
 
-This guide runs MusicDeck as a small self-hosted stack:
+This guide runs MusicDeck as a small self-hosted LAN stack:
 
 ```text
-Browser
-  -> MusicDeck Web container
-  -> /api proxy
+Browser (any LAN device)
+  -> http://SERVER_IP:MUSICDECK_WEB_PORT
+  -> MusicDeck Web container (nginx)
+     -> /api proxy  -> MusicDeck Server container
+     -> /ws proxy   -> MusicDeck Server container (reserved; no WebSockets in use yet)
   -> MusicDeck Server container
-  -> Navidrome container
+     -> Navidrome container (internal only)
+     -> Jellyfin container (internal only, optional)
 ```
 
-The browser talks to MusicDeck on one origin. MusicDeck Server talks to Navidrome internally.
+Every device on your network talks to MusicDeck on **one origin**
+(`MUSICDECK_PUBLIC_URL`). MusicDeck Server talks to Navidrome and Jellyfin
+internally over the Docker network; LAN clients never need to know those
+ports exist.
 
 ## Prerequisites
 
@@ -37,85 +43,147 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set these values before starting:
+Set these values before starting (see `.env.example` for the full list and
+explanations):
 
 ```text
+MUSICDECK_PUBLIC_URL=http://SERVER_IP:8080
+MUSICDECK_CORS_ORIGIN=http://SERVER_IP:8080
 MUSICDECK_SESSION_SECRET=replace-with-a-long-random-secret
 MUSICDECK_ADMIN_USERNAME=admin
 MUSICDECK_ADMIN_PASSWORD=change-this-admin-password
 NAVIDROME_USERNAME=admin
 NAVIDROME_PASSWORD=change-this-navidrome-password
+MUSIC_ROOT=/media/music
+NAVIDROME_DATA=/opt/navidrome/data
+JELLYFIN_CONFIG=/opt/jellyfin/config
+JELLYFIN_CACHE=/opt/jellyfin/cache
 ```
 
-Music library and Navidrome data paths are fixed host paths in `docker-compose.yml` (`/media/music` and `/opt/navidrome/data`). Edit `docker-compose.yml` directly if your host paths differ.
+Replace `SERVER_IP` with your Docker host's actual LAN IP address (e.g.
+`192.168.1.50`) or a resolvable hostname. `docker compose up` intentionally
+fails fast with a clear error if `MUSICDECK_PUBLIC_URL`, `MUSICDECK_CORS_ORIGIN`,
+`MUSICDECK_SESSION_SECRET`, `MUSICDECK_ADMIN_PASSWORD`, `NAVIDROME_USERNAME`,
+`NAVIDROME_PASSWORD`, `MUSIC_ROOT`, `NAVIDROME_DATA`, `JELLYFIN_CONFIG`, or
+`JELLYFIN_CACHE` are missing — there is no silent `localhost` fallback in
+production.
 
-`MUSICDECK_ADMIN_PASSWORD` is used only when the MusicDeck database has no users. It is not used to reset an existing admin account.
+All host paths (`MUSIC_ROOT`, `NAVIDROME_DATA`, `JELLYFIN_CONFIG`,
+`JELLYFIN_CACHE`) must be absolute paths that already exist on the Docker
+host.
+
+`MUSICDECK_ADMIN_PASSWORD` is used only when the MusicDeck database has no
+users. It is not used to reset an existing admin account.
 
 Start the stack:
 
 ```powershell
-docker compose up --build
+docker compose up -d
 ```
 
-Open MusicDeck:
+Open MusicDeck (the only URL LAN clients need):
 
 ```text
-http://localhost:8080
+http://SERVER_IP:8080
 ```
 
-Open Navidrome directly for initial Navidrome setup if needed:
+Open Navidrome directly for initial Navidrome setup if needed (optional —
+see "Required vs. optional ports" below):
 
 ```text
-http://localhost:4533
+http://SERVER_IP:4533
 ```
 
-After Navidrome has a user matching `NAVIDROME_USERNAME` and `NAVIDROME_PASSWORD`, MusicDeck Server can use it as the backend service account.
+After Navidrome has a user matching `NAVIDROME_USERNAME` and
+`NAVIDROME_PASSWORD`, MusicDeck Server can use it as the backend service
+account.
+
+Jellyfin is optional. If you want it, open it directly (also optional):
+
+```text
+http://SERVER_IP:8096
+```
+
+Create an API key under **Dashboard → API Keys**, set `JELLYFIN_API_KEY` in
+`.env`, then `docker compose up -d` again. Enable/configure the Jellyfin
+connection from MusicDeck's Admin dashboard.
 
 ## LAN Access (other devices on your network)
 
-The Docker Compose stack already binds `musicdeck-server` to `0.0.0.0` and publishes `musicdeck-web` on `${MUSICDECK_WEB_PORT:-8080}` on all host interfaces, so no extra container configuration is required for LAN access. To reach MusicDeck from a phone, tablet, or another computer on the same network:
+The Docker Compose stack already binds `musicdeck-server` to `0.0.0.0`
+internally and publishes only `musicdeck-web` on
+`${MUSICDECK_WEB_PORT:-8080}` on all host interfaces — no extra container
+configuration is required for LAN access itself. To reach MusicDeck from a
+phone, tablet, or another computer on the same network:
 
 1. Find the host machine's LAN IP address (e.g. `192.168.1.50`).
-2. Set `MUSICDECK_PUBLIC_URL` and `MUSICDECK_CORS_ORIGIN` in `.env` to that address instead of `localhost`, for example:
+2. Set `MUSICDECK_PUBLIC_URL` and `MUSICDECK_CORS_ORIGIN` in `.env` to that
+   address, for example:
    ```text
    MUSICDECK_PUBLIC_URL=http://192.168.1.50:8080
    MUSICDECK_CORS_ORIGIN=http://192.168.1.50:8080
    ```
-   These must match the exact origin browsers on other devices will use, including port.
-3. Restart the stack (`docker compose up -d --build`) so the server picks up the new environment values.
+   These must match the exact origin browsers on other devices will use,
+   including port. Both are required — there is no `localhost` default.
+3. Start/restart the stack (`docker compose up -d`) so the server picks up
+   the new environment values.
 4. Browse to `http://192.168.1.50:8080` from any device on the same network.
 
-Because the React client only ever calls same-origin relative `/api/...` paths (proxied by nginx), there is no separate frontend build step or extra environment variable needed for the API URL — whatever host/IP the browser uses to load the page is the host/IP it will use for API calls automatically. MusicDeck does not use WebSockets, so no additional WebSocket configuration is required.
+Because the React client only ever calls same-origin relative `/api/...`
+paths (proxied by nginx), there is no separate frontend build step or extra
+environment variable needed for the API URL — whatever host/IP the browser
+uses to load the page is the host/IP it will use for API calls
+automatically. MusicDeck does not currently use WebSockets; `webapp/nginx.conf`
+still proxies a reserved `/ws/` path with correct `Upgrade`/`Connection`
+header forwarding so a future real-time feature works through the same
+single origin without any client-side reconfiguration.
 
-If you plan to expose MusicDeck beyond your LAN (e.g. over the public internet), put it behind a reverse proxy with HTTPS — see "HTTPS / Reverse Proxy" below — and set `MUSICDECK_SECURE_COOKIES=true`.
+If you plan to expose MusicDeck beyond your LAN (e.g. over the public
+internet), put it behind a reverse proxy with HTTPS — see "HTTPS / Reverse
+Proxy" below — and set `MUSICDECK_SECURE_COOKIES=true`.
 
 ## Services
 
 ### musicdeck-web
 
-Builds the React app and serves it with nginx.
+Builds the React app and serves it with nginx. This is the only container
+LAN clients connect to.
 
-- Public port: `${MUSICDECK_WEB_PORT:-8080}`
-- Proxies `/api/*` to `musicdeck-server:4534`
+- Public port: `${MUSICDECK_WEB_PORT:-8080}` — **required**
+- Proxies `/api/*` and `/ws/*` to `musicdeck-server:4534`
 - Serves the React client without running the React development server
 
 ### musicdeck-server
 
 Runs the compiled TypeScript MusicDeck API server.
 
-- Internal port: `4534`
+- Internal port: `4534` — never published to the host; only reachable from
+  `musicdeck-web` over the internal Docker network
 - Uses SQLite at `/app/data/musicdeck.sqlite`
-- Stores sessions, users, settings, favorites, recently played, and playlist ownership
-- Reads Navidrome credentials from environment variables
+- Stores sessions, users, settings, favorites, recently played, and
+  playlist ownership — all isolated per user (see "Multi-User Accounts")
+- Reads Navidrome/Jellyfin credentials from environment variables
 
 ### navidrome
 
-Runs the initial music backend.
+Runs the Navidrome music backend.
 
-- Internal port: `4533`
-- Optional host port: `${NAVIDROME_PORT:-4533}`
-- Reads music from `/media/music` on the host, mounted read-only
-- Stores its own database/config/cache in `/opt/navidrome/data` on the host
+- Internal URL used by MusicDeck Server: `http://navidrome:4533`
+- Optional host port: `${NAVIDROME_PORT:-4533}` — only for direct
+  Navidrome setup/admin access; not required for normal MusicDeck use
+- Reads music from `MUSIC_ROOT` on the host, mounted read-only
+- Stores its own database/config/cache in `NAVIDROME_DATA` on the host
+
+### jellyfin
+
+Runs the optional Jellyfin backend.
+
+- Internal URL used by MusicDeck Server: `http://jellyfin:8096`
+- Optional host port: `${JELLYFIN_PORT:-8096}` — only for direct Jellyfin
+  setup/admin access; not required for normal MusicDeck use
+- Reads music from `MUSIC_ROOT` on the host, mounted read-only
+- Stores its own config in `JELLYFIN_CONFIG` and transcode/image cache in
+  `JELLYFIN_CACHE` on the host, both persistent across restarts
 
 ## Persistent Volumes
 
@@ -125,21 +193,29 @@ Docker named volumes:
 - `musicdeck-config`: reserved for future config files
 - `musicdeck-cache`: reserved for future cache/artwork/transcode data
 
-Docker host bind mounts:
+Docker host bind mounts (all configurable via `.env`):
 
-- `/opt/navidrome/data`: Navidrome database/config/cache
-- `/media/music`: your music library folder
+- `MUSIC_ROOT`: your music library folder
+- `NAVIDROME_DATA`: Navidrome database/config/cache
+- `JELLYFIN_CONFIG`: Jellyfin configuration (persistent across restarts)
+- `JELLYFIN_CACHE`: Jellyfin transcode/image cache (persistent across restarts)
 
 Music folder mapping:
 
 ```text
-/media/music:/music:ro   (navidrome)
-/media/music:/music      (musicdeck-server)
+$MUSIC_ROOT:/music:ro   (navidrome, jellyfin)
+$MUSIC_ROOT:/music      (musicdeck-server)
 ```
 
-Both containers mount the same host folder (`/media/music`) so that music downloaded through MusicDeck's acquisition pipeline (e.g. the spotDL downloader) lands in the exact folder Navidrome scans. MusicDeck Server mounts it read-write (to save downloaded files); Navidrome mounts it read-only (it only needs to scan/serve).
+All three containers mount the same host folder (`$MUSIC_ROOT`) so that
+music downloaded through MusicDeck's acquisition pipeline (e.g. the spotDL
+downloader) lands in the exact folder Navidrome/Jellyfin scan. MusicDeck
+Server mounts it read-write (to save downloaded files); Navidrome and
+Jellyfin mount it read-only (they only need to scan/serve).
 
-If your host music folder or Navidrome data folder live somewhere else, edit the bind mount paths directly in `docker-compose.yml`.
+If your host music folder or Navidrome/Jellyfin data folders need to
+change, edit the corresponding variable in `.env` and restart the stack —
+`docker-compose.yml` itself has no hard-coded host paths.
 
 ### Local (non-Compose) development
 
@@ -152,24 +228,38 @@ Set `MUSICDECK_MUSIC_ROOT` in `.env` (or the server's environment) to a path tha
 MusicDeck:
 
 - `MUSICDECK_WEB_PORT`
-- `MUSICDECK_PUBLIC_URL`
-- `MUSICDECK_CORS_ORIGIN`
-- `MUSICDECK_SESSION_SECRET`
+- `MUSICDECK_PUBLIC_URL` — required, no `localhost` default in production
+- `MUSICDECK_CORS_ORIGIN` — required, must match `MUSICDECK_PUBLIC_URL`
+- `MUSICDECK_SESSION_SECRET` — required
 - `MUSICDECK_ADMIN_USERNAME`
-- `MUSICDECK_ADMIN_PASSWORD`
+- `MUSICDECK_ADMIN_PASSWORD` — required
 
 MusicDeck Server container also uses:
 
 - `MUSICDECK_HOST=0.0.0.0`
 - `MUSICDECK_PORT=4534`
 - `MUSICDECK_DB_PATH=/app/data/musicdeck.sqlite`
-- `MUSICDECK_MUSIC_ROOT`: folder where acquired/downloaded music is written. Must match Navidrome's scanned music folder (see "Persistent Volumes" above).
+- `MUSICDECK_MUSIC_ROOT`: folder where acquired/downloaded music is written. Must match Navidrome's/Jellyfin's scanned music folder (see "Persistent Volumes" above).
 
 Navidrome backend connection:
 
-- `NAVIDROME_URL=http://navidrome:4533`
-- `NAVIDROME_USERNAME`
-- `NAVIDROME_PASSWORD`
+- `NAVIDROME_URL=http://navidrome:4533` (internal, fixed)
+- `NAVIDROME_USERNAME` — required
+- `NAVIDROME_PASSWORD` — required
+- `NAVIDROME_PORT` — optional host port for direct access
+- `NAVIDROME_DATA` — required host path
+
+Jellyfin backend connection (optional):
+
+- `JELLYFIN_URL=http://jellyfin:8096` (internal, fixed)
+- `JELLYFIN_API_KEY` — optional; leave blank to not use Jellyfin
+- `JELLYFIN_PORT` — optional host port for direct access
+- `JELLYFIN_CONFIG`, `JELLYFIN_CACHE` — required host paths
+
+Music library:
+
+- `MUSIC_ROOT` — required host path, mounted read-write into MusicDeck
+  Server and read-only into Navidrome/Jellyfin
 
 Secret file support exists for:
 
@@ -220,11 +310,11 @@ GET /api/admin/health
 In Compose, the browser talks to `musicdeck-web` only:
 
 ```text
-http://localhost:8080/
-http://localhost:8080/api/*
+http://SERVER_IP:8080/
+http://SERVER_IP:8080/api/*
 ```
 
-nginx proxies `/api/*` to the server internally. This avoids requiring users to configure browser CORS for normal production deployments.
+nginx proxies `/api/*` (and reserved `/ws/*`) to the server internally. This avoids requiring users to configure browser CORS for normal production deployments.
 
 Local development is different: React's development server uses the `proxy` setting in `webapp/package.json` to reach `http://localhost:4534`.
 
@@ -247,8 +337,9 @@ Use HTTPS so cookies can be marked secure and credentials are protected in trans
 Back up these volumes/paths:
 
 - `musicdeck-data`
-- `/opt/navidrome/data` (Navidrome database/config/cache)
-- `/media/music` (your music library folder)
+- `NAVIDROME_DATA` (Navidrome database/config/cache)
+- `JELLYFIN_CONFIG` (Jellyfin configuration)
+- `MUSIC_ROOT` (your music library folder)
 - your `.env` or secret-management configuration
 
 For SQLite, stop the containers before copying the database for the simplest safe backup:
@@ -265,7 +356,7 @@ A full backup/restore command is intentionally deferred.
 
 ```powershell
 docker compose pull
-docker compose up --build -d
+docker compose up -d --build
 ```
 
 For local source builds, `--build` is enough to rebuild the server and web images.
@@ -322,7 +413,8 @@ Common startup issues:
 - `NAVIDROME_URL must be a valid URL`: check the URL format.
 - `NAVIDROME_USERNAME is required`: set the backend service username.
 - `NAVIDROME_PASSWORD is required`: set the backend service password.
-- Cannot find music: check the `/media/music` host path in `docker-compose.yml` and host file permissions.
-- Downloads via On-Demand Library/spotDL complete successfully but tracks never appear in the library or play: MusicDeck Server and Navidrome are not sharing the same music folder. In Docker Compose both containers already mount `/media/music`; for local/manual development, set `MUSICDECK_MUSIC_ROOT` to a path Navidrome's music folder also resolves to.
+- `Set MUSIC_ROOT/NAVIDROME_DATA/JELLYFIN_CONFIG/JELLYFIN_CACHE in .env` (Compose variable errors): one or more required host paths are missing from `.env` — these have no default and must point at real, existing absolute folders.
+- Cannot find music: check the `MUSIC_ROOT` host path in `.env` and host file/folder permissions.
+- Downloads via On-Demand Library/spotDL complete successfully but tracks never appear in the library or play: MusicDeck Server and Navidrome/Jellyfin are not sharing the same music folder. In Docker Compose all three containers already mount `$MUSIC_ROOT`; for local/manual development, set `MUSICDECK_MUSIC_ROOT` to a path Navidrome's music folder also resolves to.
 
 MusicDeck does not log Navidrome passwords, session secrets, tokens, or authenticated URLs.
