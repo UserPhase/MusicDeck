@@ -1,0 +1,140 @@
+# MusicDeck — LOCAL DEVELOPMENT compose (builds from source)
+#
+# This file builds the images from the ./server and ./webapp directories in
+# this repository, so it REQUIRES a full source checkout. Use it while
+# developing MusicDeck:
+#
+#   docker compose -f docker-compose.dev.yml up -d --build
+#
+# For self-hosted/production installs use docker-compose.yml instead, which
+# pulls prebuilt images from GHCR and needs no source tree.
+
+services:
+  musicdeck-web:
+    build:
+      context: ./webapp
+    container_name: musicdeck-web
+    depends_on:
+      musicdeck-server:
+        condition: service_healthy
+    ports:
+      # This is the ONLY port LAN clients need. Everything else (API,
+      # artwork, streaming, downloads, admin) is reverse-proxied through
+      # this single origin by nginx — clients never talk to port 4534,
+      # 4533, or 8096 directly.
+      - "${MUSICDECK_WEB_PORT:-8080}:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  musicdeck-server:
+    build:
+      context: ./server
+    container_name: musicdeck-server
+    environment:
+      NODE_ENV: production
+      # Bind on all interfaces inside the container so LAN traffic proxied
+      # in by musicdeck-web can reach it. This is an internal container
+      # address, not a host-exposed port.
+      MUSICDECK_HOST: 0.0.0.0
+      MUSICDECK_PORT: 4534
+      # Must be the URL LAN clients actually use to reach MusicDeck, e.g.
+      # http://192.168.1.50:8080 — never leave this defaulted to localhost
+      # in a real deployment.
+      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:?Set MUSICDECK_PUBLIC_URL in .env to http://SERVER_IP:MUSICDECK_WEB_PORT}
+      # Defaults to MUSICDECK_PUBLIC_URL — only set MUSICDECK_CORS_ORIGIN
+      # separately if browsers reach MusicDeck through a different origin
+      # than the one MusicDeck itself reports (uncommon).
+      MUSICDECK_CORS_ORIGIN: ${MUSICDECK_CORS_ORIGIN:-${MUSICDECK_PUBLIC_URL}}
+      MUSICDECK_DB_PATH: /app/data/musicdeck.sqlite
+      MUSICDECK_SESSION_SECRET: ${MUSICDECK_SESSION_SECRET:?Set MUSICDECK_SESSION_SECRET in .env}
+      MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-false}
+      MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
+      MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:?Set MUSICDECK_ADMIN_PASSWORD in .env}
+      MUSIC_BACKEND: ${MUSIC_BACKEND:-navidrome}
+      # Internal service-to-service URLs. LAN clients never see or use these
+      # hostnames/ports — MusicDeck Server proxies all provider access.
+      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_USERNAME: ${NAVIDROME_USERNAME:-}
+      NAVIDROME_PASSWORD: ${NAVIDROME_PASSWORD:-}
+      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      # MusicDeck Server must write acquired/downloaded music into the SAME
+      # host folder Navidrome/Jellyfin scan (mounted below), otherwise
+      # downloads via spotDL/On-Demand Library will succeed but never show
+      # up in either library.
+      MUSICDECK_MUSIC_ROOT: /music
+    volumes:
+      - musicdeck-data:/app/data
+      - musicdeck-config:/app/config
+      - musicdeck-cache:/app/cache
+      # Read-write: downloaded tracks land exactly where Navidrome/Jellyfin
+      # scan from.
+      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music
+    # No depends_on for the backends: only the backend selected by
+    # MUSIC_BACKEND is started (via Compose profiles), and depending on a
+    # non-activated profile service would drag the unused backend back in.
+    # No host port published: LAN clients only ever reach this container
+    # through the musicdeck-web nginx proxy.
+    expose:
+      - "4534"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    profiles: ["navidrome"]
+    restart: unless-stopped
+    environment:
+      ND_LOGLEVEL: info
+      ND_SCANSCHEDULE: 1h
+      ND_SESSIONTIMEOUT: 24h
+    volumes:
+      - ${NAVIDROME_DATA:-./navidrome-data}:/data
+      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
+    # Host port is OPTIONAL — only needed if you want to manage Navidrome
+    # directly (e.g. first-run setup, troubleshooting). Remove it once a
+    # service-account user exists if you don't want it reachable at all.
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4533/app/ >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    profiles: ["jellyfin"]
+    restart: unless-stopped
+    volumes:
+      - ${JELLYFIN_CONFIG:-./jellyfin-config}:/config
+      - ${JELLYFIN_CACHE:-./jellyfin-cache}:/cache
+      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
+    # Host port is OPTIONAL — only needed for direct Jellyfin setup/admin
+    # access. Same guidance as Navidrome above.
+    ports:
+      - "${JELLYFIN_PORT:-8096}:8096"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8096/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  musicdeck-data:
+  musicdeck-config:
+  musicdeck-cache:
