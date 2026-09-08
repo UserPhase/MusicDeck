@@ -321,17 +321,6 @@ useEffect(() => {
         >
           Unplayed
         </button>
-        <label className="search-mode-option">
-          Rating
-          <select
-            value={filters.minimumRating}
-            onChange={(event) => setFilters((current) => ({ ...current, minimumRating: event.target.value }))}
-          >
-            <option value="">Any</option>
-            <option value="4">4+</option>
-            <option value="5">5</option>
-          </select>
-        </label>
       </div>
 
 

@@ -7,6 +7,7 @@ import Explore from "./Explore";
 import {
   getAlbum,
   getArtist,
+  getCoverUrl,
   getExplore,
   getRecommendations,
 } from "../api/musicdeck";
@@ -231,6 +232,69 @@ test("keeps an artist's zero-download album visible alongside downloaded albums"
   expect(screen.getByText("Album A")).toBeInTheDocument();
   expect(screen.getByText("Album B")).toBeInTheDocument();
   expect(screen.getByText(/not downloaded/i)).toBeInTheDocument();
+});
+
+test("artist page album cover art resolves through the same getCoverUrl call as the album detail page", async () => {
+  getCoverUrl.mockImplementation((id) => (id ? `/artwork/${id}` : null));
+
+  // Album detail page.
+  getAlbum.mockResolvedValue({
+    id: "album-legacy",
+    name: "Legacy Album",
+    artist: "Queen",
+    artistId: "artist-1",
+    year: 1975,
+    coverArt: "artwork-legacy-1",
+    song: [],
+  });
+
+  const { unmount } = render(
+    <MemoryRouter initialEntries={["/album/album-legacy"]}>
+      <Routes>
+        <Route path="/album/:id" element={<Album />} />
+      </Routes>
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByRole("heading", { name: "Legacy Album" })).toBeInTheDocument();
+  expect(screen.getByAltText("Legacy Album cover")).toHaveAttribute(
+    "src",
+    "/artwork/artwork-legacy-1"
+  );
+  unmount();
+
+  // Artist page: same coverArt id, same getCoverUrl call, same resulting src.
+  getArtist.mockResolvedValue({
+    id: "artist-1",
+    name: "Queen",
+    coverArt: null,
+    albumCount: 1,
+    album: [
+      {
+        id: "album-legacy",
+        name: "Legacy Album",
+        year: 1975,
+        coverArt: "artwork-legacy-1",
+        source: { kind: "library", count: 1 },
+      },
+    ],
+    tracks: [],
+  });
+
+  render(
+    <MemoryRouter initialEntries={["/artist/artist-1"]}>
+      <Routes>
+        <Route path="/artist/:id" element={<Artist />} />
+      </Routes>
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByRole("heading", { name: "Queen" })).toBeInTheDocument();
+  expect(screen.getByAltText("Legacy Album cover")).toHaveAttribute(
+    "src",
+    "/artwork/artwork-legacy-1"
+  );
+  expect(getCoverUrl).toHaveBeenCalledWith("artwork-legacy-1");
 });
 
 test("renders native Explore recommendation sections when data exists", async () => {

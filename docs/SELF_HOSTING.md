@@ -71,6 +71,24 @@ http://localhost:4533
 
 After Navidrome has a user matching `NAVIDROME_USERNAME` and `NAVIDROME_PASSWORD`, MusicDeck Server can use it as the backend service account.
 
+## LAN Access (other devices on your network)
+
+The Docker Compose stack already binds `musicdeck-server` to `0.0.0.0` and publishes `musicdeck-web` on `${MUSICDECK_WEB_PORT:-8080}` on all host interfaces, so no extra container configuration is required for LAN access. To reach MusicDeck from a phone, tablet, or another computer on the same network:
+
+1. Find the host machine's LAN IP address (e.g. `192.168.1.50`).
+2. Set `MUSICDECK_PUBLIC_URL` and `MUSICDECK_CORS_ORIGIN` in `.env` to that address instead of `localhost`, for example:
+   ```text
+   MUSICDECK_PUBLIC_URL=http://192.168.1.50:8080
+   MUSICDECK_CORS_ORIGIN=http://192.168.1.50:8080
+   ```
+   These must match the exact origin browsers on other devices will use, including port.
+3. Restart the stack (`docker compose up -d --build`) so the server picks up the new environment values.
+4. Browse to `http://192.168.1.50:8080` from any device on the same network.
+
+Because the React client only ever calls same-origin relative `/api/...` paths (proxied by nginx), there is no separate frontend build step or extra environment variable needed for the API URL — whatever host/IP the browser uses to load the page is the host/IP it will use for API calls automatically. MusicDeck does not use WebSockets, so no additional WebSocket configuration is required.
+
+If you plan to expose MusicDeck beyond your LAN (e.g. over the public internet), put it behind a reverse proxy with HTTPS — see "HTTPS / Reverse Proxy" below — and set `MUSICDECK_SECURE_COOKIES=true`.
+
 ## Services
 
 ### musicdeck-web
@@ -165,6 +183,15 @@ Use secret files or your platform's secret manager for production where possible
 MusicDeck no longer stores fresh Navidrome username/password values in SQLite when environment credentials are supplied. Existing database-stored credentials are scrubbed when startup credentials are provided through environment/config.
 
 Database-stored backend credentials remain a development fallback for older databases that do not yet provide deployment credentials.
+
+## Multi-User Accounts
+
+MusicDeck supports multiple independent user accounts on one server:
+
+- The first account is created automatically from `MUSICDECK_ADMIN_USERNAME`/`MUSICDECK_ADMIN_PASSWORD` the first time the database has zero users (see `seedInitialData` in `server/src/db/migrations.ts`). This only runs once — it does not reset an existing admin's password.
+- Additional accounts (admin or standard `user` role) are created by an admin from the Admin > Users page, or via `POST /api/users`.
+- Each user has their own session, settings (`/api/settings/user`), favorites, recently played history, and playlists — all scoped by `user_id` in SQLite. Non-admin users cannot read or modify another user's data or admin-only server settings (`403 Forbidden`).
+- See `server/test/multi-user-isolation.test.ts` for regression coverage confirming two accounts on the same server never see each other's settings, favorites, or history, and that logging out one account does not affect another's session.
 
 ## Health Checks
 

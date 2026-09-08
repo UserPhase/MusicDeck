@@ -70,7 +70,7 @@ function toAlbum(album, songs) {
     releaseDate: album.releaseDate || null,
     genre: album.genre || null,
     label: album.label || null,
-    coverArt: album.artworkId,
+    coverArt: album.artwork?.id || album.artworkId || null,
     songCount: isExternal ? (album.tracks || []).length : album.songCount,
     // Catalog-aware completeness: total known tracks vs. locally downloaded
     // tracks. Falls back to songCount when the server hasn't merged catalog

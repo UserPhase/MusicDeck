@@ -46,15 +46,6 @@ function Library() {
           Tracks
         </NavLink>
 
-        <NavLink
-          to="/library/health"
-          className={({ isActive }) =>
-            `library-action ${isActive ? "active" : ""}`
-          }
-        >
-          Health
-        </NavLink>
-
       </div>
 
       <div className="library-content">

@@ -1,5 +1,6 @@
 import {
   getAlbums,
+  getArtist,
   getCoverUrl,
   getCurrentSession,
   getRecentlyPlayed,
@@ -90,6 +91,56 @@ test("album responses are adapted to existing UI shapes", async () => {
       coverArt: "art-1",
     }),
   ]);
+});
+
+test("artist albums resolve cover art the same way whether the server returns a legacy artworkId or a merged catalog artwork object", async () => {
+  global.fetch
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        artist: { id: "artist-1", name: "Queen", artworkId: null, albumCount: 2 },
+      }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        albums: [
+          {
+            id: "album-legacy",
+            name: "Legacy Album",
+            artistId: "artist-1",
+            artistName: "Queen",
+            year: 1975,
+            artworkId: "art-legacy",
+            songCount: 12,
+          },
+          {
+            id: "album-merged",
+            type: "album",
+            title: "Merged Album",
+            artist: "Queen",
+            year: 1980,
+            artwork: { id: "art-merged", url: "/api/artwork/art-merged" },
+            source: { kind: "library", count: 1 },
+            identity: { id: "some-id", strength: "normalized" },
+          },
+        ],
+      }),
+    });
+
+  const artist = await getArtist("artist-1");
+
+  expect(artist.album).toEqual([
+    expect.objectContaining({ id: "album-legacy", coverArt: "art-legacy" }),
+    expect.objectContaining({ id: "album-merged", coverArt: "art-merged" }),
+  ]);
+
+  // Both cover IDs must resolve through the same artwork endpoint used by
+  // the Album detail page.
+  expect(getCoverUrl(artist.album[0].coverArt)).toBe("/api/artwork/art-legacy");
+  expect(getCoverUrl(artist.album[1].coverArt)).toBe("/api/artwork/art-merged");
 });
 
 test("search adapts provider-neutral groups while retaining legacy arrays", async () => {
