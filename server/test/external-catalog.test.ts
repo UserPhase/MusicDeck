@@ -187,7 +187,7 @@ describe("External catalog", () => {
     const localAlbum = {
       id: "local-album-10",
       providerId: "local-album-10",
-      name: "External Album",
+      name: "Greatest Hits",
       artistId: "local-artist-20",
       artistName: "External Artist",
       year: 2025,
@@ -202,7 +202,7 @@ describe("External catalog", () => {
       artistId: "local-artist-20",
       artistName: "External Artist",
       albumId: "local-album-10",
-      albumName: "External Album",
+      albumName: "Greatest Hits",
       durationSeconds: 180,
       trackNumber: 1,
       artworkId: null,
@@ -211,7 +211,15 @@ describe("External catalog", () => {
     };
     const backend = createFakeBackend({
       listAlbums: vi.fn(async () => [localAlbum]),
-      getAlbumTracks: vi.fn(async () => [localTrack]),
+      listArtists: vi.fn(async () => [{
+        id: "local-artist-20",
+        providerId: "local-artist-20",
+        name: "External Artist",
+        artworkId: null,
+        artworkUrl: null,
+        albumCount: 1,
+      }]),
+      getArtistTracks: vi.fn(async () => [localTrack]),
     });
     current = await createTestServer(backend, {}, undefined, catalogFetch as typeof fetch);
     current.externalCatalog.configure(true);

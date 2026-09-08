@@ -18,6 +18,37 @@ function titleKey(title: string | null | undefined): string {
   return `${normalizeMusicText(title)}|${versionSignature(title || "")}`;
 }
 
+function strongRecordingIds(track: UnifiedSearchResult): Set<string> {
+  const ids = new Set<string>();
+  const hints = track.identityHints;
+  if (hints?.musicBrainzId) ids.add(`musicbrainz:${normalizeMusicText(hints.musicBrainzId)}`);
+  if (hints?.isrc) ids.add(`isrc:${normalizeMusicText(hints.isrc)}`);
+  if (track.identity?.strength === "musicbrainz" || track.identity?.strength === "isrc") {
+    ids.add(`${track.identity.strength}:${track.identity.id}`);
+  }
+  return ids;
+}
+
+export function recordingsMatch(
+  localTrack: UnifiedSearchResult,
+  catalogTrack: UnifiedSearchResult
+): boolean {
+  if (localTrack.type !== "track" || catalogTrack.type !== "track") return false;
+
+  const localStrongIds = strongRecordingIds(localTrack);
+  const catalogStrongIds = strongRecordingIds(catalogTrack);
+  if (localStrongIds.size > 0 && catalogStrongIds.size > 0) {
+    return [...localStrongIds].some((id) => catalogStrongIds.has(id));
+  }
+
+  if (titleKey(localTrack.title) !== titleKey(catalogTrack.title)) return false;
+  if (normalizeMusicText(localTrack.artist) !== normalizeMusicText(catalogTrack.artist)) return false;
+
+  const localDuration = Number(localTrack.metadata.durationSeconds || 0);
+  const catalogDuration = Number(catalogTrack.metadata.durationSeconds || 0);
+  return !localDuration || !catalogDuration || Math.abs(localDuration - catalogDuration) <= 20;
+}
+
 /**
  * Combine local (already-playable) tracks with catalog tracks for the same
  * album. Local tracks are returned unchanged (they remain the normal,
@@ -27,15 +58,34 @@ function titleKey(title: string | null | undefined): string {
  */
 export function mergeAlbumTracks(
   localTracks: UnifiedSearchResult[],
-  catalogTracks: UnifiedSearchResult[]
+  catalogTracks: UnifiedSearchResult[],
+  options: { appendUnmatchedLocal?: boolean } = {}
 ): UnifiedSearchResult[] {
-  const localKeys = new Set(localTracks.map((track) => titleKey(track.title)));
+  const matchedLocalIds = new Set<string>();
+  const mergedCatalog = catalogTracks.flatMap((catalogTrack) => {
+    if (catalogTrack.type !== "track") return [];
+    const localTrack = localTracks.find((candidate) => recordingsMatch(candidate, catalogTrack));
+    if (!localTrack) return [catalogTrack];
 
-  const undownloaded = catalogTracks.filter(
-    (item) => item.type === "track" && !localKeys.has(titleKey(item.title))
-  );
+    matchedLocalIds.add(localTrack.id);
+    return [{
+      ...catalogTrack,
+      id: localTrack.id,
+      provider: localTrack.provider,
+      source: localTrack.source,
+      availability: localTrack.availability,
+      artwork: localTrack.artwork || catalogTrack.artwork,
+    }];
+  });
 
-  return [...localTracks, ...undownloaded];
+  if (options.appendUnmatchedLocal === false) {
+    return mergedCatalog;
+  }
+
+  return [
+    ...mergedCatalog,
+    ...localTracks.filter((track) => !matchedLocalIds.has(track.id)),
+  ];
 }
 
 /**

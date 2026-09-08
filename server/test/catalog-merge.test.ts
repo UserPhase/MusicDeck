@@ -103,7 +103,7 @@ describe("catalog-merge", () => {
       const merged = mergeAlbumTracks(local, catalog);
 
       expect(merged).toHaveLength(12);
-      expect(merged.slice(0, 3)).toEqual(local);
+      expect(merged.slice(0, 3).map((track) => track.id)).toEqual(local.map((track) => track.id));
       // undownloaded entries are the 9 catalog-only tracks
       const undownloadedTitles = merged.slice(3).map((t) => t.title);
       expect(undownloadedTitles).toContain("I'm in Love with My Car");
@@ -115,6 +115,25 @@ describe("catalog-merge", () => {
       expect(merged).toHaveLength(2);
     });
 
+    it("uses one downloaded recording on every authoritative album that contains it", () => {
+      const downloaded = localTrack("Bohemian Rhapsody");
+      downloaded.album = "Greatest Hits I, II & III: The Platinum Collection";
+      const originalAlbumTrack = catalogTrack("Bohemian Rhapsody");
+      originalAlbumTrack.album = "A Night at the Opera";
+
+      const merged = mergeAlbumTracks([downloaded], [originalAlbumTrack], {
+        appendUnmatchedLocal: false,
+      });
+
+      expect(merged).toHaveLength(1);
+      expect(merged[0]).toMatchObject({
+        id: downloaded.id,
+        album: "A Night at the Opera",
+        provider: "library",
+        availability: { libraryAvailable: true },
+      });
+    });
+
     it("does not merge a live/remaster version into the original local recording", () => {
       const local = [localTrack("Bohemian Rhapsody")];
       const catalog = [catalogTrack("Bohemian Rhapsody - Live")];
@@ -123,6 +142,17 @@ describe("catalog-merge", () => {
 
       // Both should be present distinctly, not collapsed into one entry.
       expect(merged).toHaveLength(2);
+    });
+
+    it("does not reuse a compilation recording when duration differs substantially", () => {
+      const local = localTrack("Bohemian Rhapsody");
+      local.metadata.durationSeconds = 355;
+      const catalog = catalogTrack("Bohemian Rhapsody");
+      catalog.metadata.durationSeconds = 240;
+
+      const merged = mergeAlbumTracks([local], [catalog], { appendUnmatchedLocal: false });
+
+      expect(merged).toEqual([catalog]);
     });
 
     it("ignores non-track catalog items", () => {

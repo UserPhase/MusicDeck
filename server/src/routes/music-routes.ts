@@ -8,7 +8,7 @@ import type { CatalogService } from "../domain/catalog.js";
 import type { LibraryService } from "../domain/library.js";
 import { SourceResolver, SourceUnavailableError } from "../domain/source-resolver.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
-import { toAlbumSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
+import { toAlbumSearchResult, toArtistSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
 import type { UnifiedSearchResult } from "../domain/search.js";
 import type { SearchProviderRegistry } from "../domain/search-provider-registry.js";
 import { deduplicateSearchGroups } from "../domain/search-deduplication.js";
@@ -330,7 +330,7 @@ export async function registerMusicRoutes(
   async function resolveAlbumCatalogTracks(
     user: { role: string; externalSearchEnabled: boolean },
     albumId: string,
-    localAlbum: { name: string; artistName: string }
+    localAlbum: { name: string; artistName: string; artistId: string | null }
   ) {
     const localTracks = await catalog.getAlbumTracks(albumId);
     const stampedLocal = localTracks.map((track) =>
@@ -364,7 +364,28 @@ export async function registerMusicRoutes(
         return { tracks: stampedLocal, localCount: stampedLocal.length };
       }
 
-      return { tracks: mergeAlbumTracks(stampedLocal, detail.tracks), localCount: stampedLocal.length };
+      const artistTracks = localAlbum.artistId
+        ? await catalog.getArtistTracks(localAlbum.artistId)
+        : localTracks;
+      const localCandidates = artistTracks.map((track) =>
+        toTrackSearchResult({
+          ...track,
+          availability: {
+            state: "available",
+            connectionId: "library",
+            sourceCount: 1,
+            availableSourceCount: 1,
+            libraryAvailable: true,
+          },
+        })
+      );
+      const merged = mergeAlbumTracks(localCandidates, detail.tracks, {
+        appendUnmatchedLocal: false,
+      });
+      return {
+        tracks: merged,
+        localCount: merged.filter((track) => track.availability?.libraryAvailable).length,
+      };
     } catch {
       // Best-effort enrichment only; local library data remains authoritative.
       return { tracks: stampedLocal, localCount: stampedLocal.length };
@@ -379,21 +400,20 @@ export async function registerMusicRoutes(
     }
   ) {
     try {
-      const localAlbums = await catalog.listAlbums(500);
-      const localAlbumResults = localAlbums.items.map((album) =>
-        toAlbumSearchResult(album)
+      const localArtists = await catalog.listArtists();
+      const localArtistResults = localArtists.items.map((artist) =>
+        toArtistSearchResult(artist)
       );
-      const localMatch = findMatchingExternalAlbum(
-        localAlbumResults,
-        externalAlbum.title,
+      const localArtist = findMatchingExternalArtist(
+        localArtistResults,
         externalAlbum.artist
       );
 
-      if (!localMatch) {
+      if (!localArtist) {
         return { tracks: externalAlbum.tracks, localCount: 0 };
       }
 
-      const localTracks = await catalog.getAlbumTracks(localMatch.id);
+      const localTracks = await catalog.getArtistTracks(localArtist.id);
       const stampedLocal = localTracks.map((track) =>
         toTrackSearchResult({
           ...track,
@@ -407,9 +427,12 @@ export async function registerMusicRoutes(
         })
       );
 
+      const tracks = mergeAlbumTracks(stampedLocal, externalAlbum.tracks, {
+        appendUnmatchedLocal: false,
+      });
       return {
-        tracks: mergeAlbumTracks(stampedLocal, externalAlbum.tracks),
-        localCount: stampedLocal.length,
+        tracks,
+        localCount: tracks.filter((track) => track.availability?.libraryAvailable).length,
       };
     } catch {
       return { tracks: externalAlbum.tracks, localCount: 0 };
