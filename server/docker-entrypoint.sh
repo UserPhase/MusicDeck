@@ -27,8 +27,8 @@ fi
 groupmod --non-unique --gid "$PGID" musicdeck
 usermod --non-unique --uid "$PUID" --gid "$PGID" musicdeck
 
-mkdir -p /app/data /app/config /app/cache
-chown -R "$PUID:$PGID" /app/data /app/config /app/cache
+mkdir -p /app/home /app/data /app/config /app/cache
+chown -R "$PUID:$PGID" /app/home /app/data /app/config /app/cache
 
 if [ -d "$MUSIC_ROOT" ] && ! gosu musicdeck test -w "$MUSIC_ROOT"; then
   owner="$(stat -c '%u:%g' "$MUSIC_ROOT" 2>/dev/null || echo unknown)"

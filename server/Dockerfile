@@ -31,6 +31,7 @@ WORKDIR /app
 # adapter's bare "spotdl"/"ffmpeg" spawns resolve without extra config.
 ENV SPOTDL_HOME=/opt/spotdl
 ENV PATH="${SPOTDL_HOME}/bin:${PATH}"
+ENV HOME=/app/home
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -47,8 +48,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system musicdeck \
-  && useradd --system --gid musicdeck --home-dir /app musicdeck \
-  && mkdir -p /app/data /app/config /app/cache \
+  && useradd --system --gid musicdeck --home-dir /app/home musicdeck \
+  && mkdir -p /app/home /app/data /app/config /app/cache \
   && chown -R musicdeck:musicdeck /app
 
 COPY package*.json ./
@@ -63,7 +64,7 @@ EXPOSE 4534
 VOLUME ["/app/data", "/app/config", "/app/cache"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD gosu musicdeck node -e "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["musicdeck-entrypoint"]
 CMD ["node", "dist/main.js"]

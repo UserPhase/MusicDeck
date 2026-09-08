@@ -107,6 +107,12 @@ downloader as root. Startup fails with an ownership/mode diagnostic when the
 configured identity cannot write to the music root, rather than allowing a
 later download to fail with `EACCES`.
 
+After changing `PUID`, `PGID`, or host ownership, recreate the server:
+
+```bash
+docker compose up -d --force-recreate musicdeck-server
+```
+
 `NAVIDROME_DATA`, `JELLYFIN_CONFIG`, and `JELLYFIN_CACHE` are optional — they
 default to `./navidrome-data`, `./jellyfin-config`, and `./jellyfin-cache`
 (created next to `docker-compose.yml`) unless you override them with your own

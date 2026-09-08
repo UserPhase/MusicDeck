@@ -244,6 +244,13 @@ match. This prevents downloads from failing later with errors such as:
 EACCES: permission denied, mkdir '/music/Artist/Album'
 ```
 
+After changing `PUID`, `PGID`, or the host directory ownership, recreate the
+server so the new identity is applied:
+
+```bash
+docker compose up -d --force-recreate musicdeck-server
+```
+
 ### 4. Set secrets, passwords, and your server's LAN address
 
 ```text
@@ -412,6 +419,19 @@ npm test            # vitest suite
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```
+
+Production Docker music-root permissions (from the repository root, Linux):
+
+```bash
+docker build -t musicdeck-server:music-root-test ./server
+bash ./scripts/test-docker-music-root.sh
+```
+
+This creates a realistically owned host music directory, runs the image with
+matching `PUID`/`PGID`, writes a valid MP3 under a nested artist/album path,
+checks ownership, verifies all three named volumes remain writable, and proves
+the backend's view of the same library is read-only. Image publishing is gated
+on this test in `.github/workflows/publish-images.yml`.
 
 Web client (from `webapp/`):
 

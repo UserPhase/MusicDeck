@@ -14,7 +14,26 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  test-server-image:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build production server image
+        run: docker build --tag musicdeck-server:music-root-test ./server
+
+      - name: Test music-root permissions
+        run: |
+          sed -i 's/\r$//' ./scripts/test-docker-music-root.sh
+          bash ./scripts/test-docker-music-root.sh
+
   build-and-push:
+    needs: test-server-image
     runs-on: ubuntu-latest
 
     permissions:
