@@ -538,7 +538,10 @@ describe("Reverb-Style Downloader Architecture", () => {
       const importedPath = updatedJob?.files?.[0].path;
       expect(importedPath).toBeDefined();
       expect(fs.existsSync(importedPath!)).toBe(true);
-      expect(importedPath).toContain(path.join("Queen", "News of the World"));
+      expect(importedPath).toBe(
+        path.join(testMusicDir, "Queen", "News of the World", "We Will Rock You.flac")
+      );
+      expect(fs.existsSync(path.join(testTmpDir, job.id))).toBe(false);
 
       // Verify live progress & completion events were emitted
       const eventNames = eventsEmitted.map((e) => e.event);

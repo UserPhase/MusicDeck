@@ -1411,11 +1411,32 @@ export class AcquisitionService {
 
         const fileName = `${trackNum}${trackTitle}${ext}`;
         const destPath = resolveSafeDestination(downloadDir, artistName, albumName, fileName);
+        const relativeDestPath = path.relative(this.baseMusicDir, destPath);
+        if (
+          relativeDestPath === "" ||
+          relativeDestPath.startsWith(`..${path.sep}`) ||
+          relativeDestPath === ".." ||
+          path.isAbsolute(relativeDestPath)
+        ) {
+          throw new Error(`Import destination is outside MUSIC_ROOT: ${destPath}`);
+        }
 
         fs.mkdirSync(path.dirname(destPath), { recursive: true });
-        fs.copyFileSync(file.path, destPath);
+        const pendingPath = `${destPath}.musicdeck-importing`;
+        try {
+          fs.copyFileSync(file.path, pendingPath);
+          fs.renameSync(pendingPath, destPath);
+        } finally {
+          if (fs.existsSync(pendingPath)) {
+            fs.rmSync(pendingPath, { force: true });
+          }
+        }
 
         const stat = fs.statSync(destPath);
+        if (!stat.isFile() || stat.size === 0) {
+          throw new Error(`Imported audio file was not written to MUSIC_ROOT: ${destPath}`);
+        }
+        console.log(`[Acquisition] imported file: ${destPath}`);
         importedFiles.push({
           path: destPath,
           title: trackTitle,
