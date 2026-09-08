@@ -3,6 +3,9 @@ import fs from "node:fs";
 
 dotenv.config();
 
+/** Music backends MusicDeck can run as its primary library provider. */
+export type MusicBackendKind = "navidrome" | "jellyfin";
+
 export type AppConfig = {
   host: string;
   port: number;
@@ -10,11 +13,15 @@ export type AppConfig = {
   corsOrigin: string;
   sessionSecret: string;
   databasePath: string;
-  backend: "navidrome";
+  backend: MusicBackendKind;
   navidrome: {
     url: string;
     username: string;
     password: string;
+  };
+  jellyfin: {
+    url: string;
+    apiKey: string;
   };
   firstAdmin: {
     username: string;
@@ -73,6 +80,23 @@ export function validateConfig(config: AppConfig) {
     throw new Error("MUSICDECK_SESSION_SECRET must be set to a non-default value");
   }
 
+  // Only the selected backend's connection settings are required. A
+  // Jellyfin-only deployment must not be forced to invent Navidrome
+  // credentials (and vice versa) just to pass startup validation.
+  if (config.backend === "jellyfin") {
+    try {
+      new URL(config.jellyfin.url);
+    } catch {
+      throw new Error("JELLYFIN_URL must be a valid URL");
+    }
+
+    if (!config.jellyfin.apiKey) {
+      throw new Error("JELLYFIN_API_KEY is required when MUSIC_BACKEND=jellyfin");
+    }
+
+    return;
+  }
+
   try {
     new URL(config.navidrome.url);
   } catch {
@@ -88,6 +112,21 @@ export function validateConfig(config: AppConfig) {
   }
 }
 
+/**
+ * Read the primary backend selection. Production Compose sets this to run
+ * exactly one backend; anything unrecognized fails loudly rather than
+ * silently falling back to a backend the operator did not deploy.
+ */
+function readBackend(): MusicBackendKind {
+  const value = readEnv("MUSIC_BACKEND", "navidrome").trim().toLowerCase();
+
+  if (value === "navidrome" || value === "jellyfin") {
+    return value;
+  }
+
+  throw new Error(`MUSIC_BACKEND must be "navidrome" or "jellyfin" (received "${value}")`);
+}
+
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const isProduction = process.env.NODE_ENV === "production";
 
@@ -98,11 +137,15 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     corsOrigin: readEnv("MUSICDECK_CORS_ORIGIN", "http://localhost:3000"),
     sessionSecret: readSecret("MUSICDECK_SESSION_SECRET", "change-this-in-development"),
     databasePath: readDbPath(),
-    backend: "navidrome",
+    backend: readBackend(),
     navidrome: {
       url: readEnv("NAVIDROME_URL", "http://192.168.2.38:4533"),
       username: readEnv("NAVIDROME_USERNAME"),
       password: readSecret("NAVIDROME_PASSWORD"),
+    },
+    jellyfin: {
+      url: readEnv("JELLYFIN_URL", "http://jellyfin:8096"),
+      apiKey: readSecret("JELLYFIN_API_KEY"),
     },
     firstAdmin: {
       username: readEnv("MUSICDECK_ADMIN_USERNAME", "admin"),
@@ -126,6 +169,10 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     navidrome: {
       ...config.navidrome,
       ...overrides.navidrome,
+    },
+    jellyfin: {
+      ...config.jellyfin,
+      ...overrides.jellyfin,
     },
     firstAdmin: {
       ...config.firstAdmin,

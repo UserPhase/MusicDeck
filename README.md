@@ -152,60 +152,104 @@ this section.
 
 ## Docker self-hosting (LAN server)
 
-MusicDeck's production Docker stack is designed to be plug-and-play: change a
-few host paths and credentials, then start it. Users on your network access
-**one URL** — nginx in `musicdeck-web` reverse-proxies `/api/*` (and any future
-WebSocket traffic under `/ws/*`) to `musicdeck-server` internally, so clients
-never need to know about the internal server, Navidrome, or Jellyfin ports.
+MusicDeck's production stack runs from **prebuilt images on GHCR** — you do not
+need this source repository, and you do not install Node.js, Python, FFmpeg, or
+spotDL on the host (they are already inside the server image).
 
-### 1. Create `.env`
+> **Do not clone or build this repository for production.** There is no
+> `git clone`, no `npm install`, and no `docker compose build` step. The
+> production `docker-compose.yml` contains **no build contexts** and never
+> references `./server` or `./webapp`. If you see an error like
+> `unable to prepare context: path "./server" not found`, you are using the
+> developer file `docker-compose.dev.yml` instead of the production one.
 
-From the workspace root:
+The published images are:
 
-```powershell
-Copy-Item .env.example .env
-notepad .env
+```text
+ghcr.io/userphase/musicdeck-server
+ghcr.io/userphase/musicdeck-web
 ```
 
-### 2. Change host paths
+Both are multi-architecture (`linux/amd64` and `linux/arm64`, so Raspberry Pi
+and other ARM servers work), and both publish a `latest` tag plus version tags
+(`1.2.3`, `1.2`) for release tags. Pin a version with `MUSICDECK_VERSION` in
+`.env` if you don't want to track `latest`.
 
-Set these to real, existing absolute folders on your Docker host:
+A complete installation is just two files:
+
+```text
+/opt/musicdeck/
+  docker-compose.yml
+  .env
+```
+
+Users on your network access **one URL** — nginx in `musicdeck-web`
+reverse-proxies `/api/*` (and WebSocket traffic under `/ws/*`) to
+`musicdeck-server` internally, so clients never need to know about the internal
+server, Navidrome, or Jellyfin ports.
+
+### 1. Create the install folder and fetch the two files
+
+```bash
+mkdir -p /opt/musicdeck && cd /opt/musicdeck
+curl -O https://raw.githubusercontent.com/UserPhase/MusicDeck/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/UserPhase/MusicDeck/main/.env.example
+```
+
+### 2. Choose your backend
+
+MusicDeck runs **exactly one** music backend. Set it in `.env`:
+
+```text
+MUSIC_BACKEND=navidrome    # or: jellyfin
+```
+
+Only the selected backend's container is started — the other one is never
+created — and only that backend's credentials are required.
+
+### 3. Change your music folder path
+
+Set this to a real, existing absolute folder on your Docker host:
 
 ```text
 MUSIC_ROOT=/media/music
-NAVIDROME_DATA=/opt/navidrome/data
-JELLYFIN_CONFIG=/opt/jellyfin/config
-JELLYFIN_CACHE=/opt/jellyfin/cache
 ```
 
 `MUSIC_ROOT` is mounted read-write into MusicDeck Server (so downloads land
-there) and read-only into Navidrome/Jellyfin (so they can scan/serve it
-without ever modifying it).
+there) and read-only into the backend (so it can scan/serve it without ever
+modifying it). The backend's own data/config/cache folders already have working
+defaults created next to `docker-compose.yml`.
 
-### 3. Set secrets, passwords, and your server's LAN address
+### 4. Set secrets, passwords, and your server's LAN address
 
 ```text
 MUSICDECK_PUBLIC_URL=http://SERVER_IP:8080
-MUSICDECK_CORS_ORIGIN=http://SERVER_IP:8080
 MUSICDECK_SESSION_SECRET=replace-with-a-long-random-secret
 MUSICDECK_ADMIN_USERNAME=admin
 MUSICDECK_ADMIN_PASSWORD=choose-a-strong-password
+
+# Only when MUSIC_BACKEND=navidrome:
 NAVIDROME_USERNAME=your-navidrome-service-user
 NAVIDROME_PASSWORD=your-navidrome-service-password
+
+# Only when MUSIC_BACKEND=jellyfin:
+JELLYFIN_API_KEY=your-jellyfin-api-key
 ```
 
 Replace `SERVER_IP` with your Docker host's actual LAN IP address (e.g.
 `192.168.1.50`) or a resolvable hostname — this is the address every device on
-your network will type into its browser. Do not leave these as `localhost` in
-a real deployment.
+your network will type into its browser. Do not leave this as `localhost` in
+a real deployment. `MUSICDECK_CORS_ORIGIN` defaults to `MUSICDECK_PUBLIC_URL`
+automatically, so you only need to set one URL.
 
-### 4. Start the stack
+### 5. Start the stack
 
-```powershell
+```bash
+docker compose pull
 docker compose up -d
 ```
 
-### 5. Open MusicDeck
+### 6. Open MusicDeck
 
 ```text
 http://SERVER_IP:8080
@@ -214,16 +258,14 @@ http://SERVER_IP:8080
 This is the only address any device on your LAN needs — phones, tablets, and
 other computers all use the same URL and port.
 
-### 6. Connect Navidrome/Jellyfin accounts
+### 7. Connect your backend account
 
-- Navidrome needs a user matching `NAVIDROME_USERNAME`/`NAVIDROME_PASSWORD`
-  before MusicDeck can read from it. Create it once via Navidrome's own UI —
-  optionally reachable directly at `http://SERVER_IP:4533` (see "Required vs.
-  optional ports" below).
-- Jellyfin is optional. If you want it, log in to Jellyfin directly at
-  `http://SERVER_IP:8096`, create an API key under **Dashboard → API Keys**,
-  set `JELLYFIN_API_KEY` in `.env`, then restart: `docker compose up -d`.
-  Enable/configure the Jellyfin connection from MusicDeck's Admin dashboard.
+- **Navidrome** needs a user matching `NAVIDROME_USERNAME`/`NAVIDROME_PASSWORD`
+  before MusicDeck can read from it. Create it once via Navidrome's own UI at
+  `http://SERVER_IP:4533` (see "Required vs. optional ports" below).
+- **Jellyfin** needs an API key. Complete Jellyfin's first-run wizard at
+  `http://SERVER_IP:8096`, create a key under **Dashboard → API Keys**, set
+  `JELLYFIN_API_KEY` in `.env`, then re-run `docker compose up -d`.
 
 ### Required vs. optional ports
 
@@ -236,13 +278,30 @@ other computers all use the same URL and port.
 MusicDeck Server itself (`4534`) is never published to the host; it is only
 reachable from `musicdeck-web` over the internal Docker network.
 
+### Bundled runtime dependencies
+
+The `musicdeck-server` image ships everything the acquisition/downloader system
+needs, so the host stays clean:
+
+| Dependency | Purpose |
+| --- | --- |
+| Node.js 24 | MusicDeck Server runtime |
+| Python 3 | spotDL runtime |
+| spotDL | On-Demand Library / track acquisition |
+| FFmpeg + ffprobe | audio conversion and tagging for downloads |
+
+Downloads are written straight into `MUSIC_ROOT`, which is the same folder your
+selected backend scans, so acquired tracks appear in the library automatically.
+
 ### Persistent data
 
 Docker named volumes: `musicdeck-data` (SQLite database — users, sessions,
 settings, favorites, recently played, playlists), `musicdeck-config`, and
 `musicdeck-cache`. Host-path volumes: `MUSIC_ROOT` (your music, read-write for
-MusicDeck / read-only for Navidrome and Jellyfin), `NAVIDROME_DATA`,
-`JELLYFIN_CONFIG`, and `JELLYFIN_CACHE`.
+MusicDeck / read-only for the backend), plus `NAVIDROME_DATA`,
+`JELLYFIN_CONFIG`, and `JELLYFIN_CACHE` — these default to `./navidrome-data`,
+`./jellyfin-config`, and `./jellyfin-cache` (created next to
+`docker-compose.yml`) unless overridden in `.env`.
 
 ### Multi-user access
 
@@ -255,10 +314,13 @@ without seeing each other's data. See
 
 ### Updating
 
-```powershell
+```bash
 docker compose pull
-docker compose up -d --build
+docker compose up -d
 ```
+
+Pin `MUSICDECK_VERSION` in `.env` to a release tag instead of `latest` for
+reproducible deployments.
 
 For more detail (HTTPS/reverse proxy, secret files, backups, health checks),
 see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md).
@@ -267,9 +329,39 @@ see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md).
 
 - **Local development**: `server` runs via `tsx watch` on `:4534`; `webapp`
   runs via `react-scripts start` on `:3000` and proxies `/api` to the server.
-- **Docker/self-hosted**: nginx serves the built React app on the web port and
-  proxies `/api/*` to the server container internally — one origin, no CORS
-  setup required.
+- **Docker (developers, builds from source)**: `docker-compose.dev.yml` builds
+  the images from `./server` and `./webapp` and therefore needs a full source
+  checkout:
+  ```bash
+  docker compose -f docker-compose.dev.yml up -d --build
+  ```
+- **Docker (self-hosted/production)**: `docker-compose.yml` pulls prebuilt GHCR
+  images and needs no source tree. nginx serves the built React app on the web
+  port and proxies `/api/*` to the server container internally — one origin, no
+  CORS setup required.
+
+### Publishing the images (maintainers only)
+
+Self-hosters never need this section. The
+[`Publish Docker images`](.github/workflows/publish-images.yml) workflow builds
+and pushes both images to GHCR on every push to `main`, on `v*` tags, and via
+manual `workflow_dispatch`. It lowercases the repository owner (`UserPhase` →
+`userphase`) because GHCR image paths must be lowercase and must match the
+references in `docker-compose.yml` exactly.
+
+**GHCR packages are private on first publish.** Until they are made public,
+`docker compose pull` fails for users with `error from registry: denied`. Make
+each package public once, after the first successful run:
+
+1. Open `https://github.com/users/UserPhase/packages/container/musicdeck-server/settings`
+2. **Danger Zone → Change visibility → Public**
+3. Repeat for `musicdeck-web`
+
+To automate this instead, create a PAT with the `write:packages` and
+`delete:packages` scopes and save it as the repository secret
+`GHCR_VISIBILITY_TOKEN`; the workflow will then set visibility on each run. If
+the secret is absent the workflow still succeeds and just prints the manual
+steps above.
 
 ## API overview
 

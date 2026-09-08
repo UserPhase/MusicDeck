@@ -54,8 +54,8 @@ export function createProvider(
 
   if (type === "jellyfin") {
     return new JellyfinBackend({
-      url: process.env.JELLYFIN_URL || storedConfig.url || "",
-      apiKey: process.env.JELLYFIN_API_KEY || storedConfig.apiKey || "",
+      url: config.jellyfin.url || storedConfig.url || "",
+      apiKey: config.jellyfin.apiKey || storedConfig.apiKey || "",
     });
   }
 
@@ -68,8 +68,8 @@ export function createProvider(
  * Preserves the previous single-connection behavior: providers are ordered
  * by created_at ASC so `getPrimary()` returns the same connection the old
  * factory selected. If the table has no enabled rows, a synthetic
- * environment-configured Navidrome entry keeps startup working, matching
- * the old factory's `stored = {}` fallback.
+ * environment-configured entry for the selected backend keeps startup
+ * working, matching the old factory's `stored = {}` fallback.
  */
 export function createProviderRegistry(db: Db, config: AppConfig): ProviderRegistry {
   const rows = db.prepare(
@@ -86,11 +86,11 @@ export function createProviderRegistry(db: Db, config: AppConfig): ProviderRegis
 
   if (providers.length === 0) {
     providers.push({
-      connectionId: "env-navidrome",
-      type: "navidrome",
-      name: "Navidrome",
+      connectionId: `env-${config.backend}`,
+      type: config.backend,
+      name: config.backend === "jellyfin" ? "Jellyfin" : "Navidrome",
       enabled: true,
-      provider: createProvider("navidrome", {}, config),
+      provider: createProvider(config.backend, {}, config),
     });
   }
 

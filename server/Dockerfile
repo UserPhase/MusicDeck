@@ -17,6 +17,34 @@ FROM node:24-bookworm-slim AS production
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Runtime dependencies for the acquisition/downloader pipeline.
+#
+# The image ships everything MusicDeck's downloaders need so operators never
+# install Python, FFmpeg, or spotDL on the Docker host:
+#   - python3 + pip: spotDL runtime
+#   - ffmpeg: audio conversion/tagging performed by spotDL
+#   - ca-certificates: TLS for provider/API/download requests
+#
+# spotDL is installed into a dedicated virtualenv at /opt/spotdl so it cannot
+# conflict with Debian's system Python packages (PEP 668 externally-managed
+# environment), and that venv's bin directory is placed on PATH so the
+# adapter's bare "spotdl"/"ffmpeg" spawns resolve without extra config.
+ENV SPOTDL_HOME=/opt/spotdl
+ENV PATH="${SPOTDL_HOME}/bin:${PATH}"
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    python3-pip \
+    ffmpeg \
+    ca-certificates \
+  && python3 -m venv "${SPOTDL_HOME}" \
+  && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir --upgrade pip \
+  && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir spotdl \
+  && apt-get purge -y --auto-remove python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system musicdeck \
   && useradd --system --gid musicdeck --home-dir /app musicdeck \
   && mkdir -p /app/data /app/config /app/cache \

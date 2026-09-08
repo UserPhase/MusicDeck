@@ -1,0 +1,109 @@
+name: Publish Docker images
+
+# Builds the MusicDeck server and web images and publishes them to GHCR so
+# self-hosted deployments can `docker compose pull` without needing the
+# source repository or any local build context.
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: musicdeck-server
+            context: ./server
+          - name: musicdeck-web
+            context: ./webapp
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase owner
+        id: owner
+        # GHCR image paths must be lowercase, but the GitHub owner is
+        # "UserPhase". Without this the published package name would not
+        # match the ghcr.io/userphase/... references in docker-compose.yml.
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/${{ matrix.name }}
+          # `latest` tracks the default branch so the documented
+          # docker-compose.yml default (:latest) always resolves.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+      - name: Make package public
+        # GHCR packages are PRIVATE on first publish, which would make
+        # `docker compose pull` fail for self-hosters with a 403/denied
+        # error. GITHUB_TOKEN cannot change package visibility, so this
+        # uses an optional PAT (scope: read:packages, write:packages,
+        # delete:packages). If the secret is absent we skip and print the
+        # one-time manual step instead of failing the build.
+        env:
+          PAT: ${{ secrets.GHCR_VISIBILITY_TOKEN }}
+          PACKAGE: ${{ matrix.name }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::notice::GHCR_VISIBILITY_TOKEN not set. Make the package public once, manually:"
+            echo "::notice::https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE}/settings -> Change visibility -> Public"
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/packages/container/${PACKAGE}" \
+            -d '{"visibility":"public"}')
+          if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+            echo "Package ${PACKAGE} is public."
+          else
+            echo "::warning::Could not set visibility (HTTP $code). Set it manually in package settings."
+            cat /tmp/resp.json || true
+          fi

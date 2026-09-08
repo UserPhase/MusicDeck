@@ -50,6 +50,14 @@ export function autoDetectSpotDLPath(): string {
     candidates.push("C:\\Python313\\Scripts\\spotdl.exe");
     candidates.push("C:\\Python312\\Scripts\\spotdl.exe");
   } else {
+    // Container images install spotDL into a dedicated virtualenv; prefer
+    // it so detection does not depend on PATH being inherited by the
+    // spawning process.
+    const venvHome = process.env.SPOTDL_HOME;
+    if (venvHome) {
+      candidates.push(path.join(venvHome, "bin", "spotdl"));
+    }
+    candidates.push("/opt/spotdl/bin/spotdl");
     candidates.push(path.join(home, ".local", "bin", "spotdl"));
     candidates.push("/usr/local/bin/spotdl");
     candidates.push("/usr/bin/spotdl");

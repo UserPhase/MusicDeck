@@ -1,6 +1,7 @@
 import { loadConfig, validateConfig } from "./config.js";
 import { createProviderRegistry } from "./backends/factory.js";
-import { hasUserDataSync, type MusicBackend } from "./backends/music-backend.js";
+import { type MusicBackend } from "./backends/music-backend.js";
+import { withLocalUserDataSync } from "./backends/local-user-data-sync.js";
 import { openDatabase } from "./db/database.js";
 import { buildServer } from "./server.js";
 import { CatalogService } from "./domain/catalog.js";
@@ -32,13 +33,10 @@ async function start() {
   const registry = createProviderRegistry(db, config);
   const primaryProvider = registry.getPrimary().provider;
 
-  // Routes/services that exercise provider-side user-data sync require the
-  // primary provider to implement UserDataSync. Navidrome (the current
-  // primary) always does; fail clearly at startup if it does not.
-  if (!hasUserDataSync(primaryProvider)) {
-    throw new Error("Primary backend provider must support user-data sync");
-  }
-  const backend: MusicBackend = primaryProvider;
+  // Backends that support provider-side user-data sync (Navidrome) are used
+  // directly. Backends that do not (Jellyfin) are wrapped so favorites and
+  // playlists stay in MusicDeck's own database instead of blocking startup.
+  const backend: MusicBackend = withLocalUserDataSync(primaryProvider);
 
   const library = new LibraryService(db);
   const catalog = new CatalogService(registry, library);

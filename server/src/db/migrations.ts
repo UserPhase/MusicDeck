@@ -468,9 +468,13 @@ export async function seedInitialData(db: Database.Database, config: AppConfig) 
   ).run("user", "Standard MusicDeck user");
 
   const now = new Date().toISOString();
+  // Seed a connection row for the backend this deployment actually runs.
+  // A Jellyfin-only install must not be seeded with an unreachable
+  // Navidrome connection that would then be selected as primary.
+  const seedType = config.backend;
   const backendCount = db.prepare(
     "SELECT COUNT(*) AS count FROM backend_connections WHERE type = ?"
-  ).get("navidrome") as { count: number };
+  ).get(seedType) as { count: number };
 
   if (backendCount.count === 0) {
     db.prepare(`
@@ -479,10 +483,10 @@ export async function seedInitialData(db: Database.Database, config: AppConfig) 
       VALUES (?, ?, ?, ?, 1, ?, ?)
     `).run(
       createId("backend"),
-      "navidrome",
-      "Navidrome",
+      seedType,
+      seedType === "jellyfin" ? "Jellyfin" : "Navidrome",
       JSON.stringify({
-        url: config.navidrome.url,
+        url: seedType === "jellyfin" ? config.jellyfin.url : config.navidrome.url,
         credentials: "environment",
       }),
       now,
