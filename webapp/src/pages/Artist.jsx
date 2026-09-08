@@ -177,10 +177,19 @@ function Artist() {
         const artistSongs = Array.isArray(artistData.tracks)
           ? artistData.tracks
           : (await Promise.all(
-            artistAlbums.map(
-              (album) =>
-                getAlbum(album.id)
-            )
+            artistAlbums
+              // Catalog-only albums merged in from the external catalog
+              // (zero local tracks) don't have a local track listing to
+              // fetch — skip them here; they still render on the page via
+              // `albums`, they just don't contribute to the derived
+              // "popular tracks" list below.
+              .filter((album) => album.source?.kind !== "external")
+              .map((album) =>
+                getAlbum(album.id).catch((err) => {
+                  console.error("Could not load album tracks:", err);
+                  return null;
+                })
+              )
           )).flatMap(
             (album) =>
               album?.song || []
@@ -589,6 +598,14 @@ function Artist() {
 
                   <div className="album-artist">
                     {album.year}
+                  </div>
+
+                )}
+
+                {album.source?.kind === "external" && (
+
+                  <div className="album-artist album-not-downloaded">
+                    Not downloaded
                   </div>
 
                 )}

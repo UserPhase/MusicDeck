@@ -467,6 +467,17 @@ function Album() {
               ? "song"
               : "songs"}
 
+            {typeof album.trackCount === "number" &&
+              typeof album.localTrackCount === "number" &&
+              album.trackCount > album.localTrackCount && (
+                <>
+                  {" · "}
+                  <span className="album-completion">
+                    {album.localTrackCount} / {album.trackCount} in library
+                  </span>
+                </>
+              )}
+
           </div>
 
 
@@ -526,10 +537,18 @@ function Album() {
 
 
         {songs.map(
-          (song, index) => (
+          (song, index) => {
+
+          const isDownloaded =
+            Boolean(song.availability?.libraryAvailable) ||
+            song.source?.kind === "library";
+
+          return (
 
           <div
-            className="track track-album-page"
+            className={
+              `track track-album-page${isDownloaded ? "" : " track-not-downloaded"}`
+            }
             key={`${song.id}-${index}`}
           >
 
@@ -546,10 +565,13 @@ function Album() {
               <button
                 className="track-play"
                 onClick={() =>
-                  playSong(song)
+                  isDownloaded && playSong(song)
                 }
+                disabled={!isDownloaded}
                 aria-label={
-                  `Play ${song.title}`
+                  isDownloaded
+                    ? `Play ${song.title}`
+                    : `${song.title} not downloaded`
                 }
               >
                 ▶
@@ -563,6 +585,14 @@ function Album() {
             <div className="track-info">
 
               <div className="track-title">
+                <span
+                  className={
+                    `track-availability-mark ${isDownloaded ? "available" : "unavailable"}`
+                  }
+                  aria-hidden="true"
+                >
+                  {isDownloaded ? "✓" : "↓"}
+                </span>
                 {song.title}
                 <AvailabilityHint availability={song.availability} />
                 <SourceIndicator source={song.source} />
@@ -583,7 +613,7 @@ function Album() {
               ) : (
 
                 <div className="track-artist">
-                  {song.artist}
+                  {isDownloaded ? song.artist : `${song.artist} · Not downloaded`}
                 </div>
 
               )}
@@ -705,7 +735,8 @@ function Album() {
 
           </div>
 
-        ))}
+          );
+        })}
 
       </div>
 

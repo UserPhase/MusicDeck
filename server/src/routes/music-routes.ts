@@ -8,7 +8,8 @@ import type { CatalogService } from "../domain/catalog.js";
 import type { LibraryService } from "../domain/library.js";
 import { SourceResolver, SourceUnavailableError } from "../domain/source-resolver.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
-import { toLegacySearchResponse } from "../domain/search.js";
+import { toAlbumSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
+import type { UnifiedSearchResult } from "../domain/search.js";
 import type { SearchProviderRegistry } from "../domain/search-provider-registry.js";
 import { deduplicateSearchGroups } from "../domain/search-deduplication.js";
 import type { SourceProviderRegistry } from "../domain/source-provider-registry.js";
@@ -16,6 +17,12 @@ import type { ExternalCatalogRegistry } from "../domain/external-catalog.js";
 import type { RecommendationRegistry, RecommendationKind } from "../domain/recommendations.js";
 import type { LibraryInsightsService, LibraryFilter } from "../domain/library-insights.js";
 import type { AcquisitionService } from "../domain/acquisition.js";
+import {
+  findMatchingExternalAlbum,
+  findMatchingExternalArtist,
+  mergeAlbumTracks,
+  mergeArtistAlbums,
+} from "../domain/catalog-merge.js";
 
 const sourceRequestSchema = z.object({
   preference: z.enum(["library", "external", "manual", "best", "lossless", "highest-bitrate", "preferred"]).optional(),
@@ -315,6 +322,55 @@ export async function registerMusicRoutes(
     return { albums: result.items, degraded: result.degraded };
   });
 
+  // Best-effort catalog completeness for a local album: finds the matching
+  // external (iTunes) album by normalized title/artist and merges its known
+  // tracklist with the locally downloaded tracks. Never throws — falls back
+  // to local-only data when the external catalog is unavailable, disabled,
+  // not permitted for this user, or no confident match is found.
+  async function resolveAlbumCatalogTracks(
+    user: { role: string; externalSearchEnabled: boolean },
+    albumId: string,
+    localAlbum: { name: string; artistName: string }
+  ) {
+    const localTracks = await catalog.getAlbumTracks(albumId);
+    const stampedLocal = localTracks.map((track) =>
+      toTrackSearchResult({
+        ...track,
+        availability: {
+          state: "available",
+          connectionId: "library",
+          sourceCount: 1,
+          availableSourceCount: 1,
+          libraryAvailable: true,
+        },
+      })
+    );
+
+    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
+    if (!externalCatalog.isEnabled() || !externalAllowed) {
+      return { tracks: stampedLocal, localCount: stampedLocal.length };
+    }
+
+    try {
+      const query = `${localAlbum.name} ${localAlbum.artistName || ""}`.trim();
+      const results = await externalCatalog.search(query, { limit: 10 });
+      const match = findMatchingExternalAlbum(results, localAlbum.name, localAlbum.artistName);
+      if (!match) {
+        return { tracks: stampedLocal, localCount: stampedLocal.length };
+      }
+
+      const detail = await externalCatalog.getAlbum(match.id);
+      if (!detail) {
+        return { tracks: stampedLocal, localCount: stampedLocal.length };
+      }
+
+      return { tracks: mergeAlbumTracks(stampedLocal, detail.tracks), localCount: stampedLocal.length };
+    } catch {
+      // Best-effort enrichment only; local library data remains authoritative.
+      return { tracks: stampedLocal, localCount: stampedLocal.length };
+    }
+  }
+
   app.get("/api/albums/:albumId", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -331,7 +387,12 @@ export async function registerMusicRoutes(
     }
 
     const album = await catalog.getAlbum(albumId);
-    return album ? { album } : sendError(reply, 404, "Album not found");
+    if (!album) {
+      return sendError(reply, 404, "Album not found");
+    }
+
+    const { tracks, localCount } = await resolveAlbumCatalogTracks(user, albumId, album);
+    return { album: { ...album, trackCount: tracks.length, localTrackCount: localCount } };
   });
 
   app.get("/api/albums/:albumId/tracks", async (request, reply) => {
@@ -348,7 +409,13 @@ export async function registerMusicRoutes(
       return album ? { tracks: album.tracks } : sendError(reply, 404, "Album not found");
     }
 
-    return { tracks: await catalog.getAlbumTracks(albumId) };
+    const album = await catalog.getAlbum(albumId);
+    if (!album) {
+      return sendError(reply, 404, "Album not found");
+    }
+
+    const { tracks } = await resolveAlbumCatalogTracks(user, albumId, album);
+    return { tracks };
   });
 
   app.get("/api/artists", async (request, reply) => {
@@ -378,6 +445,69 @@ export async function registerMusicRoutes(
     return artist ? { artist } : sendError(reply, 404, "Artist not found");
   });
 
+  // Best-effort catalog completeness for a local artist: finds the matching
+  // external (iTunes) artist by normalized name and merges its known albums
+  // with the locally known albums, so albums with zero downloaded tracks
+  // still remain visible. Falls back to local-only data on any failure.
+  async function resolveArtistCatalogAlbums(
+    user: { role: string; externalSearchEnabled: boolean },
+    artistId: string,
+    localArtist: { name: string }
+  ) {
+    const localAlbums = await catalog.getArtistAlbums(artistId);
+    const stampedLocal = localAlbums.map((album) =>
+      toAlbumSearchResult({
+        ...album,
+        availability: {
+          state: "available",
+          connectionId: "library",
+          sourceCount: 1,
+          availableSourceCount: 1,
+          libraryAvailable: true,
+        },
+      })
+    );
+
+    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
+    if (!externalCatalog.isEnabled() || !externalAllowed) {
+      return stampedLocal;
+    }
+
+    try {
+      const results = await externalCatalog.search(localArtist.name, { limit: 10 });
+      const match = findMatchingExternalArtist(results, localArtist.name);
+      if (!match) {
+        return stampedLocal;
+      }
+
+      const detail = await externalCatalog.getArtist(match.id);
+      if (!detail) {
+        return stampedLocal;
+      }
+
+      const catalogAlbums: UnifiedSearchResult[] = detail.albums.map((album) => ({
+        type: "album",
+        id: album.id,
+        title: album.title,
+        subtitle: localArtist.name,
+        artist: localArtist.name,
+        album: null,
+        artwork: album.artworkId
+          ? { id: album.artworkId, url: `/api/artwork/external/${encodeURIComponent(album.artworkId)}` }
+          : null,
+        provider: "external",
+        source: { kind: "external", count: 0 },
+        availability: null,
+        identity: album.identity,
+        metadata: { year: album.year },
+      }));
+
+      return mergeArtistAlbums(stampedLocal, catalogAlbums);
+    } catch {
+      return stampedLocal;
+    }
+  }
+
   app.get("/api/artists/:artistId/albums", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -392,7 +522,12 @@ export async function registerMusicRoutes(
       return artist ? { albums: artist.albums } : sendError(reply, 404, "Artist not found");
     }
 
-    return { albums: await catalog.getArtistAlbums(artistId) };
+    const artist = await catalog.getArtist(artistId);
+    if (!artist) {
+      return sendError(reply, 404, "Artist not found");
+    }
+
+    return { albums: await resolveArtistCatalogAlbums(user, artistId, artist) };
   });
 
   app.get("/api/artists/:artistId/tracks", async (request, reply) => {

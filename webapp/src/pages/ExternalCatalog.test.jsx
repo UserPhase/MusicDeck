@@ -126,6 +126,113 @@ test("renders an external artist in the shared artist page and links albums", as
   expect(screen.getByText("External Song")).toBeInTheDocument();
 });
 
+test("shows the complete catalog tracklist for an album with only some tracks downloaded", async () => {
+  getAlbum.mockResolvedValue({
+    id: "album-1",
+    name: "A Night at the Opera",
+    artist: "Queen",
+    artistId: "artist-1",
+    year: 1975,
+    coverArt: null,
+    trackCount: 4,
+    localTrackCount: 2,
+    song: [
+      {
+        id: "local-1",
+        type: "track",
+        title: "Death on Two Legs",
+        artist: "Queen",
+        source: { kind: "library", count: 1 },
+        availability: { libraryAvailable: true, state: "available" },
+        metadata: {},
+      },
+      {
+        id: "local-2",
+        type: "track",
+        title: "Bohemian Rhapsody",
+        artist: "Queen",
+        source: { kind: "library", count: 1 },
+        availability: { libraryAvailable: true, state: "available" },
+        metadata: {},
+      },
+      {
+        id: "cat-3",
+        type: "track",
+        title: "I'm in Love with My Car",
+        artist: "Queen",
+        source: { kind: "external", count: 0 },
+        availability: null,
+        provider: "external",
+        metadata: {},
+      },
+      {
+        id: "cat-4",
+        type: "track",
+        title: "You're My Best Friend",
+        artist: "Queen",
+        source: { kind: "external", count: 0 },
+        availability: null,
+        provider: "external",
+        metadata: {},
+      },
+    ],
+  });
+
+  render(
+    <MemoryRouter initialEntries={["/album/album-1"]}>
+      <Routes>
+        <Route path="/album/:id" element={<Album />} />
+      </Routes>
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByRole("heading", { name: "A Night at the Opera" })).toBeInTheDocument();
+
+  // All four known tracks remain visible, downloaded and undownloaded alike.
+  expect(screen.getByText("Death on Two Legs")).toBeInTheDocument();
+  expect(screen.getByText("Bohemian Rhapsody")).toBeInTheDocument();
+  expect(screen.getByText("I'm in Love with My Car")).toBeInTheDocument();
+  expect(screen.getByText("You're My Best Friend")).toBeInTheDocument();
+
+  // Completion summary is shown.
+  expect(screen.getByText(/2 \/ 4 in library/i)).toBeInTheDocument();
+
+  // Undownloaded tracks cannot be played directly (no working play control).
+  expect(
+    screen.getByRole("button", { name: "I'm in Love with My Car not downloaded" })
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Play Death on Two Legs" })
+  ).toBeEnabled();
+});
+
+test("keeps an artist's zero-download album visible alongside downloaded albums", async () => {
+  getArtist.mockResolvedValue({
+    id: "artist-1",
+    name: "Queen",
+    coverArt: null,
+    albumCount: 2,
+    album: [
+      { id: "album-downloaded", name: "Album A", year: 2000, source: { kind: "library", count: 1 } },
+      { id: "album-catalog-only", name: "Album B", year: 2001, source: { kind: "external", count: 0 } },
+    ],
+    tracks: [],
+  });
+
+  render(
+    <MemoryRouter initialEntries={["/artist/artist-1"]}>
+      <Routes>
+        <Route path="/artist/:id" element={<Artist />} />
+      </Routes>
+    </MemoryRouter>
+  );
+
+  expect(await screen.findByRole("heading", { name: "Queen" })).toBeInTheDocument();
+  expect(screen.getByText("Album A")).toBeInTheDocument();
+  expect(screen.getByText("Album B")).toBeInTheDocument();
+  expect(screen.getByText(/not downloaded/i)).toBeInTheDocument();
+});
+
 test("renders native Explore recommendation sections when data exists", async () => {
   getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
   getRecommendations.mockResolvedValue({

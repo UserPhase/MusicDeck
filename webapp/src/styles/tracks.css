@@ -1,4 +1,11 @@
 .track-list { width: 100%; }
+.track-availability-mark { display: inline-block; margin-right: 6px; font-size: 12px; }
+.track-availability-mark.available { color: var(--accent); }
+.track-availability-mark.unavailable { color: var(--text-muted); }
+.track-not-downloaded .track-title, .track-not-downloaded .track-duration { color: var(--text-muted); }
+.track-not-downloaded .track-play { cursor: default; }
+.album-completion { color: var(--text-muted); }
+
 .track { display: grid; grid-template-columns: 40px minmax(0, 1fr) minmax(120px, 220px) 36px 70px 80px; align-items: center; min-height: 58px; padding: 0 12px; border-radius: 7px; transition: background 0.15s ease; }
 .track:hover { background: var(--card-hover); }
 .track-number { position: relative; width: 40px; min-width: 40px; display: flex; align-items: center; justify-content: center; }

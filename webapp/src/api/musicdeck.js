@@ -72,6 +72,11 @@ function toAlbum(album, songs) {
     label: album.label || null,
     coverArt: album.artworkId,
     songCount: isExternal ? (album.tracks || []).length : album.songCount,
+    // Catalog-aware completeness: total known tracks vs. locally downloaded
+    // tracks. Falls back to songCount when the server hasn't merged catalog
+    // data (e.g. external catalog disabled), so the UI degrades gracefully.
+    trackCount: typeof album.trackCount === "number" ? album.trackCount : undefined,
+    localTrackCount: typeof album.localTrackCount === "number" ? album.localTrackCount : undefined,
     availability: album.availability || null,
     source: external ? { kind: "external", count: 0 } : undefined,
     provider: external ? "external" : undefined,

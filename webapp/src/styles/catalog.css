@@ -36,6 +36,7 @@
 .album-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .album-artist { display: inline-block; color: var(--text-secondary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }
 .album-artist:hover { color: var(--text); }
+.album-not-downloaded { display: block; color: var(--text-muted); font-size: 12px; }
 .availability-hint { display: inline-block; margin-left: 8px; color: var(--text-secondary); font-size: 11px; letter-spacing: 0.2px; opacity: 0.85; }
 .source-indicator { display: inline-block; margin-left: var(--space-2); color: var(--text-secondary); font-size: var(--font-xs); opacity: 0.85; }
 .recommendation-reason { margin: -4px 12px 8px 76px; color: var(--text-secondary); font-size: var(--font-xs); }
