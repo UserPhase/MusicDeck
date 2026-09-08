@@ -14,7 +14,7 @@ import {
   type AcquisitionResult,
 } from "../src/domain/acquisition.js";
 import { updateServerSettings } from "../src/domain/settings.js";
-import { AuthorizedHttpAcquisitionProvider } from "../src/plugins/on-demand-library.js";
+import { AuthorizedHttpAcquisitionProvider } from "../src/plugins/in-progress/on-demand-library.js";
 
 // Helper to construct a minimal valid ZIP in memory
 function createMockZipBuffer(files: Array<{ name: string; content: Buffer | string }>): Buffer {

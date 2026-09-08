@@ -10,8 +10,8 @@ import {
   extractArchiveRepresentations,
   isAudioFile,
   parseDurationSeconds,
-} from "../src/plugins/archive-org-source.js";
-import { DebridCloudSourceProvider } from "../src/plugins/first-party.js";
+} from "../src/plugins/in-progress/archive-org-source.js";
+import { DebridCloudSourceProvider } from "../src/plugins/in-progress/external-source-plugins.js";
 import { closeTestServer, createTestServer, login } from "./helpers.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;

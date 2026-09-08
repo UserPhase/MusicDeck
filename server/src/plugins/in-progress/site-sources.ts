@@ -1,4 +1,4 @@
-import type { MusicDeckPlugin, MusicDeckPluginContext } from "./plugin-registry.js";
+import type { MusicDeckPlugin, MusicDeckPluginContext } from "../plugin-registry.js";
 import type {
   AcquisitionInputs,
   CandidateResolver,
@@ -7,11 +7,11 @@ import type {
   SourceDetailProvider,
   SourceDiscoveryOptions,
   SourceDiscoveryProvider,
-} from "../domain/source-discovery.js";
-import { isAlbumContainer, validatedPlayableUrl } from "../domain/source-discovery.js";
-import type { PlayableSource } from "../domain/playable-sources.js";
-import type { UnifiedSearchResult } from "../domain/search.js";
-import { normalizeMusicText } from "../domain/music-identity.js";
+} from "../../domain/source-discovery.js";
+import { isAlbumContainer, validatedPlayableUrl } from "../../domain/source-discovery.js";
+import type { PlayableSource } from "../../domain/playable-sources.js";
+import type { UnifiedSearchResult } from "../../domain/search.js";
+import { normalizeMusicText } from "../../domain/music-identity.js";
 
 export type SiteResultStrategy = "direct-files" | "detail-page" | "container" | "item-files" | "auto";
 

@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { MusicDeckPlugin, MusicDeckPluginContext } from "./plugin-registry.js";
-import type { AcquisitionProvider, AcquisitionContext, AcquisitionResult, AcquiredFile } from "../domain/acquisition.js";
-import { extractZipSafely } from "../domain/acquisition.js";
-import type { SourceCandidate } from "../domain/source-discovery.js";
+import type { MusicDeckPlugin, MusicDeckPluginContext } from "../plugin-registry.js";
+import type { AcquisitionProvider, AcquisitionContext, AcquisitionResult, AcquiredFile } from "../../domain/acquisition.js";
+import { extractZipSafely } from "../../domain/acquisition.js";
+import type { SourceCandidate } from "../../domain/source-discovery.js";
 
 function isPrivateHostname(hostname: string) {
   return (

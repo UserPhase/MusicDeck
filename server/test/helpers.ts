@@ -23,19 +23,21 @@ import { LibraryInsightsService } from "../src/domain/library-insights.js";
 import { AcquisitionProviderRegistry, AcquisitionService } from "../src/domain/acquisition.js";
 import { PluginRegistry } from "../src/plugins/plugin-registry.js";
 import {
+  createExternalArtworkPlugin,
+  createLastFmPlugin,
+  createListenBrainzPlugin,
+  createMusicBrainzPlugin,
+} from "../src/plugins/first-party.js";
+import {
   createArchiveOrgSourcePlugin,
   createAuthorizedExternalSourcePlugin,
   createDebridCloudSourcePlugin,
   createDiscordPresencePlugin,
-  createExternalArtworkPlugin,
   createHomeAssistantPlugin,
-  createLastFmPlugin,
-  createListenBrainzPlugin,
-  createMusicBrainzPlugin,
   createOnDemandLibraryPlugin,
   createSpotifyImporterPlugin,
-} from "../src/plugins/first-party.js";
-import { createSiteSourcesPlugin } from "../src/plugins/site-sources.js";
+  createSiteSourcesPlugin,
+} from "../src/plugins/in-progress/index.js";
 
 export function createFakeBackend(overrides: Partial<MusicBackend> = {}): MusicBackend {
   const track = {
@@ -217,6 +219,8 @@ export async function createTestServer(
   await plugins.register(createLastFmPlugin());
   await plugins.register(createMusicBrainzPlugin());
   await plugins.register(createExternalArtworkPlugin());
+  // Integration tests opt into the in-progress plugins explicitly. They are
+  // not registered by the production server entrypoint.
   await plugins.register(createSpotifyImporterPlugin());
   await plugins.register(createDiscordPresencePlugin());
   await plugins.register(createHomeAssistantPlugin());

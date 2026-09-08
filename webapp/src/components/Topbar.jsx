@@ -1,5 +1,6 @@
 import {
   Link,
+  useLocation,
   useNavigate,
 } from "react-router-dom";
 
@@ -28,6 +29,10 @@ import DownloadsMenu from "./DownloadsMenu";
 function Topbar() {
 
   const navigate = useNavigate();
+
+  const location = useLocation();
+
+  const isAdminShell = location.pathname.startsWith("/admin");
 
   const {
     playSong,
@@ -351,6 +356,10 @@ function Topbar() {
       >
         Music<span>Deck</span>
       </Link>
+
+      {isAdminShell && (
+        <span className="admin-shell-badge">Admin</span>
+      )}
 
 
       {/* CENTER */}

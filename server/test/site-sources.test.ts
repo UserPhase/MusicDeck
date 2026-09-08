@@ -15,7 +15,7 @@ import {
   type SiteSourceDefinition,
   testSite,
   validateSiteBaseUrl,
-} from "../src/plugins/site-sources.js";
+} from "../src/plugins/in-progress/site-sources.js";
 import { closeTestServer, createTestServer, login } from "./helpers.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;

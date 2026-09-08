@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { DebridCloudSourceProvider, debridFileMatchesForTest } from "../src/plugins/first-party.js";
+import { DebridCloudSourceProvider, debridFileMatchesForTest } from "../src/plugins/in-progress/external-source-plugins.js";
 import type { MusicDeckPluginContext } from "../src/plugins/plugin-registry.js";
 import type { UnifiedSearchResult } from "../src/domain/search.js";
 

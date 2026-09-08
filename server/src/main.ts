@@ -18,20 +18,12 @@ import { DownloaderAdapterRegistry } from "./domain/downloader-adapter.js";
 import { SpotDLDownloaderAdapter } from "./domain/spotdl-downloader-adapter.js";
 import { PluginRegistry } from "./plugins/plugin-registry.js";
 import {
-  createArchiveOrgSourcePlugin,
-  createAuthorizedExternalSourcePlugin,
-  createDebridCloudSourcePlugin,
-  createDiscordPresencePlugin,
   createExternalArtworkPlugin,
-  createHomeAssistantPlugin,
   createLastFmPlugin,
   createListenBrainzPlugin,
   createMusicBrainzPlugin,
-  createOnDemandLibraryPlugin,
   createSpotDLDownloaderPlugin,
-  createSpotifyImporterPlugin,
 } from "./plugins/first-party.js";
-import { createSiteSourcesPlugin } from "./plugins/site-sources.js";
 
 async function start() {
   const config = loadConfig();
@@ -90,18 +82,13 @@ async function start() {
       downloaderRegistry,
     }
   );
+  // Active, supported first-party plugins. In-progress plugins live under
+  // plugins/in-progress/ and are deliberately NOT auto-registered here so they
+  // do not appear in the normal Admin Plugins page or affect the runtime.
   await plugins.register(createListenBrainzPlugin());
   await plugins.register(createLastFmPlugin());
   await plugins.register(createMusicBrainzPlugin());
   await plugins.register(createExternalArtworkPlugin());
-  await plugins.register(createSpotifyImporterPlugin());
-  await plugins.register(createDiscordPresencePlugin());
-  await plugins.register(createHomeAssistantPlugin());
-  await plugins.register(createAuthorizedExternalSourcePlugin());
-  await plugins.register(createDebridCloudSourcePlugin());
-  await plugins.register(createSiteSourcesPlugin());
-  await plugins.register(createArchiveOrgSourcePlugin());
-  await plugins.register(createOnDemandLibraryPlugin());
   await plugins.register(createSpotDLDownloaderPlugin(spotdlAdapter));
   for (const manifest of plugins.loadInstalledCustomPlugins()) {
     try {

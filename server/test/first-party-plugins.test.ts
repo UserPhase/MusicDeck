@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { conservativeSpotifyMatch } from "../src/plugins/first-party.js";
+import { conservativeSpotifyMatch } from "../src/plugins/in-progress/automation-plugins.js";
 import { closeTestServer, createTestServer, login } from "./helpers.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;

@@ -7,6 +7,7 @@ import './styles/detail-pages.css';
 import './styles/player.css';
 import './styles/tracks.css';
 import './styles/topbar.css';
+import './styles/admin.css';
 import App from './App';
 import reportWebVitals from './reportWebVitals';
 

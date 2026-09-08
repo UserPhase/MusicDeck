@@ -29,7 +29,7 @@ import { LibraryService } from "../src/domain/library.js";
 import { CatalogService } from "../src/domain/catalog.js";
 import { ProviderRegistry } from "../src/backends/registry.js";
 import type { UnifiedSearchResult } from "../src/domain/search.js";
-import { SiteDiscoveryProvider, type SiteSourceDefinition } from "../src/plugins/site-sources.js";
+import { SiteDiscoveryProvider, type SiteSourceDefinition } from "../src/plugins/in-progress/site-sources.js";
 
 function createValidFlacBuffer(): Buffer {
   const buf = Buffer.alloc(128);
