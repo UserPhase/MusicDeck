@@ -63,6 +63,10 @@ services:
       MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-false}
       MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
       MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:?Set MUSICDECK_ADMIN_PASSWORD in .env}
+      # Run as the host account that owns MUSIC_ROOT. This lets the non-root
+      # server create artist/album folders on the bind-mounted library.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
       # Selects the single backend this deployment runs: navidrome or
       # jellyfin. Only that backend's credentials below are required.
       MUSIC_BACKEND: ${MUSIC_BACKEND:-navidrome}

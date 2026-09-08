@@ -68,6 +68,8 @@ MUSICDECK_PUBLIC_URL=http://SERVER_IP:8080
 MUSICDECK_SESSION_SECRET=replace-with-a-long-random-secret
 MUSICDECK_ADMIN_USERNAME=admin
 MUSICDECK_ADMIN_PASSWORD=change-this-admin-password
+PUID=1000
+PGID=1000
 MUSIC_ROOT=/media/music
 
 # Required only when MUSIC_BACKEND=navidrome
@@ -90,7 +92,21 @@ backend's own credentials are present.
 Leave `COMPOSE_PROFILES=${MUSIC_BACKEND}` in `.env` exactly as shipped — it is
 what makes Compose start only the backend you selected.
 
-`MUSIC_ROOT` must be an absolute path that already exists on the Docker host.
+`MUSIC_ROOT` must be an absolute path that already exists on the Docker host
+and is writable by `PUID:PGID`. On most Linux hosts, set these to the account
+that owns the library (`id -u` and `id -g`). If needed, fix an existing
+library's ownership before startup:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" /media/music
+```
+
+MusicDeck uses root only for container initialization, then immediately drops
+to `PUID:PGID` before starting Node. It never runs the application or
+downloader as root. Startup fails with an ownership/mode diagnostic when the
+configured identity cannot write to the music root, rather than allowing a
+later download to fail with `EACCES`.
+
 `NAVIDROME_DATA`, `JELLYFIN_CONFIG`, and `JELLYFIN_CACHE` are optional — they
 default to `./navidrome-data`, `./jellyfin-config`, and `./jellyfin-cache`
 (created next to `docker-compose.yml`) unless you override them with your own

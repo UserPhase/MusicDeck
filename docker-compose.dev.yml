@@ -55,6 +55,8 @@ services:
       MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-false}
       MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
       MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:?Set MUSICDECK_ADMIN_PASSWORD in .env}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
       MUSIC_BACKEND: ${MUSIC_BACKEND:-navidrome}
       # Internal service-to-service URLs. LAN clients never see or use these
       # hostnames/ports — MusicDeck Server proxies all provider access.

@@ -38,6 +38,7 @@ RUN apt-get update \
     python3-venv \
     python3-pip \
     ffmpeg \
+    gosu \
     ca-certificates \
   && python3 -m venv "${SPOTDL_HOME}" \
   && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir --upgrade pip \
@@ -54,12 +55,15 @@ COPY package*.json ./
 COPY --from=deps /app/node_modules ./node_modules
 RUN npm prune --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY docker-entrypoint.sh /usr/local/bin/musicdeck-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/musicdeck-entrypoint \
+  && chmod 0755 /usr/local/bin/musicdeck-entrypoint
 
-USER musicdeck
 EXPOSE 4534
 VOLUME ["/app/data", "/app/config", "/app/cache"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+ENTRYPOINT ["musicdeck-entrypoint"]
 CMD ["node", "dist/main.js"]

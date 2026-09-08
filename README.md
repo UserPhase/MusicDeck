@@ -213,12 +213,36 @@ Set this to a real, existing absolute folder on your Docker host:
 
 ```text
 MUSIC_ROOT=/media/music
+PUID=1000
+PGID=1000
 ```
 
 `MUSIC_ROOT` is mounted read-write into MusicDeck Server (so downloads land
 there) and read-only into the backend (so it can scan/serve it without ever
 modifying it). The backend's own data/config/cache folders already have working
 defaults created next to `docker-compose.yml`.
+
+#### Music folder permissions
+
+MusicDeck runs as a non-root user. `PUID` and `PGID` must identify a host
+account that can write to `MUSIC_ROOT`; on most Linux systems, use the IDs of
+the account that owns the music folder:
+
+```bash
+id -u
+id -g
+sudo chown -R "$(id -u):$(id -g)" /media/music
+```
+
+Replace `/media/music` with your actual `MUSIC_ROOT`. If another service or
+account must retain ownership, grant the configured group write access instead
+of changing ownership. MusicDeck checks this permission during startup and
+prints the container identity plus the directory's owner/mode when they do not
+match. This prevents downloads from failing later with errors such as:
+
+```text
+EACCES: permission denied, mkdir '/music/Artist/Album'
+```
 
 ### 4. Set secrets, passwords, and your server's LAN address
 
