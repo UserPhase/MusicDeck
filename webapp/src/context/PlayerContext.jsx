@@ -16,6 +16,7 @@ import {
   getRandomSongs,
   getUserSettings,
   getSilenceAnalysis,
+  getPlayableSources,
 } from "../api/musicdeck";
 
 import {
@@ -209,6 +210,42 @@ export function PlayerProvider({
 
   const trimBoundsRef = useRef(null);
 
+  /*
+   * PLAYBACK CONTEXT
+   *
+   * What the current queue was started from (e.g. a playlist), so the player
+   * can show where playback is coming from using that item's own resolved
+   * artwork.
+   */
+
+  const [
+    playbackContext,
+    setPlaybackContext,
+  ] = useState(null);
+
+  /*
+   * EXTERNAL PREVIEW PLAYBACK
+   *
+   * A track that is not in the local library can still be auditioned when an
+   * external source provides a preview. Resolution goes through the
+   * provider-neutral PlayableSource model, so the player never knows (or
+   * hard-codes) which provider supplied the preview. `previewSource` is set
+   * only while a preview — rather than a full track — is loaded.
+   */
+
+  const [
+    previewSource,
+    setPreviewSource,
+  ] = useState(null);
+
+  const [
+    playbackUnavailable,
+    setPlaybackUnavailable,
+  ] = useState(false);
+
+  /* Mirrors previewSource for the timeupdate handler's end-of-preview check. */
+  const previewSourceRef = useRef(null);
+
   useEffect(() => {
     if (!isAuthenticated) {
       return;
@@ -275,6 +312,10 @@ export function PlayerProvider({
     setLikedSongIds(new Set());
     setIsCurrentSongLiked(false);
     setRecentlyPlayed([]);
+    setPlaybackContext(null);
+    setPlaybackUnavailable(false);
+    setPreviewSource(null);
+    previewSourceRef.current = null;
 
     try {
       localStorage.removeItem("recentlyPlayed");
@@ -626,6 +667,46 @@ export function PlayerProvider({
 
 
   /*
+   * LOCAL AVAILABILITY
+   *
+   * Whether a song can be streamed straight from the local library. Anything
+   * the server has already marked as library-backed (or that carries no
+   * availability information at all, e.g. library reads) plays normally; only
+   * catalog-only entries need an external source resolved.
+   */
+
+  function isLibraryPlayable(song) {
+
+    if (!song) {
+      return false;
+    }
+
+
+    if (
+      song.availability &&
+      typeof song.availability.libraryAvailable === "boolean"
+    ) {
+
+      return song.availability.libraryAvailable;
+
+    }
+
+
+    const kind =
+      song.source &&
+      song.source.kind;
+
+
+    return (
+      !kind ||
+      kind === "library" ||
+      kind === "musicdeck"
+    );
+
+  }
+
+
+  /*
    * PLAY SONG
    */
 
@@ -647,8 +728,93 @@ export function PlayerProvider({
     playbackRequestRef.current =
       requestId;
 
+
+    /*
+     * Prefer the full local track. When the track is not in the library,
+     * transparently resolve a playable external source (typically a
+     * preview) through the provider-neutral source model instead of
+     * failing playback.
+     */
+
+    let source =
+      song.playableSource ||
+      song.sourceId ||
+      null;
+
+
+    if (
+      !source &&
+      !isLibraryPlayable(song)
+    ) {
+
+      try {
+
+        const resolution =
+          await getPlayableSources(song);
+
+        source =
+          resolution.selectedSource ||
+          (resolution.sources || []).find(
+            (candidate) =>
+              candidate.availability ===
+              "available"
+          ) ||
+          null;
+
+      } catch (error) {
+
+        source = null;
+
+      }
+
+
+      if (
+        requestId !== playbackRequestRef.current
+      ) {
+
+        return;
+
+      }
+
+
+      if (!source) {
+
+        /*
+         * Nothing playable exists for this track: keep the existing
+         * unavailable state rather than loading a broken stream.
+         */
+
+        audioRef.current.pause();
+
+        setCurrentSong(song);
+        setIsPlaying(false);
+        setCurrentTime(0);
+        setDuration(0);
+        setPreviewSource(null);
+        previewSourceRef.current = null;
+        setPlaybackUnavailable(true);
+
+        return;
+
+      }
+
+    }
+
+
+    const preview =
+      source &&
+      typeof source === "object" &&
+      source.type === "preview"
+        ? source
+        : null;
+
+    setPreviewSource(preview);
+    previewSourceRef.current = preview;
+    setPlaybackUnavailable(false);
+
+
     const streamUrl =
-      getStreamUrl(song.id, song.playableSource || song.sourceId);
+      getStreamUrl(song.id, source);
 
 
     audioRef.current.pause();
@@ -667,7 +833,7 @@ export function PlayerProvider({
     // track until (and unless) an analysis is available.
     trimBoundsRef.current = null;
 
-    if (silenceTrimSettings.enabled) {
+    if (silenceTrimSettings.enabled && !preview) {
       getSilenceAnalysis(song.id)
         .then((analysis) => {
           if (
@@ -734,6 +900,7 @@ export function PlayerProvider({
       return;
     }
 
+    setPlaybackContext(null);
     setQueue([song]);
     setQueueIndex(0);
 
@@ -766,7 +933,8 @@ export function PlayerProvider({
 
   async function playQueue(
     songs,
-    startIndex = 0
+    startIndex = 0,
+    context = null
   ) {
 
     if (
@@ -787,6 +955,9 @@ export function PlayerProvider({
       startIndex = 0;
 
     }
+
+
+    setPlaybackContext(context);
 
 
     let newQueue = [
@@ -1106,6 +1277,30 @@ export function PlayerProvider({
       audioRef.current.currentTime
     );
 
+    /*
+     * A preview is only a fragment of the real recording: stop at the
+     * preview endpoint instead of letting the source run past it.
+     */
+
+    const preview =
+      previewSourceRef.current;
+
+    const previewDuration =
+      preview &&
+      preview.quality &&
+      Number(preview.quality.durationSeconds);
+
+    if (
+      previewDuration &&
+      audioRef.current.currentTime >= previewDuration
+    ) {
+
+      audioRef.current.pause();
+      handleEnded();
+      return;
+
+    }
+
     // Effective track end: when trailing silence has been detected and
     // trimming is enabled, treat that boundary as "the track finished"
     // instead of waiting for the full (silent) tail to play out.
@@ -1252,6 +1447,18 @@ export function PlayerProvider({
         likedSongIds,
 
         isCurrentSongLiked,
+
+        playbackContext,
+
+        isPreview: Boolean(previewSource),
+
+        previewDurationSeconds:
+          (previewSource &&
+            previewSource.quality &&
+            previewSource.quality.durationSeconds) ||
+          null,
+
+        playbackUnavailable,
 
         volume,
 

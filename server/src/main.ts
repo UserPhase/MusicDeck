@@ -41,8 +41,8 @@ async function start() {
 
   const library = new LibraryService(db);
   const catalog = new CatalogService(registry, library);
-  const playlists = new PlaylistService(db, backend, catalog, library);
   const sourceResolver = new SourceResolver(registry, library);
+  const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
   const externalCatalog = new ExternalCatalogRegistry(undefined, db);
   const searchProviders = new SearchProviderRegistry(db, catalog, playlists, undefined, externalCatalog.artwork);
   const sourcePipeline = new SourcePipelineRegistry(db);

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import AlbumCard from "../components/AlbumCard";
+import PlaylistCover from "../components/PlaylistCover";
 import RecentItem from "../components/RecentItem";
 import {
   EmptyState,
@@ -338,7 +339,7 @@ function Home() {
                 className="playlist-card"
               >
                 <div className="playlist-cover">
-                  <div className="playlist-cover-icon">♫</div>
+                  <PlaylistCover playlist={playlist} size={300} />
                 </div>
 
                 <div className="playlist-title">{playlist.name}</div>

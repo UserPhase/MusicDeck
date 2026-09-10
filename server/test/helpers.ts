@@ -139,6 +139,15 @@ export function createFakeBackend(overrides: Partial<MusicBackend> = {}): MusicB
   };
 }
 
+/**
+ * Keeps source providers hermetic: tests that do not supply a fetch mock get an
+ * empty JSON payload instead of reaching a real external service.
+ */
+const offlineSourceFetch: typeof fetch = async () => new Response("{}", {
+  status: 200,
+  headers: { "content-type": "application/json" },
+});
+
 export async function createTestServer(
   backend = createFakeBackend(),
   configOverrides: Partial<AppConfig> = {},
@@ -172,8 +181,8 @@ export async function createTestServer(
   }]);
   const library = new LibraryService(db);
   const catalog = new CatalogService(registry, library);
-  const playlists = new PlaylistService(db, backend, catalog, library);
   const sourceResolver = new SourceResolver(registry, library);
+  const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
   const externalCatalog = new ExternalCatalogRegistry(externalFetchImpl, db);
   const searchProviders = new SearchProviderRegistry(db, catalog, playlists, externalFetchImpl, externalCatalog.artwork);
   const sourcePipeline = new SourcePipelineRegistry(db);
@@ -182,7 +191,7 @@ export async function createTestServer(
     library,
     registry,
     sourceResolver,
-    sourceFetchImpl || pluginFetchImpl,
+    sourceFetchImpl || pluginFetchImpl || offlineSourceFetch,
     sourcePipeline
   );
   const spotifyConfig = searchProviders.rawConfig("spotify");

@@ -148,26 +148,10 @@ SQLite database and applies migrations on startup):
 
 ```powershell
 npm install
-npm run dev
+npm start
 ```
 
 The server listens on `http://localhost:4534`.
-
-To initialize the database without starting the server:
-
-```powershell
-npm run db:init
-```
-
-### 2. Start the web client
-
-In a second terminal, from the workspace root:
-
-```powershell
-cd webapp
-npm install
-npm start
-```
 
 The client opens on `http://localhost:3000` and proxies API calls to the
 server.

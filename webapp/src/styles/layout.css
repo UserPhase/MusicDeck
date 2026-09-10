@@ -11,6 +11,10 @@ a { color: inherit; }
 .nav-item.active { background: var(--nav-active); border-color: var(--border-hover); }
 .nav-icon { width: 20px; text-align: center; font-size: 22px; color: var(--text-secondary); transition: color 0.15s ease; }
 .nav-item:hover .nav-icon, .nav-item.active .nav-icon { color: var(--text); }
+/* Playlist nav entries show the same resolved playlist artwork as everywhere else. */
+.nav-icon-playlist { flex: none; width: 20px; height: 20px; border-radius: 3px; overflow: hidden; background: var(--nav-hover); }
+.nav-icon-playlist img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.nav-icon-playlist-placeholder { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; font-size: 13px; color: var(--text-muted); }
 .playlists-section { margin-top: 4px; }
 .playlist-list { display: flex; flex-direction: column; gap: 2px; }
 .playlist-item { display: flex; align-items: center; gap: 12px; width: 100%; padding: 9px 12px; border-radius: 7px; background: var(--nav-background); color: var(--text-secondary); font-size: 15px; text-decoration: none; transition: background 0.15s ease, color 0.15s ease; }

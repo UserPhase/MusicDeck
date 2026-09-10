@@ -17,6 +17,7 @@ import {
 } from "../api/musicdeck";
 
 import AvailabilityHint from "../components/AvailabilityHint";
+import PlaylistCover from "../components/PlaylistCover";
 import SourceMenu from "../components/SourceMenu";
 import SourceIndicator from "../components/SourceIndicator";
 import TrackDownloadButton from "../components/TrackDownloadButton";
@@ -668,12 +669,13 @@ function Search() {
                         <button
                           type="button"
                           className="track-play"
-                          disabled={song.source?.kind === "external"}
                           onClick={() =>
                             playSong(song)
                           }
                           aria-label={
-                            `Play ${song.title}`
+                            song.source?.kind === "external"
+                              ? `Play preview of ${song.title}`
+                              : `Play ${song.title}`
                           }
                         >
                           ▶
@@ -904,6 +906,13 @@ function Search() {
                       to={`/playlist/${playlist.id}`}
                       className="search-result"
                     >
+
+                      <div className="search-result-cover">
+
+                        <PlaylistCover playlist={playlist} size={160} />
+
+                      </div>
+
 
                       <div className="search-result-info">
 

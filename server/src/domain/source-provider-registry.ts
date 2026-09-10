@@ -192,6 +192,140 @@ class ItunesPreviewSourceProvider implements SourceProvider {
 }
 
 /**
+ * Deezer publishes 30-second track previews through its public, keyless API.
+ * This keeps automatic preview playback working on a default install (where
+ * no external credentials are configured at all) while staying inside the
+ * same provider-neutral SourceProvider contract: the player only ever sees an
+ * opaque token and a `preview` source type.
+ */
+class DeezerPreviewSourceProvider implements SourceProvider {
+  readonly id = "deezer-preview";
+  readonly name = "External preview";
+  readonly capabilities = {
+    tracks: true,
+    albums: false,
+    quality: true,
+    multipleSources: false,
+    caching: true,
+  };
+
+  /** Deezer previews are a fixed-length excerpt, not the full recording. */
+  private static readonly PREVIEW_SECONDS = 30;
+
+  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+
+  canResolve(result: UnifiedSearchResult) {
+    return result.type === "track" && (
+      /^external_deezer_\d+$/.test(result.id)
+      || result.source.kind === "external"
+      || Boolean(result.source.externalAvailable)
+    );
+  }
+
+  async getSources(result: UnifiedSearchResult): Promise<PlayableSource[]> {
+    if (!this.canResolve(result)) {
+      return [];
+    }
+
+    const previewUrl = result.id.startsWith("external_deezer_")
+      ? await this.lookupPreview(result.id.slice("external_deezer_".length))
+      : await this.searchPreview(result);
+
+    if (!previewUrl) {
+      return [];
+    }
+
+    const preview = new URL(previewUrl);
+
+    // Previews are served from Deezer's public preview CDN only; anything
+    // else is treated as an untrusted redirect and refused.
+    if (preview.protocol !== "https:" || !/(^|\.)dzcdn\.net$/.test(preview.hostname)) {
+      throw new Error("External preview is unavailable");
+    }
+
+    return [{
+      // Replaced with an opaque MusicDeck token before returning to the UI.
+      id: preview.toString(),
+      provider: "external",
+      type: "preview",
+      mediaType: "audio",
+      label: "External preview",
+      availability: "available",
+      quality: {
+        codec: "MP3",
+        lossless: false,
+        durationSeconds: DeezerPreviewSourceProvider.PREVIEW_SECONDS,
+      },
+    }];
+  }
+
+  private async lookupPreview(trackId: string): Promise<string | undefined> {
+    if (!/^\d+$/.test(trackId)) {
+      return undefined;
+    }
+
+    const response = await this.fetchImpl(new URL(`https://api.deezer.com/track/${trackId}`));
+
+    if (!response.ok) {
+      throw new Error("External preview is unavailable");
+    }
+
+    const payload = await response.json() as { preview?: string };
+    return payload.preview || undefined;
+  }
+
+  private async searchPreview(result: UnifiedSearchResult): Promise<string | undefined> {
+    const search = new URL("https://api.deezer.com/search");
+    search.searchParams.set("q", `${result.artist || ""} ${result.title}`.trim());
+    search.searchParams.set("limit", "5");
+
+    const response = await this.fetchImpl(search);
+
+    if (!response.ok) {
+      throw new Error("External preview is unavailable");
+    }
+
+    const payload = await response.json() as {
+      data?: Array<{
+        title?: string;
+        preview?: string;
+        artist?: { name?: string };
+        album?: { title?: string };
+      }>;
+    };
+
+    const title = normalizeMusicText(result.title);
+    const artist = normalizeMusicText(result.artist);
+    const album = normalizeMusicText(result.album);
+
+    return payload.data?.find((item) =>
+      normalizeMusicText(item.title) === title
+      && (!artist || normalizeMusicText(item.artist?.name) === artist)
+      && (!album || normalizeMusicText(item.album?.title) === album)
+    )?.preview || undefined;
+  }
+
+  async test() {
+    const response = await this.fetchImpl(new URL("https://api.deezer.com/search?q=test&limit=1"));
+
+    return {
+      ok: response.ok,
+      message: response.ok
+        ? "External preview is reachable"
+        : `External preview is unavailable (preview catalog responded with ${response.status})`,
+    };
+  }
+
+  async fetchStream(source: PlayableSource, range?: string) {
+    const response = await this.fetchImpl(source.id, {
+      headers: range ? { Range: range } : undefined,
+    });
+
+    return { body: response.body, status: response.status, headers: response.headers };
+  }
+}
+
+/**
  * Provider-neutral source resolution registry. It returns only opaque source
  * tokens to the client; provider connection IDs, provider URLs, and source
  * implementation details remain server-side in a short-lived in-memory map.
@@ -210,6 +344,7 @@ export class SourceProviderRegistry {
   ) {
     this.providers = [
       new LibrarySourceProvider(library, providers),
+      new DeezerPreviewSourceProvider(fetchImpl),
       new ItunesPreviewSourceProvider(fetchImpl),
       ...(pipeline ? [new SourcePipelineProvider(pipeline, fetchImpl)] : []),
     ];
@@ -443,8 +578,18 @@ export class SourceProviderRegistry {
     return provider.fetchStream({ ...stored.source, id: stored.providerSourceId }, range);
   }
 
+  /**
+   * Whether the token refers to non-library audio (a full external source or
+   * a preview excerpt). Used to gate streaming on the caller's external
+   * playback permission, so a token minted for a permitted user cannot be
+   * replayed by a user without that permission.
+   */
   isExternalSource(resultId: string, sourceId: string) {
     const stored = this.sourceCache.get(sourceId);
-    return Boolean(stored && stored.resultId === resultId && stored.source.type === "external");
+    return Boolean(
+      stored
+      && stored.resultId === resultId
+      && (stored.source.type === "external" || stored.source.type === "preview")
+    );
   }
 }

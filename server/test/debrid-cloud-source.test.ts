@@ -65,6 +65,15 @@ function debridFetch(input: URL | string) {
     }));
   }
 
+  // The keyless external preview provider is enabled by default; it has no
+  // preview for this fixture, which must not affect debrid resolution.
+  if (url.hostname === "api.deezer.com") {
+    return Promise.resolve(new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+  }
+
   return Promise.resolve(new Response("not found", { status: 404 }));
 }
 

@@ -208,6 +208,15 @@ test("stream and artwork URLs never include backend credentials", () => {
   expect(getStreamUrl("track-1")).toBe("/api/tracks/track-1/stream");
   expect(getStreamUrl("track-1", { id: "playable_1" })).toBe("/api/tracks/track-1/stream?playableSource=playable_1");
   expect(getCoverUrl("art-1")).toBe("/api/artwork/art-1");
+
+  // Thumbnail hints are forwarded to the artwork proxy, and external artwork
+  // keeps its own opaque-token route.
+  expect(getCoverUrl("art-1", 64)).toBe("/api/artwork/art-1?size=64");
+  expect(getCoverUrl("mdplart_sig_mdpl_1", 300)).toBe(
+    "/api/artwork/mdplart_sig_mdpl_1?size=300"
+  );
+  expect(getCoverUrl("extart_1", 64)).toBe("/api/artwork/external/extart_1");
+  expect(getCoverUrl(null, 64)).toBeNull();
 });
 
 test("playable source resolution sends normalized result data only to MusicDeck", async () => {

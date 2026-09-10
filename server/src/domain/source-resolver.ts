@@ -120,9 +120,13 @@ export class SourceResolver {
   }
 
   /** Resolve a stable artwork/library ID to artwork, with source fallback. */
-  fetchArtwork(libraryItemId: string): Promise<StreamResult> {
+  fetchArtwork(libraryItemId: string, size?: number): Promise<StreamResult> {
     return this.resolveWithFallback(libraryItemId, (provider, source) =>
-      provider.fetchArtwork(source.providerItemId)
+      // Omitted rather than passed as undefined so providers without
+      // thumbnail support see an unchanged call.
+      size === undefined
+        ? provider.fetchArtwork(source.providerItemId)
+        : provider.fetchArtwork(source.providerItemId, size)
     );
   }
 

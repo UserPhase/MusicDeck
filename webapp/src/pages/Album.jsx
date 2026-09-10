@@ -564,14 +564,11 @@ function Album() {
 
               <button
                 className="track-play"
-                onClick={() =>
-                  isDownloaded && playSong(song)
-                }
-                disabled={!isDownloaded}
+                onClick={() => playSong(song)}
                 aria-label={
                   isDownloaded
                     ? `Play ${song.title}`
-                    : `${song.title} not downloaded`
+                    : `Play preview of ${song.title}`
                 }
               >
                 ▶

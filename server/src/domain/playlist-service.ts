@@ -5,6 +5,12 @@ import { createId } from "../utils/ids.js";
 import { getPrimaryConnectionId } from "./connections.js";
 import type { CatalogService } from "./catalog.js";
 import type { LibraryService } from "./library.js";
+import {
+  COLLAGE_TILE_COUNT,
+  PlaylistArtworkService,
+  type PlaylistArtworkMode,
+  type RenderedArtwork,
+} from "./playlist-artwork.js";
 
 /**
  * MusicDeck-owned playlist service.
@@ -40,26 +46,61 @@ type PlaylistItemRow = {
   created_at: string;
 };
 
-function toPlaylist(row: PlaylistRow, tracks: Track[] | undefined): Playlist {
+function toPlaylist(
+  row: PlaylistRow,
+  tracks: Track[] | undefined,
+  artwork: PlaylistArtworkFields
+): Playlist {
   return {
     id: row.id,
     providerId: row.source_playlist_id || row.id,
     name: row.name,
     description: row.description,
-    artworkId: null,
-    artworkUrl: null,
+    artworkId: artwork.artworkId,
+    artworkUrl: artwork.artworkUrl,
+    artworkMode: artwork.artworkMode,
     songCount: tracks ? tracks.length : 0,
     ...(tracks ? { tracks } : {}),
   };
 }
 
+type PlaylistArtworkFields = {
+  artworkId: string | null;
+  artworkUrl: string | null;
+  artworkMode: PlaylistArtworkMode | null;
+};
+
+const NO_ARTWORK: PlaylistArtworkFields = {
+  artworkId: null,
+  artworkUrl: null,
+  artworkMode: null,
+};
+
 export class PlaylistService {
+  private readonly artwork: PlaylistArtworkService;
+
   constructor(
     private readonly db: Db,
     private readonly backend: MusicBackend,
     private readonly catalog: CatalogService,
-    private readonly library: LibraryService
-  ) {}
+    private readonly library: LibraryService,
+    /** Used to read library cover art when rendering the automatic collage. */
+    sourceResolver?: { fetchArtwork(libraryItemId: string, size?: number): Promise<{
+      body: ReadableStream<Uint8Array> | null;
+      status: number;
+      headers: Headers;
+    }> }
+  ) {
+    this.artwork = new PlaylistArtworkService(
+      db,
+      sourceResolver
+        ? (artworkId, size) =>
+            size === undefined
+              ? sourceResolver.fetchArtwork(artworkId)
+              : sourceResolver.fetchArtwork(artworkId, size)
+        : undefined
+    );
+  }
 
   private getRow(playlistId: string): PlaylistRow | undefined {
     return this.db.prepare(
@@ -118,9 +159,94 @@ export class PlaylistService {
 
   private withOwner(row: PlaylistRow, tracks?: Track[]): Playlist & { ownerUserId: string | null } {
     return {
-      ...toPlaylist(row, tracks),
+      ...toPlaylist(row, tracks, this.artworkFields(row.id)),
       ownerUserId: row.owner_user_id,
     };
+  }
+
+  /**
+   * Stable references for the playlist's leading tracks. Deliberately read
+   * straight from SQLite (no provider hydration) so listing playlists stays
+   * cheap: the collage itself is only rendered when the artwork token is
+   * actually requested.
+   */
+  private collageTrackRefs(playlistId: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT COALESCE(library_track_id, connection_id || ':' || provider_track_id) AS ref
+      FROM playlist_items
+      WHERE playlist_id = ?
+      ORDER BY position ASC
+      LIMIT ?
+    `).all(playlistId, COLLAGE_TILE_COUNT) as Array<{ ref: string }>;
+
+    return rows.map((row) => row.ref);
+  }
+
+  private artworkFields(playlistId: string): PlaylistArtworkFields {
+    const descriptor = this.artwork.describe(playlistId, this.collageTrackRefs(playlistId));
+    return descriptor || NO_ARTWORK;
+  }
+
+  /**
+   * Resolve the playlist's cover art bytes. Custom artwork always wins;
+   * otherwise the 2x2 collage is generated from the current first four
+   * tracks. Returns null only when the playlist is unknown or empty and has
+   * no custom artwork, so callers can fall back to their placeholder.
+   */
+  async renderArtwork(playlistId: string, size?: number): Promise<RenderedArtwork | null> {
+    if (!this.getRow(playlistId)) {
+      return null;
+    }
+
+    const custom = this.artwork.getCustom(playlistId);
+
+    if (custom) {
+      return { body: custom.data, contentType: custom.contentType };
+    }
+
+    const items = this.itemRows(playlistId).slice(0, COLLAGE_TILE_COUNT);
+
+    if (items.length === 0) {
+      return null;
+    }
+
+    const artworkIds: string[] = [];
+
+    for (const item of items) {
+      try {
+        const track = item.library_track_id
+          ? await this.catalog.getTrack(item.library_track_id)
+          : await this.backend.getTrack(item.provider_track_id);
+
+        if (track?.artworkId) {
+          artworkIds.push(track.artworkId);
+        }
+      } catch {
+        // A track that cannot be resolved simply contributes no tile.
+      }
+    }
+
+    return this.artwork.renderCollage(artworkIds, size);
+  }
+
+  /** Replace the playlist's automatic collage with custom artwork. */
+  setCustomArtwork(playlistId: string, data: Buffer, contentType: string): boolean {
+    if (!this.getRow(playlistId)) {
+      return false;
+    }
+
+    this.artwork.setCustom(playlistId, data, contentType);
+    return true;
+  }
+
+  /** Drop custom artwork so the playlist reverts to the automatic collage. */
+  clearCustomArtwork(playlistId: string): boolean {
+    if (!this.getRow(playlistId)) {
+      return false;
+    }
+
+    this.artwork.clearCustom(playlistId);
+    return true;
   }
 
   async list(): Promise<Array<Playlist & { ownerUserId: string | null }>> {

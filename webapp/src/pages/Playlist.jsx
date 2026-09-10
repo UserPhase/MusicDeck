@@ -1,11 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 
-import {
-  getCoverUrl,
-} from "../api/musicdeck";
-
 import AvailabilityHint from "../components/AvailabilityHint";
+import PlaylistCover from "../components/PlaylistCover";
 import SourceMenu from "../components/SourceMenu";
 import TrackDownloadButton from "../components/TrackDownloadButton";
 
@@ -13,6 +10,8 @@ import {
   getPlaylist,
   removeSongFromPlaylist as removeSongFromPlaylistRequest,
   deletePlaylist,
+  setPlaylistArtwork,
+  clearPlaylistArtwork,
 } from "../api/playlists";
 
 import { usePlayer } from "../context/PlayerContext";
@@ -52,6 +51,16 @@ function Playlist() {
   deleting,
   setDeleting,
   ] = useState(false);
+
+  const [
+    artworkBusy,
+    setArtworkBusy,
+  ] = useState(false);
+
+  const [
+    artworkError,
+    setArtworkError,
+  ] = useState(null);
 
   const {
     playSong,
@@ -151,11 +160,159 @@ useEffect(() => {
   }, [id]);
 
 
+  /*
+   * CUSTOM COVER ART
+   *
+   * Custom artwork overrides the automatic 2x2 collage. Only the custom image
+   * is stored server-side; clearing it restores the generated collage.
+   *
+   * The server is the authority on what it accepts; these client-side limits
+   * only mirror it so an obviously invalid file is reported immediately
+   * instead of after a large upload.
+   */
+
+  const MAX_COVER_BYTES = 5 * 1024 * 1024;
+
+  const ACCEPTED_COVER_TYPES = [
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+  ];
+
+  function readImageAsDataUrl(file) {
+
+    return new Promise((resolve, reject) => {
+
+      const reader = new FileReader();
+
+      reader.onload = () =>
+        resolve(reader.result);
+
+      reader.onerror = () =>
+        reject(
+          new Error(
+            "Could not read the selected image."
+          )
+        );
+
+      reader.readAsDataURL(file);
+
+    });
+
+  }
+
+
+  function applyArtwork(updated) {
+
+    if (!updated) {
+      return;
+    }
+
+    setPlaylist((currentPlaylist) =>
+      currentPlaylist
+        ? {
+            ...currentPlaylist,
+            coverArt: updated.coverArt,
+            coverMode: updated.coverMode,
+          }
+        : currentPlaylist
+    );
+
+  }
+
+
+  async function handleCoverUpload(event) {
+
+    const file =
+      event.target.files &&
+      event.target.files[0];
+
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!ACCEPTED_COVER_TYPES.includes(file.type)) {
+
+      setArtworkError(
+        "Choose a PNG, JPEG, WebP, or GIF image."
+      );
+
+      return;
+
+    }
+
+    if (file.size > MAX_COVER_BYTES) {
+
+      setArtworkError(
+        "Cover images must be 5 MB or smaller."
+      );
+
+      return;
+
+    }
+
+    setArtworkBusy(true);
+    setArtworkError(null);
+
+    try {
+
+      applyArtwork(
+        await setPlaylistArtwork(
+          id,
+          await readImageAsDataUrl(file)
+        )
+      );
+
+    } catch (err) {
+
+      setArtworkError(
+        err.message ||
+        "Could not update the playlist cover."
+      );
+
+    } finally {
+
+      setArtworkBusy(false);
+
+    }
+
+  }
+
+
+  async function handleCoverReset() {
+
+    setArtworkBusy(true);
+    setArtworkError(null);
+
+    try {
+
+      applyArtwork(
+        await clearPlaylistArtwork(id)
+      );
+
+    } catch (err) {
+
+      setArtworkError(
+        err.message ||
+        "Could not restore the automatic cover."
+      );
+
+    } finally {
+
+      setArtworkBusy(false);
+
+    }
+
+  }
+
+
 async function handleRemoveSong(
   song,
   songIndex
 ) {
-
   try {
 
     await removeSongFromPlaylistRequest(
@@ -261,7 +418,13 @@ async function handleRemoveSong(
     }
     playQueue(
       songs,
-      0
+      0,
+      {
+        type: "playlist",
+        id: playlist.id,
+        name: playlist.name,
+        coverArt: playlist.coverArt,
+      }
     );
 
   }
@@ -283,24 +446,72 @@ async function handleRemoveSong(
       <div className="playlist-header">
 
 
-        <div className="playlist-page-cover">
+        <div className="playlist-cover-column">
 
-          {playlist.coverArt ? (
+          <div className="playlist-page-cover">
 
-            <img
-              src={getCoverUrl(
-                playlist.coverArt
-              )}
-              alt={`${playlist.name} cover`}
-            />
+          <PlaylistCover
+            playlist={playlist}
+            placeholderClassName="playlist-placeholder"
+          />
 
-          ) : (
+          </div>
 
-            <div className="playlist-placeholder">
-              ♫
+
+        {/* COVER ART MODE */}
+
+        <div className="playlist-cover-actions">
+
+          <label
+            className="playlist-cover-action"
+            htmlFor="playlist-cover-upload"
+          >
+
+            {artworkBusy
+              ? "Updating cover…"
+              : playlist.coverMode === "custom"
+                ? "Change cover"
+                : "Upload cover"}
+
+          </label>
+
+
+          <input
+            id="playlist-cover-upload"
+            className="playlist-cover-input"
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            disabled={artworkBusy}
+            onChange={handleCoverUpload}
+          />
+
+
+          {playlist.coverMode === "custom" && (
+
+            <button
+              type="button"
+              className="playlist-cover-action"
+              disabled={artworkBusy}
+              onClick={handleCoverReset}
+            >
+              Remove custom cover
+            </button>
+
+          )}
+
+
+          {artworkError && (
+
+            <div
+              className="error playlist-cover-error"
+              role="alert"
+            >
+              {artworkError}
             </div>
 
           )}
+
+        </div>
 
         </div>
 

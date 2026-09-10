@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Db } from "../db/database.js";
 import { requireUser } from "../auth/authorization.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
+import { parseImageDataUrl, MAX_ARTWORK_REQUEST_BYTES } from "../domain/playlist-artwork.js";
 import { sendError } from "../utils/http.js";
 
 const createPlaylistSchema = z.object({
@@ -21,6 +22,10 @@ const addTrackSchema = z.object({
 
 const reorderSchema = z.object({
   trackIds: z.array(z.string().min(1)),
+});
+
+const artworkSchema = z.object({
+  image: z.string().min(1),
 });
 
 export async function registerPlaylistRoutes(app: FastifyInstance, db: Db, playlists: PlaylistService) {
@@ -138,6 +143,63 @@ export async function registerPlaylistRoutes(app: FastifyInstance, db: Db, playl
     }
 
     const playlist = await playlists.reorder(playlistId, parsed.data.trackIds);
+    return playlist ? { playlist } : sendError(reply, 404, "Playlist not found");
+  });
+
+  /**
+   * Replace the automatic 2x2 collage with custom playlist artwork. The image
+   * is uploaded as a validated base64 data URL so no multipart dependency is
+   * needed; only the custom artwork is stored, never a generated collage.
+   *
+   * The route raises its body limit above the image cap because base64
+   * inflates the payload; without it the server's default 1 MiB limit would
+   * reject valid uploads before validation ever runs.
+   */
+  app.put(
+    "/api/playlists/:playlistId/artwork",
+    { bodyLimit: MAX_ARTWORK_REQUEST_BYTES },
+    async (request, reply) => {
+      const user = requireUser(db, request, reply);
+      if (!user) return reply;
+
+      const { playlistId } = request.params as { playlistId: string };
+
+      if (!playlists.canModify(playlistId, user)) {
+        return sendError(reply, 403, "Playlist access denied");
+      }
+
+      const parsed = artworkSchema.safeParse(request.body);
+      const image = parsed.success ? parseImageDataUrl(parsed.data.image) : null;
+
+      if (!image) {
+        return sendError(reply, 400, "Invalid playlist artwork upload", "VALIDATION_ERROR");
+      }
+
+      if (!playlists.setCustomArtwork(playlistId, image.data, image.contentType)) {
+        return sendError(reply, 404, "Playlist not found");
+      }
+
+      const playlist = await playlists.get(playlistId);
+      return playlist ? { playlist } : sendError(reply, 404, "Playlist not found");
+    }
+  );
+
+  /** Remove custom artwork so the playlist falls back to the automatic collage. */
+  app.delete("/api/playlists/:playlistId/artwork", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const { playlistId } = request.params as { playlistId: string };
+
+    if (!playlists.canModify(playlistId, user)) {
+      return sendError(reply, 403, "Playlist access denied");
+    }
+
+    if (!playlists.clearCustomArtwork(playlistId)) {
+      return sendError(reply, 404, "Playlist not found");
+    }
+
+    const playlist = await playlists.get(playlistId);
     return playlist ? { playlist } : sendError(reply, 404, "Playlist not found");
   });
 }

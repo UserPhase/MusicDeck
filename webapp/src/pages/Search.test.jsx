@@ -123,7 +123,7 @@ test("renders external results without provider-specific UI and disables unavail
   renderSearch();
 
   expect(await screen.findByLabelText("Available externally")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Play External Song" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Play preview of External Song" })).toBeEnabled();
   expect(screen.queryByText(/itunes|navidrome|jellyfin/i)).toBeNull();
 });
 

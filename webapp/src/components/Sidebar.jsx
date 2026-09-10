@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 
+import PlaylistCover from "./PlaylistCover";
+
 import {
   getPlaylists,
   createPlaylist,
@@ -240,8 +242,12 @@ function Sidebar() {
             }`}
           >
 
-            <span className="nav-icon">
-              ♫
+            <span className="nav-icon nav-icon-playlist">
+              <PlaylistCover
+                playlist={playlist}
+                size={64}
+                placeholderClassName="nav-icon-playlist-placeholder"
+              />
             </span>
 
             <span>

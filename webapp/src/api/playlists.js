@@ -5,6 +5,8 @@ import {
   addSongToPlaylist as requestAddSongToPlaylist,
   removeSongFromPlaylist as requestRemoveSongFromPlaylist,
   deletePlaylist as requestDeletePlaylist,
+  setPlaylistArtwork as requestSetPlaylistArtwork,
+  clearPlaylistArtwork as requestClearPlaylistArtwork,
 } from "./musicdeck";
 
 
@@ -66,5 +68,22 @@ export async function removeSongFromPlaylist(
     playlistId,
     songIndex
   );
+}
+
+
+/*
+ * Playlist cover art.
+ *
+ * A playlist always resolves to one of exactly two modes: the automatic 2x2
+ * collage of its first four tracks, or custom artwork that overrides it.
+ * Setting artwork switches to custom mode; clearing it restores the collage.
+ */
+export async function setPlaylistArtwork(playlistId, image) {
+  return requestSetPlaylistArtwork(playlistId, image);
+}
+
+
+export async function clearPlaylistArtwork(playlistId) {
+  return requestClearPlaylistArtwork(playlistId);
 }
 

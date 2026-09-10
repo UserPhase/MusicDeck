@@ -274,8 +274,10 @@ export class NavidromeBackend implements MusicBackend {
     };
   }
 
-  async fetchArtwork(artworkId: string): Promise<StreamResult> {
-    const response = await this.fetchImpl(this.buildUrl("getCoverArt", { id: artworkId }));
+  async fetchArtwork(artworkId: string, size?: number): Promise<StreamResult> {
+    // Subsonic's `size` asks the server for a square thumbnail, which keeps
+    // grid/sidebar artwork small without any local image processing.
+    const response = await this.fetchImpl(this.buildUrl("getCoverArt", { id: artworkId, size }));
 
     return {
       body: response.body,

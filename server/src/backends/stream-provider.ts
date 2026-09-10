@@ -13,5 +13,10 @@ export type StreamResult = {
  */
 export interface StreamProvider {
   fetchStream(trackId: string, range?: string): Promise<StreamResult>;
-  fetchArtwork(artworkId: string): Promise<StreamResult>;
+  /**
+   * Fetch cover art. `size` requests a square thumbnail of that pixel edge
+   * length; providers that cannot resize simply return the full image, so
+   * callers must treat it as a hint rather than a guarantee.
+   */
+  fetchArtwork(artworkId: string, size?: number): Promise<StreamResult>;
 }

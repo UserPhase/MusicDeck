@@ -198,10 +198,10 @@ test("shows the complete catalog tracklist for an album with only some tracks do
   // Completion summary is shown.
   expect(screen.getByText(/2 \/ 4 in library/i)).toBeInTheDocument();
 
-  // Undownloaded tracks cannot be played directly (no working play control).
+  // Undownloaded tracks stay playable: pressing play resolves an external preview.
   expect(
-    screen.getByRole("button", { name: "I'm in Love with My Car not downloaded" })
-  ).toBeDisabled();
+    screen.getByRole("button", { name: "Play preview of I'm in Love with My Car" })
+  ).toBeEnabled();
   expect(
     screen.getByRole("button", { name: "Play Death on Two Legs" })
   ).toBeEnabled();

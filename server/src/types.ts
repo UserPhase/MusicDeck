@@ -67,6 +67,8 @@ export type Playlist = {
   description: string | null;
   artworkId: string | null;
   artworkUrl: string | null;
+  /** How the cover art was resolved: user-supplied art or the automatic collage. */
+  artworkMode?: "custom" | "collage" | null;
   songCount: number;
   tracks?: Track[];
 };

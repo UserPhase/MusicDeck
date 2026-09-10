@@ -25,7 +25,11 @@
 .playlist-card { display: block; padding: 12px; background: transparent; border: 1px solid transparent; border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .playlist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
 .playlist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: linear-gradient(135deg, #242936, #171b24); display: flex; align-items: center; justify-content: center; }
+.playlist-cover img { width: 100%; height: 100%; object-fit: cover; }
 .playlist-cover-icon { color: var(--text-secondary); font-size: 52px; line-height: 1; }
+.search-result-cover { position: relative; aspect-ratio: 1; margin-bottom: var(--space-2); overflow: hidden; border-radius: 6px; background: linear-gradient(135deg, #242936, #171b24); display: flex; align-items: center; justify-content: center; }
+.search-result-cover img { width: 100%; height: 100%; object-fit: cover; }
+.search-result-cover .playlist-cover-icon { font-size: 44px; }
 .playlist-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .playlist-meta { color: var(--text-secondary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .playlist-empty { color: var(--text-secondary); padding: 20px 0; }

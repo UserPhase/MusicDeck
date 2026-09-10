@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import Home from "./Home";
 import {
   getAlbum,
+  getCoverUrl,
   getExplore,
   getRandomAlbums,
   getRandomSongs,
@@ -18,7 +19,7 @@ import { usePlayer } from "../context/PlayerContext";
 
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
-  getCoverUrl: jest.fn((id) => (id ? `/api/artwork/${id}` : null)),
+  getCoverUrl: jest.fn(),
   getExplore: jest.fn(),
   getRandomAlbums: jest.fn(),
   getRandomSongs: jest.fn(),
@@ -68,6 +69,8 @@ const playlist = {
   id: "playlist-1",
   name: "Evening Drive",
   songCount: 12,
+  coverArt: "mdplart_sig1_mdpl_1",
+  coverMode: "collage",
 };
 
 function renderHome({
@@ -82,6 +85,10 @@ function renderHome({
   playlistsReject = false,
 } = {}) {
   jest.clearAllMocks();
+
+  getCoverUrl.mockImplementation((id, size) =>
+    id ? `/api/artwork/${id}${size ? `?size=${size}` : ""}` : null
+  );
 
   useAuth.mockReturnValue({ session });
   usePlayer.mockReturnValue({
@@ -160,6 +167,29 @@ test("renders playlists when available", async () => {
 
   expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
   expect(screen.getByText("Evening Drive")).toBeInTheDocument();
+});
+
+test("Home playlist cards render the resolved playlist artwork as a thumbnail", async () => {
+  renderHome({ playlists: [playlist] });
+
+  expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
+
+  const cover = screen.getByAltText("Evening Drive cover");
+
+  expect(cover).toHaveAttribute(
+    "src",
+    "/api/artwork/mdplart_sig1_mdpl_1?size=300"
+  );
+});
+
+test("Home playlist cards fall back to the placeholder without artwork", async () => {
+  const { container } = renderHome({
+    playlists: [{ ...playlist, coverArt: null, coverMode: null }],
+  });
+
+  expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
+  expect(screen.queryByAltText("Evening Drive cover")).toBeNull();
+  expect(container.querySelector(".playlist-cover-icon")).toBeInTheDocument();
 });
 
 test("omits playlists when empty", async () => {

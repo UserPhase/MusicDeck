@@ -108,6 +108,7 @@ function toPlaylist(playlist) {
     name: playlist.name,
     comment: playlist.description,
     coverArt: playlist.artworkId,
+    coverMode: playlist.artworkMode || null,
     songCount: playlist.songCount,
     entry: (playlist.tracks || []).map(toSong),
   };
@@ -314,12 +315,25 @@ export async function deleteUser(userId) {
   });
 }
 
-export function getCoverUrl(coverArt) {
+/**
+ * Resolve any MusicDeck artwork reference (library, playlist, or external) to
+ * its authenticated proxy URL. `size` is an optional square-thumbnail hint in
+ * pixels; the server snaps it to a supported size and resizes at the source,
+ * so grids and sidebars never download full-resolution covers.
+ */
+export function getCoverUrl(coverArt, size) {
   if (!coverArt) return null;
   if (typeof coverArt === "object") return coverArt.url || null;
-  return String(coverArt).startsWith("extart_")
-    ? `/api/artwork/external/${encodeURIComponent(coverArt)}`
-    : `/api/artwork/${encodeURIComponent(coverArt)}`;
+
+  const id = String(coverArt);
+
+  if (id.startsWith("extart_")) {
+    return `/api/artwork/external/${encodeURIComponent(id)}`;
+  }
+
+  const url = `/api/artwork/${encodeURIComponent(id)}`;
+
+  return size ? `${url}?size=${encodeURIComponent(size)}` : url;
 }
 
 export function getStreamUrl(songId, source) {
@@ -609,6 +623,31 @@ export async function removeSongFromPlaylist(playlistId, songIndex) {
     `/api/playlists/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(song.id)}`,
     { method: "DELETE" }
   );
+}
+
+/*
+ * Replace a playlist's automatic 2x2 collage with custom artwork.
+ *
+ * The image is sent as a base64 data URL; the server validates the media
+ * type and size, stores only the custom artwork, and continues to serve it
+ * through the same authenticated artwork proxy as the collage.
+ */
+export async function setPlaylistArtwork(playlistId, image) {
+  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}/artwork`, {
+    method: "PUT",
+    body: JSON.stringify({ image }),
+  });
+
+  return data.playlist ? toPlaylist(data.playlist) : null;
+}
+
+/* Remove custom artwork so the playlist falls back to the automatic collage. */
+export async function clearPlaylistArtwork(playlistId) {
+  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}/artwork`, {
+    method: "DELETE",
+  });
+
+  return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
 export async function getStarred() {

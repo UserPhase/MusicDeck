@@ -12,6 +12,8 @@ import {
   usePlayer,
 } from "../context/PlayerContext";
 
+import PlaylistCover from "./PlaylistCover";
+
 import {
   getCoverUrl,
 } from "../api/musicdeck";
@@ -73,6 +75,11 @@ function Player() {
 
     toggleLike,
     isCurrentSongLiked,
+
+    playbackContext,
+    isPreview,
+    previewDurationSeconds,
+    playbackUnavailable,
 
   } = usePlayer();
 
@@ -274,6 +281,34 @@ function Player() {
             {currentSong
               ? currentSong.title
               : "Nothing playing"}
+
+
+            {isPreview && (
+
+              <span
+                className="now-badge now-badge-preview"
+                title={
+                  previewDurationSeconds
+                    ? `Preview only (${Math.round(previewDurationSeconds)}s), not the full track`
+                    : "Preview only, not the full track"
+                }
+              >
+                Preview
+              </span>
+
+            )}
+
+
+            {playbackUnavailable && (
+
+              <span
+                className="now-badge now-badge-unavailable"
+                role="status"
+              >
+                Unavailable
+              </span>
+
+            )}
 
           </div>
 
@@ -507,6 +542,46 @@ function Player() {
           {showQueue && (
 
             <div className="player-queue-panel">
+
+
+              {/* =============================== */}
+              {/* PLAYBACK CONTEXT */}
+              {/* =============================== */}
+
+              {playbackContext &&
+                playbackContext.type === "playlist" && (
+
+                <div className="player-queue-context">
+
+                  <div className="player-queue-context-cover">
+
+                    <PlaylistCover
+                      playlist={playbackContext}
+                      size={160}
+                    />
+
+                  </div>
+
+
+                  <div className="player-queue-context-info">
+
+                    <div className="player-queue-context-label">
+                      Playing from playlist
+                    </div>
+
+
+                    <Link
+                      to={`/playlist/${playbackContext.id}`}
+                      className="player-queue-context-name"
+                    >
+                      {playbackContext.name}
+                    </Link>
+
+                  </div>
+
+                </div>
+
+              )}
 
 
               {/* =============================== */}

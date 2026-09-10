@@ -11,6 +11,8 @@ import {
   getPlaylists,
 } from "../api/playlists";
 
+import PlaylistCover from "../components/PlaylistCover";
+
 
 function Playlists() {
 
@@ -171,9 +173,7 @@ function Playlists() {
 
             <div className="playlist-cover">
 
-              <div className="playlist-cover-icon">
-                ♫
-              </div>
+              <PlaylistCover playlist={playlist} size={300} />
 
             </div>
 

@@ -67,6 +67,33 @@ export async function buildServer(options: {
 
   app.setErrorHandler((error, _request, reply) => {
     app.log.error(error);
+
+    // Fastify's own request-payload failures (body too large, malformed JSON,
+    // unsupported content type) are client errors that already describe
+    // themselves accurately. Classifying them as plugin failures would report
+    // a misleading 500 for what is really a bad request.
+    const { code, statusCode, message } = error as {
+      code?: string;
+      statusCode?: number;
+      message?: string;
+    };
+
+    if (
+      typeof code === "string" &&
+      code.startsWith("FST_ERR_CTP_") &&
+      typeof statusCode === "number" &&
+      statusCode >= 400 &&
+      statusCode < 500
+    ) {
+      reply.code(statusCode).send({
+        error: {
+          code,
+          message: message ?? "Request could not be processed",
+        },
+      });
+      return;
+    }
+
     // Even an unexpected throw should surface as a normalized plugin error
     // instead of an opaque 500 when the failure is classifiable.
     const classified = classifyPluginError(error);

@@ -227,9 +227,14 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     };
   }
 
-  async fetchArtwork(artworkId: string): Promise<StreamResult> {
+  async fetchArtwork(artworkId: string, size?: number): Promise<StreamResult> {
+    // Jellyfin resizes server-side via fillWidth/fillHeight, so thumbnails
+    // cost no local image processing.
     const response = await this.fetchImpl(
-      this.buildUrl(`Items/${encodeURIComponent(artworkId)}/Images/Primary`),
+      this.buildUrl(`Items/${encodeURIComponent(artworkId)}/Images/Primary`, {
+        fillWidth: size,
+        fillHeight: size,
+      }),
       { headers: this.authHeaders() }
     );
 

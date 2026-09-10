@@ -8,6 +8,7 @@ import type { CatalogService } from "../domain/catalog.js";
 import type { LibraryService } from "../domain/library.js";
 import { SourceResolver, SourceUnavailableError } from "../domain/source-resolver.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
+import { parsePlaylistArtworkId, resolveArtworkSize } from "../domain/playlist-artwork.js";
 import { toAlbumSearchResult, toArtistSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
 import type { UnifiedSearchResult } from "../domain/search.js";
 import type { SearchProviderRegistry } from "../domain/search-provider-registry.js";
@@ -927,6 +928,29 @@ export async function registerMusicRoutes(
     if (!user) return reply;
 
     const { artworkId } = request.params as { artworkId: string };
+    const { size } = request.query as { size?: string };
+
+    // Playlist cover art (custom upload or the automatic 2x2 collage)
+    // resolves through the same authenticated artwork proxy as every other
+    // MusicDeck artwork reference.
+    const playlistArtwork = parsePlaylistArtworkId(artworkId);
+
+    if (playlistArtwork) {
+      const rendered = await playlists.renderArtwork(
+        playlistArtwork.playlistId,
+        resolveArtworkSize(size)
+      );
+
+      if (!rendered) {
+        return sendError(reply, 404, "Artwork not found");
+      }
+
+      reply.header("content-type", rendered.contentType);
+      reply.header("cache-control", "private, max-age=300");
+      reply.header("x-content-type-options", "nosniff");
+      reply.header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'");
+      return reply.send(rendered.body);
+    }
 
     // MusicDeck artwork IDs (mdart_) resolve through the SourceResolver.
     // A provider-native cover-art ID is still accepted as a bounded
@@ -938,11 +962,20 @@ export async function registerMusicRoutes(
       return sendError(reply, 404, "Artwork not found");
     }
 
+    // A thumbnail hint is forwarded to the backing provider, which resizes
+    // server-side; providers that cannot resize return the full image.
+    const thumbnailSize = size === undefined ? undefined : resolveArtworkSize(size);
+
     try {
       if (isMusicDeckArtwork) {
-        return await sendProxyResponse(reply, await sourceResolver.fetchArtwork(artworkId));
+        return await sendProxyResponse(reply, await sourceResolver.fetchArtwork(artworkId, thumbnailSize));
       }
-      return await sendProxyResponse(reply, await backend.fetchArtwork(artworkId));
+      return await sendProxyResponse(
+        reply,
+        thumbnailSize === undefined
+          ? await backend.fetchArtwork(artworkId)
+          : await backend.fetchArtwork(artworkId, thumbnailSize)
+      );
     } catch (error) {
       if (error instanceof SourceUnavailableError) {
         return sendError(reply, 502, "Artwork unavailable");

@@ -456,6 +456,26 @@ const migrations = [
       UPDATE search_provider_configs SET enabled = 0 WHERE provider_id = 'itunes';
     `,
   },
+  {
+    id: 18,
+    name: "playlist-custom-artwork",
+    sql: `
+      CREATE TABLE playlist_artwork (
+        playlist_id TEXT PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
+        content_type TEXT NOT NULL,
+        data BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    id: 19,
+    name: "keyless-external-preview-source",
+    sql: `
+      INSERT OR IGNORE INTO source_provider_configs (provider_id, enabled, config_json, updated_at)
+      VALUES ('deezer-preview', 1, '{}', CURRENT_TIMESTAMP);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

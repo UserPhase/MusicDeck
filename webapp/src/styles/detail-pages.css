@@ -8,6 +8,15 @@
 .album-header, .playlist-header, .artist-header { display: flex; align-items: flex-end; gap: 30px; margin-bottom: 42px; }
 .album-page-cover, .playlist-page-cover { width: 230px; height: 230px; flex-shrink: 0; overflow: hidden; border-radius: 10px; background: #171b24; box-shadow: 0 15px 40px rgba(0, 0, 0, 0.35); }
 .album-page-cover img, .playlist-page-cover img { width: 100%; height: 100%; object-fit: cover; }
+.playlist-cover-column { display: flex; flex-direction: column; gap: 12px; flex-shrink: 0; }
+.playlist-page-cover { display: flex; align-items: center; justify-content: center; }
+.playlist-placeholder { color: var(--text-secondary); font-size: 72px; line-height: 1; }
+.playlist-cover-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 230px; }
+.playlist-cover-action { padding: 6px 12px; border: 1px solid var(--border); border-radius: 16px; background: var(--card); color: var(--text-secondary); font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
+.playlist-cover-action:hover { background: var(--card-hover); color: var(--text); }
+.playlist-cover-input { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.playlist-cover-input:focus-visible + .playlist-cover-action { outline: var(--focus-ring); outline-offset: 2px; }
+.playlist-cover-error { width: 230px; font-size: 12px; }
 .album-page-info, .playlist-page-info, .artist-page-info { min-width: 0; }
 .album-type, .playlist-type, .artist-type { margin-bottom: 8px; color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; }
 .album-page-info h1, .playlist-page-info h1 { color: var(--text); font-size: 38px; font-weight: 750; letter-spacing: -1.2px; line-height: 1.1; }
