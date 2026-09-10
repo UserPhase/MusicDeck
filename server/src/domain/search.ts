@@ -25,6 +25,7 @@ export interface SearchProvider {
   id: string;
   name: string;
   search(query: string, options?: SearchOptions): Promise<UnifiedSearchResult[]>;
+  test?(): Promise<{ ok: boolean; message?: string; status?: string }>;
 }
 
 export type UnifiedSearchResult = {
@@ -56,6 +57,8 @@ export type UnifiedSearchResult = {
     spotifyUrl?: string;
     spotifyTrackId?: string;
     spotifyId?: string;
+    deezerTrackId?: number;
+    deezerTrackUrl?: string;
   };
   /** Internal matching input; removed before the API response. */
   identityHints?: IdentityHints;

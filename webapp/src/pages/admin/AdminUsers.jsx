@@ -6,6 +6,7 @@ import {
   getUsers,
 } from "../../api/musicdeck";
 import { useAdminData } from "./useAdminData";
+import { AdminPageHeader } from "../../components/admin/ui";
 
 
 const EMPTY_USER = {
@@ -76,22 +77,19 @@ function AdminUsers() {
 
   return (
     <div className="admin-page">
-      <div className="account-header">
-        <div>
-          <div className="account-label">ADMIN</div>
-          <h1>Users</h1>
-          <div className="account-meta">
-            {users.length} account{users.length === 1 ? "" : "s"}
-          </div>
-        </div>
-        <button
-          type="button"
-          className="account-primary"
-          onClick={() => setAddOpen((open) => !open)}
-        >
-          + Add user
-        </button>
-      </div>
+      <AdminPageHeader
+        title="Users"
+        meta={`${users.length} account${users.length === 1 ? "" : "s"}`}
+        actions={
+          <button
+            type="button"
+            className="account-primary"
+            onClick={() => setAddOpen((open) => !open)}
+          >
+            + Add user
+          </button>
+        }
+      />
 
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}

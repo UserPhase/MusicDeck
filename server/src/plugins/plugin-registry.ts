@@ -519,7 +519,7 @@ export class PluginRegistry {
       // The real error (which may include upstream details) is logged
       // server-side only; clients only ever see the normalized status.
       this.log(pluginId, "error", `enable failed: ${error instanceof Error ? error.message : String(error)}`);
-      throw new ClassifiedPluginError(classified.status, classified.message);
+      throw new ClassifiedPluginError(classified.status, `${state.plugin.manifest.name}: ${classified.message}`);
     }
   }
 
@@ -642,7 +642,7 @@ export class PluginRegistry {
     try {
       const result = await state.plugin.test?.(this.context(pluginId, state.plugin.manifest));
       if (!result) {
-        return { ok: true, status: "success" as PluginErrorStatus, message: "Plugin is registered" };
+        return { ok: true, status: "success" as PluginErrorStatus, message: `${state.plugin.manifest.name} is registered` };
       }
       const status: PluginErrorStatus = result.ok
         ? "success"
@@ -650,7 +650,8 @@ export class PluginRegistry {
       return {
         ok: result.ok,
         status,
-        message: result.message,
+        message: result.message
+          || (result.ok ? `${state.plugin.manifest.name} is reachable` : `${state.plugin.manifest.name} is unavailable`),
         details: (result as { details?: Record<string, unknown> }).details,
       };
     } catch (error) {
@@ -658,7 +659,7 @@ export class PluginRegistry {
       // Preserve the real underlying failure in server logs only; the
       // client only ever receives the normalized status/message.
       this.log(pluginId, "error", `test failed: ${error instanceof Error ? error.message : String(error)}`);
-      return { ok: false, status: classified.status, message: classified.message };
+      return { ok: false, status: classified.status, message: `${state.plugin.manifest.name}: ${classified.message}` };
     }
   }
 

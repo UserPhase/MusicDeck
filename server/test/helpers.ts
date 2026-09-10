@@ -21,6 +21,7 @@ import { ExternalCatalogRegistry } from "../src/domain/external-catalog.js";
 import { RecommendationRegistry, RecommendationService } from "../src/domain/recommendations.js";
 import { LibraryInsightsService } from "../src/domain/library-insights.js";
 import { AcquisitionProviderRegistry, AcquisitionService } from "../src/domain/acquisition.js";
+import { SilenceAnalysisService } from "../src/domain/silence-analysis.js";
 import { PluginRegistry } from "../src/plugins/plugin-registry.js";
 import {
   createExternalArtworkPlugin,
@@ -173,7 +174,8 @@ export async function createTestServer(
   const catalog = new CatalogService(registry, library);
   const playlists = new PlaylistService(db, backend, catalog, library);
   const sourceResolver = new SourceResolver(registry, library);
-  const searchProviders = new SearchProviderRegistry(db, catalog, playlists);
+  const externalCatalog = new ExternalCatalogRegistry(externalFetchImpl, db);
+  const searchProviders = new SearchProviderRegistry(db, catalog, playlists, externalFetchImpl, externalCatalog.artwork);
   const sourcePipeline = new SourcePipelineRegistry(db);
   const sourceProviders = new SourceProviderRegistry(
     db,
@@ -183,8 +185,8 @@ export async function createTestServer(
     sourceFetchImpl || pluginFetchImpl,
     sourcePipeline
   );
-  const externalCatalog = new ExternalCatalogRegistry(externalFetchImpl);
-  externalCatalog.configure(searchProviders.list().some((provider) => provider.id === "itunes" && provider.enabled));
+  const spotifyConfig = searchProviders.rawConfig("spotify");
+  externalCatalog.configure(Boolean(spotifyConfig?.enabled), spotifyConfig?.config);
   const recommendations = new RecommendationRegistry(new RecommendationService(db, catalog));
   const libraryInsights = new LibraryInsightsService(db, catalog);
   const acquisitionProviders = new AcquisitionProviderRegistry();
@@ -229,9 +231,20 @@ export async function createTestServer(
   await plugins.register(createSiteSourcesPlugin());
   await plugins.register(createArchiveOrgSourcePlugin());
   await plugins.register(createOnDemandLibraryPlugin());
-  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, logger: false });
+  const silenceAnalysis = new SilenceAnalysisService(db, sourceResolver, {
+    // Tests never spawn a real ffmpeg; a no-op stub keeps route tests fast
+    // and hermetic while still exercising the persistence/route wiring.
+    processRunner: {
+      run: () => {
+        const promise = Promise.resolve({ exitCode: 0, stdout: "", stderr: "", signal: null });
+        return { pid: undefined, kill: () => {}, cancel: () => {}, promise, completion: promise };
+      },
+    },
+    ffmpegPath: "ffmpeg-test-stub",
+  });
+  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis, logger: false });
 
-  return { app, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, sourcePipeline, externalCatalog, recommendations, libraryInsights, plugins, acquisition, acquisitionProviders, registry, directory };
+  return { app, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, sourcePipeline, externalCatalog, recommendations, libraryInsights, plugins, acquisition, acquisitionProviders, registry, directory, silenceAnalysis };
 }
 
 export async function closeTestServer(app: FastifyInstance, db: Db) {

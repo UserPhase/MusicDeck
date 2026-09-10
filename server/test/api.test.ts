@@ -147,21 +147,21 @@ describe("MusicDeck media API", () => {
     expect(listed.statusCode).toBe(200);
     expect(listed.json().searchProviders).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "library", enabled: true }),
-      expect.objectContaining({ id: "itunes", enabled: false, config: {} }),
+      expect.objectContaining({ id: "spotify", enabled: false, config: {} }),
     ]));
 
     const updated = await app.inject({
       method: "PATCH",
-      url: "/api/admin/search-providers/itunes",
+      url: "/api/admin/search-providers/spotify",
       headers: { cookie },
-      payload: { enabled: true, config: { country: "GB", apiKey: "redact-me" } },
+      payload: { enabled: true, config: { clientId: "abc", apiKey: "redact-me" } },
     });
 
     expect(updated.statusCode).toBe(200);
     expect(updated.json().searchProvider).toMatchObject({
-      id: "itunes",
+      id: "spotify",
       enabled: true,
-      config: { country: "GB" },
+      config: { clientId: "abc" },
     });
     expect(JSON.stringify(updated.json())).not.toContain("redact-me");
   });

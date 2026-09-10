@@ -461,8 +461,9 @@ export class SourcePipelineRegistry {
   async test(providerId: string) {
     const resolver = this.resolverProviders.find((item) => item.id === providerId);
     if (!resolver) {
-      if (this.discoveryProviders.some((item) => item.id === providerId)) {
-        return { id: providerId, ok: true, status: "success" as const, message: "Provider is configured" };
+      const discovery = this.discoveryProviders.find((item) => item.id === providerId);
+      if (discovery) {
+        return { id: providerId, ok: true, status: "success" as const, message: `${discovery.name} is configured` };
       }
       throw new Error("Unknown source pipeline provider");
     }
@@ -473,11 +474,17 @@ export class SourcePipelineRegistry {
         id: providerId,
         ok: result.ok,
         status: result.ok ? "success" : "plugin_error",
-        message: result.message || (result.ok ? "Provider is reachable" : "Provider is unavailable"),
+        message: result.message
+          || (result.ok ? `${resolver.name} is reachable` : `${resolver.name} is unavailable`),
       };
     } catch (error) {
       const classified = classifyPluginError(error);
-      return { id: providerId, ok: false, status: classified.status, message: classified.message };
+      return {
+        id: providerId,
+        ok: false,
+        status: classified.status,
+        message: `${resolver.name}: ${classified.message}`,
+      };
     }
   }
 

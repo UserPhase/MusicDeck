@@ -428,6 +428,34 @@ const migrations = [
       ALTER TABLE acquisition_jobs ADD COLUMN speed_bytes_per_second INTEGER;
     `,
   },
+  {
+    id: 16,
+    name: "silence-trim-analysis",
+    sql: `
+      CREATE TABLE track_silence_analysis (
+        track_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        leading_silence_seconds REAL,
+        trailing_silence_seconds REAL,
+        duration_seconds REAL,
+        threshold_db REAL NOT NULL,
+        min_silence_seconds REAL NOT NULL,
+        error_message TEXT,
+        analyzed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    id: 17,
+    name: "spotify-external-catalog-provider",
+    sql: `
+      INSERT OR IGNORE INTO search_provider_configs (provider_id, enabled, config_json, updated_at)
+      VALUES ('spotify', 0, '{}', CURRENT_TIMESTAMP);
+
+      UPDATE search_provider_configs SET enabled = 0 WHERE provider_id = 'itunes';
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

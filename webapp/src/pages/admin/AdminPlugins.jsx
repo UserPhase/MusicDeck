@@ -7,6 +7,7 @@ import {
   updateAdminPlugin,
 } from "../../api/musicdeck";
 import { useAdminData } from "./useAdminData";
+import { AdminBadge, AdminPageHeader } from "../../components/admin/ui";
 
 
 function AdminPlugins() {
@@ -119,23 +120,19 @@ function AdminPlugins() {
 
   return (
     <div className="admin-page">
-      <div className="account-header">
-        <div>
-          <div className="account-label">ADMIN</div>
-          <h1>Plugins</h1>
-          <div className="account-meta">
-            {plugins.filter((plugin) => plugin.enabled).length} of{" "}
-            {plugins.length} enabled
-          </div>
-        </div>
-        <button
-          type="button"
-          className="account-primary"
-          onClick={() => setAddOpen((open) => !open)}
-        >
-          + Add Plugin
-        </button>
-      </div>
+      <AdminPageHeader
+        title="Plugins"
+        meta={`${plugins.filter((plugin) => plugin.enabled).length} of ${plugins.length} enabled`}
+        actions={
+          <button
+            type="button"
+            className="account-primary"
+            onClick={() => setAddOpen((open) => !open)}
+          >
+            + Add Plugin
+          </button>
+        }
+      />
 
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
@@ -277,9 +274,11 @@ function AdminPlugins() {
                     disabled={saving}
                     onChange={(event) => handleTogglePlugin(plugin, event.target.checked)}
                   />
-                  <span className={`admin-badge ${plugin.enabled ? "is-active" : "is-disabled"}`}>
-                    {plugin.enabled ? "● Enabled · On" : "○ Disabled · Off"}
-                  </span>
+                  <AdminBadge
+                    active={plugin.enabled}
+                    activeLabel="Enabled · On"
+                    inactiveLabel="Disabled · Off"
+                  />
                 </label>
               </div>
             ))

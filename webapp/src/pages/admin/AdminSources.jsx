@@ -5,6 +5,8 @@ import {
   getAdminPlugins,
   getAdminSearchProviders,
   getAdminSourceProviders,
+  testAdminSearchProvider,
+  testAdminSourceProvider,
   updateAdminSearchProvider,
   updateAdminSourceProvider,
 } from "../../api/musicdeck";
@@ -13,6 +15,16 @@ import { useAdminData } from "./useAdminData";
 
 const ACQUISITION_CAPABILITY_PATTERN = /acquisition|download/i;
 const DISCOVERY_CAPABILITY_PATTERN = /recommendation|discovery|radio/i;
+
+const TEST_STATUS_LABELS = {
+  success: "Connected",
+  not_configured: "Not configured",
+  authentication_failed: "Authentication failed",
+  provider_unavailable: "Unavailable",
+  timeout: "Timed out",
+  permission_denied: "Permission denied",
+  plugin_error: "Error",
+};
 
 
 function AdminSources() {
@@ -24,6 +36,9 @@ function AdminSources() {
   });
 
   const [regionDraft, setRegionDraft] = useState(null);
+  const [spotifyDraft, setSpotifyDraft] = useState({ clientId: null, clientSecret: null });
+  const [testResults, setTestResults] = useState({});
+  const [testingId, setTestingId] = useState(null);
 
   const backendConnections = data.backendConnections || [];
   const searchProviders = data.searchProviders || [];
@@ -79,6 +94,36 @@ function AdminSources() {
     }
   }
 
+  async function handleTestSearchProvider(provider) {
+    setTestingId(provider.id);
+    try {
+      const result = await testAdminSearchProvider(provider.id);
+      setTestResults((current) => ({ ...current, [provider.id]: result }));
+    } catch (err) {
+      setTestResults((current) => ({
+        ...current,
+        [provider.id]: { ok: false, message: err.message || "Test failed." },
+      }));
+    } finally {
+      setTestingId(null);
+    }
+  }
+
+  async function handleTestSourceProvider(provider) {
+    setTestingId(provider.id);
+    try {
+      const result = await testAdminSourceProvider(provider.id);
+      setTestResults((current) => ({ ...current, [provider.id]: result }));
+    } catch (err) {
+      setTestResults((current) => ({
+        ...current,
+        [provider.id]: { ok: false, message: err.message || "Test failed." },
+      }));
+    } finally {
+      setTestingId(null);
+    }
+  }
+
   if (loading) {
     return <div className="loading">Loading sources & providers...</div>;
   }
@@ -125,11 +170,25 @@ function AdminSources() {
                 <strong>{provider.name}</strong>
                 <span>
                   {provider.status === "error"
-                    ? "Search unavailable"
+                    ? provider.statusMessage || "Search unavailable"
                     : provider.status}
                 </span>
+                {testResults[provider.id] && (
+                  <span className={testResults[provider.id].ok ? "success" : "error"}>
+                    {TEST_STATUS_LABELS[testResults[provider.id].status] || (testResults[provider.id].ok ? "Connected" : "Failed")}
+                    {testResults[provider.id].message ? ` — ${testResults[provider.id].message}` : ""}
+                  </span>
+                )}
               </div>
               <span className="admin-provider-kind">{provider.kind}</span>
+              <button
+                type="button"
+                className="account-action"
+                disabled={saving || testingId === provider.id}
+                onClick={() => handleTestSearchProvider(provider)}
+              >
+                {testingId === provider.id ? "Testing..." : "Test"}
+              </button>
               <label className="account-checkbox">
                 <input
                   type="checkbox"
@@ -168,6 +227,92 @@ function AdminSources() {
                   />
                 </label>
               )}
+              {provider.id === "spotify" && (() => {
+                const spotdlPlugin = plugins.find((plugin) => plugin.id === "spotdl-downloader");
+                const spotdlHasCredentials = Boolean(
+                  spotdlPlugin?.config?.clientId && spotdlPlugin?.config?.clientSecret
+                );
+                const hasOwnCredentials = Boolean(provider.config?.clientId);
+                const clientIdValue =
+                  spotifyDraft.clientId !== null
+                    ? spotifyDraft.clientId
+                    : provider.config?.clientId || "";
+                const clientSecretValue =
+                  spotifyDraft.clientSecret !== null ? spotifyDraft.clientSecret : "";
+
+                function commitClientId(event) {
+                  const clientId = event.target.value.trim();
+                  setSpotifyDraft((current) => ({ ...current, clientId: null }));
+                  if (clientId !== (provider.config?.clientId || "")) {
+                    handleSearchProviderUpdate(provider, {
+                      config: { ...provider.config, clientId },
+                    });
+                  }
+                }
+
+                function commitClientSecret(event) {
+                  const clientSecret = event.target.value.trim();
+                  setSpotifyDraft((current) => ({ ...current, clientSecret: null }));
+                  if (clientSecret) {
+                    handleSearchProviderUpdate(provider, {
+                      config: { ...provider.config, clientSecret },
+                    });
+                  }
+                }
+
+                return (
+                  <div className="admin-provider-config admin-provider-config-spotify">
+                    <label>
+                      <span>Spotify Client ID</span>
+                      <input
+                        aria-label="Spotify Client ID"
+                        value={clientIdValue}
+                        placeholder={
+                          spotdlHasCredentials && !hasOwnCredentials
+                            ? "Using spotDL Downloader credentials"
+                            : "Client ID"
+                        }
+                        disabled={saving}
+                        onChange={(event) =>
+                          setSpotifyDraft((current) => ({ ...current, clientId: event.target.value }))
+                        }
+                        onBlur={commitClientId}
+                      />
+                    </label>
+                    <label>
+                      <span>Spotify Client Secret</span>
+                      <input
+                        type="password"
+                        aria-label="Spotify Client Secret"
+                        value={clientSecretValue}
+                        placeholder={
+                          spotdlHasCredentials && !hasOwnCredentials
+                            ? "Using spotDL Downloader credentials"
+                            : "Client secret"
+                        }
+                        disabled={saving}
+                        onChange={(event) =>
+                          setSpotifyDraft((current) => ({ ...current, clientSecret: event.target.value }))
+                        }
+                        onBlur={commitClientSecret}
+                      />
+                    </label>
+                    {spotdlHasCredentials && !hasOwnCredentials && (
+                      <small className="admin-provider-config-hint">
+                        No credentials set here — reusing the Spotify app credentials already
+                        configured on the spotDL Downloader plugin. Enter credentials above to
+                        override them for search only.
+                      </small>
+                    )}
+                    {!spotdlHasCredentials && !hasOwnCredentials && (
+                      <small className="admin-provider-config-hint">
+                        Enter Spotify app credentials here, or configure them once on the spotDL
+                        Downloader plugin to share them with both acquisition and search.
+                      </small>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           ))}
         </div>
@@ -181,7 +326,21 @@ function AdminSources() {
               <div>
                 <strong>{provider.name}</strong>
                 <span>{provider.enabled ? "Enabled" : "Disabled"}</span>
+                {testResults[provider.id] && (
+                  <span className={testResults[provider.id].ok ? "success" : "error"}>
+                    {TEST_STATUS_LABELS[testResults[provider.id].status] || (testResults[provider.id].ok ? "Connected" : "Failed")}
+                    {testResults[provider.id].message ? ` — ${testResults[provider.id].message}` : ""}
+                  </span>
+                )}
               </div>
+              <button
+                type="button"
+                className="account-action"
+                disabled={saving || testingId === provider.id}
+                onClick={() => handleTestSourceProvider(provider)}
+              >
+                {testingId === provider.id ? "Testing..." : "Test"}
+              </button>
               <label className="account-checkbox">
                 <input
                   type="checkbox"

@@ -204,6 +204,13 @@ export async function updateAdminSearchProvider(providerId, updates) {
   return data.searchProvider;
 }
 
+export async function testAdminSearchProvider(providerId) {
+  const data = await request(`/api/admin/search-providers/${encodeURIComponent(providerId)}/test`, {
+    method: "POST",
+  });
+  return data.test;
+}
+
 export async function getAdminSourceProviders() {
   const data = await request("/api/admin/source-providers");
   return data.sourceProviders || [];
@@ -216,6 +223,13 @@ export async function updateAdminSourceProvider(providerId, updates) {
   });
 
   return data.sourceProvider;
+}
+
+export async function testAdminSourceProvider(providerId) {
+  const data = await request(`/api/admin/source-providers/${encodeURIComponent(providerId)}/test`, {
+    method: "POST",
+  });
+  return data.test;
 }
 
 export async function getPlugins() {
@@ -320,6 +334,23 @@ export function getStreamUrl(songId, source) {
   }
 
   return source ? `${base}?source=${encodeURIComponent(source)}` : base;
+}
+
+export async function getSilenceAnalysis(songId) {
+  if (!songId) {
+    return null;
+  }
+
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/silence-analysis`);
+  return data.analysis;
+}
+
+export async function analyzeSilence(songId, options = {}) {
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/silence-analysis`, {
+    method: "POST",
+    body: JSON.stringify(options),
+  });
+  return data.analysis;
 }
 
 export async function getPlayableSources(result) {

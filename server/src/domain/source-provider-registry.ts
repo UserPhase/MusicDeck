@@ -174,7 +174,12 @@ class ItunesPreviewSourceProvider implements SourceProvider {
 
   async test() {
     const response = await this.fetchImpl(new URL("https://itunes.apple.com/search?term=test&media=music&entity=song&limit=1"));
-    return { ok: response.ok };
+    return {
+      ok: response.ok,
+      message: response.ok
+        ? "External preview is reachable"
+        : `External preview is unavailable (iTunes responded with ${response.status})`,
+    };
   }
 
   async fetchStream(source: PlayableSource, range?: string) {
@@ -311,11 +316,17 @@ export class SourceProviderRegistry {
         id: provider.id,
         ok: result.ok,
         status: result.ok ? "success" : "plugin_error",
-        message: result.message || (result.ok ? "Provider is reachable" : "Provider is unavailable"),
+        message: result.message
+          || (result.ok ? `${provider.name} is reachable` : `${provider.name} is unavailable`),
       };
     } catch (error) {
       const classified = classifyPluginError(error);
-      return { id: provider.id, ok: false, status: classified.status, message: classified.message };
+      return {
+        id: provider.id,
+        ok: false,
+        status: classified.status,
+        message: `${provider.name}: ${classified.message}`,
+      };
     }
   }
 

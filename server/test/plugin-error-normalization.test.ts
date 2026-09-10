@@ -192,4 +192,58 @@ describe("source provider test endpoint returns normalized results", () => {
     expect(response.json().test).toMatchObject({ ok: false, status: "timeout" });
     await closeTestServer(app, current.db);
   });
+
+  test("identifies the failing provider by name instead of a generic 'Provider is unavailable' message", async () => {
+    const current = await createTestServer();
+    const { app, sourceProviders } = current;
+    sourceProviders.register({
+      id: "unavailable-provider",
+      name: "Unavailable Provider",
+      capabilities: { tracks: true, albums: false, quality: false, multipleSources: false, caching: false },
+      canResolve: () => true,
+      async getSources() {
+        return [];
+      },
+      async test() {
+        return { ok: false };
+      },
+    });
+    const { cookie } = await login(app);
+
+    const response = await app.inject({ method: "POST", url: "/api/admin/source-providers/unavailable-provider/test", headers: { cookie } });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().test).toMatchObject({ ok: false, status: "plugin_error" });
+    expect(response.json().test.message).toBe("Unavailable Provider is unavailable");
+    expect(response.json().test.message).not.toBe("Provider is unavailable");
+    await closeTestServer(app, current.db);
+  });
+});
+
+describe("search provider test endpoint", () => {
+  test("returns a not_configured status with a specific message when Spotify credentials are missing", async () => {
+    const current = await createTestServer();
+    const { app, searchProviders } = current;
+    searchProviders.configure("spotify", { enabled: true, config: {} });
+    const { cookie } = await login(app);
+
+    const response = await app.inject({ method: "POST", url: "/api/admin/search-providers/spotify/test", headers: { cookie } });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().test).toMatchObject({ ok: false, status: "not_configured" });
+    expect(response.json().test.message).toContain("Spotify search is not configured");
+    await closeTestServer(app, current.db);
+  });
+
+  test("returns 404 with a clear message for an unknown search provider", async () => {
+    const current = await createTestServer();
+    const { app } = current;
+    const { cookie } = await login(app);
+
+    const response = await app.inject({ method: "POST", url: "/api/admin/search-providers/does-not-exist/test", headers: { cookie } });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.code).toBe("NOT_FOUND");
+    await closeTestServer(app, current.db);
+  });
 });

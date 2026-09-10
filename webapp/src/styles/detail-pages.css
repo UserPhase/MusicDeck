@@ -89,3 +89,6 @@
 .admin-provider-config { display: grid; gap: 5px; color: var(--text-secondary); font-size: 12px; }
 .admin-provider-config input { width: 100%; padding: 8px 10px; background: #080b12; border: 1px solid var(--border); border-radius: 7px; color: var(--text); }
 .admin-provider-config input:focus { outline: var(--focus-ring); outline-offset: 2px; }
+.admin-provider-config-spotify { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 8px; }
+.admin-provider-config-spotify label { display: grid; gap: 4px; }
+.admin-provider-config-hint { grid-column: 1 / -1; color: var(--text-secondary); font-size: 11px; line-height: 1.4; }

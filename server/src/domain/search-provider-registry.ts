@@ -1,6 +1,9 @@
 import type { Db } from "../db/database.js";
 import type { CatalogService } from "./catalog.js";
 import type { PlaylistService } from "./playlist-service.js";
+import { SpotifyAuthClient, SpotifyAuthError, describeSpotifyErrorBody, hasSpotifyCredentials, resolveSpotifyCredentials } from "./spotify-auth.js";
+import { ExternalArtworkTokenStore } from "./external-catalog.js";
+import { classifyPluginError } from "../plugins/plugin-errors.js";
 import {
   groupSearchResults,
   toSearchGroups,
@@ -34,6 +37,7 @@ export type AdminSearchProvider = {
   kind: SearchProviderKind;
   enabled: boolean;
   status: SearchProviderStatus;
+  statusMessage?: string;
   config: Record<string, unknown>;
 };
 
@@ -93,75 +97,390 @@ class PlaylistSearchProvider implements SearchProvider {
 }
 
 /**
- * Safe example external search provider. It uses iTunes Search's public
- * catalog endpoint with no credentials and returns metadata-only results.
- * Tracks deliberately have no playable source yet: media resolution remains
- * a future provider capability rather than a client-side URL leak.
+ * Built-in external catalog search provider backed by Deezer's public API
+ * (https://api.deezer.com), which requires no API key/OAuth for search. This
+ * is MusicDeck's primary, keyless external catalog: a fresh install gets
+ * external search results with zero configuration. Deezer signals errors
+ * in-band (HTTP 200 with a `{ error: {...} }` body) as well as via normal
+ * HTTP error statuses, so both are treated as provider failures.
  */
-class ItunesSearchProvider implements SearchProvider {
-  readonly id = "itunes";
-  readonly name = "External Catalog";
+class DeezerSearchProvider implements SearchProvider {
+  readonly id = "deezer";
+  readonly name = "Deezer";
 
   constructor(
-    private readonly config: Record<string, unknown>,
-    private readonly fetchImpl: typeof fetch = fetch
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly artworkTokens?: ExternalArtworkTokenStore
   ) {}
 
-  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
-    const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
-    const url = new URL("https://itunes.apple.com/search");
-    url.searchParams.set("term", query);
-    url.searchParams.set("media", "music");
-    url.searchParams.set("entity", "song");
-    url.searchParams.set("limit", String(limit));
+  private artwork(url: unknown) {
+    const id = this.artworkTokens ? this.artworkTokens.token(url, ["dzcdn.net"]) : null;
+    return id ? { id, url: `/api/artwork/external/${encodeURIComponent(id)}` } : null;
+  }
 
-    const country = typeof this.config.country === "string" ? this.config.country : "US";
-    url.searchParams.set("country", country);
+  private async get<T>(path: string, params: Record<string, string>): Promise<T> {
+    const url = new URL(`https://api.deezer.com${path}`);
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
 
     let response: Response;
     try {
       response = await this.fetchImpl(url);
+    } catch (error) {
+      throw new Error(`Deezer catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let bodyText: string;
+    try {
+      bodyText = await response.text();
     } catch {
-      throw new Error("External catalog is unavailable");
+      throw new Error("Deezer returned invalid data");
     }
 
     if (!response.ok) {
-      throw new Error("External catalog is unavailable");
+      throw new Error(`Deezer catalog request failed (HTTP ${response.status})`);
     }
 
-    let payload: { results?: any[] };
+    let payload: any;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new Error("Deezer returned invalid data");
+    }
+
+    if (payload && typeof payload === "object" && payload.error) {
+      const message = typeof payload.error.message === "string" ? payload.error.message : "unknown error";
+      throw new Error(`Deezer catalog request failed: ${message}`);
+    }
+
+    return payload as T;
+  }
+
+  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+    const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
+    const types = (options.types && options.types.length ? options.types : ["track", "album", "artist"])
+      .filter((type) => type !== "playlist");
+    if (types.length === 0) {
+      return [];
+    }
+
+    const requests: Promise<UnifiedSearchResult[]>[] = [];
+
+    if (types.includes("track")) {
+      requests.push(
+        this.get<{ data?: any[] }>("/search/track", { q: query, limit: String(limit) }).then((payload) =>
+          (payload.data || []).flatMap((item) => {
+            if (item?.id == null) return [];
+            return [{
+              type: "track" as const,
+              id: `external_deezer_track_${item.id}`,
+              title: item.title || "Unknown title",
+              subtitle: item.artist?.name || null,
+              artist: item.artist?.name || null,
+              album: item.album?.title || null,
+              // Deezer's public CDN images (dzcdn.net) are exchanged for an
+              // opaque artwork token here, consistent with how Spotify's
+              // scdn.co images are proxied -- raw external CDN URLs are
+              // never returned to the client.
+              artwork: this.artwork(item.album?.cover_big || item.album?.cover_medium),
+              provider: "external" as const,
+              source: { kind: "external" as const, count: 0 },
+              availability: null,
+              metadata: {
+                durationSeconds: typeof item.duration === "number" ? item.duration : null,
+              },
+            }];
+          })
+        )
+      );
+    }
+
+    if (types.includes("album")) {
+      requests.push(
+        this.get<{ data?: any[] }>("/search/album", { q: query, limit: String(limit) }).then((payload) =>
+          (payload.data || []).flatMap((item) => {
+            if (item?.id == null) return [];
+            return [{
+              type: "album" as const,
+              id: `external_deezer_album_${item.id}`,
+              title: item.title || "Unknown album",
+              subtitle: item.artist?.name || null,
+              artist: item.artist?.name || null,
+              album: null,
+              artwork: this.artwork(item.cover_big || item.cover_medium),
+              provider: "external" as const,
+              source: { kind: "external" as const, count: 0 },
+              availability: null,
+              metadata: {},
+            }];
+          })
+        )
+      );
+    }
+
+    if (types.includes("artist")) {
+      requests.push(
+        this.get<{ data?: any[] }>("/search/artist", { q: query, limit: String(limit) }).then((payload) =>
+          (payload.data || []).flatMap((item) => {
+            if (item?.id == null) return [];
+            return [{
+              type: "artist" as const,
+              id: `external_deezer_artist_${item.id}`,
+              title: item.name || "Unknown artist",
+              subtitle: "Artist",
+              artist: item.name || null,
+              album: null,
+              artwork: this.artwork(item.picture_big || item.picture_medium),
+              provider: "external" as const,
+              source: { kind: "external" as const, count: 0 },
+              availability: null,
+              metadata: {},
+            }];
+          })
+        )
+      );
+    }
+
+    const results = await Promise.all(requests);
+    return results.flat().filter((item) => isIncluded(item, options.types));
+  }
+
+  async test(): Promise<{ ok: boolean; message?: string; status?: string }> {
+    try {
+      const payload = await this.get<{ data?: any[] }>("/search/track", { q: "test", limit: "1" });
+      if (!Array.isArray(payload.data)) {
+        return { ok: false, status: "provider_unavailable", message: "Deezer returned an unexpected response shape" };
+      }
+      return { ok: true, message: "Deezer is reachable" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        status: "provider_unavailable",
+        message: `Deezer is unavailable: ${message}`,
+      };
+    }
+  }
+}
+
+/**
+ * Built-in external catalog search provider backed by Spotify's official
+ * Web API (https://api.spotify.com/v1/search) using the client-credentials
+ * flow. Credentials are configured server-side via this provider's admin
+ * settings and never sent to clients. When credentials are absent the
+ * provider reports itself unavailable rather than failing the whole search.
+ */
+class SpotifySearchProvider implements SearchProvider {
+  readonly id = "spotify";
+  readonly name = "Spotify";
+
+  private readonly auth: SpotifyAuthClient;
+
+  constructor(
+    private readonly config: Record<string, unknown>,
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly db?: Db
+  ) {
+    this.auth = new SpotifyAuthClient(fetchImpl);
+  }
+
+  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+    const credentials = resolveSpotifyCredentials({
+      clientId: typeof this.config.clientId === "string" ? this.config.clientId : undefined,
+      clientSecret: typeof this.config.clientSecret === "string" ? this.config.clientSecret : undefined,
+    }, this.db);
+
+    if (!hasSpotifyCredentials(credentials)) {
+      // No credentials configured: Spotify search is simply unavailable,
+      // not an error. The registry treats an empty result set from an
+      // enabled provider as a normal (non-degraded) outcome.
+      return [];
+    }
+
+    let token: string | null;
+    try {
+      token = await this.auth.getAccessToken(credentials);
+    } catch (error) {
+      if (error instanceof SpotifyAuthError) {
+        throw new Error(`Spotify token request failed: ${error.message}`);
+      }
+      throw new Error(`Spotify is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!token) {
+      throw new Error("Spotify is unavailable: no credentials configured");
+    }
+
+    const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
+    const types = (options.types && options.types.length ? options.types : ["track", "album", "artist"])
+      .filter((type) => type !== "playlist");
+    if (types.length === 0) {
+      return [];
+    }
+
+    const url = new URL("https://api.spotify.com/v1/search");
+    url.searchParams.set("q", query);
+    url.searchParams.set("type", types.join(","));
+    url.searchParams.set("limit", String(limit));
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, { headers: { Authorization: `Bearer ${token}` } });
+    } catch (error) {
+      throw new Error(`Spotify catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      const detail = describeSpotifyErrorBody(bodyText);
+      throw new Error(
+        `Spotify catalog request failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`
+      );
+    }
+
+    let payload: {
+      tracks?: { items?: any[] };
+      albums?: { items?: any[] };
+      artists?: { items?: any[] };
+    };
     try {
       payload = await response.json();
     } catch {
       throw new Error("External catalog returned invalid data");
     }
 
-    return (payload.results || []).flatMap((item) => {
-      const id = item.trackId ? `external_itunes_${item.trackId}` : null;
-      if (!id || !isIncluded({ type: "track" } as UnifiedSearchResult, options.types)) {
-        return [];
-      }
-
+    const tracks = (payload.tracks?.items || []).flatMap((item) => {
+      if (!item?.id) return [];
+      const artistName = Array.isArray(item.artists) && item.artists[0]?.name ? item.artists[0].name : null;
       return [{
         type: "track" as const,
-        id,
-        title: item.trackName || "Unknown title",
-        subtitle: item.artistName || null,
-        artist: item.artistName || null,
-        album: item.collectionName || null,
-        // The external artwork URL remains private to the provider until an
-        // artwork proxy/source resolver is implemented for external catalogs.
+        id: `external_spotify_track_${item.id}`,
+        title: item.name || "Unknown title",
+        subtitle: artistName,
+        artist: artistName,
+        album: item.album?.name || null,
+        // Artwork is resolved via the external catalog registry's artwork
+        // proxy, not exposed here to keep raw provider URLs server-side.
         artwork: null,
         provider: "external" as const,
         source: { kind: "external" as const, count: 0 },
         availability: null,
         metadata: {
-          durationSeconds: typeof item.trackTimeMillis === "number"
-            ? Math.round(item.trackTimeMillis / 1000)
-            : null,
+          durationSeconds: typeof item.duration_ms === "number" ? Math.round(item.duration_ms / 1000) : null,
         },
       }];
     });
+
+    const albums = (payload.albums?.items || []).flatMap((item) => {
+      if (!item?.id || !isIncluded({ type: "album" } as UnifiedSearchResult, options.types)) return [];
+      const artistName = Array.isArray(item.artists) && item.artists[0]?.name ? item.artists[0].name : null;
+      return [{
+        type: "album" as const,
+        id: `external_spotify_album_${item.id}`,
+        title: item.name || "Unknown album",
+        subtitle: artistName,
+        artist: artistName,
+        album: null,
+        artwork: null,
+        provider: "external" as const,
+        source: { kind: "external" as const, count: 0 },
+        availability: null,
+        metadata: {},
+      }];
+    });
+
+    const artists = (payload.artists?.items || []).flatMap((item) => {
+      if (!item?.id || !isIncluded({ type: "artist" } as UnifiedSearchResult, options.types)) return [];
+      return [{
+        type: "artist" as const,
+        id: `external_spotify_artist_${item.id}`,
+        title: item.name || "Unknown artist",
+        subtitle: "Artist",
+        artist: item.name || null,
+        album: null,
+        artwork: null,
+        provider: "external" as const,
+        source: { kind: "external" as const, count: 0 },
+        availability: null,
+        metadata: {},
+      }];
+    });
+
+    return [
+      ...tracks.filter((item) => isIncluded(item, options.types)),
+      ...albums,
+      ...artists,
+    ];
+  }
+
+  async test(): Promise<{ ok: boolean; message?: string; status?: string }> {
+    const credentials = resolveSpotifyCredentials({
+      clientId: typeof this.config.clientId === "string" ? this.config.clientId : undefined,
+      clientSecret: typeof this.config.clientSecret === "string" ? this.config.clientSecret : undefined,
+    }, this.db);
+
+    if (!hasSpotifyCredentials(credentials)) {
+      return {
+        ok: false,
+        status: "not_configured",
+        message: "Spotify search is not configured — add a Client ID/Secret here or on the spotDL Downloader plugin.",
+      };
+    }
+
+    // Stage 1: token acquisition. A failure here almost always means a bad
+    // Client ID/Secret or an app that has been reset/deleted in the Spotify
+    // developer dashboard.
+    let token: string | null;
+    try {
+      token = await this.auth.getAccessToken(credentials);
+    } catch (error) {
+      if (error instanceof SpotifyAuthError) {
+        return {
+          ok: false,
+          status: error.status === 400 ? "authentication_failed" : "provider_unavailable",
+          message: `Spotify authentication failed during token acquisition: ${error.message}`,
+        };
+      }
+      return {
+        ok: false,
+        status: "authentication_failed",
+        message: `Spotify authentication failed during token acquisition: ${error instanceof Error ? error.message : "invalid credentials"}`,
+      };
+    }
+
+    if (!token) {
+      return { ok: false, status: "authentication_failed", message: "Spotify authentication failed during token acquisition — check the Client ID/Secret." };
+    }
+
+    // Stage 2: the actual catalog request. A 403 here (with a valid token)
+    // typically means the Spotify app is missing required authorization —
+    // e.g. it was created after the Nov 2024 Web API changes and never had
+    // the "Web API" scope granted, or it's in Development Mode with
+    // restricted access — rather than a credentials problem.
+    try {
+      const response = await this.fetchImpl(new URL("https://api.spotify.com/v1/search?q=test&type=track&limit=1"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => "");
+        const detail = describeSpotifyErrorBody(bodyText);
+        return {
+          ok: false,
+          status: response.status === 401 || response.status === 403 ? "authentication_failed" : "provider_unavailable",
+          message: `Spotify catalog request failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`
+            + (response.status === 403
+              ? " — the app's Client ID/Secret are valid, but Spotify rejected the catalog request itself. Check the app's status in the Spotify developer dashboard (e.g. Development Mode restrictions or a revoked app)."
+              : ""),
+        };
+      }
+      return { ok: true, message: "Spotify is reachable" };
+    } catch (error) {
+      return {
+        ok: false,
+        status: "provider_unavailable",
+        message: `Spotify catalog request failed — could not reach api.spotify.com: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 }
 
@@ -174,7 +493,13 @@ export class SearchProviderRegistry {
   private readonly lastErrors = new Map<string, string>();
   private readonly definitions: SearchProviderDefinition[];
 
-  constructor(db: Db, catalog: CatalogService, playlists: PlaylistService, fetchImpl?: typeof fetch) {
+  constructor(
+    db: Db,
+    catalog: CatalogService,
+    playlists: PlaylistService,
+    fetchImpl?: typeof fetch,
+    artworkTokens?: ExternalArtworkTokenStore
+  ) {
     this.db = db;
     this.definitions = [
       {
@@ -192,11 +517,18 @@ export class SearchProviderRegistry {
         create: () => new PlaylistSearchProvider(playlists),
       },
       {
-        id: "itunes",
-        name: "External Catalog",
+        id: "deezer",
+        name: "Deezer",
+        kind: "external",
+        defaultEnabled: true,
+        create: () => new DeezerSearchProvider(fetchImpl, artworkTokens),
+      },
+      {
+        id: "spotify",
+        name: "Spotify",
         kind: "external",
         defaultEnabled: false,
-        create: (config) => new ItunesSearchProvider(config, fetchImpl),
+        create: (config) => new SpotifySearchProvider(config, fetchImpl, db),
       },
     ];
   }
@@ -225,9 +557,26 @@ export class SearchProviderRegistry {
         kind: definition.kind,
         enabled,
         status: lastError ? "error" : enabled ? "enabled" : "disabled",
+        ...(lastError ? { statusMessage: lastError } : {}),
         config: publicConfig(config),
       };
     });
+  }
+
+  /**
+   * Returns the enablement state and raw (non-redacted) config for a
+   * provider. Intended for server-side wiring (e.g. the external catalog
+   * registry) that legitimately needs credentials -- unlike `list()`, which
+   * redacts secret-shaped keys for admin API responses.
+   */
+  rawConfig(providerId: string): { enabled: boolean; config: Record<string, unknown> } | null {
+    const definition = this.definitions.find((item) => item.id === providerId);
+    if (!definition) return null;
+
+    const row = this.configs().get(providerId);
+    const config = row ? readConfig(row.config_json) : {};
+    const enabled = row ? Boolean(row.enabled) : definition.defaultEnabled;
+    return { enabled, config };
   }
 
   configure(providerId: string, input: { enabled?: boolean; config?: Record<string, unknown> }) {
@@ -277,8 +626,9 @@ export class SearchProviderRegistry {
         const items = await definition.create(config).search(query, options);
         this.lastErrors.delete(definition.id);
         return { ok: true as const, providerId: definition.id, items };
-      } catch {
-        this.lastErrors.set(definition.id, "Search unavailable");
+      } catch (error) {
+        const classified = classifyPluginError(error);
+        this.lastErrors.set(definition.id, `${definition.name} is unavailable: ${classified.message}`);
         return { ok: false as const, providerId: definition.id, items: [] as UnifiedSearchResult[] };
       }
     }));
@@ -297,5 +647,36 @@ export class SearchProviderRegistry {
       groups: groupSearchResults(results.flatMap((result) => result.items)),
       degraded: successful.length < enabled.length,
     };
+  }
+
+  /** Runs a provider's connectivity/configuration check without performing a real search. */
+  async test(providerId: string) {
+    const definition = this.definitions.find((item) => item.id === providerId);
+    if (!definition) {
+      throw new Error("Unknown search provider");
+    }
+
+    const row = this.configs().get(providerId);
+    const config = row ? readConfig(row.config_json) : {};
+    const provider = definition.create(config);
+
+    if (!provider.test) {
+      return { id: providerId, ok: true, status: "success" as const, message: `${definition.name} is configured` };
+    }
+
+    try {
+      const result = await provider.test();
+      const status = result.ok ? "success" : (result.status || classifyPluginError(new Error(result.message)).status);
+      return {
+        id: providerId,
+        ok: result.ok,
+        status,
+        message: result.message
+          || (result.ok ? `${definition.name} is reachable` : `${definition.name} is unavailable`),
+      };
+    } catch (error) {
+      const classified = classifyPluginError(error);
+      return { id: providerId, ok: false, status: classified.status, message: `${definition.name}: ${classified.message}` };
+    }
   }
 }

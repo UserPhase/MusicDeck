@@ -185,6 +185,25 @@ export class CatalogService {
     };
   }
 
+  /**
+   * Map an album's provider-native artistId relationship to a stable
+   * MusicDeck ID, mirroring track relationship stamping. Without this, an
+   * album's artistId stays a raw provider ID that never resolves through
+   * `getPrimarySource`, breaking artist-track cross-referencing (e.g.
+   * `resolveAlbumCatalogTracks`) and album -> artist navigation links.
+   */
+  private withStableAlbumArtistId<T extends { artistId: string | null }>(
+    album: T,
+    connectionId: string
+  ): T {
+    return {
+      ...album,
+      artistId: album.artistId
+        ? this.library.ensureId("artist", { connectionId, providerItemId: album.artistId })
+        : null,
+    };
+  }
+
   /** Stamp either a track or a plain entity, normalizing track relationships
    * and artwork identity. */
   private stamp<T extends { id: string; artworkId: string | null; artworkUrl: string | null }>(
@@ -196,6 +215,11 @@ export class CatalogService {
 
     if (type === "track") {
       return this.withStableTrackId(withArtwork as T & { albumId: string | null; artistId: string | null }, connectionId) as T;
+    }
+
+    if (type === "album") {
+      const withId = this.withStableId(withArtwork, type, connectionId);
+      return this.withStableAlbumArtistId(withId as T & { artistId: string | null }, connectionId) as T;
     }
 
     return this.withStableId(withArtwork, type, connectionId);
@@ -345,7 +369,9 @@ export class CatalogService {
       return null;
     }
     const album = await this.primary().getAlbum(providerId);
-    return album ? this.withStableId(album, "album", this.library.getPrimarySource(albumId)!.connectionId) : null;
+    if (!album) return null;
+    const connectionId = this.library.getPrimarySource(albumId)!.connectionId;
+    return this.withStableAlbumArtistId(this.withStableId(album, "album", connectionId), connectionId);
   }
 
   async getAlbumTracks(albumId: string): Promise<Track[]> {
@@ -372,7 +398,9 @@ export class CatalogService {
       return [];
     }
     const albums = await this.primary().getArtistAlbums(source.providerItemId);
-    return albums.map((album) => this.withStableId(album, "album", source.connectionId));
+    return albums.map((album) =>
+      this.withStableAlbumArtistId(this.withStableId(album, "album", source.connectionId), source.connectionId)
+    );
   }
 
   async getArtistTracks(artistId: string): Promise<Track[]> {

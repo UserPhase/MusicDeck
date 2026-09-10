@@ -92,13 +92,32 @@ export async function registerAdminRoutes(
     try {
       const { providerId } = request.params as { providerId: string };
       searchProviders.configure(providerId, parsed.data);
-      if (providerId === "itunes") {
-        externalCatalog.configure(Boolean(parsed.data.enabled));
+      if (providerId === "spotify") {
+        const raw = searchProviders.rawConfig("spotify");
+        externalCatalog.configure(Boolean(raw?.enabled), raw?.config);
       }
       const provider = searchProviders.list().find((item) => item.id === providerId);
       return { searchProvider: provider };
     } catch {
       return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Search provider not found" } });
+    }
+  });
+
+  app.post("/api/admin/search-providers/:providerId/test", async (request, reply) => {
+    const user = requireAdmin(db, request, reply);
+    if (!user) return reply;
+
+    try {
+      const { providerId } = request.params as { providerId: string };
+      return { test: await searchProviders.test(providerId) };
+    } catch (error) {
+      if (error instanceof Error && error.message === "Unknown search provider") {
+        return reply.code(404).send({ error: { code: "NOT_FOUND", message: "Search provider not found" } });
+      }
+      const classified = classifyPluginError(error);
+      return reply.code(httpStatusForPluginError(classified.status)).send({
+        error: { code: classified.status.toUpperCase(), message: classified.message },
+      });
     }
   });
 

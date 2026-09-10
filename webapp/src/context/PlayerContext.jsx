@@ -14,6 +14,8 @@ import {
   starSong,
   unstarSong,
   getRandomSongs,
+  getUserSettings,
+  getSilenceAnalysis,
 } from "../api/musicdeck";
 
 import {
@@ -190,6 +192,65 @@ export function PlayerProvider({
     return 1;
 
   });
+
+
+  /*
+   * SILENCE TRIMMING
+   *
+   * Per-user preference, loaded once on auth. Actual trim bounds for the
+   * currently loaded track are fetched lazily and applied at playback time;
+   * a missing/failed analysis simply falls back to playing the full track.
+   */
+
+  const [
+    silenceTrimSettings,
+    setSilenceTrimSettings,
+  ] = useState({ enabled: false, thresholdDb: -35, minSilenceSeconds: 0.5 });
+
+  const trimBoundsRef = useRef(null);
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
+
+    let cancelled = false;
+
+    getUserSettings()
+      .then((settings) => {
+        if (cancelled || !Array.isArray(settings)) {
+          return;
+        }
+
+        const map = {};
+        for (const setting of settings) {
+          try {
+            map[setting.key] = JSON.parse(setting.value);
+          } catch {
+            map[setting.key] = setting.value;
+          }
+        }
+
+        setSilenceTrimSettings((current) => ({
+          enabled: Boolean(map["playback.silenceTrim.enabled"]),
+          thresholdDb:
+            typeof map["playback.silenceTrim.thresholdDb"] === "number"
+              ? map["playback.silenceTrim.thresholdDb"]
+              : current.thresholdDb,
+          minSilenceSeconds:
+            typeof map["playback.silenceTrim.minSilenceSeconds"] === "number"
+              ? map["playback.silenceTrim.minSilenceSeconds"]
+              : current.minSilenceSeconds,
+        }));
+      })
+      .catch(() => {
+        // Silence trimming stays disabled when settings cannot be loaded.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated]);
 
 
   /*
@@ -602,6 +663,41 @@ export function PlayerProvider({
 
     setDuration(0);
 
+    // Reset trim bounds for the new track; graceful fallback to the full
+    // track until (and unless) an analysis is available.
+    trimBoundsRef.current = null;
+
+    if (silenceTrimSettings.enabled) {
+      getSilenceAnalysis(song.id)
+        .then((analysis) => {
+          if (
+            requestId !== playbackRequestRef.current ||
+            !analysis ||
+            analysis.status !== "completed"
+          ) {
+            return;
+          }
+
+          trimBoundsRef.current = {
+            leading: analysis.leadingSilenceSeconds || 0,
+            trailing: analysis.trailingSilenceSeconds || 0,
+          };
+
+          // Analysis can arrive after playback has already started; jump
+          // past any leading silence immediately in that case.
+          if (
+            audioRef.current &&
+            trimBoundsRef.current.leading > 0 &&
+            audioRef.current.currentTime < trimBoundsRef.current.leading
+          ) {
+            audioRef.current.currentTime = trimBoundsRef.current.leading;
+          }
+        })
+        .catch(() => {
+          // Analysis unavailable — play the full track.
+        });
+    }
+
 
     try {
 
@@ -1010,6 +1106,20 @@ export function PlayerProvider({
       audioRef.current.currentTime
     );
 
+    // Effective track end: when trailing silence has been detected and
+    // trimming is enabled, treat that boundary as "the track finished"
+    // instead of waiting for the full (silent) tail to play out.
+    const bounds = trimBoundsRef.current;
+    if (
+      silenceTrimSettings.enabled &&
+      bounds &&
+      bounds.trailing > 0 &&
+      audioRef.current.duration &&
+      audioRef.current.currentTime >= audioRef.current.duration - bounds.trailing
+    ) {
+      handleEnded();
+    }
+
   }
 
 
@@ -1027,6 +1137,17 @@ export function PlayerProvider({
     setDuration(
       audioRef.current.duration
     );
+
+    // Start playback at the first-audio position when trim bounds are
+    // already known (analysis resolved before metadata finished loading).
+    const bounds = trimBoundsRef.current;
+    if (
+      silenceTrimSettings.enabled &&
+      bounds &&
+      bounds.leading > 0
+    ) {
+      audioRef.current.currentTime = bounds.leading;
+    }
 
   }
 

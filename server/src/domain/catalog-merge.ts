@@ -2,7 +2,7 @@ import type { UnifiedSearchResult } from "./search.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 
 /**
- * Merges MusicDeck's local library reads with the existing (iTunes-backed)
+ * Merges MusicDeck's local library reads with the existing (Spotify-backed)
  * external catalog to keep known-but-undownloaded tracks/albums visible on
  * album/artist detail pages instead of silently disappearing once any track
  * from the same album/artist has been downloaded locally.

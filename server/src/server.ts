@@ -16,6 +16,7 @@ import type { RecommendationRegistry } from "./domain/recommendations.js";
 import type { LibraryInsightsService } from "./domain/library-insights.js";
 import type { PluginRegistry } from "./plugins/plugin-registry.js";
 import type { AcquisitionService } from "./domain/acquisition.js";
+import type { SilenceAnalysisService } from "./domain/silence-analysis.js";
 import { classifyPluginError, httpStatusForPluginError } from "./plugins/plugin-errors.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
@@ -39,6 +40,7 @@ export async function buildServer(options: {
   libraryInsights: LibraryInsightsService;
   plugins: PluginRegistry;
   acquisition?: AcquisitionService;
+  silenceAnalysis?: SilenceAnalysisService;
   logger?: boolean;
 }) {
   const app = Fastify({
@@ -80,7 +82,7 @@ export async function buildServer(options: {
   await registerAuthRoutes(app, options.db, options.config);
   await registerUserRoutes(app, options.db);
   await registerSettingsRoutes(app, options.db);
-  await registerMusicRoutes(app, options.db, options.backend, options.catalog, options.library, options.sourceResolver, options.playlists, options.searchProviders, options.sourceProviders, options.externalCatalog, options.recommendations, options.libraryInsights, options.acquisition);
+  await registerMusicRoutes(app, options.db, options.backend, options.catalog, options.library, options.sourceResolver, options.playlists, options.searchProviders, options.sourceProviders, options.externalCatalog, options.recommendations, options.libraryInsights, options.acquisition, options.silenceAnalysis);
   await registerPlaylistRoutes(app, options.db, options.playlists);
 
   return app;

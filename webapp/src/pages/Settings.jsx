@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 
 import {
+  analyzeSilence,
   getPlugins,
   getUserSettings,
   updateUserSettings,
 } from "../api/musicdeck";
+
+import { usePlayer } from "../context/PlayerContext";
 
 
 function parseSettingValue(value) {
@@ -22,6 +25,8 @@ function getSetting(settings, key, fallback) {
 
 
 function Settings() {
+  const player = usePlayer();
+  const currentSong = player?.currentSong || null;
   const [settings, setSettings] = useState([]);
   const [compactLists, setCompactLists] = useState(false);
   const [defaultVolume, setDefaultVolume] = useState(1);
@@ -30,11 +35,16 @@ function Settings() {
   const [acquisitionEnabled, setAcquisitionEnabled] = useState(true);
   const [acquisitionProvider, setAcquisitionProvider] = useState("auto");
   const [autoScanLibrary, setAutoScanLibrary] = useState(true);
+  const [silenceTrimEnabled, setSilenceTrimEnabled] = useState(false);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState(-35);
+  const [silenceMinSeconds, setSilenceMinSeconds] = useState(0.5);
   const [plugins, setPlugins] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const [message, setMessage] = useState("");
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalyzeMessage, setReanalyzeMessage] = useState("");
 
 
   useEffect(() => {
@@ -58,6 +68,9 @@ function Settings() {
           setAcquisitionEnabled(Boolean(getSetting(data, "acquisition.enabled", true)));
           setAcquisitionProvider(getSetting(data, "acquisition.provider", "auto"));
           setAutoScanLibrary(Boolean(getSetting(data, "acquisition.autoScan", true)));
+          setSilenceTrimEnabled(Boolean(getSetting(data, "playback.silenceTrim.enabled", false)));
+          setSilenceThresholdDb(Number(getSetting(data, "playback.silenceTrim.thresholdDb", -35)));
+          setSilenceMinSeconds(Number(getSetting(data, "playback.silenceTrim.minSilenceSeconds", 0.5)));
         }
       } catch (err) {
         if (!cancelled) {
@@ -94,6 +107,9 @@ function Settings() {
         "acquisition.enabled": acquisitionEnabled,
         "acquisition.provider": acquisitionProvider,
         "acquisition.autoScan": autoScanLibrary,
+        "playback.silenceTrim.enabled": silenceTrimEnabled,
+        "playback.silenceTrim.thresholdDb": Number(silenceThresholdDb),
+        "playback.silenceTrim.minSilenceSeconds": Number(silenceMinSeconds),
       });
 
       setSettings(data);
@@ -102,6 +118,29 @@ function Settings() {
       setError(err.message || "Could not save settings.");
     } finally {
       setSaving(false);
+    }
+  }
+
+
+  async function handleReanalyze() {
+    if (!currentSong) {
+      return;
+    }
+
+    try {
+      setReanalyzing(true);
+      setReanalyzeMessage("");
+
+      await analyzeSilence(currentSong.id, {
+        thresholdDb: Number(silenceThresholdDb),
+        minSilenceSeconds: Number(silenceMinSeconds),
+      });
+
+      setReanalyzeMessage("Re-analysis complete for the current track.");
+    } catch (err) {
+      setReanalyzeMessage(err.message || "Could not re-analyze the current track.");
+    } finally {
+      setReanalyzing(false);
     }
   }
 
@@ -203,6 +242,52 @@ function Settings() {
             />
             <span>Auto-scan library after import</span>
           </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Automatic Silence Trimming</legend>
+          <label className="account-checkbox">
+            <input
+              type="checkbox"
+              checked={silenceTrimEnabled}
+              onChange={(event) => setSilenceTrimEnabled(event.target.checked)}
+            />
+            <span>Skip leading/trailing silence during playback</span>
+          </label>
+
+          <label>
+            <span>Silence threshold (dB)</span>
+            <input
+              type="number"
+              step="1"
+              value={silenceThresholdDb}
+              onChange={(event) => setSilenceThresholdDb(event.target.value)}
+              disabled={!silenceTrimEnabled}
+            />
+          </label>
+
+          <label>
+            <span>Minimum silence duration (seconds)</span>
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              value={silenceMinSeconds}
+              onChange={(event) => setSilenceMinSeconds(event.target.value)}
+              disabled={!silenceTrimEnabled}
+            />
+          </label>
+
+          <button
+            type="button"
+            className="account-secondary"
+            onClick={handleReanalyze}
+            disabled={!currentSong || reanalyzing}
+          >
+            {reanalyzing ? "Analyzing..." : "Re-analyze current track"}
+          </button>
+
+          {reanalyzeMessage && <div className="library-empty">{reanalyzeMessage}</div>}
         </fieldset>
 
         {settings.length === 0 && (

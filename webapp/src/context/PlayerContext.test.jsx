@@ -20,6 +20,8 @@ import {
   getRandomSongs,
   getStarred,
   getStreamUrl,
+  getUserSettings,
+  getSilenceAnalysis,
   recordRecentlyPlayed,
 } from "../api/musicdeck";
 
@@ -30,6 +32,8 @@ jest.mock("../api/musicdeck", () => ({
   getRandomSongs: jest.fn(),
   getStarred: jest.fn(),
   getStreamUrl: jest.fn(),
+  getUserSettings: jest.fn(),
+  getSilenceAnalysis: jest.fn(),
   recordRecentlyPlayed: jest.fn(),
   starSong: jest.fn(),
   unstarSong: jest.fn(),
@@ -107,6 +111,8 @@ function renderPlayer() {
   getRandomSongs.mockResolvedValue([]);
   getRecentlyPlayed.mockResolvedValue([]);
   getStarred.mockResolvedValue([]);
+  getUserSettings.mockResolvedValue([]);
+  getSilenceAnalysis.mockResolvedValue(null);
   recordRecentlyPlayed.mockResolvedValue(undefined);
   getStreamUrl.mockImplementation(
     (songId) => `/stream/${songId}`

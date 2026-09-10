@@ -17,6 +17,7 @@ import type { ExternalCatalogRegistry } from "../domain/external-catalog.js";
 import type { RecommendationRegistry, RecommendationKind } from "../domain/recommendations.js";
 import type { LibraryInsightsService, LibraryFilter } from "../domain/library-insights.js";
 import type { AcquisitionService } from "../domain/acquisition.js";
+import type { SilenceAnalysisService } from "../domain/silence-analysis.js";
 import {
   findMatchingExternalAlbum,
   findMatchingExternalArtist,
@@ -98,7 +99,8 @@ export async function registerMusicRoutes(
   externalCatalog: ExternalCatalogRegistry,
   recommendations: RecommendationRegistry,
   libraryInsights: LibraryInsightsService,
-  acquisition?: AcquisitionService
+  acquisition?: AcquisitionService,
+  silenceAnalysis?: SilenceAnalysisService
 ) {
   app.get("/api/library/random-albums", async (request, reply) => {
     const user = requireUser(db, request, reply);
@@ -323,7 +325,7 @@ export async function registerMusicRoutes(
   });
 
   // Best-effort catalog completeness for a local album: finds the matching
-  // external (iTunes) album by normalized title/artist and merges its known
+  // external (Spotify) album by normalized title/artist and merges its known
   // tracklist with the locally downloaded tracks. Never throws — falls back
   // to local-only data when the external catalog is unavailable, disabled,
   // not permitted for this user, or no confident match is found.
@@ -531,7 +533,7 @@ export async function registerMusicRoutes(
   });
 
   // Best-effort catalog completeness for a local artist: finds the matching
-  // external (iTunes) artist by normalized name and merges its known albums
+  // external (Spotify) artist by normalized name and merges its known albums
   // with the locally known albums, so albums with zero downloaded tracks
   // still remain visible. Falls back to local-only data on any failure.
   async function resolveArtistCatalogAlbums(
@@ -647,6 +649,52 @@ export async function registerMusicRoutes(
     const { trackId } = request.params as { trackId: string };
     const track = await catalog.getTrack(trackId);
     return track ? { track } : sendError(reply, 404, "Track not found");
+  });
+
+  // Silence-trim metadata: exposes whatever MusicDeck has already analyzed
+  // for this track (or `analysis: null` when it has never been analyzed).
+  // Never triggers analysis itself — that is an explicit, separate action.
+  app.get("/api/tracks/:trackId/silence-analysis", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    if (!silenceAnalysis) {
+      return { analysis: null };
+    }
+
+    const { trackId } = request.params as { trackId: string };
+    return { analysis: silenceAnalysis.getAnalysis(trackId) };
+  });
+
+  const silenceAnalysisRequestSchema = z.object({
+    thresholdDb: z.number().optional(),
+    minSilenceSeconds: z.number().positive().optional(),
+  });
+
+  // Manual (re-)analysis. Always resolves with a result (completed or
+  // failed) rather than a 5xx — a failed analysis is a valid, persisted
+  // outcome that the client falls back on.
+  app.post("/api/tracks/:trackId/silence-analysis", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    if (!silenceAnalysis) {
+      return sendError(reply, 503, "Silence analysis is not available");
+    }
+
+    const { trackId } = request.params as { trackId: string };
+
+    if (!library.exists(trackId)) {
+      return sendError(reply, 404, "Track not found");
+    }
+
+    const parsed = silenceAnalysisRequestSchema.safeParse(request.body || {});
+    if (!parsed.success) {
+      return sendError(reply, 400, "Invalid silence analysis request", "VALIDATION_ERROR");
+    }
+
+    const analysis = await silenceAnalysis.analyzeTrack(trackId, parsed.data);
+    return { analysis };
   });
 
   app.get("/api/search", async (request, reply) => {

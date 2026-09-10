@@ -9,6 +9,7 @@ import {
 
 
 jest.mock("../api/musicdeck", () => ({
+  analyzeSilence: jest.fn(async () => ({ status: "completed" })),
   getPlugins: jest.fn(async () => []),
   getUserSettings: jest.fn(),
   updateUserSettings: jest.fn(),
@@ -53,6 +54,9 @@ test("loads and updates user settings", async () => {
       "acquisition.enabled": true,
       "acquisition.provider": "auto",
       "acquisition.autoScan": true,
+      "playback.silenceTrim.enabled": false,
+      "playback.silenceTrim.thresholdDb": -35,
+      "playback.silenceTrim.minSilenceSeconds": 0.5,
     });
   });
   expect(await screen.findByText(/settings saved/i)).toBeInTheDocument();
@@ -90,4 +94,14 @@ test("shows API errors when settings fail to load", async () => {
   render(<Settings />);
 
   expect(await screen.findByText(/settings unavailable/i)).toBeInTheDocument();
+});
+
+
+test("silence trim re-analyze button is disabled without a current song", async () => {
+  getUserSettings.mockResolvedValue([]);
+
+  render(<Settings />);
+
+  expect(await screen.findByRole("heading", { name: /settings/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /re-analyze current track/i })).toBeDisabled();
 });

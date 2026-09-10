@@ -15,6 +15,7 @@ import { ExternalCatalogRegistry } from "./domain/external-catalog.js";
 import { RecommendationRegistry, RecommendationService } from "./domain/recommendations.js";
 import { LibraryInsightsService } from "./domain/library-insights.js";
 import { AcquisitionProviderRegistry, AcquisitionService } from "./domain/acquisition.js";
+import { SilenceAnalysisService } from "./domain/silence-analysis.js";
 import { DownloaderAdapterRegistry } from "./domain/downloader-adapter.js";
 import { SpotDLDownloaderAdapter } from "./domain/spotdl-downloader-adapter.js";
 import { PluginRegistry } from "./plugins/plugin-registry.js";
@@ -42,11 +43,12 @@ async function start() {
   const catalog = new CatalogService(registry, library);
   const playlists = new PlaylistService(db, backend, catalog, library);
   const sourceResolver = new SourceResolver(registry, library);
-  const searchProviders = new SearchProviderRegistry(db, catalog, playlists);
+  const externalCatalog = new ExternalCatalogRegistry(undefined, db);
+  const searchProviders = new SearchProviderRegistry(db, catalog, playlists, undefined, externalCatalog.artwork);
   const sourcePipeline = new SourcePipelineRegistry(db);
   const sourceProviders = new SourceProviderRegistry(db, library, registry, sourceResolver, undefined, sourcePipeline);
-  const externalCatalog = new ExternalCatalogRegistry();
-  externalCatalog.configure(searchProviders.list().some((provider) => provider.id === "itunes" && provider.enabled));
+  const spotifyConfig = searchProviders.rawConfig("spotify");
+  externalCatalog.configure(Boolean(spotifyConfig?.enabled), spotifyConfig?.config);
   const recommendations = new RecommendationRegistry(new RecommendationService(db, catalog));
   const libraryInsights = new LibraryInsightsService(db, catalog);
   const acquisitionProviders = new AcquisitionProviderRegistry();
@@ -95,7 +97,7 @@ async function start() {
       console.error(`Failed to rehydrate custom plugin ${manifest.id}`, error);
     }
   }
-  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition });
+  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis: new SilenceAnalysisService(db, sourceResolver) });
 
   await app.listen({
     host: config.host,

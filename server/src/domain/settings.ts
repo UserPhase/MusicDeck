@@ -8,6 +8,9 @@ const ALLOWED_USER_SETTINGS = new Set([
   "acquisition.enabled",
   "acquisition.provider",
   "acquisition.autoScan",
+  "playback.silenceTrim.enabled",
+  "playback.silenceTrim.thresholdDb",
+  "playback.silenceTrim.minSilenceSeconds",
 ]);
 
 const ALLOWED_SERVER_SETTINGS = new Set([
