@@ -37,7 +37,9 @@ Follow these steps to deploy MusicDeck using Docker Compose.
 
 ### Step 1: Create Project Directory
 
+```bash
 mkdir musicdeck && cd musicdeck
+```
 
 ### Step 2: Download Configuration Files
 
@@ -51,10 +53,12 @@ curl -o .env https://raw.githubusercontent.com/UserPhase/MusicDeck/main/.env.exa
 ### Step 3: Configure Base Environment
 
 Open .env to configure your initial deployment:
+
 ```bash
 nano .env
 ```
-    Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin. 
+
+Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin. 
 
     Set host path & IP:
 
@@ -65,7 +69,7 @@ nano .env
 
     Set MusicDeck credentials:
 
-        MUSICDECK_SESSION_SECRET: Set a long random string (e.g., run `openssl rand -hex 32` in a terminal).
+        MUSICDECK_SESSION_SECRET: Set a long random string (e.g., run 'openssl rand -hex 32' in a terminal).
 
         MUSICDECK_ADMIN_PASSWORD: Set your MusicDeck admin password.
 
@@ -75,17 +79,21 @@ Option A: Navidrome Setup
     Set NAVIDROME_PASSWORD in .env.
 
     Start the stack:
+
 ```bash
     docker compose pull && docker compose up -d
 ```
+
     Open http://[YOUR_SERVER_IP]:4533 in your browser and create the admin account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD from your .env.
 
 Option B: Jellyfin Setup
 
     Start Jellyfin first so you can configure it:
+
 ```bash
     docker compose pull && docker compose up -d jellyfin
 ```
+    
     Open http://[YOUR_SERVER_IP]:8096 in your browser, complete the initial setup wizard, and log in.
 
     Go to Dashboard -> API Keys, create a new API key (e.g., named "MusicDeck"), and copy the key string.
@@ -95,10 +103,13 @@ Option B: Jellyfin Setup
 ```bash
     nano .env
 ```
+
     Start the full MusicDeck stack:
+
 ```bash
     docker compose up -d
 ```
+
 Step 5: Access MusicDeck
 
 Open http://[YOUR_SERVER_IP]:8080 in your browser and log in using your MUSICDECK_ADMIN_USERNAME and MUSICDECK_ADMIN_PASSWORD.
