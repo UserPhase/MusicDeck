@@ -60,51 +60,51 @@ nano .env
 
 Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin. 
 
-    Set host path & IP:
+- Set host path & IP:
 
-        MUSIC_ROOT: Absolute path to your music folder (e.g., /media/music).
+  - MUSIC_ROOT: Absolute path to your music folder (e.g., /media/music).
 
-        MUSICDECK_PUBLIC_URL: Your server's LAN IP (e.g., http://192.168.1.50:8080).
-          Tip (Find your Server IP): Run  `ip -4  addr` in your server terminal. Look for your primary network interface (e.g., enp3s0 or eth0) and use the IP address listed after inet.
+    - MUSICDECK_PUBLIC_URL: Your server's LAN IP (e.g., http://192.168.1.50:8080).
+      - Tip (Find your Server IP): Run  `ip -4  addr` in your server terminal. Look for your primary network interface (e.g., enp3s0 or eth0) and use the IP address listed after inet.
 
-    Set MusicDeck credentials:
+- Set MusicDeck credentials:
 
-        MUSICDECK_SESSION_SECRET: Set a long random string (e.g., run 'openssl rand -hex 32' in a terminal).
+  - MUSICDECK_SESSION_SECRET: Set a long random string (e.g., run 'openssl rand -hex 32' in a terminal).
 
-        MUSICDECK_ADMIN_PASSWORD: Set your MusicDeck admin password.
+  - MUSICDECK_ADMIN_PASSWORD: Set your MusicDeck admin password.
 
 ### Step 4: First-Run Setup (Choose Your Backend)
 Option A: Navidrome Setup
 
-    Set NAVIDROME_PASSWORD in .env.
+- Set NAVIDROME_PASSWORD in .env.
 
-    Start the stack:
+  - Start the stack:
 
 ```bash
     docker compose pull && docker compose up -d
 ```
 
-    Open http://[YOUR_SERVER_IP]:4533 in your browser and create the admin account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD from your .env.
+  - Open http://[YOUR_SERVER_IP]:4533 in your browser and create the admin account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD from your .env.
 
 Option B: Jellyfin Setup
 
-    Start Jellyfin first so you can configure it:
+  - Start Jellyfin first so you can configure it:
 
 ```bash
     docker compose pull && docker compose up -d jellyfin
 ```
     
-    Open http://[YOUR_SERVER_IP]:8096 in your browser, complete the initial setup wizard, and log in.
+  - Open http://[YOUR_SERVER_IP]:8096 in your browser, complete the initial setup wizard, and log in.
 
-    Go to Dashboard -> API Keys, create a new API key (e.g., named "MusicDeck"), and copy the key string.
+  - Go to Dashboard -> API Keys, create a new API key (e.g., named "MusicDeck"), and copy the key string.
 
-    Open .env and set JELLYFIN_API_KEY=<your-copied-key>:
+  - Open .env and set JELLYFIN_API_KEY=[YOUR_COPIED_API_KEY]:
 
 ```bash
     nano .env
 ```
 
-    Start the full MusicDeck stack:
+  - Start the full MusicDeck stack:
 
 ```bash
     docker compose up -d
@@ -113,6 +113,8 @@ Option B: Jellyfin Setup
 Step 5: Access MusicDeck
 
 Open http://[YOUR_SERVER_IP]:8080 in your browser and log in using your MUSICDECK_ADMIN_USERNAME and MUSICDECK_ADMIN_PASSWORD.
+
+
 
 ## Local development (for tweaking it yourself)
 
