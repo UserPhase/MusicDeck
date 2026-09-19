@@ -92,6 +92,18 @@ export function PlayerProvider({
   ] = useState(-1);
 
 
+  const [
+    isShuffleEnabled,
+    setIsShuffleEnabled,
+  ] = useState(false);
+
+
+  const [
+    isLooping,
+    setIsLooping,
+  ] = useState(false);
+
+
   /*
    * RECENTLY PLAYED
    */
@@ -309,6 +321,8 @@ export function PlayerProvider({
     setDuration(0);
     setQueue([]);
     setQueueIndex(-1);
+    setIsShuffleEnabled(false);
+    setIsLooping(false);
     setLikedSongIds(new Set());
     setIsCurrentSongLiked(false);
     setRecentlyPlayed([]);
@@ -927,6 +941,56 @@ export function PlayerProvider({
   }
 
 
+  function shuffleUpcomingSongs(songs, currentIndex) {
+
+    const upcomingStart =
+      currentIndex + 1;
+
+
+    if (
+      currentIndex < 0 ||
+      songs.length - upcomingStart < 2
+    ) {
+      return songs;
+    }
+
+
+    const shuffledUpcoming =
+      songs.slice(upcomingStart);
+
+
+    for (
+      let index = shuffledUpcoming.length - 1;
+      index > 0;
+      index -= 1
+    ) {
+
+      const randomIndex =
+        Math.floor(
+          Math.random() *
+          (index + 1)
+        );
+
+
+      [
+        shuffledUpcoming[index],
+        shuffledUpcoming[randomIndex],
+      ] = [
+        shuffledUpcoming[randomIndex],
+        shuffledUpcoming[index],
+      ];
+
+    }
+
+
+    return [
+      ...songs.slice(0, upcomingStart),
+      ...shuffledUpcoming,
+    ];
+
+  }
+
+
   /*
    * PLAY QUEUE
    */
@@ -975,6 +1039,15 @@ export function PlayerProvider({
         newQueue,
         startIndex
       );
+
+
+    if (isShuffleEnabled) {
+      newQueue =
+        shuffleUpcomingSongs(
+          newQueue,
+          startIndex
+        );
+    }
 
 
     setQueue(newQueue);
@@ -1232,6 +1305,48 @@ export function PlayerProvider({
 
 
   /*
+   * TOGGLE SHUFFLE
+   *
+   * Enabling shuffle randomizes the unplayed portion of the queue. Playback
+   * then continues through that order, ensuring that every queued track is
+   * heard once before any new tracks are added.
+   */
+
+  function toggleShuffle() {
+
+    const shouldEnable =
+      !isShuffleEnabled;
+
+
+    setIsShuffleEnabled(
+      shouldEnable
+    );
+
+
+    if (!shouldEnable) {
+      return;
+    }
+
+    setQueue(
+      shuffleUpcomingSongs(
+        queue,
+        queueIndex
+      )
+    );
+
+  }
+
+
+  function toggleLoop() {
+
+    setIsLooping(
+      (current) => !current
+    );
+
+  }
+
+
+  /*
    * PLAY / PAUSE
    */
 
@@ -1452,6 +1567,10 @@ export function PlayerProvider({
 
         isPreview: Boolean(previewSource),
 
+        isShuffleEnabled,
+
+        isLooping,
+
         previewDurationSeconds:
           (previewSource &&
             previewSource.quality &&
@@ -1474,6 +1593,10 @@ export function PlayerProvider({
 
         previousSong,
 
+        toggleShuffle,
+
+        toggleLoop,
+
         togglePlay,
 
         toggleLike,
@@ -1492,6 +1615,8 @@ export function PlayerProvider({
 
       <audio
         ref={audioRef}
+
+        loop={isLooping}
 
         onTimeUpdate={
           handleTimeUpdate

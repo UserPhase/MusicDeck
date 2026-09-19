@@ -61,6 +61,10 @@ function Player() {
 
     nextSong,
     previousSong,
+    toggleShuffle,
+    isShuffleEnabled,
+    toggleLoop,
+    isLooping,
 
     volume,
     changeVolume,
@@ -156,18 +160,15 @@ function Player() {
 
 
   /*
-   * ONLY SHOW UPCOMING SONGS
+   * SHOW CURRENT AND UPCOMING SONGS
    *
    * queueIndex is the currently
    * playing song.
-   *
-   * Everything before it has
-   * already been played.
    */
 
-  const upcomingQueue =
+  const visibleQueue =
     queueIndex >= 0
-      ? queue.slice(queueIndex + 1)
+      ? queue.slice(queueIndex)
       : [];
 
 
@@ -214,7 +215,6 @@ function Player() {
 
     const actualIndex =
       queueIndex +
-      1 +
       index;
 
 
@@ -392,6 +392,47 @@ function Player() {
         <div className="control-buttons">
 
 
+          {/* SHUFFLE */}
+
+          <button
+            className={
+              `control shuffle-control ${
+                isShuffleEnabled
+                  ? "active"
+                  : ""
+              }`
+            }
+
+            onClick={
+              toggleShuffle
+            }
+
+            disabled={
+              !currentSong
+            }
+
+            aria-label={
+              isShuffleEnabled
+                ? "Turn off shuffle"
+                : "Turn on shuffle"
+            }
+
+            aria-pressed={
+              isShuffleEnabled
+            }
+          >
+            <svg
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path d="M3 7h3.2c1.3 0 2.5.6 3.3 1.6L17 17" />
+              <path d="m15 14 3 3-3 3" />
+              <path d="M3 17h3.2c1.3 0 2.5-.6 3.3-1.6L11 13" />
+              <path d="m15 4 3 3-3 3" />
+            </svg>
+          </button>
+
+
           {/* PREVIOUS */}
 
           <button
@@ -454,6 +495,47 @@ function Player() {
             aria-label="Next song"
           >
             ▶
+          </button>
+
+
+          {/* LOOP */}
+
+          <button
+            className={
+              `control loop-control ${
+                isLooping
+                  ? "active"
+                  : ""
+              }`
+            }
+
+            onClick={
+              toggleLoop
+            }
+
+            disabled={
+              !currentSong
+            }
+
+            aria-label={
+              isLooping
+                ? "Turn off repeat"
+                : "Turn on repeat"
+            }
+
+            aria-pressed={
+              isLooping
+            }
+          >
+            <svg
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path d="M17 3l4 4-4 4" />
+              <path d="M3 7h18" />
+              <path d="M7 21l-4-4 4-4" />
+              <path d="M21 17H3" />
+            </svg>
           </button>
 
         </div>
@@ -636,7 +718,7 @@ function Player() {
                 <div className="player-queue-list">
 
 
-                  {upcomingQueue.length === 0 ? (
+                  {visibleQueue.length === 0 ? (
 
                     <div className="player-queue-empty">
 
@@ -648,7 +730,7 @@ function Player() {
 
                   ) : (
 
-                    upcomingQueue.map(
+                    visibleQueue.map(
                       (
                         song,
                         index
@@ -659,7 +741,19 @@ function Player() {
                             `${song.id}-${index}`
                           }
 
-                          className="player-queue-song"
+                          className={
+                            `player-queue-song ${
+                              index === 0
+                                ? "playing"
+                                : ""
+                            }`
+                          }
+
+                          aria-current={
+                            index === 0
+                              ? "true"
+                              : undefined
+                          }
 
                           onClick={() =>
                             handleQueueSongClick(
@@ -670,7 +764,7 @@ function Player() {
 
 
                           <span className="player-queue-number">
-                            {index + 1}
+                            {queueIndex + index + 1}
                           </span>
 
 

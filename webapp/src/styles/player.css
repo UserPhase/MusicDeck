@@ -15,6 +15,14 @@
 .control-buttons { display: flex; align-items: center; justify-content: center; gap: 20px; }
 .control { border: none; background: transparent; color: #737985; font-size: 17px; cursor: pointer; transition: color 0.15s ease; }
 .control:hover { color: var(--text); }
+.shuffle-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
+.shuffle-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.shuffle-control.active { color: var(--accent); }
+.loop-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
+.loop-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.loop-control.active { color: var(--accent); }
+.control:disabled { cursor: not-allowed; opacity: 0.45; }
+.control:disabled:hover { color: #737985; }
 .play-button { width: 34px; height: 34px; display: grid; place-items: center; border: none; border-radius: 50%; background: white; color: black; font-size: 14px; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease; }
 .play-button:hover { background: #e8e9ed; transform: scale(1.05); }
 .progress-container { display: flex; align-items: center; gap: 9px; width: 100%; }
@@ -41,7 +49,9 @@
 .player-queue-list { padding: 6px; overflow-y: auto; min-height: 0; }
 .player-queue-song { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: none; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; transition: background 0.15s ease; }
 .player-queue-song:hover { background: var(--card-hover); }
-.player-queue-song.playing { color: var(--accent); }
+.player-queue-song.playing { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-weight: 650; }
+.player-queue-song.playing:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.player-queue-song.playing .player-queue-number { color: inherit; }
 .player-queue-number { width: 22px; flex-shrink: 0; color: var(--text-muted); font-size: 12px; text-align: center; }
 .player-queue-info { min-width: 0; display: flex; flex-direction: column; }
 .player-queue-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }

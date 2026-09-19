@@ -76,6 +76,10 @@ function PlayerHarness() {
     playQueue,
     nextSong,
     previousSong,
+    toggleShuffle,
+    isShuffleEnabled,
+    toggleLoop,
+    isLooping,
     queue,
     queueIndex,
     isPreview,
@@ -97,6 +101,9 @@ function PlayerHarness() {
       <button onClick={() => playQueue(songs, 1)}>
         album
       </button>
+      <button onClick={() => playQueue(songs, 0)}>
+        album-start
+      </button>
       <button onClick={() => playQueue(playlistSongs, 1)}>
         playlist
       </button>
@@ -109,6 +116,18 @@ function PlayerHarness() {
       <button onClick={previousSong}>
         previous
       </button>
+      <button onClick={toggleShuffle}>
+        shuffle
+      </button>
+      <button onClick={toggleLoop}>
+        loop
+      </button>
+      <div data-testid="shuffle-enabled">
+        {String(isShuffleEnabled)}
+      </div>
+      <div data-testid="loop-enabled">
+        {String(isLooping)}
+      </div>
       <div data-testid="queue">
         {queue.map((song) => song.id).join(",")}
       </div>
@@ -226,6 +245,46 @@ test("album queues honor their start index and support next and previous", async
   await waitFor(() => {
     expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
   });
+});
+
+
+test("shuffle mode stays active and randomizes only upcoming songs", async () => {
+  const random = jest.spyOn(Math, "random").mockReturnValue(0);
+
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("album-start"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("queue")).toHaveTextContent(
+      "song-1,song-2,song-3"
+    );
+  });
+
+  fireEvent.click(screen.getByText("shuffle"));
+
+  expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("true");
+  expect(screen.getByTestId("queue")).toHaveTextContent(
+    "song-1,song-3,song-2"
+  );
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+
+  fireEvent.click(screen.getByText("shuffle"));
+
+  expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("false");
+
+  random.mockRestore();
+});
+
+
+test("loop mode toggles independently of playback queue state", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("loop"));
+  expect(screen.getByTestId("loop-enabled")).toHaveTextContent("true");
+
+  fireEvent.click(screen.getByText("loop"));
+  expect(screen.getByTestId("loop-enabled")).toHaveTextContent("false");
 });
 
 

@@ -20,6 +20,7 @@ import {
 import AvailabilityHint from "../components/AvailabilityHint";
 import SourceMenu from "../components/SourceMenu";
 import TrackDownloadButton from "../components/TrackDownloadButton";
+import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
 import {
   EmptyState,
   ErrorState,
@@ -41,7 +42,19 @@ function Tracks() {
   const {
     playSong,
     playSongFromSource,
+    currentSong,
+    isPlaying,
+    togglePlay,
   } = usePlayer();
+
+  function handleTrackPlayback(song) {
+    if (currentSong && String(currentSong.id) === String(song.id)) {
+      togglePlay();
+      return;
+    }
+
+    playSong(song);
+  }
 
 
   const [songs, setSongs] =
@@ -365,7 +378,18 @@ useEffect(() => {
             (song, index) => (
 
             <div
-              className="track"
+              className={
+                `track${
+                  currentSong && String(currentSong.id) === String(song.id)
+                    ? ` is-current-track${isPlaying ? " is-playing" : ""}`
+                    : ""
+                }`
+              }
+              onClick={(event) => {
+                if (!event.target.closest("a, button, input")) {
+                  handleTrackPlayback(song);
+                }
+              }}
               key={song.id}
             >
 
@@ -374,16 +398,22 @@ useEffect(() => {
 
               <div className="track-number">
 
-                <span className="track-number-text">
-                  {index + 1}
-                </span>
+                <TrackPlaybackIndicator
+                  index={index}
+                  isCurrentTrack={
+                    Boolean(currentSong) &&
+                    String(currentSong.id) === String(song.id)
+                  }
+                  isPlaying={isPlaying}
+                />
 
 
                 <button
                   className="track-play"
-                  onClick={() =>
-                    playSong(song)
-                  }
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    handleTrackPlayback(song);
+                  }}
                   aria-label={
                     `Play ${song.title}`
                   }
