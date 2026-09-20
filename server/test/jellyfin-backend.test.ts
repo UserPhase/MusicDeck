@@ -182,6 +182,23 @@ describe("JellyfinBackend requests", () => {
     await expect(backend.getTrack("missing")).resolves.toBeNull();
   });
 
+  test("reads lyrics and follows the track artist to its biography", async () => {
+    const fetchImpl = vi.fn(async (url: URL) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes("/Audio/jf-track-1/Lyrics")) {
+        return jsonResponse({ Lyrics: [{ Text: "First line" }, { Text: "Second line" }] });
+      }
+      if (requestUrl.includes("Ids=jf-track-1")) {
+        return jsonResponse({ Items: [trackFixture] });
+      }
+      return jsonResponse({ Items: [{ Id: "jf-artist-1", Overview: "An artist story." }] });
+    });
+    const backend = makeBackend(fetchImpl);
+
+    await expect(backend.getLyrics("jf-track-1")).resolves.toBe("First line\nSecond line");
+    await expect(backend.getArtistBiographyForTrack("jf-track-1")).resolves.toBe("An artist story.");
+  });
+
   test("streams with direct play and forwards the Range header", async () => {
     const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])); c.close(); } });
     const fetchImpl = vi.fn(async () => new Response(body, {
@@ -190,11 +207,12 @@ describe("JellyfinBackend requests", () => {
     }));
     const backend = makeBackend(fetchImpl);
 
-    const result = await backend.fetchStream("jf-track-1", "bytes=0-0");
+    const result = await backend.fetchStream("jf-track-1", "bytes=0-0", 320);
 
     const [url, init] = fetchImpl.mock.calls[0] as any[];
     expect(String(url)).toContain("/Audio/jf-track-1/stream");
-    expect(String(url)).toContain("static=true");
+    expect(String(url)).toContain("MaxStreamingBitrate=320000");
+    expect(String(url)).not.toContain("static=true");
     expect(String(url)).not.toContain("test-api-key");
     expect(init.headers.Range).toBe("bytes=0-0");
     expect(init.headers["X-Emby-Token"]).toBe("test-api-key");

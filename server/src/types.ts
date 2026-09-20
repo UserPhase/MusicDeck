@@ -34,6 +34,12 @@ export type Track = {
   artworkId: string | null;
   artworkUrl: string | null;
   streamUrl: string;
+  replayGain?: {
+    trackGainDb?: number | null;
+    trackPeak?: number | null;
+    albumGainDb?: number | null;
+    albumPeak?: number | null;
+  };
   identityHints?: IdentityHints;
 };
 

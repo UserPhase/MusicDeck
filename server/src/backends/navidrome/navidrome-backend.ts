@@ -146,6 +146,70 @@ export class NavidromeBackend implements MusicBackend {
     return result.song ? mapTrack(result.song) : null;
   }
 
+  async getLyrics(trackId: string): Promise<string | null> {
+    // OpenSubsonic/Navidrome exposes richer, song-ID based lyrics. Older
+    // servers may only implement the classic artist/title endpoint, so keep
+    // that as a provider-local fallback.
+    try {
+      const result = await this.request("getLyricsBySongId", { id: trackId });
+      const structured = result.lyricsList?.structuredLyrics;
+      const candidates = Array.isArray(structured) ? structured : structured ? [structured] : [];
+
+      for (const candidate of candidates) {
+        const lines = Array.isArray(candidate?.line) ? candidate.line : [];
+        const text = lines
+          .map((line: any) => typeof line === "string" ? line : line?.value ?? line?.text ?? "")
+          .join("\n")
+          .trim();
+        if (text) return text;
+      }
+
+      const plain = typeof result.lyricsList?.lyrics === "string"
+        ? result.lyricsList.lyrics
+        : typeof result.lyrics?.value === "string"
+          ? result.lyrics.value
+          : typeof result.lyrics === "string"
+            ? result.lyrics
+            : "";
+      if (plain.trim()) return plain.trim();
+    } catch {
+      // Fall through to the legacy Subsonic endpoint below.
+    }
+
+    try {
+      const songResult = await this.request("getSong", { id: trackId });
+      const song = songResult.song;
+      if (!song?.artist || !song?.title) return null;
+      const result = await this.request("getLyrics", { artist: song.artist, title: song.title });
+      const lyrics = typeof result.lyrics?.value === "string"
+        ? result.lyrics.value
+        : typeof result.lyrics === "string"
+          ? result.lyrics
+          : "";
+      return lyrics.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getArtistBiographyForTrack(trackId: string): Promise<string | null> {
+    try {
+      const songResult = await this.request("getSong", { id: trackId });
+      const artistId = songResult.song?.artistId;
+      if (!artistId) return null;
+
+      const result = await this.request("getArtistInfo2", {
+        id: artistId,
+        count: 0,
+        includeNotPresent: false,
+      });
+      const biography = result.artistInfo2?.biography ?? result.artistInfo?.biography;
+      return typeof biography === "string" && biography.trim() ? biography.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
   async search(query: string, types: string[] = ["artists", "albums", "tracks"]): Promise<SearchResult> {
     if (!query.trim()) {
       return { artists: [], albums: [], tracks: [] };
@@ -262,8 +326,11 @@ export class NavidromeBackend implements MusicBackend {
     return (result.albumList2?.album || []).map(mapAlbum);
   }
 
-  async fetchStream(trackId: string, range?: string): Promise<StreamResult> {
-    const response = await this.fetchImpl(this.buildUrl("stream", { id: trackId }), {
+  async fetchStream(trackId: string, range?: string, maxBitRate?: number): Promise<StreamResult> {
+    const response = await this.fetchImpl(this.buildUrl("stream", {
+      id: trackId,
+      maxBitRate,
+    }), {
       headers: range ? { Range: range } : undefined,
     });
 

@@ -44,6 +44,25 @@ function ticksToSeconds(ticks: unknown): number | null {
   return typeof ticks === "number" ? Math.round(ticks / 10_000_000) : null;
 }
 
+function replayGainNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function replayGain(item: any) {
+  const values = item.ReplayGain || item.replayGain || {};
+  return {
+    trackGainDb: replayGainNumber(values.TrackGain ?? values.trackGain ?? item.ReplayGainTrackGain),
+    trackPeak: replayGainNumber(values.TrackPeak ?? values.trackPeak ?? item.ReplayGainTrackPeak),
+    albumGainDb: replayGainNumber(values.AlbumGain ?? values.albumGain ?? item.ReplayGainAlbumGain),
+    albumPeak: replayGainNumber(values.AlbumPeak ?? values.albumPeak ?? item.ReplayGainAlbumPeak),
+  };
+}
+
 function identityHints(item: any, musicBrainzKey: string) {
   return {
     musicBrainzId: id(item.ProviderIds?.[musicBrainzKey] || item.ProviderIds?.MusicBrainz),
@@ -68,6 +87,7 @@ export function mapJellyfinTrack(item: any): Track {
     artworkId: item.ImageTags?.Primary ? trackId : null,
     artworkUrl: item.ImageTags?.Primary ? `/api/artwork/${encodeURIComponent(trackId)}` : null,
     streamUrl: `/api/tracks/${encodeURIComponent(trackId)}/stream`,
+    replayGain: replayGain(item),
     identityHints: identityHints(item, "MusicBrainzTrack"),
   };
 }

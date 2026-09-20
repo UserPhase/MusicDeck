@@ -1,3 +1,7 @@
+import {
+  normalizeTrackData,
+} from "../utils/normalizeTrackData";
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     credentials: "include",
@@ -33,27 +37,7 @@ async function request(path, options = {}) {
 }
 
 function toSong(track) {
-  const isUnified = typeof track.artist === "string" || track.provider || track.source;
-
-  return {
-    id: track.id,
-    type: "track",
-    title: track.title,
-    artistId: isUnified ? track.metadata?.artistId || null : track.artistId,
-    artist: isUnified ? track.artist : track.artistName,
-    albumId: isUnified ? track.metadata?.albumId || null : track.albumId,
-    album: isUnified ? track.album : track.albumName,
-    duration: isUnified ? track.metadata?.durationSeconds || null : track.durationSeconds,
-    track: track.trackNumber || null,
-    coverArt: isUnified ? track.artwork?.id || null : track.artworkId,
-    artwork: isUnified ? track.artwork || null : undefined,
-    streamUrl: isUnified ? null : track.streamUrl,
-    availability: track.availability || null,
-    source: isUnified ? track.source : undefined,
-    provider: isUnified ? track.provider : undefined,
-    metadata: isUnified ? track.metadata || {} : {},
-    sources: Array.isArray(track.sources) ? track.sources : [],
-  };
+  return normalizeTrackData(track);
 }
 
 function toAlbum(album, songs) {
@@ -110,11 +94,20 @@ function toPlaylist(playlist) {
     coverArt: playlist.artworkId,
     coverMode: playlist.artworkMode || null,
     songCount: playlist.songCount,
-    entry: (playlist.tracks || []).map(toSong),
+    entry: (playlist.tracks || []).map((track) =>
+      normalizeTrackData(track, "playlist")
+    ),
   };
 }
 
 function toSearchItem(result) {
+  if (result.type === "track") {
+    return {
+      ...normalizeTrackData(result, "search"),
+      subtitle: result.subtitle || null,
+    };
+  }
+
   return {
     type: result.type,
     id: result.id,
@@ -336,18 +329,38 @@ export function getCoverUrl(coverArt, size) {
   return size ? `${url}?size=${encodeURIComponent(size)}` : url;
 }
 
-export function getStreamUrl(songId, source) {
+export function getStreamUrl(songId, source, streamQuality = "original") {
   if (!songId) {
     return null;
   }
 
   const base = `/api/tracks/${encodeURIComponent(songId)}/stream`;
+  const params = new URLSearchParams();
 
   if (source && typeof source === "object" && source.id) {
-    return `${base}?playableSource=${encodeURIComponent(source.id)}`;
+    params.set("playableSource", source.id);
+  } else if (source) {
+    params.set("source", source);
   }
 
-  return source ? `${base}?source=${encodeURIComponent(source)}` : base;
+  if (streamQuality === "128" || streamQuality === "320") {
+    params.set("maxBitRate", streamQuality);
+  }
+
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
+}
+
+export async function getTrackLyrics(songId) {
+  if (!songId) return null;
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/lyrics`);
+  return typeof data.lyrics === "string" ? data.lyrics : null;
+}
+
+export async function getTrackArtistBiography(songId) {
+  if (!songId) return null;
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/artist-biography`);
+  return typeof data.biography === "string" ? data.biography : null;
 }
 
 export async function getSilenceAnalysis(songId) {
@@ -421,7 +434,9 @@ export async function getAlbum(albumId) {
 
 export async function getAllSongs() {
   const data = await request("/api/tracks");
-  return (data.tracks || []).map(toSong);
+  return (data.tracks || []).map((track) =>
+    normalizeTrackData(track, "library")
+  );
 }
 
 export async function getArtists() {
@@ -652,7 +667,9 @@ export async function clearPlaylistArtwork(playlistId) {
 
 export async function getStarred() {
   const data = await request("/api/favorites/tracks");
-  return (data.tracks || []).map(toSong);
+  return (data.tracks || []).map((track) =>
+    normalizeTrackData(track, "liked")
+  );
 }
 
 export async function getRecentlyPlayed() {

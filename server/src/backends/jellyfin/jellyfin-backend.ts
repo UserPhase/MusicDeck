@@ -153,6 +153,47 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     return item ? mapJellyfinTrack(item) : null;
   }
 
+  async getLyrics(trackId: string): Promise<string | null> {
+    try {
+      const result = await this.request<any>(`Audio/${encodeURIComponent(trackId)}/Lyrics`);
+      const lines = Array.isArray(result?.Lyrics)
+        ? result.Lyrics
+        : Array.isArray(result?.lyrics)
+          ? result.lyrics
+          : [];
+      const text = lines
+        .map((line: any) => typeof line === "string" ? line : line?.Text ?? line?.text ?? "")
+        .join("\n")
+        .trim();
+      return text || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async getArtistBiographyForTrack(trackId: string): Promise<string | null> {
+    try {
+      const trackResult = await this.request<{ Items?: any[] }>("Items", {
+        Ids: trackId,
+        IncludeItemTypes: "Audio",
+        Fields: "ArtistItems,AlbumArtists",
+      });
+      const track = trackResult.Items?.[0];
+      const artistId = track?.ArtistItems?.[0]?.Id ?? track?.AlbumArtists?.[0]?.Id;
+      if (!artistId) return null;
+
+      const artistResult = await this.request<{ Items?: any[] }>("Items", {
+        Ids: artistId,
+        IncludeItemTypes: "MusicArtist",
+        Fields: "Overview",
+      });
+      const biography = artistResult.Items?.[0]?.Overview;
+      return typeof biography === "string" && biography.trim() ? biography.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
   async search(query: string, types: string[] = ["artists", "albums", "tracks"]): Promise<SearchResult> {
     const empty: SearchResult = { artists: [], albums: [], tracks: [] };
 
@@ -209,9 +250,12 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     }, mapJellyfinAlbum);
   }
 
-  async fetchStream(trackId: string, range?: string): Promise<StreamResult> {
+  async fetchStream(trackId: string, range?: string, maxBitRate?: number): Promise<StreamResult> {
     const response = await this.fetchImpl(
-      this.buildUrl(`Audio/${encodeURIComponent(trackId)}/stream`, { static: "true" }),
+      this.buildUrl(`Audio/${encodeURIComponent(trackId)}/stream`, {
+        static: maxBitRate ? undefined : "true",
+        MaxStreamingBitrate: maxBitRate ? maxBitRate * 1000 : undefined,
+      }),
       {
         headers: {
           ...this.authHeaders(),

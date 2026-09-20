@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -60,6 +61,12 @@ const catalogSong = {
   availability: { libraryAvailable: false },
 };
 
+const replayGainSong = {
+  id: "replay-gain-song",
+  title: "Normalized song",
+  replayGain: { trackGainDb: -6 },
+};
+
 const previewSource = {
   id: "playable_preview",
   type: "preview",
@@ -73,6 +80,7 @@ function PlayerHarness() {
   const {
     playSong,
     playSongFromSource,
+    playContext,
     playQueue,
     nextSong,
     previousSong,
@@ -85,6 +93,13 @@ function PlayerHarness() {
     isPreview,
     previewDurationSeconds,
     playbackUnavailable,
+    currentSong,
+    crossfadeDuration,
+    changeCrossfadeDuration,
+    streamQuality,
+    changeStreamQuality,
+    isReplayGainEnabled,
+    changeReplayGainEnabled,
   } = usePlayer();
 
   return (
@@ -98,8 +113,17 @@ function PlayerHarness() {
       <button onClick={() => playSong(catalogSong)}>
         catalog
       </button>
+      <button onClick={() => playSong(replayGainSong)}>
+        replay-gain-song
+      </button>
       <button onClick={() => playQueue(songs, 1)}>
         album
+      </button>
+      <button onClick={() => playContext(songs, 1, { type: "album", name: "Album" })}>
+        context-second
+      </button>
+      <button onClick={() => playContext(songs, 0, { type: "album", name: "Album" })}>
+        context-first
       </button>
       <button onClick={() => playQueue(songs, 0)}>
         album-start
@@ -122,6 +146,15 @@ function PlayerHarness() {
       <button onClick={toggleLoop}>
         loop
       </button>
+      <button onClick={() => changeCrossfadeDuration(3)}>
+        crossfade-three
+      </button>
+      <button onClick={() => changeStreamQuality("320")}>
+        quality-320
+      </button>
+      <button onClick={() => changeReplayGainEnabled(true)}>
+        enable-replay-gain
+      </button>
       <div data-testid="shuffle-enabled">
         {String(isShuffleEnabled)}
       </div>
@@ -142,6 +175,18 @@ function PlayerHarness() {
       </div>
       <div data-testid="unavailable">
         {String(playbackUnavailable)}
+      </div>
+      <div data-testid="current-song">
+        {currentSong?.id || "none"}
+      </div>
+      <div data-testid="crossfade-duration">
+        {crossfadeDuration}
+      </div>
+      <div data-testid="stream-quality">
+        {streamQuality}
+      </div>
+      <div data-testid="replay-gain-enabled">
+        {String(isReplayGainEnabled)}
       </div>
     </>
   );
@@ -219,7 +264,8 @@ test("selected normalized source reaches the stream URL helper", async () => {
   await waitFor(() => {
     expect(getStreamUrl).toHaveBeenCalledWith(
       "song-1",
-      expect.objectContaining({ id: "playable_external", type: "external" })
+      expect.objectContaining({ id: "playable_external", type: "external" }),
+      "original"
     );
   });
 });
@@ -245,6 +291,35 @@ test("album queues honor their start index and support next and previous", async
   await waitFor(() => {
     expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
   });
+});
+
+
+test("context playback starts at the clicked track and queues only the remaining tracks", async () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("context-second"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("queue")).toHaveTextContent("song-2,song-3");
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+    expect(getStreamUrl).toHaveBeenCalledWith("song-2", null, "original");
+  });
+});
+
+
+test("context playback shuffles only tracks after the clicked track", async () => {
+  const random = jest.spyOn(Math, "random").mockReturnValue(0);
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("shuffle"));
+  fireEvent.click(screen.getByText("context-first"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2");
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+  });
+
+  random.mockRestore();
 });
 
 
@@ -288,6 +363,110 @@ test("loop mode toggles independently of playback queue state", () => {
 });
 
 
+test("crossfade duration is global and persists locally", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("crossfade-three"));
+
+  expect(screen.getByTestId("crossfade-duration")).toHaveTextContent("3");
+  expect(localStorage.getItem("playerCrossfadeDuration")).toBe("3");
+});
+
+
+test("stream quality is global, persistent, and applied to newly loaded streams", async () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("quality-320"));
+  expect(screen.getByTestId("stream-quality")).toHaveTextContent("320");
+  expect(localStorage.getItem("playerStreamQuality")).toBe("320");
+
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => {
+    expect(getStreamUrl).toHaveBeenCalledWith("song-1", null, "320");
+  });
+});
+
+
+test("ReplayGain adjusts the newly loaded track volume when enabled", async () => {
+  const { container } = renderPlayer();
+
+  fireEvent.click(screen.getByText("enable-replay-gain"));
+  expect(screen.getByTestId("replay-gain-enabled")).toHaveTextContent("true");
+  expect(localStorage.getItem("playerReplayGainEnabled")).toBe("true");
+
+  fireEvent.click(screen.getByText("replay-gain-song"));
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("replay-gain-song");
+  });
+
+  expect(container.querySelector("audio").volume).toBeCloseTo(10 ** (-6 / 20));
+});
+
+
+test("crossfade starts the next queued track on the idle deck and hands it off", async () => {
+  const frames = [];
+  const animationSpy = jest
+    .spyOn(window, "requestAnimationFrame")
+    .mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+  const cancelAnimationSpy = jest
+    .spyOn(window, "cancelAnimationFrame")
+    .mockImplementation(() => {});
+  const nowSpy = jest
+    .spyOn(performance, "now")
+    .mockReturnValue(1000);
+
+  const { container } = renderPlayer();
+
+  fireEvent.click(screen.getByText("context-first"));
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  });
+
+  fireEvent.click(screen.getByText("crossfade-three"));
+
+  const [outgoingAudio, incomingAudio] = container.querySelectorAll("audio");
+  Object.defineProperty(outgoingAudio, "duration", {
+    configurable: true,
+    value: 100,
+  });
+  Object.defineProperty(outgoingAudio, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 97,
+  });
+
+  fireEvent.timeUpdate(outgoingAudio);
+
+  await waitFor(() => {
+    expect(getStreamUrl).toHaveBeenCalledWith("song-2", null, "original");
+    expect(frames.length).toBeGreaterThan(0);
+  });
+
+  act(() => {
+    frames.shift()(2500);
+  });
+  expect(outgoingAudio.volume).toBeCloseTo(0.5);
+  expect(incomingAudio.volume).toBeCloseTo(0.5);
+
+  act(() => {
+    frames.shift()(4000);
+  });
+
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
+  });
+  expect(incomingAudio.volume).toBe(1);
+
+  animationSpy.mockRestore();
+  cancelAnimationSpy.mockRestore();
+  nowSpy.mockRestore();
+});
+
+
 test("playlist queues honor their start index", async () => {
   renderPlayer();
 
@@ -321,7 +500,7 @@ test("a library track plays locally without resolving an external source", async
   fireEvent.click(screen.getByText("direct"));
 
   await waitFor(() => {
-    expect(getStreamUrl).toHaveBeenCalledWith("song-1", null);
+    expect(getStreamUrl).toHaveBeenCalledWith("song-1", null, "original");
   });
 
   expect(getPlayableSources).not.toHaveBeenCalled();
@@ -343,7 +522,8 @@ test("a track missing from the library transparently plays an external preview",
   await waitFor(() => {
     expect(getStreamUrl).toHaveBeenCalledWith(
       "external_deezer_42",
-      expect.objectContaining({ id: "playable_preview", type: "preview" })
+      expect.objectContaining({ id: "playable_preview", type: "preview" }),
+      "original"
     );
   });
 

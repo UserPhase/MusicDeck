@@ -6,7 +6,7 @@
   --border: #181e29; --border-hover: #252d3a;
   --accent: #6d8cff; --accent-hover: #82a0ff;
   --nav-background: #0d121b; --nav-hover: #121925; --nav-active: #182131;
-  --sidebar-width: 280px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
+  --sidebar-width: 280px; --right-sidebar-width: 300px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
 
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
   --font-xs: 11px; --font-sm: 12px; --font-md: 13px; --font-base: 14px; --font-lg: 16px; --font-title: 21px;

@@ -60,6 +60,30 @@ function isIncluded(item: UnifiedSearchResult, types?: SearchOptions["types"]) {
   return !types || types.includes(item.type);
 }
 
+function searchIdentity(value: string | null) {
+  return (value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** Deezer results are passed first, so an exact normalized title/artist
+ * collision keeps Deezer and drops the supplementary iTunes copy. */
+export function dedupeKeylessSearchResults(items: UnifiedSearchResult[]) {
+  const seenTracks = new Set<string>();
+
+  return items.filter((item) => {
+    if (item.type !== "track") return true;
+
+    const key = `${searchIdentity(item.title)}::${searchIdentity(item.artist)}`;
+    if (seenTracks.has(key)) return false;
+    seenTracks.add(key);
+    return true;
+  });
+}
+
 class LibrarySearchProvider implements SearchProvider {
   readonly id = "library";
   readonly name = "Your Library";
@@ -97,12 +121,9 @@ class PlaylistSearchProvider implements SearchProvider {
 }
 
 /**
- * Built-in external catalog search provider backed by Deezer's public API
- * (https://api.deezer.com), which requires no API key/OAuth for search. This
- * is MusicDeck's primary, keyless external catalog: a fresh install gets
- * external search results with zero configuration. Deezer signals errors
- * in-band (HTTP 200 with a `{ error: {...} }` body) as well as via normal
- * HTTP error statuses, so both are treated as provider failures.
+ * Built-in keyless external catalog backed by Deezer and iTunes Search.
+ * Deezer remains primary; iTunes supplements track results and is discarded
+ * when its normalized title/artist identity duplicates a Deezer track.
  */
 class DeezerSearchProvider implements SearchProvider {
   readonly id = "deezer";
@@ -115,6 +136,11 @@ class DeezerSearchProvider implements SearchProvider {
 
   private artwork(url: unknown) {
     const id = this.artworkTokens ? this.artworkTokens.token(url, ["dzcdn.net"]) : null;
+    return id ? { id, url: `/api/artwork/external/${encodeURIComponent(id)}` } : null;
+  }
+
+  private itunesArtwork(url: unknown) {
+    const id = this.artworkTokens ? this.artworkTokens.token(url, ["mzstatic.com"]) : null;
     return id ? { id, url: `/api/artwork/external/${encodeURIComponent(id)}` } : null;
   }
 
@@ -157,7 +183,7 @@ class DeezerSearchProvider implements SearchProvider {
     return payload as T;
   }
 
-  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+  private async searchDeezer(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
     const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
     const types = (options.types && options.types.length ? options.types : ["track", "album", "artist"])
       .filter((type) => type !== "playlist");
@@ -244,6 +270,89 @@ class DeezerSearchProvider implements SearchProvider {
 
     const results = await Promise.all(requests);
     return results.flat().filter((item) => isIncluded(item, options.types));
+  }
+
+  private async searchItunes(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+    if (options.types && !options.types.includes("track")) {
+      return [];
+    }
+
+    const url = new URL("https://itunes.apple.com/search");
+    url.searchParams.set("term", query);
+    url.searchParams.set("entity", "song");
+    url.searchParams.set("limit", "15");
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url);
+    } catch (error) {
+      throw new Error(`iTunes catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (!response.ok) {
+      throw new Error(`iTunes catalog request failed (HTTP ${response.status})`);
+    }
+
+    let payload: { results?: any[] };
+    try {
+      payload = await response.json() as { results?: any[] };
+    } catch {
+      throw new Error("iTunes returned invalid data");
+    }
+
+    if (!Array.isArray(payload.results)) {
+      throw new Error("iTunes returned an unexpected response shape");
+    }
+
+    return payload.results.flatMap((item): UnifiedSearchResult[] => {
+      if (item?.trackId == null || typeof item.trackName !== "string") return [];
+
+      const durationSeconds = typeof item.trackTimeMillis === "number"
+        ? Math.round(item.trackTimeMillis / 1000)
+        : null;
+
+      return [{
+        type: "track",
+        id: `external_itunes_${item.trackId}`,
+        title: item.trackName,
+        subtitle: typeof item.artistName === "string" ? item.artistName : null,
+        artist: typeof item.artistName === "string" ? item.artistName : null,
+        album: typeof item.collectionName === "string" ? item.collectionName : null,
+        artwork: this.itunesArtwork(item.artworkUrl100),
+        provider: "external",
+        source: { kind: "external", count: 0, externalAvailable: true },
+        availability: null,
+        metadata: {
+          durationSeconds,
+          itunesTrackId: Number(item.trackId),
+        },
+      }];
+    });
+  }
+
+  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+    const [deezerOutcome, itunesOutcome] = await Promise.allSettled([
+      this.searchDeezer(query, options),
+      this.searchItunes(query, options),
+    ]);
+
+    const deezerResults = deezerOutcome.status === "fulfilled" ? deezerOutcome.value : [];
+    const itunesResults = itunesOutcome.status === "fulfilled" ? itunesOutcome.value : [];
+
+    if (deezerOutcome.status === "rejected" && itunesOutcome.status === "rejected") {
+      const deezerError = deezerOutcome.reason instanceof Error
+        ? deezerOutcome.reason.message
+        : String(deezerOutcome.reason);
+      const itunesError = itunesOutcome.reason instanceof Error
+        ? itunesOutcome.reason.message
+        : String(itunesOutcome.reason);
+      throw new Error(`Keyless catalog search failed: ${deezerError}; ${itunesError}`);
+    }
+
+    return dedupeKeylessSearchResults([
+      ...deezerResults,
+      ...itunesResults,
+    ]);
   }
 
   async test(): Promise<{ ok: boolean; message?: string; status?: string }> {

@@ -402,6 +402,91 @@ describe("SearchProviderRegistry", () => {
     ]));
   });
 
+  test("merges iTunes tracks with Deezer and keeps Deezer when title and artist match", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+
+      if (url.hostname === "api.deezer.com") {
+        return new Response(JSON.stringify({
+          data: [
+            { id: 11, title: "Digital Love", artist: { name: "Daft Punk" }, album: { title: "Discovery" } },
+            { id: 12, title: "Deezer Only", artist: { name: "Artist A" }, album: { title: "Album A" } },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.hostname === "itunes.apple.com") {
+        expect(url.searchParams.get("entity")).toBe("song");
+        expect(url.searchParams.get("limit")).toBe("15");
+        return new Response(JSON.stringify({
+          results: [
+            { trackId: 21, trackName: "Digital Love", artistName: "Daft Punk", collectionName: "Discovery" },
+            { trackId: 22, trackName: "iTunes Only", artistName: "Artist B", collectionName: "Album B", trackTimeMillis: 185000 },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`unexpected request: ${url}`);
+    });
+    const { registry } = await setup(fetchImpl as unknown as typeof fetch);
+
+    const result = await registry.search("digital love", { mode: "external", types: ["track"] });
+
+    expect(result.groups.track).toHaveLength(3);
+    expect(result.groups.track).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "external_deezer_track_11", title: "Digital Love" }),
+      expect.objectContaining({ id: "external_deezer_track_12", title: "Deezer Only" }),
+      expect.objectContaining({
+        id: "external_itunes_22",
+        title: "iTunes Only",
+        artist: "Artist B",
+        album: "Album B",
+        metadata: expect.objectContaining({ durationSeconds: 185, itunesTrackId: 22 }),
+      }),
+    ]));
+    expect(result.groups.track).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "external_itunes_21" }),
+    ]));
+  });
+
+  test("returns iTunes results when Deezer is unavailable", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === "api.deezer.com") {
+        throw new Error("Deezer offline");
+      }
+      return new Response(JSON.stringify({
+        results: [{ trackId: 33, trackName: "Fallback Song", artistName: "Fallback Artist" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const { registry } = await setup(fetchImpl as unknown as typeof fetch);
+
+    const result = await registry.search("fallback", { mode: "external", types: ["track"] });
+
+    expect(result.groups.track).toEqual([
+      expect.objectContaining({ id: "external_itunes_33", title: "Fallback Song" }),
+    ]);
+  });
+
+  test("returns Deezer results when iTunes is unavailable", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === "itunes.apple.com") {
+        throw new Error("iTunes offline");
+      }
+      return new Response(JSON.stringify({
+        data: [{ id: 44, title: "Primary Song", artist: { name: "Primary Artist" } }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const { registry } = await setup(fetchImpl as unknown as typeof fetch);
+
+    const result = await registry.search("primary", { mode: "external", types: ["track"] });
+
+    expect(result.groups.track).toEqual([
+      expect.objectContaining({ id: "external_deezer_track_44", title: "Primary Song" }),
+    ]);
+  });
+
   test("treats Deezer's in-band error payload (HTTP 200) as a provider failure", async () => {
     const fetchImpl = vi.fn(async () => new Response(
       JSON.stringify({ error: { type: "QuotaException", message: "Quota limit exceeded", code: 4 } }),

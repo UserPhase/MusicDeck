@@ -652,6 +652,22 @@ export async function registerMusicRoutes(
     return track ? { track } : sendError(reply, 404, "Track not found");
   });
 
+  app.get("/api/tracks/:trackId/lyrics", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const { trackId } = request.params as { trackId: string };
+    return { lyrics: await catalog.getTrackLyrics(trackId) };
+  });
+
+  app.get("/api/tracks/:trackId/artist-biography", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const { trackId } = request.params as { trackId: string };
+    return { biography: await catalog.getTrackArtistBiography(trackId) };
+  });
+
   // Silence-trim metadata: exposes whatever MusicDeck has already analyzed
   // for this track (or `analysis: null` when it has never been analyzed).
   // Never triggers analysis itself — that is an explicit, separate action.
@@ -862,9 +878,13 @@ export async function registerMusicRoutes(
     if (!user) return reply;
 
     const { trackId } = request.params as { trackId: string };
-    const query = request.query as { source?: string; playableSource?: string };
+    const query = request.query as { source?: string; playableSource?: string; maxBitRate?: string };
     const preferredSource = typeof query.source === "string" && query.source ? query.source : undefined;
     const playableSource = typeof query.playableSource === "string" && query.playableSource ? query.playableSource : undefined;
+    const requestedBitRate = Number(query.maxBitRate);
+    const maxBitRate = requestedBitRate === 128 || requestedBitRate === 320
+      ? requestedBitRate
+      : undefined;
 
     if (playableSource) {
       if (sourceProviders.isExternalSource(trackId, playableSource)
@@ -885,7 +905,7 @@ export async function registerMusicRoutes(
     }
 
     try {
-      return await sendProxyResponse(reply, await sourceResolver.fetchStream(trackId, request.headers.range, preferredSource));
+      return await sendProxyResponse(reply, await sourceResolver.fetchStream(trackId, request.headers.range, preferredSource, maxBitRate));
     } catch (error) {
       if (error instanceof SourceUnavailableError) {
         return sendError(reply, 502, "Playback unavailable");

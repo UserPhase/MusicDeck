@@ -52,8 +52,11 @@ const customPlaylist = {
   coverMode: "custom",
 };
 
+const playContext = jest.fn();
+const togglePlay = jest.fn();
 
-function renderPlaylist(playlist = collagePlaylist) {
+
+function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
   jest.clearAllMocks();
 
   getCoverUrl.mockImplementation((id, size) =>
@@ -62,9 +65,13 @@ function renderPlaylist(playlist = collagePlaylist) {
 
   usePlayer.mockReturnValue({
     playSong: jest.fn(),
+    playContext,
     playQueue: jest.fn(),
+    playSongFromSource: jest.fn(),
     currentSong: null,
     isPlaying: false,
+    togglePlay,
+    ...playerOverrides,
   });
 
   getPlaylist.mockResolvedValue(playlist);
@@ -77,6 +84,45 @@ function renderPlaylist(playlist = collagePlaylist) {
     </MemoryRouter>
   );
 }
+
+
+test("clicking a playlist row starts its full playback context", async () => {
+  const playlist = {
+    ...collagePlaylist,
+    entry: [
+      { id: "track-1", title: "First", artist: "Artist" },
+      { id: "track-2", title: "Second", artist: "Artist" },
+    ],
+  };
+
+  renderPlaylist(playlist);
+  fireEvent.click(await screen.findByRole("button", { name: "Play Second" }));
+
+  expect(playContext).toHaveBeenCalledWith(
+    playlist.entry,
+    1,
+    {
+      type: "playlist",
+      id: playlist.id,
+      name: playlist.name,
+      coverArt: playlist.coverArt,
+    }
+  );
+});
+
+
+test("clicking the active playlist track toggles playback without rebuilding its queue", async () => {
+  const playlist = {
+    ...collagePlaylist,
+    entry: [{ id: "track-1", title: "First", artist: "Artist" }],
+  };
+
+  renderPlaylist(playlist, { currentSong: playlist.entry[0], isPlaying: true });
+  fireEvent.click(await screen.findByRole("button", { name: "Play First" }));
+
+  expect(togglePlay).toHaveBeenCalledTimes(1);
+  expect(playContext).not.toHaveBeenCalled();
+});
 
 
 function coverInput() {

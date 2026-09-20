@@ -18,6 +18,7 @@ import SourceMenu from "../components/SourceMenu";
 import SourceIndicator from "../components/SourceIndicator";
 import TrackDownloadButton from "../components/TrackDownloadButton";
 import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
+import TrackDownloadStatus from "../components/TrackDownloadStatus";
 
 import {
   getPlaylists,
@@ -49,7 +50,7 @@ function Album() {
 
 
   const {
-    playSong,
+    playContext,
     playQueue,
     playSongFromSource,
     currentSong,
@@ -57,13 +58,22 @@ function Album() {
     togglePlay,
   } = usePlayer();
 
-  function handleTrackPlayback(song) {
+  function handleTrackPlayback(song, index) {
     if (currentSong && String(currentSong.id) === String(song.id)) {
       togglePlay();
       return;
     }
 
-    playSong(song);
+    playContext(
+      songs,
+      index,
+      {
+        type: "album",
+        id: album.id,
+        name: album.name,
+        coverArt: album.coverArt,
+      }
+    );
   }
 
 
@@ -553,8 +563,10 @@ function Album() {
           (song, index) => {
 
           const isDownloaded =
-            Boolean(song.availability?.libraryAvailable) ||
-            song.source?.kind === "library";
+            typeof song.isDownloaded === "boolean"
+              ? song.isDownloaded
+              : Boolean(song.availability?.libraryAvailable) ||
+                song.source?.kind === "library";
 
           return (
 
@@ -564,7 +576,7 @@ function Album() {
             }
             onClick={(event) => {
               if (!event.target.closest("a, button, input")) {
-                handleTrackPlayback(song);
+                handleTrackPlayback(song, index);
               }
             }}
             key={`${song.id}-${index}`}
@@ -589,7 +601,7 @@ function Album() {
                 className="track-play"
                 onClick={(event) => {
                   event.stopPropagation();
-                  handleTrackPlayback(song);
+                  handleTrackPlayback(song, index);
                 }}
                 aria-label={
                   isDownloaded
@@ -608,14 +620,11 @@ function Album() {
             <div className="track-info">
 
               <div className="track-title">
-                <span
-                  className={
-                    `track-availability-mark ${isDownloaded ? "available" : "unavailable"}`
-                  }
-                  aria-hidden="true"
-                >
-                  {isDownloaded ? "✓" : "↓"}
-                </span>
+                <TrackDownloadStatus
+                  isDownloaded={song.isDownloaded}
+                  availability={song.availability}
+                  source={song.source}
+                />
                 {song.title}
                 <AvailabilityHint availability={song.availability} />
                 <SourceIndicator source={song.source} />

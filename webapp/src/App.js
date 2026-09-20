@@ -6,9 +6,15 @@ import {
   useLocation,
 } from "react-router-dom";
 
+import {
+  useState,
+} from "react";
+
 import Topbar from "./components/Topbar";
 import AdminTopBar from "./components/admin/AdminTopBar";
 import Sidebar from "./components/Sidebar";
+import QueueSidebar from "./components/QueueSidebar";
+import NowPlayingSidebar from "./components/NowPlayingSidebar";
 import Player from "./components/Player";
 import AdminSidebar from "./components/admin/AdminSidebar";
 import RequireAdmin from "./components/admin/RequireAdmin";
@@ -79,6 +85,8 @@ function AdminLayout() {
 
 function AuthenticatedApp() {
   const location = useLocation();
+  const [activeSidebar, setActiveSidebar] = useState("none");
+  const isSidebarOpen = activeSidebar !== "none";
 
   return (
     <>
@@ -109,7 +117,25 @@ function AuthenticatedApp() {
           element={
             <>
               <Sidebar />
-              <main className="main">
+              <main
+                className={
+                  `main${
+                    isSidebarOpen
+                      ? " sidebar-open"
+                      : ""
+                  }`
+                }
+              >
+                <button
+                  className={`main-now-playing-toggle${activeSidebar === "now-playing" ? " active" : ""}`}
+                  type="button"
+                  onClick={() => setActiveSidebar((current) => current === "now-playing" ? "none" : "now-playing")}
+                  aria-pressed={activeSidebar === "now-playing"}
+                  aria-label="Toggle Now Playing sidebar"
+                >
+                  <span aria-hidden="true">♫</span>
+                  Now Playing
+                </button>
                 <Routes>
                   <Route path="/" element={<Home />} />
                   <Route path="/login" element={<Navigate to="/" replace />} />
@@ -132,11 +158,23 @@ function AuthenticatedApp() {
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </main>
+              <QueueSidebar
+                isOpen={activeSidebar === "queue"}
+                onClose={() => setActiveSidebar("none")}
+              />
+              <NowPlayingSidebar
+                isOpen={activeSidebar === "now-playing"}
+                onClose={() => setActiveSidebar("none")}
+                onOpenQueue={() => setActiveSidebar("queue")}
+              />
             </>
           }
         />
       </Routes>
-      <Player />
+      <Player
+        isQueueSidebarOpen={activeSidebar === "queue"}
+        onToggleQueueSidebar={() => setActiveSidebar((current) => current === "queue" ? "none" : "queue")}
+      />
     </>
   );
 }

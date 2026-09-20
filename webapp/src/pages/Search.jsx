@@ -80,7 +80,7 @@ function Search() {
 
 
   const {
-    playSong,
+    playContext,
     playSongFromSource,
     playQueue,
     currentSong,
@@ -88,13 +88,18 @@ function Search() {
     togglePlay,
   } = usePlayer();
 
-  function handleTrackPlayback(song) {
+  function handleTrackPlayback(song, index) {
     if (currentSong && String(currentSong.id) === String(song.id)) {
       togglePlay();
       return;
     }
 
-    playSong(song);
+    playContext(results.track, index, {
+      type: "search",
+      id: query,
+      name: `Search: ${query}`,
+      coverArt: null,
+    });
   }
 
 
@@ -671,7 +676,7 @@ function Search() {
                       }
                       onClick={(event) => {
                         if (!event.target.closest("a, button, input")) {
-                          handleTrackPlayback(song);
+                          handleTrackPlayback(song, index);
                         }
                       }}
                     >
@@ -693,7 +698,7 @@ function Search() {
                           className="track-play"
                           onClick={(event) => {
                             event.stopPropagation();
-                            handleTrackPlayback(song);
+                            handleTrackPlayback(song, index);
                           }}
                           aria-label={
                             song.source?.kind === "external"

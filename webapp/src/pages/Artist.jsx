@@ -56,7 +56,7 @@ function Artist() {
 
 
   const {
-    playSong,
+    playContext,
     playQueue,
     playSongFromSource,
     currentSong,
@@ -64,13 +64,18 @@ function Artist() {
     togglePlay,
   } = usePlayer();
 
-  function handleTrackPlayback(song) {
+  function handleTrackPlayback(song, index) {
     if (currentSong && String(currentSong.id) === String(song.id)) {
       togglePlay();
       return;
     }
 
-    playSong(song);
+    playContext(songs, index, {
+      type: "artist",
+      id: artist.id,
+      name: artist.name,
+      coverArt: artist.coverArt,
+    });
   }
 
 
@@ -666,7 +671,7 @@ function Artist() {
               }
               onClick={(event) => {
                 if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song);
+                  handleTrackPlayback(song, index);
                 }
               }}
               key={`${song.id}-${index}`}
@@ -688,7 +693,7 @@ function Artist() {
                   className="track-play"
                   onClick={(event) => {
                     event.stopPropagation();
-                    handleTrackPlayback(song);
+                    handleTrackPlayback(song, index);
                   }}
                   aria-label={
                     `Play ${song.title}`

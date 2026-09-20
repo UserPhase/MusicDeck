@@ -207,6 +207,8 @@ test("search adapts provider-neutral groups while retaining legacy arrays", asyn
 test("stream and artwork URLs never include backend credentials", () => {
   expect(getStreamUrl("track-1")).toBe("/api/tracks/track-1/stream");
   expect(getStreamUrl("track-1", { id: "playable_1" })).toBe("/api/tracks/track-1/stream?playableSource=playable_1");
+  expect(getStreamUrl("track-1", null, "128")).toBe("/api/tracks/track-1/stream?maxBitRate=128");
+  expect(getStreamUrl("track-1", { id: "playable_1" }, "320")).toBe("/api/tracks/track-1/stream?playableSource=playable_1&maxBitRate=320");
   expect(getCoverUrl("art-1")).toBe("/api/artwork/art-1");
 
   // Thumbnail hints are forwarded to the artwork proxy, and external artwork

@@ -21,6 +21,7 @@ import AvailabilityHint from "../components/AvailabilityHint";
 import SourceMenu from "../components/SourceMenu";
 import TrackDownloadButton from "../components/TrackDownloadButton";
 import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
+import TrackDownloadStatus from "../components/TrackDownloadStatus";
 import {
   EmptyState,
   ErrorState,
@@ -40,20 +41,25 @@ import {
 function Tracks() {
 
   const {
-    playSong,
+    playContext,
     playSongFromSource,
     currentSong,
     isPlaying,
     togglePlay,
   } = usePlayer();
 
-  function handleTrackPlayback(song) {
+  function handleTrackPlayback(song, index) {
     if (currentSong && String(currentSong.id) === String(song.id)) {
       togglePlay();
       return;
     }
 
-    playSong(song);
+    playContext(songs, index, {
+      type: "collection",
+      id: "library-tracks",
+      name: "Library Tracks",
+      coverArt: null,
+    });
   }
 
 
@@ -387,7 +393,7 @@ useEffect(() => {
               }
               onClick={(event) => {
                 if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song);
+                  handleTrackPlayback(song, index);
                 }
               }}
               key={song.id}
@@ -412,7 +418,7 @@ useEffect(() => {
                   className="track-play"
                   onClick={(event) => {
                     event.stopPropagation();
-                    handleTrackPlayback(song);
+                    handleTrackPlayback(song, index);
                   }}
                   aria-label={
                     `Play ${song.title}`
@@ -429,6 +435,11 @@ useEffect(() => {
               <div className="track-info">
 
                 <div className="track-title">
+                  <TrackDownloadStatus
+                    isDownloaded={song.isDownloaded}
+                    availability={song.availability}
+                    source={song.source}
+                  />
                   {song.title}
                   <AvailabilityHint availability={song.availability} />
                 </div>

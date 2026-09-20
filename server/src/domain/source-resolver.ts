@@ -113,9 +113,16 @@ export class SourceResolver {
    * When `preferredConnectionId` is given and maps to a mapped, enabled
    * source, that source is tried first; other sources still provide fallback
    * if it fails. */
-  fetchStream(libraryItemId: string, range?: string, preferredConnectionId?: string): Promise<StreamResult> {
+  fetchStream(
+    libraryItemId: string,
+    range?: string,
+    preferredConnectionId?: string,
+    maxBitRate?: number
+  ): Promise<StreamResult> {
     return this.resolveWithFallback(libraryItemId, (provider, source) =>
-      provider.fetchStream(source.providerItemId, range)
+      maxBitRate === undefined
+        ? provider.fetchStream(source.providerItemId, range)
+        : provider.fetchStream(source.providerItemId, range, maxBitRate)
     , preferredConnectionId);
   }
 

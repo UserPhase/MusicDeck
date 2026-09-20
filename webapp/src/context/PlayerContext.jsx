@@ -35,6 +35,30 @@ export function PlayerProvider({
   const audioRef =
     useRef(null);
 
+  const primaryAudioRef =
+    useRef(null);
+
+  const secondaryAudioRef =
+    useRef(null);
+
+  const volumeRef =
+    useRef(1);
+
+  const crossfadeDurationRef =
+    useRef(0);
+
+  const crossfadeFrameRef =
+    useRef(null);
+
+  const crossfadeTokenRef =
+    useRef(0);
+
+  const isCrossfadingRef =
+    useRef(false);
+
+  const deckGainRef =
+    useRef(new Map());
+
 
 
   const {
@@ -207,6 +231,80 @@ export function PlayerProvider({
   });
 
 
+  const [
+    crossfadeDuration,
+    setCrossfadeDuration,
+  ] = useState(() => {
+
+    try {
+
+      const saved =
+        localStorage.getItem(
+          "playerCrossfadeDuration"
+        );
+
+      const value =
+        Number(saved);
+
+      if (
+        saved !== null &&
+        Number.isFinite(value)
+      ) {
+
+        return Math.max(
+          0,
+          Math.min(12, value)
+        );
+
+      }
+
+    } catch (error) {
+
+      console.error(
+        "Could not load crossfade duration:",
+        error
+      );
+
+    }
+
+    return 0;
+
+  });
+
+
+  const [
+    streamQuality,
+    setStreamQuality,
+  ] = useState(() => {
+    try {
+      const saved = localStorage.getItem("playerStreamQuality");
+      return ["128", "320", "original"].includes(saved)
+        ? saved
+        : "original";
+    } catch (error) {
+      console.error("Could not load streaming quality:", error);
+      return "original";
+    }
+  });
+
+  const streamQualityRef = useRef(streamQuality);
+
+
+  const [
+    isReplayGainEnabled,
+    setIsReplayGainEnabled,
+  ] = useState(() => {
+    try {
+      return localStorage.getItem("playerReplayGainEnabled") === "true";
+    } catch (error) {
+      console.error("Could not load ReplayGain preference:", error);
+      return false;
+    }
+  });
+
+  const isReplayGainEnabledRef = useRef(isReplayGainEnabled);
+
+
   /*
    * SILENCE TRIMMING
    *
@@ -259,6 +357,35 @@ export function PlayerProvider({
   const previewSourceRef = useRef(null);
 
   useEffect(() => {
+    if (!audioRef.current) {
+      audioRef.current = primaryAudioRef.current;
+    }
+  }, []);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+  }, [volume]);
+
+  useEffect(() => {
+    crossfadeDurationRef.current = crossfadeDuration;
+  }, [crossfadeDuration]);
+
+  useEffect(() => {
+    streamQualityRef.current = streamQuality;
+  }, [streamQuality]);
+
+  useEffect(() => {
+    isReplayGainEnabledRef.current = isReplayGainEnabled;
+  }, [isReplayGainEnabled]);
+
+  useEffect(() => () => {
+    crossfadeTokenRef.current += 1;
+    isCrossfadingRef.current = false;
+
+    cancelFadeFrame(crossfadeFrameRef.current);
+  }, []);
+
+  useEffect(() => {
     if (!isAuthenticated) {
       return;
     }
@@ -291,6 +418,74 @@ export function PlayerProvider({
               ? map["playback.silenceTrim.minSilenceSeconds"]
               : current.minSilenceSeconds,
         }));
+
+        if (
+          typeof map["playback.crossfadeDuration"] === "number"
+        ) {
+          const nextCrossfadeDuration =
+            Math.max(
+              0,
+              Math.min(
+                12,
+                map["playback.crossfadeDuration"]
+              )
+            );
+
+          setCrossfadeDuration(nextCrossfadeDuration);
+          crossfadeDurationRef.current = nextCrossfadeDuration;
+
+          try {
+            localStorage.setItem(
+              "playerCrossfadeDuration",
+              String(nextCrossfadeDuration)
+            );
+          } catch (error) {
+            console.error(
+              "Could not save crossfade duration:",
+              error
+            );
+          }
+        }
+
+        if (
+          ["128", "320", "original"].includes(
+            map["playback.streamQuality"]
+          )
+        ) {
+          const nextStreamQuality =
+            map["playback.streamQuality"];
+
+          setStreamQuality(nextStreamQuality);
+          streamQualityRef.current = nextStreamQuality;
+
+          try {
+            localStorage.setItem(
+              "playerStreamQuality",
+              nextStreamQuality
+            );
+          } catch (error) {
+            console.error("Could not save streaming quality:", error);
+          }
+        }
+
+        if (
+          typeof map["playback.replayGain.enabled"] === "boolean"
+        ) {
+          const nextReplayGainEnabled =
+            map["playback.replayGain.enabled"];
+
+          setIsReplayGainEnabled(nextReplayGainEnabled);
+          isReplayGainEnabledRef.current = nextReplayGainEnabled;
+
+          try {
+            localStorage.setItem(
+              "playerReplayGainEnabled",
+              String(nextReplayGainEnabled)
+            );
+          } catch (error) {
+            console.error("Could not save ReplayGain preference:", error);
+          }
+        }
       })
       .catch(() => {
         // Silence trimming stays disabled when settings cannot be loaded.
@@ -302,12 +497,69 @@ export function PlayerProvider({
   }, [isAuthenticated]);
 
 
+  function requestFadeFrame(callback) {
+    if (typeof window.requestAnimationFrame === "function") {
+      return window.requestAnimationFrame(callback);
+    }
+
+    return window.setTimeout(
+      () => callback(Date.now()),
+      16
+    );
+  }
+
+
+  function cancelFadeFrame(frameId) {
+    if (frameId === null) {
+      return;
+    }
+
+    if (typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(frameId);
+      return;
+    }
+
+    window.clearTimeout(frameId);
+  }
+
+
+  function getInactiveAudio() {
+    return audioRef.current === primaryAudioRef.current
+      ? secondaryAudioRef.current
+      : primaryAudioRef.current;
+  }
+
+
+  function cancelCrossfade() {
+    crossfadeTokenRef.current += 1;
+    isCrossfadingRef.current = false;
+    cancelFadeFrame(crossfadeFrameRef.current);
+    crossfadeFrameRef.current = null;
+
+    const incomingAudio =
+      getInactiveAudio();
+
+    if (incomingAudio) {
+      incomingAudio.pause();
+      incomingAudio.removeAttribute("src");
+      incomingAudio.load();
+      incomingAudio.volume = 0;
+    }
+
+    if (audioRef.current) {
+      applyDeckVolume(audioRef.current);
+    }
+  }
+
+
   /*
    * LOAD LIKED SONGS
    */
 
   function resetPlayer() {
     playbackRequestRef.current += 1;
+
+    cancelCrossfade();
 
     if (audioRef.current) {
       audioRef.current.pause();
@@ -446,10 +698,18 @@ export function PlayerProvider({
 
   useEffect(() => {
 
-    if (audioRef.current) {
+    if (
+      audioRef.current &&
+      !isCrossfadingRef.current
+    ) {
 
-      audioRef.current.volume =
-        volume;
+      audioRef.current.volume = Math.max(
+        0,
+        Math.min(
+          1,
+          volume * (deckGainRef.current.get(audioRef.current) || 1)
+        )
+      );
 
     }
 
@@ -735,6 +995,8 @@ export function PlayerProvider({
 
     }
 
+    cancelCrossfade();
+
 
     const requestId =
       playbackRequestRef.current + 1;
@@ -828,13 +1090,24 @@ export function PlayerProvider({
 
 
     const streamUrl =
-      getStreamUrl(song.id, source);
+      getStreamUrl(
+        song.id,
+        source,
+        streamQualityRef.current
+      );
 
 
     audioRef.current.pause();
 
+    deckGainRef.current.set(
+      audioRef.current,
+      replayGainMultiplierForSong(song)
+    );
+
     audioRef.current.src =
       streamUrl;
+
+    applyDeckVolume(audioRef.current);
 
 
     setCurrentSong(song);
@@ -938,6 +1211,115 @@ export function PlayerProvider({
       ...song,
       ...(typeof source === "object" ? { playableSource: source } : { sourceId: source }),
     });
+  }
+
+
+  function replayGainDbForSong(song) {
+    const replayGain =
+      song?.replayGain ||
+      song?.metadata?.replayGain ||
+      {};
+
+    const rawGain =
+      replayGain.trackGainDb ??
+      replayGain.trackGain ??
+      song?.replayGainTrackGainDb ??
+      song?.replayGainTrackGain ??
+      song?.metadata?.replayGainTrackGainDb ??
+      song?.metadata?.replayGainTrackGain ??
+      null;
+
+    if (typeof rawGain === "number") {
+      return Number.isFinite(rawGain) ? rawGain : null;
+    }
+
+    if (typeof rawGain === "string") {
+      const parsed = Number.parseFloat(rawGain);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    return null;
+  }
+
+
+  function replayGainMultiplierForSong(song) {
+    if (!isReplayGainEnabledRef.current) {
+      return 1;
+    }
+
+    const gainDb = replayGainDbForSong(song);
+
+    if (gainDb === null) {
+      return 1;
+    }
+
+    return Math.max(
+      0,
+      Math.min(
+        4,
+        10 ** (gainDb / 20)
+      )
+    );
+  }
+
+
+  function deckGain(audio) {
+    return deckGainRef.current.get(audio) || 1;
+  }
+
+
+  function applyDeckVolume(audio, intensity = 1) {
+    if (!audio) {
+      return;
+    }
+
+    audio.volume = Math.max(
+      0,
+      Math.min(
+        1,
+        volumeRef.current * deckGain(audio) * intensity
+      )
+    );
+  }
+
+
+  /*
+   * PLAY A TRACK IN ITS LIST CONTEXT
+   *
+   * Row clicks use this path so the selected track starts immediately while
+   * the tracks after it become the upcoming queue. The queue's internal
+   * contract still keeps the current song at index 0, which lets next/previous
+   * and the queue UI share one consistent playback sequence.
+   */
+
+  async function playContext(
+    tracks,
+    startIndex = 0,
+    context = null
+  ) {
+    if (!Array.isArray(tracks) || tracks.length === 0) {
+      return;
+    }
+
+    const safeStartIndex =
+      startIndex >= 0 && startIndex < tracks.length
+        ? startIndex
+        : 0;
+    const activeTrack = tracks[safeStartIndex];
+    let contextQueue = [
+      activeTrack,
+      ...tracks.slice(safeStartIndex + 1),
+    ];
+
+    if (isShuffleEnabled) {
+      contextQueue = shuffleUpcomingSongs(contextQueue, 0);
+    }
+
+    setPlaybackContext(context);
+    setQueue(contextQueue);
+    setQueueIndex(0);
+
+    await loadAndPlaySong(activeTrack);
   }
 
 
@@ -1305,6 +1687,259 @@ export function PlayerProvider({
 
 
   /*
+   * CROSSFADE
+   *
+   * Two audio elements alternate roles. The current deck fades down while
+   * the idle deck starts the next queued track at zero volume. Once the fade
+   * finishes, the incoming deck becomes the active player used by every
+   * existing playback control.
+   */
+
+  async function startCrossfade() {
+    const fadeSeconds =
+      crossfadeDurationRef.current;
+
+    const nextIndex =
+      queueIndex + 1;
+
+    if (
+      fadeSeconds <= 0 ||
+      isCrossfadingRef.current ||
+      isLooping ||
+      queueIndex < 0 ||
+      nextIndex >= queue.length
+    ) {
+      return;
+    }
+
+    const outgoingAudio =
+      audioRef.current;
+
+    const incomingAudio =
+      getInactiveAudio();
+
+    const nextTrack =
+      queue[nextIndex];
+
+    if (
+      !outgoingAudio ||
+      !incomingAudio ||
+      !nextTrack
+    ) {
+      return;
+    }
+
+    isCrossfadingRef.current = true;
+
+    const transitionToken =
+      crossfadeTokenRef.current + 1;
+
+    crossfadeTokenRef.current =
+      transitionToken;
+
+    playbackRequestRef.current += 1;
+
+    let source =
+      nextTrack.playableSource ||
+      nextTrack.sourceId ||
+      null;
+
+    if (
+      !source &&
+      !isLibraryPlayable(nextTrack)
+    ) {
+      try {
+        const resolution =
+          await getPlayableSources(nextTrack);
+
+        source =
+          resolution.selectedSource ||
+          (resolution.sources || []).find(
+            (candidate) =>
+              candidate.availability === "available"
+          ) ||
+          null;
+      } catch (error) {
+        source = null;
+      }
+    }
+
+    if (
+      transitionToken !== crossfadeTokenRef.current
+    ) {
+      return;
+    }
+
+    if (
+      !source &&
+      !isLibraryPlayable(nextTrack)
+    ) {
+      isCrossfadingRef.current = false;
+      return;
+    }
+
+    const incomingPreview =
+      source &&
+      typeof source === "object" &&
+      source.type === "preview"
+        ? source
+        : null;
+
+    incomingAudio.pause();
+    incomingAudio.src =
+      getStreamUrl(
+        nextTrack.id,
+        source,
+        streamQualityRef.current
+      );
+    incomingAudio.currentTime = 0;
+    deckGainRef.current.set(
+      incomingAudio,
+      replayGainMultiplierForSong(nextTrack)
+    );
+    incomingAudio.volume = 0;
+
+    try {
+      await incomingAudio.play();
+    } catch (error) {
+      if (
+        transitionToken === crossfadeTokenRef.current
+      ) {
+        isCrossfadingRef.current = false;
+        incomingAudio.removeAttribute("src");
+        incomingAudio.load();
+
+        if (outgoingAudio.ended) {
+          nextSong();
+        }
+      }
+      return;
+    }
+
+    if (
+      transitionToken !== crossfadeTokenRef.current
+    ) {
+      incomingAudio.pause();
+      return;
+    }
+
+    const fadeStartedAt =
+      typeof performance !== "undefined"
+        ? performance.now()
+        : Date.now();
+
+    const fadeDurationMs =
+      Math.max(100, fadeSeconds * 1000);
+
+    function finishCrossfade() {
+      if (
+        transitionToken !== crossfadeTokenRef.current
+      ) {
+        return;
+      }
+
+      audioRef.current = incomingAudio;
+      applyDeckVolume(incomingAudio);
+
+      outgoingAudio.pause();
+      outgoingAudio.removeAttribute("src");
+      outgoingAudio.load();
+      outgoingAudio.volume = 0;
+
+      isCrossfadingRef.current = false;
+      crossfadeFrameRef.current = null;
+
+      setQueueIndex(nextIndex);
+      setCurrentSong(nextTrack);
+      setCurrentTime(incomingAudio.currentTime || 0);
+      setDuration(
+        Number.isFinite(incomingAudio.duration)
+          ? incomingAudio.duration
+          : 0
+      );
+      setPreviewSource(incomingPreview);
+      previewSourceRef.current = incomingPreview;
+      setPlaybackUnavailable(false);
+      setIsPlaying(true);
+      trimBoundsRef.current = null;
+
+      addToRecentlyPlayed(nextTrack);
+      recordRecentlyPlayed(nextTrack.id).catch((error) => {
+        console.error(
+          "Could not record recently played:",
+          error
+        );
+      });
+
+      if (
+        silenceTrimSettings.enabled &&
+        !incomingPreview
+      ) {
+        getSilenceAnalysis(nextTrack.id)
+          .then((analysis) => {
+            if (
+              audioRef.current !== incomingAudio ||
+              !analysis ||
+              analysis.status !== "completed"
+            ) {
+              return;
+            }
+
+            trimBoundsRef.current = {
+              leading: analysis.leadingSilenceSeconds || 0,
+              trailing: analysis.trailingSilenceSeconds || 0,
+            };
+          })
+          .catch(() => {
+            // Analysis unavailable — play the full incoming track.
+          });
+      }
+
+      refillQueue(queue, nextIndex)
+        .then((updatedQueue) => {
+          if (
+            audioRef.current === incomingAudio
+          ) {
+            setQueue(updatedQueue);
+          }
+        });
+    }
+
+    function animateCrossfade(timestamp) {
+      if (
+        transitionToken !== crossfadeTokenRef.current
+      ) {
+        return;
+      }
+
+      const progress =
+        Math.min(
+          1,
+          Math.max(
+            0,
+            (timestamp - fadeStartedAt) /
+              fadeDurationMs
+          )
+        );
+
+      applyDeckVolume(outgoingAudio, 1 - progress);
+      applyDeckVolume(incomingAudio, progress);
+
+      if (progress >= 1) {
+        finishCrossfade();
+        return;
+      }
+
+      crossfadeFrameRef.current =
+        requestFadeFrame(animateCrossfade);
+    }
+
+    crossfadeFrameRef.current =
+      requestFadeFrame(animateCrossfade);
+  }
+
+
+  /*
    * TOGGLE SHUFFLE
    *
    * Enabling shuffle randomizes the unplayed portion of the queue. Playback
@@ -1364,6 +1999,10 @@ export function PlayerProvider({
 
     if (isPlaying) {
 
+      if (isCrossfadingRef.current) {
+        cancelCrossfade();
+      }
+
       audioRef.current.pause();
 
     } else {
@@ -1381,15 +2020,21 @@ export function PlayerProvider({
    * TIME
    */
 
-  function handleTimeUpdate() {
+  function handleTimeUpdate(event) {
 
-    if (!audioRef.current) {
+    const activeAudio =
+      event.currentTarget;
+
+    if (
+      !activeAudio ||
+      activeAudio !== audioRef.current
+    ) {
       return;
     }
 
 
     setCurrentTime(
-      audioRef.current.currentTime
+      activeAudio.currentTime
     );
 
     /*
@@ -1405,12 +2050,39 @@ export function PlayerProvider({
       preview.quality &&
       Number(preview.quality.durationSeconds);
 
+    const bounds = trimBoundsRef.current;
+
+    const effectiveEnd =
+      previewDuration ||
+      (
+        activeAudio.duration
+          ? activeAudio.duration -
+            (
+              silenceTrimSettings.enabled &&
+              bounds
+                ? bounds.trailing || 0
+                : 0
+            )
+          : 0
+      );
+
+    if (
+      crossfadeDurationRef.current > 0 &&
+      effectiveEnd > 0 &&
+      activeAudio.currentTime >=
+        effectiveEnd - crossfadeDurationRef.current
+    ) {
+      startCrossfade();
+    }
+
     if (
       previewDuration &&
-      audioRef.current.currentTime >= previewDuration
+      activeAudio.currentTime >= previewDuration
     ) {
 
-      audioRef.current.pause();
+      if (!isCrossfadingRef.current) {
+        activeAudio.pause();
+      }
       handleEnded();
       return;
 
@@ -1419,13 +2091,12 @@ export function PlayerProvider({
     // Effective track end: when trailing silence has been detected and
     // trimming is enabled, treat that boundary as "the track finished"
     // instead of waiting for the full (silent) tail to play out.
-    const bounds = trimBoundsRef.current;
     if (
       silenceTrimSettings.enabled &&
       bounds &&
       bounds.trailing > 0 &&
-      audioRef.current.duration &&
-      audioRef.current.currentTime >= audioRef.current.duration - bounds.trailing
+      activeAudio.duration &&
+      activeAudio.currentTime >= activeAudio.duration - bounds.trailing
     ) {
       handleEnded();
     }
@@ -1437,15 +2108,21 @@ export function PlayerProvider({
    * METADATA
    */
 
-  function handleLoadedMetadata() {
+  function handleLoadedMetadata(event) {
 
-    if (!audioRef.current) {
+    const activeAudio =
+      event.currentTarget;
+
+    if (
+      !activeAudio ||
+      activeAudio !== audioRef.current
+    ) {
       return;
     }
 
 
     setDuration(
-      audioRef.current.duration
+      activeAudio.duration
     );
 
     // Start playback at the first-audio position when trim bounds are
@@ -1456,7 +2133,7 @@ export function PlayerProvider({
       bounds &&
       bounds.leading > 0
     ) {
-      audioRef.current.currentTime = bounds.leading;
+      activeAudio.currentTime = bounds.leading;
     }
 
   }
@@ -1499,13 +2176,17 @@ export function PlayerProvider({
       );
 
 
+    volumeRef.current = newVolume;
+
     setVolume(newVolume);
 
 
-    if (audioRef.current) {
+    if (
+      audioRef.current &&
+      !isCrossfadingRef.current
+    ) {
 
-      audioRef.current.volume =
-        newVolume;
+      applyDeckVolume(audioRef.current);
 
     }
 
@@ -1529,11 +2210,80 @@ export function PlayerProvider({
   }
 
 
+  function changeCrossfadeDuration(value) {
+    const nextDuration =
+      Math.max(
+        0,
+        Math.min(
+          12,
+          Number(value) || 0
+        )
+      );
+
+    crossfadeDurationRef.current =
+      nextDuration;
+
+    setCrossfadeDuration(
+      nextDuration
+    );
+
+    try {
+      localStorage.setItem(
+        "playerCrossfadeDuration",
+        String(nextDuration)
+      );
+    } catch (error) {
+      console.error(
+        "Could not save crossfade duration:",
+        error
+      );
+    }
+  }
+
+
+  function changeStreamQuality(value) {
+    const nextQuality =
+      ["128", "320", "original"].includes(value)
+        ? value
+        : "original";
+
+    streamQualityRef.current = nextQuality;
+    setStreamQuality(nextQuality);
+
+    try {
+      localStorage.setItem("playerStreamQuality", nextQuality);
+    } catch (error) {
+      console.error("Could not save streaming quality:", error);
+    }
+  }
+
+
+  function changeReplayGainEnabled(value) {
+    const nextEnabled = Boolean(value);
+
+    isReplayGainEnabledRef.current = nextEnabled;
+    setIsReplayGainEnabled(nextEnabled);
+
+    try {
+      localStorage.setItem(
+        "playerReplayGainEnabled",
+        String(nextEnabled)
+      );
+    } catch (error) {
+      console.error("Could not save ReplayGain preference:", error);
+    }
+  }
+
+
   /*
    * SONG FINISHED
    */
 
   function handleEnded() {
+
+    if (isCrossfadingRef.current) {
+      return;
+    }
 
     nextSong();
 
@@ -1559,6 +2309,10 @@ export function PlayerProvider({
 
         recentlyPlayed,
 
+        // QueueSidebar calls this play history. It is the same existing
+        // recently-played array, exposed under a clearer playback name.
+        playHistory: recentlyPlayed,
+
         likedSongIds,
 
         isCurrentSongLiked,
@@ -1581,9 +2335,17 @@ export function PlayerProvider({
 
         volume,
 
+        crossfadeDuration,
+
+        streamQuality,
+
+        isReplayGainEnabled,
+
         playSong,
 
         playSongFromSource,
+
+        playContext,
 
         playQueue,
 
@@ -1605,6 +2367,12 @@ export function PlayerProvider({
 
         changeVolume,
 
+        changeCrossfadeDuration,
+
+        changeStreamQuality,
+
+        changeReplayGainEnabled,
+
         resetPlayer,
 
       }}
@@ -1614,7 +2382,7 @@ export function PlayerProvider({
 
 
       <audio
-        ref={audioRef}
+        ref={primaryAudioRef}
 
         loop={isLooping}
 
@@ -1626,22 +2394,75 @@ export function PlayerProvider({
           handleLoadedMetadata
         }
 
-        onPlay={() =>
-          setIsPlaying(true)
-        }
-
-        onPause={() =>
-          setIsPlaying(false)
-        }
-
-        onError={() => {
-          setIsPlaying(false);
-          setDuration(0);
+        onPlay={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            setIsPlaying(true);
+          }
         }}
 
-        onEnded={
-          handleEnded
+        onPause={(event) => {
+          if (
+            event.currentTarget === audioRef.current &&
+            !isCrossfadingRef.current
+          ) {
+            setIsPlaying(false);
+          }
+        }}
+
+        onError={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            setIsPlaying(false);
+            setDuration(0);
+          }
+        }}
+
+        onEnded={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            handleEnded();
+          }
+        }}
+      />
+
+      <audio
+        ref={secondaryAudioRef}
+
+        loop={isLooping}
+
+        onTimeUpdate={
+          handleTimeUpdate
         }
+
+        onLoadedMetadata={
+          handleLoadedMetadata
+        }
+
+        onPlay={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            setIsPlaying(true);
+          }
+        }}
+
+        onPause={(event) => {
+          if (
+            event.currentTarget === audioRef.current &&
+            !isCrossfadingRef.current
+          ) {
+            setIsPlaying(false);
+          }
+        }}
+
+        onError={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            setIsPlaying(false);
+            setDuration(0);
+          }
+        }}
+
+        onEnded={(event) => {
+          if (event.currentTarget === audioRef.current) {
+            handleEnded();
+          }
+        }}
       />
 
     </PlayerContext.Provider>

@@ -104,6 +104,37 @@ describe("NavidromeBackend", () => {
     expect(updateUrl).not.toContain("songIdToAdd=track-1");
   });
 
+  test("reads structured lyrics and artist biography from Subsonic metadata endpoints", async () => {
+    const fetchImpl = vi.fn(async (url: URL) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes("getLyricsBySongId.view")) {
+        return jsonResponse({
+          "subsonic-response": {
+            status: "ok",
+            lyricsList: { structuredLyrics: [{ line: [{ value: "First line" }, { value: "Second line" }] }] },
+          },
+        });
+      }
+      if (requestUrl.includes("getSong.view")) {
+        return jsonResponse({
+          "subsonic-response": { status: "ok", song: { id: "track-1", artistId: "artist-1" } },
+        });
+      }
+      return jsonResponse({
+        "subsonic-response": { status: "ok", artistInfo2: { biography: "An artist story." } },
+      });
+    });
+
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test",
+      username: "navidrome-user",
+      password: "navidrome-password",
+    }, fetchImpl as any);
+
+    await expect(backend.getLyrics("track-1")).resolves.toBe("First line\nSecond line");
+    await expect(backend.getArtistBiographyForTrack("track-1")).resolves.toBe("An artist story.");
+  });
+
   test("scanLibrary waits for Navidrome's async scan to finish before resolving", async () => {
     let scanStatusCalls = 0;
     const fetchImpl = vi.fn(async (url: URL) => {
@@ -146,5 +177,19 @@ describe("NavidromeBackend", () => {
     }, fetchImpl as any);
 
     await expect(backend.scanLibrary()).resolves.toEqual({ scanning: false });
+  });
+
+  test("forwards the selected bitrate cap to the Subsonic stream endpoint", async () => {
+    const fetchImpl = vi.fn(async (_url: URL) => new Response("audio", { status: 200 }));
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test",
+      username: "navidrome-user",
+      password: "navidrome-password",
+    }, fetchImpl as any);
+
+    await backend.fetchStream("track-1", undefined, 128);
+
+    expect(String(fetchImpl.mock.calls[0][0])).toContain("stream.view");
+    expect(String(fetchImpl.mock.calls[0][0])).toContain("maxBitRate=128");
   });
 });

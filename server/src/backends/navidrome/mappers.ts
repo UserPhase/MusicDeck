@@ -4,6 +4,25 @@ function id(value: unknown) {
   return value === undefined || value === null ? null : String(value);
 }
 
+function replayGainNumber(value: unknown) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function replayGain(song: any) {
+  const values = song.replayGain || song.replaygain || {};
+  return {
+    trackGainDb: replayGainNumber(values.trackGain ?? values.trackGainDb ?? song.replayGainTrackGain),
+    trackPeak: replayGainNumber(values.trackPeak ?? song.replayGainTrackPeak),
+    albumGainDb: replayGainNumber(values.albumGain ?? values.albumGainDb ?? song.replayGainAlbumGain),
+    albumPeak: replayGainNumber(values.albumPeak ?? song.replayGainAlbumPeak),
+  };
+}
+
 function identityHints(value: any) {
   return {
     musicBrainzId: id(value.musicBrainzId || value.mbId),
@@ -36,6 +55,7 @@ export function mapTrack(song: any): Track {
     artworkId: id(song.coverArt),
     artworkUrl: artworkUrl(id(song.coverArt)),
     streamUrl: streamUrl(trackId),
+    replayGain: replayGain(song),
     identityHints: identityHints(song),
   };
 }

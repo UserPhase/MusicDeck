@@ -59,6 +59,7 @@ export type UnifiedSearchResult = {
     spotifyId?: string;
     deezerTrackId?: number;
     deezerTrackUrl?: string;
+    itunesTrackId?: number;
   };
   /** Internal matching input; removed before the API response. */
   identityHints?: IdentityHints;

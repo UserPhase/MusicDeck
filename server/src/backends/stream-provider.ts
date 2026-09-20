@@ -12,7 +12,7 @@ export type StreamResult = {
  * deferred to a later phase.
  */
 export interface StreamProvider {
-  fetchStream(trackId: string, range?: string): Promise<StreamResult>;
+  fetchStream(trackId: string, range?: string, maxBitRate?: number): Promise<StreamResult>;
   /**
    * Fetch cover art. `size` requests a square thumbnail of that pixel edge
    * length; providers that cannot resize simply return the full image, so

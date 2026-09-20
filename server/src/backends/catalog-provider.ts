@@ -21,6 +21,9 @@ export interface CatalogProvider {
   getArtistTracks(artistId: string): Promise<Track[]>;
   listTracks(): Promise<Track[]>;
   getTrack(trackId: string): Promise<Track | null>;
+  /** Optional provider-native metadata used by the Now Playing context panel. */
+  getLyrics?(trackId: string): Promise<string | null>;
+  getArtistBiographyForTrack?(trackId: string): Promise<string | null>;
   search(query: string, types?: string[]): Promise<SearchResult>;
   getRandomTracks(limit?: number): Promise<Track[]>;
   getRandomAlbums(limit?: number): Promise<Album[]>;

@@ -122,6 +122,28 @@ export class CatalogService {
     return options.length > 1 ? options : undefined;
   }
 
+  /** Detail reads hydrate a single library item rather than fan out through
+   * `aggregate`, so attach the same availability contract explicitly. */
+  private withDetailAvailability<T extends { id: string }>(
+    item: T,
+    connectionId: string
+  ): Available<T> {
+    const sources = this.library.getSources(item.id);
+    const availableSourceCount = sources.filter((source) => {
+      const entry = this.registry.getByConnectionId(source.connectionId);
+      return Boolean(entry?.enabled);
+    }).length;
+
+    return {
+      ...item,
+      availability: availabilityFor(
+        connectionId,
+        Math.max(sources.length, 1),
+        availableSourceCount
+      ),
+    };
+  }
+
   /**
    * Stamp an item with its stable MusicDeck ID, mapping the provider-native
    * ID to the library identity for the connection that returned it. The
@@ -380,7 +402,12 @@ export class CatalogService {
       return [];
     }
     const tracks = await this.primary().getAlbumTracks(source.providerItemId);
-    return tracks.map((track) => this.stamp(track, "track", source.connectionId));
+    return tracks.map((track) =>
+      this.withDetailAvailability(
+        this.stamp(track, "track", source.connectionId),
+        source.connectionId
+      )
+    );
   }
 
   async getArtist(artistId: string): Promise<Artist | null> {
@@ -409,7 +436,12 @@ export class CatalogService {
       return [];
     }
     const tracks = await this.primary().getArtistTracks(source.providerItemId);
-    return tracks.map((track) => this.stamp(track, "track", source.connectionId));
+    return tracks.map((track) =>
+      this.withDetailAvailability(
+        this.stamp(track, "track", source.connectionId),
+        source.connectionId
+      )
+    );
   }
 
   async getTrack(trackId: string): Promise<Track | null> {
@@ -418,7 +450,39 @@ export class CatalogService {
       return null;
     }
     const track = await this.primary().getTrack(source.providerItemId);
-    return track ? this.stamp(track, "track", source.connectionId) : null;
+    return track
+      ? this.withDetailAvailability(
+          this.stamp(track, "track", source.connectionId),
+          source.connectionId
+        )
+      : null;
+  }
+
+  private metadataProviderForTrack(trackId: string): {
+    provider: CatalogProvider;
+    providerTrackId: string;
+  } | null {
+    const source = this.library.getPrimarySource(trackId);
+    if (!source) return null;
+
+    const entry = this.registry.getByConnectionId(source.connectionId);
+    if (!entry?.enabled) return null;
+
+    return { provider: entry.provider, providerTrackId: source.providerItemId };
+  }
+
+  async getTrackLyrics(trackId: string): Promise<string | null> {
+    const resolved = this.metadataProviderForTrack(trackId);
+    if (!resolved || typeof resolved.provider.getLyrics !== "function") return null;
+
+    return resolved.provider.getLyrics(resolved.providerTrackId);
+  }
+
+  async getTrackArtistBiography(trackId: string): Promise<string | null> {
+    const resolved = this.metadataProviderForTrack(trackId);
+    if (!resolved || typeof resolved.provider.getArtistBiographyForTrack !== "function") return null;
+
+    return resolved.provider.getArtistBiographyForTrack(resolved.providerTrackId);
   }
 
   async scanLibrary(): Promise<void> {
