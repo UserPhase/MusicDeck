@@ -36,6 +36,7 @@ export type UnifiedSearchResult = {
   artist: string | null;
   album: string | null;
   artwork: { id: string; url: string } | null;
+  previewUrl?: string | null;
   provider: SearchProviderKind;
   source: {
     kind: "library" | "musicdeck" | "external";

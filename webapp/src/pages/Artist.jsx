@@ -18,6 +18,7 @@ import AvailabilityHint from "../components/AvailabilityHint";
 import SourceMenu from "../components/SourceMenu";
 import SourceIndicator from "../components/SourceIndicator";
 import TrackDownloadButton from "../components/TrackDownloadButton";
+import TrackLikeButton from "../components/TrackLikeButton";
 import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
 
 import {
@@ -791,6 +792,8 @@ function Artist() {
                   sources={song.sources}
                   onSelect={playSongFromSource}
                 />
+
+                <TrackLikeButton song={song} />
 
                 <button
                   className="track-menu"

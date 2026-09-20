@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   analyzeSilence,
@@ -6,6 +6,18 @@ import {
   updateUserSettings,
 } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
+import {
+  clearLocalBrowserCache,
+  formatStorageSize,
+  getBrowserStorageUsage,
+} from "../utils/browserCache";
+import {
+  applySettingsBackup,
+  createSettingsBackup,
+  downloadSettingsBackup,
+  MAX_SETTINGS_BACKUP_BYTES,
+} from "../utils/settingsBackup";
+import { ACCENT_COLORS, DEFAULT_ACCENT_COLOR, normalizeAccentColor } from "../utils/accentColors";
 
 function parseSettingValue(value) {
   try {
@@ -30,6 +42,14 @@ function Settings() {
     changeStreamQuality,
     isReplayGainEnabled: globalReplayGainEnabled = false,
     changeReplayGainEnabled,
+    layoutDensity: globalLayoutDensity = "comfortable",
+    changeLayoutDensity,
+    accentColor: globalAccentColor = DEFAULT_ACCENT_COLOR,
+    changeAccentColor,
+    autoOpenSidebar: globalAutoOpenSidebar = false,
+    changeAutoOpenSidebar,
+    isAutoplayEnabled: globalAutoplayEnabled = true,
+    changeAutoplayEnabled,
   } = player;
   const [silenceTrimEnabled, setSilenceTrimEnabled] = useState(false);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState(-35);
@@ -41,12 +61,23 @@ function Settings() {
   const [isReplayGainEnabled, setIsReplayGainEnabled] = useState(
     globalReplayGainEnabled,
   );
+  const [layoutDensity, setLayoutDensity] = useState(globalLayoutDensity);
+  const [accentColor, setAccentColor] = useState(globalAccentColor);
+  const [autoOpenSidebar, setAutoOpenSidebar] = useState(globalAutoOpenSidebar);
+  const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(globalAutoplayEnabled);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const [message, setMessage] = useState("");
   const [reanalyzing, setReanalyzing] = useState(false);
   const [reanalyzeMessage, setReanalyzeMessage] = useState("");
+  const [storageUsage, setStorageUsage] = useState({
+    supported: false,
+    usage: null,
+    quota: null,
+  });
+  const [isClearingCache, setIsClearingCache] = useState(false);
+  const [cacheMessage, setCacheMessage] = useState("");
   const initialCrossfadePreference = useRef({
     duration: globalCrossfadeDuration,
     change: changeCrossfadeDuration,
@@ -57,6 +88,31 @@ function Settings() {
     replayGainEnabled: globalReplayGainEnabled,
     changeReplayGainEnabled,
   });
+  const initialLayoutPreference = useRef({
+    density: globalLayoutDensity,
+    change: changeLayoutDensity,
+    accentColor: globalAccentColor,
+    changeAccentColor,
+  });
+  const initialQueuePreferences = useRef({
+    autoOpenSidebar: globalAutoOpenSidebar,
+    changeAutoOpenSidebar,
+    autoplayEnabled: globalAutoplayEnabled,
+    changeAutoplayEnabled,
+  });
+
+  const refreshStorageUsage = useCallback(async () => {
+    const estimate = await getBrowserStorageUsage();
+    setStorageUsage(estimate || {
+      supported: false,
+      usage: null,
+      quota: null,
+    });
+  }, []);
+
+  useEffect(() => {
+    refreshStorageUsage();
+  }, [refreshStorageUsage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -126,6 +182,42 @@ function Settings() {
           initialAudioPreferences.current.changeReplayGainEnabled?.(
             nextReplayGainEnabled,
           );
+
+          const nextLayoutDensity = getSetting(
+            settings,
+            "ui.layoutDensity",
+            initialLayoutPreference.current.density,
+          ) === "compact"
+            ? "compact"
+            : "comfortable";
+
+          setLayoutDensity(nextLayoutDensity);
+          initialLayoutPreference.current.change?.(nextLayoutDensity);
+
+          const nextAccentColor = normalizeAccentColor(getSetting(
+            settings,
+            "ui.accentColor",
+            initialLayoutPreference.current.accentColor,
+          ));
+          setAccentColor(nextAccentColor);
+          initialLayoutPreference.current.changeAccentColor?.(nextAccentColor);
+
+          const nextAutoOpenSidebar = Boolean(getSetting(
+            settings,
+            "ui.autoOpenSidebar",
+            initialQueuePreferences.current.autoOpenSidebar,
+          ));
+          setAutoOpenSidebar(nextAutoOpenSidebar);
+          initialQueuePreferences.current.changeAutoOpenSidebar?.(nextAutoOpenSidebar);
+
+          const nextAutoplayEnabled = Boolean(getSetting(
+            settings,
+            "playback.autoplay.enabled",
+            initialQueuePreferences.current.autoplayEnabled,
+          ));
+          setIsAutoplayEnabled(nextAutoplayEnabled);
+          initialQueuePreferences.current.changeAutoplayEnabled?.(nextAutoplayEnabled);
+
         }
       } catch (err) {
         if (!cancelled) setError(err.message || "Could not load settings.");
@@ -154,6 +246,10 @@ function Settings() {
         "playback.crossfadeDuration": Number(crossfadeDuration),
         "playback.streamQuality": streamQuality,
         "playback.replayGain.enabled": isReplayGainEnabled,
+        "ui.layoutDensity": layoutDensity,
+        "ui.accentColor": accentColor,
+        "ui.autoOpenSidebar": autoOpenSidebar,
+        "playback.autoplay.enabled": isAutoplayEnabled,
       });
       setMessage("Settings saved.");
     } catch (err) {
@@ -209,6 +305,79 @@ function Settings() {
     }
   }
 
+  function handleLayoutDensityChange(nextDensity) {
+    setLayoutDensity(nextDensity);
+    changeLayoutDensity?.(nextDensity);
+
+    if (!changeLayoutDensity) {
+      try {
+        localStorage.setItem("playerLayoutDensity", nextDensity);
+      } catch {
+        // Saving to the backend remains available if browser storage is blocked.
+      }
+    }
+  }
+
+  function handleAccentColorChange(nextAccentColor) {
+    const normalizedColor = normalizeAccentColor(nextAccentColor);
+    setAccentColor(normalizedColor);
+    changeAccentColor?.(normalizedColor);
+    if (!changeAccentColor) {
+      localStorage.setItem("playerAccentColor", normalizedColor);
+      document.documentElement.style.setProperty("--color-accent", normalizedColor);
+    }
+  }
+
+  function handleQueuePreferenceChange(value, setValue, changeValue, storageKey) {
+    const nextEnabled = value.target.checked;
+    setValue(nextEnabled);
+    changeValue?.(nextEnabled);
+
+    if (!changeValue) {
+      try {
+        localStorage.setItem(storageKey, String(nextEnabled));
+      } catch {
+        // Saving to the backend remains available if browser storage is blocked.
+      }
+    }
+  }
+
+  async function handleClearCache() {
+    try {
+      setIsClearingCache(true);
+      setCacheMessage("");
+      await clearLocalBrowserCache();
+      await refreshStorageUsage();
+      setCacheMessage("Local cache cleared. Your preferences and session are still intact.");
+    } catch {
+      setCacheMessage("Could not clear the local cache. Please try again.");
+    } finally {
+      setIsClearingCache(false);
+    }
+  }
+
+  function handleExportBackup() {
+    downloadSettingsBackup(createSettingsBackup());
+    setCacheMessage("Preferences exported successfully.");
+  }
+
+  async function handleImportBackup(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      if (file.size > MAX_SETTINGS_BACKUP_BYTES) {
+        throw new Error("That backup file is too large.");
+      }
+      const backup = JSON.parse(await file.text());
+      applySettingsBackup(backup);
+      setCacheMessage("Preferences restored. Applying your settings now...");
+      window.setTimeout(() => window.location.reload(), 250);
+    } catch (err) {
+      setCacheMessage(err.message || "That backup could not be imported.");
+    }
+  }
+
   async function handleReanalyze() {
     if (!currentSong) return;
 
@@ -228,6 +397,10 @@ function Settings() {
       setReanalyzing(false);
     }
   }
+
+  const storagePercent = storageUsage.supported && storageUsage.quota > 0
+    ? Math.min(100, Math.max(0, (storageUsage.usage / storageUsage.quota) * 100))
+    : 0;
 
   if (loading) return <div className="loading">Loading settings...</div>;
 
@@ -365,26 +538,186 @@ function Settings() {
           </article>
         </section>
 
-        <section
-          className="settings-section settings-section-placeholder"
-          aria-labelledby="interface-layout-title"
-        >
+        <section className="settings-section" aria-labelledby="interface-layout-title">
           <div className="settings-section-heading">
             <span>02</span>
             <h2 id="interface-layout-title">Interface &amp; Layout</h2>
           </div>
-          <p>Personal presentation controls will appear here.</p>
+
+          <article className="settings-row settings-layout-density-row">
+            <div className="settings-row-copy">
+              <h3>Layout Density</h3>
+              <p>Choose how much breathing room track lists use throughout the app.</p>
+            </div>
+            <div
+              className="settings-density-control"
+              role="radiogroup"
+              aria-label="Layout Density"
+            >
+              <span
+                className={`settings-density-indicator${layoutDensity === "compact" ? " compact" : ""}`}
+                aria-hidden="true"
+              />
+              <button
+                type="button"
+                role="radio"
+                aria-checked={layoutDensity === "comfortable"}
+                className={layoutDensity === "comfortable" ? "active" : ""}
+                onClick={() => handleLayoutDensityChange("comfortable")}
+              >
+                Comfortable
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={layoutDensity === "compact"}
+                className={layoutDensity === "compact" ? "active" : ""}
+                onClick={() => handleLayoutDensityChange("compact")}
+              >
+                Compact
+              </button>
+            </div>
+          </article>
+
+          <article className="settings-row settings-accent-row">
+            <div className="settings-row-copy">
+              <h3>Accent Color</h3>
+              <p>Choose the highlight used for playback controls and active states.</p>
+            </div>
+            <div className="settings-accent-swatches" role="radiogroup" aria-label="Accent Color">
+              {ACCENT_COLORS.map((accent) => (
+                <button
+                  key={accent.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={accentColor === accent.value}
+                  aria-label={accent.label}
+                  className={accentColor === accent.value ? "active" : ""}
+                  style={{ "--swatch-color": accent.value }}
+                  onClick={() => handleAccentColorChange(accent.value)}
+                >
+                  <span aria-hidden="true" />
+                </button>
+              ))}
+            </div>
+          </article>
         </section>
 
-        <section
-          className="settings-section settings-section-placeholder"
-          aria-labelledby="data-storage-title"
-        >
+        <section className="settings-section" aria-labelledby="queue-behavior-title">
           <div className="settings-section-heading">
             <span>03</span>
+            <h2 id="queue-behavior-title">Queue &amp; Behavior</h2>
+          </div>
+
+          <article className="settings-row">
+            <div className="settings-row-copy">
+              <h3>Auto-Open Now Playing Sidebar</h3>
+              <p>Automatically open the Now Playing sidebar when you start a new song.</p>
+            </div>
+            <label className="settings-switch" aria-label="Auto-Open Now Playing Sidebar">
+              <input
+                type="checkbox"
+                checked={autoOpenSidebar}
+                onChange={(event) => handleQueuePreferenceChange(event, setAutoOpenSidebar, changeAutoOpenSidebar, "playerAutoOpenSidebar")}
+              />
+              <span aria-hidden="true" />
+            </label>
+          </article>
+
+          <article className="settings-row">
+            <div className="settings-row-copy">
+              <h3>Autoplay / Endless Radio</h3>
+              <p>Keep playing similar or random tracks when your queue ends.</p>
+            </div>
+            <label className="settings-switch" aria-label="Autoplay / Endless Radio">
+              <input
+                type="checkbox"
+                checked={isAutoplayEnabled}
+                onChange={(event) => handleQueuePreferenceChange(event, setIsAutoplayEnabled, changeAutoplayEnabled, "playerAutoplayEnabled")}
+              />
+              <span aria-hidden="true" />
+            </label>
+          </article>
+
+        </section>
+
+        <section className="settings-section" aria-labelledby="data-storage-title">
+          <div className="settings-section-heading">
+            <span>04</span>
             <h2 id="data-storage-title">Data &amp; Storage</h2>
           </div>
-          <p>Library and offline-data controls will appear here.</p>
+
+          <div className="settings-storage-card">
+            <div className="settings-storage-card-header">
+              <div>
+                <h3>Local browser storage</h3>
+                <p>Artwork, track metadata, and offline cache stored on this device.</p>
+              </div>
+              <button
+                className="settings-storage-refresh"
+                type="button"
+                onClick={refreshStorageUsage}
+              >
+                Refresh
+              </button>
+            </div>
+
+            {storageUsage.supported ? (
+              <>
+                <div className="settings-storage-amount">
+                  <strong>{formatStorageSize(storageUsage.usage)}</strong>
+                  <span>of {formatStorageSize(storageUsage.quota)} used</span>
+                </div>
+                <div
+                  className="settings-storage-meter"
+                  role="progressbar"
+                  aria-label="Local browser storage usage"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={Math.round(storagePercent)}
+                >
+                  <span
+                    style={{
+                      width: `${storagePercent}%`,
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <p className="settings-storage-unavailable">
+                Storage usage is unavailable in this browser.
+              </p>
+            )}
+          </div>
+
+          <article className="settings-row settings-cache-row">
+            <div className="settings-row-copy">
+              <h3>Clear Local Cache</h3>
+              <p>Deletes cached album art and normalized track metadata. Your preferences and login session will not be deleted.</p>
+            </div>
+            <button
+              className="settings-cache-button"
+              type="button"
+              onClick={handleClearCache}
+              disabled={isClearingCache}
+            >
+              {isClearingCache ? "Clearing..." : "Clear Cache"}
+            </button>
+          </article>
+          <article className="settings-row settings-backup-row">
+            <div className="settings-row-copy">
+              <h3>Backup &amp; Restore Preferences</h3>
+              <p>Move your playback and interface preferences to another device.</p>
+            </div>
+            <div className="settings-backup-actions">
+              <button type="button" className="settings-storage-refresh" onClick={handleExportBackup}>Export Backup</button>
+              <label className="settings-cache-button settings-import-button">
+                Import Backup
+                <input type="file" accept="application/json,.json" onChange={handleImportBackup} />
+              </label>
+            </div>
+          </article>
+          {cacheMessage && <p className="settings-cache-message" role="status">{cacheMessage}</p>}
         </section>
 
         <div className="settings-submit-row">

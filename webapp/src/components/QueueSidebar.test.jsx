@@ -33,6 +33,22 @@ test("switches between the queue and play-history tabs", () => {
   expect(screen.getByRole("tab", { name: "Recently Played" })).toHaveAttribute("aria-selected", "true");
 });
 
+test("shows only tracks after the active queue item", () => {
+  usePlayer.mockReturnValue({
+    playHistory: [],
+    queueIndex: 0,
+    queue: [
+      { id: "current", title: "Playing Now", artist: "Artist" },
+      { id: "next", title: "Actually Next", artist: "Artist" },
+    ],
+  });
+
+  render(<QueueSidebar isOpen onClose={jest.fn()} />);
+
+  expect(screen.queryByText("Playing Now")).not.toBeInTheDocument();
+  expect(screen.getByText("Actually Next")).toBeInTheDocument();
+});
+
 test("closes through its dedicated close control", () => {
   const onClose = jest.fn();
   render(<QueueSidebar isOpen onClose={onClose} />);

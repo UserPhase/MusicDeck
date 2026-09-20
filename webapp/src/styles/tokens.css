@@ -1,11 +1,19 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
-  --black: #000000; --background: #05070c;
-  --surface: #090d14; --card: #0d121b; --card-hover: #141a25;
-  --text: #f5f7fa; --text-secondary: #969eac; --text-muted: #606977;
-  --border: #181e29; --border-hover: #252d3a;
-  --accent: #6d8cff; --accent-hover: #82a0ff;
-  --nav-background: #0d121b; --nav-hover: #121925; --nav-active: #182131;
+  --bg-app: #09090b;
+  /* Keep the chrome neutral: violet belongs to the atmosphere and active states. */
+  --bg-panel: rgba(18, 18, 20, 0.85);
+  --bg-chrome: rgba(9, 9, 11, 0.94);
+  --bg-card: rgba(24, 24, 27, 0.6);
+  --border-glass: rgba(255, 255, 255, 0.1);
+  --black: var(--bg-app); --background: var(--bg-app);
+  --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: #211f27;
+  --text: #f5f7fa; --text-secondary: rgb(255 255 255 / 60%); --text-muted: #a1a1aa;
+  --border: var(--border-glass); --border-hover: rgba(255, 255, 255, 0.16);
+  --layout-divider: var(--border-glass);
+  --color-accent: #A855F7; --accent: var(--color-accent); --accent-hover: color-mix(in srgb, var(--color-accent) 82%, white);
+  --ambient-glow: #C12C91;
+  --nav-background: #101014; --nav-hover: #1a181f; --nav-active: #29252e;
   --sidebar-width: 280px; --right-sidebar-width: 300px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
 
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
@@ -16,4 +24,17 @@
   --content-max: 1100px; --content-wide: 1200px;
   --focus-ring: 2px solid var(--accent);
   --transition-fast: 0.15s ease; --transition-base: 0.2s ease;
+}
+
+:root[data-theme="light"] {
+  --bg-app: #f4f7fb;
+  --bg-panel: rgba(255, 255, 255, 0.88);
+  --bg-chrome: rgba(255, 255, 255, 0.94);
+  --bg-card: rgba(249, 251, 254, 0.82);
+  --border-glass: rgba(18, 24, 39, 0.12);
+  --black: var(--bg-app); --background: #edf2f8;
+  --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: #e8eef7;
+  --text: #121827; --text-secondary: #536073; --text-muted: #768196;
+  --border: var(--border-glass); --border-hover: #cbd6e5;
+  --nav-background: #f8faff; --nav-hover: #eef3fa; --nav-active: #e2eaff;
 }

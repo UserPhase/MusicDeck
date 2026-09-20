@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { SearchProviderRegistry } from "../src/domain/search-provider-registry.js";
+import { SearchProviderRegistry, searchIdentity } from "../src/domain/search-provider-registry.js";
 import { closeTestServer, createTestServer } from "./helpers.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;
@@ -23,6 +23,21 @@ afterEach(async () => {
     await closeTestServer(current.app, current.db);
     current = null;
   }
+});
+
+describe("searchIdentity", () => {
+  test("keeps Unicode letters and numbers while removing diacritics", () => {
+    expect(searchIdentity("Beyoncé")).toBe("beyonce");
+    expect(searchIdentity("鬼滅の刃")).toBe("鬼滅の刃");
+    expect(searchIdentity("周杰倫")).toBe("周杰倫");
+    expect(searchIdentity("Кино 2000")).toBe("кино 2000");
+    expect(searchIdentity("أُغنية")).toBe("اغنية");
+  });
+
+  test("uses a non-empty fallback when no letters or numbers are available", () => {
+    expect(searchIdentity(null)).toBe("unknown");
+    expect(searchIdentity("---")).toBe("---");
+  });
 });
 
 const TOKEN_RESPONSE = () => new Response(
@@ -420,8 +435,8 @@ describe("SearchProviderRegistry", () => {
         expect(url.searchParams.get("limit")).toBe("15");
         return new Response(JSON.stringify({
           results: [
-            { trackId: 21, trackName: "Digital Love", artistName: "Daft Punk", collectionName: "Discovery" },
-            { trackId: 22, trackName: "iTunes Only", artistName: "Artist B", collectionName: "Album B", trackTimeMillis: 185000 },
+            { trackId: 21, trackName: "Digital Love", artistName: "Daft Punk", collectionName: "Discovery", previewUrl: "https://audio-ssl.itunes.apple.com/digital-love.m4a" },
+            { trackId: 22, trackName: "iTunes Only", artistName: "Artist B", collectionName: "Album B", trackTimeMillis: 185000, previewUrl: "https://audio-ssl.itunes.apple.com/itunes-only.m4a" },
           ],
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
@@ -434,7 +449,11 @@ describe("SearchProviderRegistry", () => {
 
     expect(result.groups.track).toHaveLength(3);
     expect(result.groups.track).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "external_deezer_track_11", title: "Digital Love" }),
+      expect.objectContaining({
+        id: "external_deezer_track_11",
+        title: "Digital Love",
+        previewUrl: "https://audio-ssl.itunes.apple.com/digital-love.m4a",
+      }),
       expect.objectContaining({ id: "external_deezer_track_12", title: "Deezer Only" }),
       expect.objectContaining({
         id: "external_itunes_22",
@@ -442,6 +461,7 @@ describe("SearchProviderRegistry", () => {
         artist: "Artist B",
         album: "Album B",
         metadata: expect.objectContaining({ durationSeconds: 185, itunesTrackId: 22 }),
+        previewUrl: "https://audio-ssl.itunes.apple.com/itunes-only.m4a",
       }),
     ]));
     expect(result.groups.track).not.toEqual(expect.arrayContaining([

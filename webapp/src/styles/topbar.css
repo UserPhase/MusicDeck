@@ -1,4 +1,4 @@
-.topbar { position: fixed; top: 0; left: 0; right: 0; height: 72px; padding: 0 24px; background: var(--black); display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; z-index: 30; }
+.topbar { position: fixed; top: 0; left: 0; right: 0; height: 72px; padding: 0 24px; background: var(--bg-chrome); border-bottom: 1px solid var(--layout-divider); display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; z-index: 30; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
 .logo { justify-self: start; font-size: 24px; font-weight: 800; letter-spacing: -1px; text-decoration: none;}
 .topbar-center { display: flex; align-items: center; gap: 12px; }
 .homebutton { width: 44px; height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: center; background: #080b12; border-radius: 50%; color: #d9dce3; text-decoration: none; transition: background 0.15s ease, border-color 0.15s ease; }
@@ -7,7 +7,7 @@
 .downloads-menu-toggle { position: relative; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: 50%; color: #d9dce3; cursor: pointer; transition: background 0.15s ease; }
 .downloads-menu-toggle:hover { background: var(--card-hover); }
 .downloads-menu-toggle:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
-.downloads-menu-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 3px; display: flex; align-items: center; justify-content: center; background: var(--accent); color: #08090c; font-size: 10px; font-weight: 800; line-height: 1; border-radius: 8px; }
+.downloads-menu-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 3px; display: flex; align-items: center; justify-content: center; border: 1px solid rgb(168 85 247 / 20%); background: rgb(168 85 247 / 10%); color: #c084fc; font-size: 10px; font-weight: 800; line-height: 1; border-radius: 8px; }
 .downloads-menu-popover { min-width: 280px; max-width: 340px; max-height: 400px; overflow-y: auto; }
 .downloads-menu-list { display: flex; flex-direction: column; gap: 4px; }
 .downloads-menu-empty { padding: 16px 10px; color: var(--text-muted); font-size: 13px; text-align: center; }

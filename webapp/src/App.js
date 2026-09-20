@@ -7,7 +7,10 @@ import {
 } from "react-router-dom";
 
 import {
+  useEffect,
+  useRef,
   useState,
+  useCallback,
 } from "react";
 
 import Topbar from "./components/Topbar";
@@ -15,6 +18,8 @@ import AdminTopBar from "./components/admin/AdminTopBar";
 import Sidebar from "./components/Sidebar";
 import QueueSidebar from "./components/QueueSidebar";
 import NowPlayingSidebar from "./components/NowPlayingSidebar";
+import CommandPalette from "./components/CommandPalette";
+import AmbientBackground from "./components/AmbientBackground";
 import Player from "./components/Player";
 import AdminSidebar from "./components/admin/AdminSidebar";
 import RequireAdmin from "./components/admin/RequireAdmin";
@@ -63,6 +68,7 @@ import AdminServer from "./pages/admin/AdminServer";
 
 import {
   PlayerProvider,
+  usePlayer,
 } from "./context/PlayerContext";
 
 import {
@@ -70,6 +76,7 @@ import {
   useAuth,
 } from "./context/AuthContext";
 
+import useGlobalHotkeys from "./hooks/useGlobalHotkeys";
 
 function AdminLayout() {
   return (
@@ -85,11 +92,88 @@ function AdminLayout() {
 
 function AuthenticatedApp() {
   const location = useLocation();
-  const [activeSidebar, setActiveSidebar] = useState("none");
+  const {
+    currentSong,
+    activeSidebar,
+    setActiveSidebar,
+    autoOpenSidebar,
+    togglePlay,
+    nextSong,
+    previousSong,
+    toggleLike,
+    volume,
+    changeVolume,
+  } = usePlayer();
+  const previousTrackIdRef = useRef(null);
+  const lastAudibleVolumeRef = useRef(0.7);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem("musicdeckTheme") === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
   const isSidebarOpen = activeSidebar !== "none";
+
+  const toggleTheme = useCallback(() => {
+    setTheme((currentTheme) => currentTheme === "dark" ? "light" : "dark");
+  }, []);
+
+  const toggleMute = useCallback(() => {
+    if (volume > 0) {
+      lastAudibleVolumeRef.current = volume;
+      changeVolume(0);
+      return;
+    }
+    changeVolume(lastAudibleVolumeRef.current || 0.7);
+  }, [changeVolume, volume]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("musicdeckTheme", theme);
+    } catch {
+      // Theme persistence is optional when storage is unavailable.
+    }
+  }, [theme]);
+
+  useGlobalHotkeys({
+    enabled: !isCommandPaletteOpen,
+    onTogglePlay: togglePlay,
+    onToggleMute: toggleMute,
+    onNext: nextSong,
+    onPrevious: previousSong,
+    onToggleLike: toggleLike,
+    onOpenPalette: () => setIsCommandPaletteOpen(true),
+  });
+
+  useEffect(() => {
+    const nextTrackId = currentSong?.id == null
+      ? null
+      : String(currentSong.id);
+    const previousTrackId = previousTrackIdRef.current;
+    const isNewTrack = Boolean(nextTrackId) && nextTrackId !== previousTrackId;
+
+    if (
+      isNewTrack &&
+      autoOpenSidebar &&
+      activeSidebar !== "now-playing"
+    ) {
+      setActiveSidebar("now-playing");
+    }
+
+    previousTrackIdRef.current = nextTrackId;
+  }, [
+    currentSong?.id,
+    autoOpenSidebar,
+    activeSidebar,
+    setActiveSidebar,
+  ]);
 
   return (
     <>
+      {!location.pathname.startsWith("/admin") && <AmbientBackground />}
       {location.pathname.startsWith("/admin") ? <AdminTopBar /> : <Topbar />}
       <CustomCssStyle />
       <CustomCssResetButton />
@@ -174,6 +258,11 @@ function AuthenticatedApp() {
       <Player
         isQueueSidebarOpen={activeSidebar === "queue"}
         onToggleQueueSidebar={() => setActiveSidebar((current) => current === "queue" ? "none" : "queue")}
+      />
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        onToggleTheme={toggleTheme}
       />
     </>
   );

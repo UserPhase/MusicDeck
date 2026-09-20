@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   useEffect,
+  useCallback,
 } from "react";
 
 import {
@@ -22,10 +23,28 @@ import {
 import {
   useAuth,
 } from "./AuthContext";
+import {
+  DEFAULT_ACCENT_COLOR,
+  normalizeAccentColor,
+} from "../utils/accentColors";
+import { findItunesPreview, trustedPreviewUrl } from "../utils/previewPlayback";
 
 
 const PlayerContext =
   createContext(null);
+
+const VALID_SIDEBARS = new Set(["none", "now-playing", "queue"]);
+const MAX_RECENTLY_PLAYED = 50;
+
+function normalizeSidebar(value) {
+  return VALID_SIDEBARS.has(value) ? value : "none";
+}
+
+function normalizeRecentlyPlayed(value) {
+  return Array.isArray(value)
+    ? value.slice(0, MAX_RECENTLY_PLAYED)
+    : [];
+}
 
 
 export function PlayerProvider({
@@ -56,6 +75,9 @@ export function PlayerProvider({
   const isCrossfadingRef =
     useRef(false);
 
+  const isTransitioningRef =
+    useRef(false);
+
   const deckGainRef =
     useRef(new Map());
 
@@ -75,6 +97,60 @@ export function PlayerProvider({
     currentSong,
     setCurrentSong,
   ] = useState(null);
+
+
+  const [
+    activeSidebar,
+    setActiveSidebarState,
+  ] = useState("none");
+
+  const setActiveSidebar = useCallback((nextSidebar) => {
+    setActiveSidebarState((currentSidebar) => normalizeSidebar(
+      typeof nextSidebar === "function"
+        ? nextSidebar(currentSidebar)
+        : nextSidebar
+    ));
+  }, []);
+
+
+  const [
+    autoOpenSidebar,
+    setAutoOpenSidebar,
+  ] = useState(() => {
+    try {
+      return localStorage.getItem("playerAutoOpenSidebar") === "true";
+    } catch (error) {
+      console.error("Could not load auto-open sidebar preference:", error);
+      return false;
+    }
+  });
+
+
+  const [
+    isAutoplayEnabled,
+    setIsAutoplayEnabled,
+  ] = useState(() => {
+    try {
+      const saved = localStorage.getItem("playerAutoplayEnabled");
+      return saved === null ? true : saved === "true";
+    } catch (error) {
+      console.error("Could not load autoplay preference:", error);
+      return true;
+    }
+  });
+
+
+  const [
+    autoDownloadLiked,
+    setAutoDownloadLiked,
+  ] = useState(() => {
+    try {
+      return localStorage.getItem("playerAutoDownloadLiked") === "true";
+    } catch (error) {
+      console.error("Could not load auto-download preference:", error);
+      return false;
+    }
+  });
 
 
   const [
@@ -148,7 +224,7 @@ export function PlayerProvider({
         return [];
       }
 
-      return JSON.parse(saved);
+      return normalizeRecentlyPlayed(JSON.parse(saved));
 
     } catch (error) {
 
@@ -273,6 +349,34 @@ export function PlayerProvider({
 
 
   const [
+    layoutDensity,
+    setLayoutDensity,
+  ] = useState(() => {
+    try {
+      return localStorage.getItem("playerLayoutDensity") === "compact"
+        ? "compact"
+        : "comfortable";
+    } catch (error) {
+      console.error("Could not load layout density:", error);
+      return "comfortable";
+    }
+  });
+
+  const [accentColor, setAccentColor] = useState(() => {
+    try {
+      return normalizeAccentColor(localStorage.getItem("playerAccentColor"));
+    } catch (error) {
+      console.error("Could not load accent color:", error);
+      return DEFAULT_ACCENT_COLOR;
+    }
+  });
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--color-accent", accentColor);
+  }, [accentColor]);
+
+
+  const [
     streamQuality,
     setStreamQuality,
   ] = useState(() => {
@@ -353,8 +457,16 @@ export function PlayerProvider({
     setPlaybackUnavailable,
   ] = useState(false);
 
+  const [playbackMessage, setPlaybackMessage] = useState("");
+
   /* Mirrors previewSource for the timeupdate handler's end-of-preview check. */
   const previewSourceRef = useRef(null);
+
+  useEffect(() => {
+    if (!playbackMessage) return undefined;
+    const timeout = window.setTimeout(() => setPlaybackMessage(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [playbackMessage]);
 
   useEffect(() => {
     if (!audioRef.current) {
@@ -377,6 +489,14 @@ export function PlayerProvider({
   useEffect(() => {
     isReplayGainEnabledRef.current = isReplayGainEnabled;
   }, [isReplayGainEnabled]);
+
+  useEffect(() => {
+    document.documentElement.dataset.layoutDensity = layoutDensity;
+
+    return () => {
+      delete document.documentElement.dataset.layoutDensity;
+    };
+  }, [layoutDensity]);
 
   useEffect(() => () => {
     crossfadeTokenRef.current += 1;
@@ -486,6 +606,56 @@ export function PlayerProvider({
             console.error("Could not save ReplayGain preference:", error);
           }
         }
+
+        if (
+          map["ui.layoutDensity"] === "comfortable" ||
+          map["ui.layoutDensity"] === "compact"
+        ) {
+          const nextLayoutDensity = map["ui.layoutDensity"];
+          setLayoutDensity(nextLayoutDensity);
+
+          try {
+            localStorage.setItem("playerLayoutDensity", nextLayoutDensity);
+          } catch (error) {
+            console.error("Could not save layout density:", error);
+          }
+        }
+
+        if (typeof map["ui.autoOpenSidebar"] === "boolean") {
+          const nextAutoOpenSidebar = map["ui.autoOpenSidebar"];
+          setAutoOpenSidebar(nextAutoOpenSidebar);
+
+          try {
+            localStorage.setItem(
+              "playerAutoOpenSidebar",
+              String(nextAutoOpenSidebar)
+            );
+          } catch (error) {
+            console.error("Could not save auto-open sidebar preference:", error);
+          }
+        }
+
+        if (typeof map["playback.autoplay.enabled"] === "boolean") {
+          const nextAutoplayEnabled = map["playback.autoplay.enabled"];
+          setIsAutoplayEnabled(nextAutoplayEnabled);
+
+          try {
+            localStorage.setItem("playerAutoplayEnabled", String(nextAutoplayEnabled));
+          } catch (error) {
+            console.error("Could not save autoplay preference:", error);
+          }
+        }
+
+        if (typeof map["acquisition.autoDownloadLiked"] === "boolean") {
+          const nextAutoDownloadLiked = map["acquisition.autoDownloadLiked"];
+          setAutoDownloadLiked(nextAutoDownloadLiked);
+
+          try {
+            localStorage.setItem("playerAutoDownloadLiked", String(nextAutoDownloadLiked));
+          } catch (error) {
+            console.error("Could not save auto-download preference:", error);
+          }
+        }
       })
       .catch(() => {
         // Silence trimming stays disabled when settings cannot be loaded.
@@ -558,6 +728,7 @@ export function PlayerProvider({
 
   function resetPlayer() {
     playbackRequestRef.current += 1;
+    isTransitioningRef.current = false;
 
     cancelCrossfade();
 
@@ -568,6 +739,7 @@ export function PlayerProvider({
     }
 
     setCurrentSong(null);
+    setActiveSidebar("none");
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
@@ -640,7 +812,7 @@ export function PlayerProvider({
           await getRecentlyPlayed();
 
         if (!cancelled) {
-          setRecentlyPlayed(songs || []);
+          setRecentlyPlayed(normalizeRecentlyPlayed(songs));
         }
 
       } catch (error) {
@@ -731,7 +903,7 @@ export function PlayerProvider({
       (current) => {
 
         const withoutSong =
-          current.filter(
+          normalizeRecentlyPlayed(current).filter(
             (recentSong) =>
               String(recentSong.id) !==
               String(song.id)
@@ -741,7 +913,7 @@ export function PlayerProvider({
         const updated = [
           song,
           ...withoutSong,
-        ].slice(0, 10);
+        ].slice(0, MAX_RECENTLY_PLAYED);
 
 
         try {
@@ -773,15 +945,15 @@ export function PlayerProvider({
    * LIKE / UNLIKE
    */
 
-  async function toggleLike() {
+  async function toggleLikeSong(song) {
 
-    if (!currentSong) {
+    if (!song?.id) {
       return;
     }
 
 
     const songId =
-      String(currentSong.id);
+      String(song.id);
 
 
     const currentlyLiked =
@@ -793,7 +965,7 @@ export function PlayerProvider({
       if (currentlyLiked) {
 
         await unstarSong(
-          currentSong.id
+          song.id
         );
 
 
@@ -811,12 +983,14 @@ export function PlayerProvider({
         );
 
 
-        setIsCurrentSongLiked(false);
+        if (String(currentSong?.id) === songId) {
+          setIsCurrentSongLiked(false);
+        }
 
       } else {
 
         await starSong(
-          currentSong.id
+          song.id
         );
 
 
@@ -834,7 +1008,9 @@ export function PlayerProvider({
         );
 
 
-        setIsCurrentSongLiked(true);
+        if (String(currentSong?.id) === songId) {
+          setIsCurrentSongLiked(true);
+        }
 
       }
 
@@ -861,6 +1037,10 @@ export function PlayerProvider({
     currentQueue,
     currentIndex
   ) {
+
+    if (!isAutoplayEnabled) {
+      return currentQueue;
+    }
 
     const upcomingCount =
       Math.max(
@@ -1004,6 +1184,8 @@ export function PlayerProvider({
     playbackRequestRef.current =
       requestId;
 
+    setPlaybackMessage("");
+
 
     /*
      * Prefer the full local track. When the track is not in the library,
@@ -1017,20 +1199,52 @@ export function PlayerProvider({
       song.sourceId ||
       null;
 
+    let directPreviewUrl = null;
+
 
     if (
       !source &&
       !isLibraryPlayable(song)
     ) {
 
+      directPreviewUrl = trustedPreviewUrl(song.previewUrl);
+
+      if (!directPreviewUrl) {
+        directPreviewUrl = await findItunesPreview(song);
+
+        if (requestId !== playbackRequestRef.current) return;
+
+        if (directPreviewUrl) {
+          song = { ...song, previewUrl: directPreviewUrl };
+          setQueue((currentQueue) => currentQueue.map((queuedSong) =>
+            queuedSong?.id === song.id
+              ? { ...queuedSong, previewUrl: directPreviewUrl }
+              : queuedSong
+          ));
+        }
+      }
+
+      if (directPreviewUrl) {
+        source = {
+          id: `direct-preview:${song.id}`,
+          provider: "external",
+          type: "preview",
+          mediaType: "audio",
+          label: "30-second preview",
+          availability: "available",
+          quality: { durationSeconds: 30, lossless: false },
+        };
+      }
+
       try {
 
-        const resolution =
-          await getPlayableSources(song);
+        const resolution = directPreviewUrl
+          ? null
+          : await getPlayableSources(song);
 
-        source =
-          resolution.selectedSource ||
-          (resolution.sources || []).find(
+        source = source ||
+          resolution?.selectedSource ||
+          (resolution?.sources || []).find(
             (candidate) =>
               candidate.availability ===
               "available"
@@ -1069,6 +1283,7 @@ export function PlayerProvider({
         setPreviewSource(null);
         previewSourceRef.current = null;
         setPlaybackUnavailable(true);
+        setPlaybackMessage("No audio preview available for this track.");
 
         return;
 
@@ -1089,7 +1304,7 @@ export function PlayerProvider({
     setPlaybackUnavailable(false);
 
 
-    const streamUrl =
+    const streamUrl = directPreviewUrl ||
       getStreamUrl(
         song.id,
         source,
@@ -1187,6 +1402,17 @@ export function PlayerProvider({
       return;
     }
 
+    if (
+      song.id !== null &&
+      song.id !== undefined &&
+      currentSong?.id !== null &&
+      currentSong?.id !== undefined &&
+      String(song.id) === String(currentSong.id)
+    ) {
+      togglePlay();
+      return;
+    }
+
     setPlaybackContext(null);
     setQueue([song]);
     setQueueIndex(0);
@@ -1211,6 +1437,10 @@ export function PlayerProvider({
       ...song,
       ...(typeof source === "object" ? { playableSource: source } : { sourceId: source }),
     });
+  }
+
+  function toggleLike() {
+    return toggleLikeSong(currentSong);
   }
 
 
@@ -1478,149 +1708,86 @@ export function PlayerProvider({
 
   async function nextSong() {
 
-    /*
-     * No queue:
-     * create a fresh random queue.
-     */
-
-    if (
-      queue.length === 0 ||
-      queueIndex < 0
-    ) {
-
-      try {
-
-        const randomSongs =
-          await getRandomSongs(10);
-
-
-        if (
-          !randomSongs ||
-          randomSongs.length === 0
-        ) {
-
-          setIsPlaying(false);
-
-          return;
-
-        }
-
-
-        setQueue(randomSongs);
-
-        setQueueIndex(0);
-
-
-        await loadAndPlaySong(
-          randomSongs[0]
-        );
-
-      } catch (error) {
-
-        console.error(
-          "Could not create queue:",
-          error
-        );
-
-        setIsPlaying(false);
-
-      }
-
+    if (isTransitioningRef.current) {
       return;
-
     }
 
+    isTransitioningRef.current = true;
 
-    const nextIndex =
-      queueIndex + 1;
+    try {
+      const nextIndex = queueIndex + 1;
 
+      if (
+        queueIndex >= 0 &&
+        nextIndex < queue.length
+      ) {
+        setQueueIndex(nextIndex);
+        await loadAndPlaySong(queue[nextIndex]);
 
-    /*
-     * Existing next song.
-     */
-
-    if (
-      nextIndex < queue.length
-    ) {
-
-      setQueueIndex(
-        nextIndex
-      );
-
-
-      await loadAndPlaySong(
-        queue[nextIndex]
-      );
-
-
-      /*
-       * Refill after advancing.
-       */
-
-      const updatedQueue =
-        await refillQueue(
+        const updatedQueue = await refillQueue(
           queue,
           nextIndex
         );
 
-
-      setQueue(
-        updatedQueue
-      );
-
-
-      return;
-
-    }
-
-
-    /*
-     * End of queue.
-     *
-     * Generate 10 completely
-     * new random songs.
-     */
-
-    try {
-
-      const randomSongs =
-        await getRandomSongs(10);
-
-
-      if (
-        !randomSongs ||
-        randomSongs.length === 0
-      ) {
-
-        setIsPlaying(false);
-
+        setQueue(updatedQueue);
         return;
-
       }
 
+      if (!isAutoplayEnabled) {
+        stopPlaybackAtQueueEnd();
+        return;
+      }
 
-      setQueue(
-        randomSongs
-      );
+      try {
+        const randomSongs = await getRandomSongs(10);
 
-      setQueueIndex(0);
+        if (!randomSongs || randomSongs.length === 0) {
+          stopPlaybackAtQueueEnd();
+          return;
+        }
 
-
-      await loadAndPlaySong(
-        randomSongs[0]
-      );
-
-    } catch (error) {
-
-      console.error(
-        "Could not generate new songs:",
-        error
-      );
-
-      setIsPlaying(false);
-
+        setQueue(randomSongs);
+        setQueueIndex(0);
+        await loadAndPlaySong(randomSongs[0]);
+      } catch (error) {
+        console.error(
+          "Could not generate new songs:",
+          error
+        );
+        stopPlaybackAtQueueEnd();
+      }
+    } finally {
+      isTransitioningRef.current = false;
     }
 
+  }
+
+
+  function stopPlaybackAtQueueEnd() {
+    playbackRequestRef.current += 1;
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+
+      try {
+        audioRef.current.currentTime = 0;
+      } catch {
+        // Some media implementations expose currentTime as read-only while
+        // their source is being detached. State still resets below.
+      }
+    }
+
+    setCurrentSong(null);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setQueue([]);
+    setQueueIndex(-1);
+    setPlaybackContext(null);
+    setPlaybackUnavailable(false);
+    setPreviewSource(null);
+    previewSourceRef.current = null;
+    trimBoundsRef.current = null;
   }
 
 
@@ -2275,17 +2442,108 @@ export function PlayerProvider({
   }
 
 
+  function changeLayoutDensity(value) {
+    const nextDensity =
+      value === "compact"
+        ? "compact"
+        : "comfortable";
+
+    setLayoutDensity(nextDensity);
+
+    try {
+      localStorage.setItem("playerLayoutDensity", nextDensity);
+    } catch (error) {
+      console.error("Could not save layout density:", error);
+    }
+  }
+
+  function changeAccentColor(value) {
+    const nextAccentColor = normalizeAccentColor(value);
+    setAccentColor(nextAccentColor);
+    try {
+      localStorage.setItem("playerAccentColor", nextAccentColor);
+    } catch (error) {
+      console.error("Could not save accent color:", error);
+    }
+  }
+
+
+  function changeAutoOpenSidebar(value) {
+    const nextEnabled = Boolean(value);
+    setAutoOpenSidebar(nextEnabled);
+
+    try {
+      localStorage.setItem(
+        "playerAutoOpenSidebar",
+        String(nextEnabled)
+      );
+    } catch (error) {
+      console.error("Could not save auto-open sidebar preference:", error);
+    }
+  }
+
+
+  function changeAutoplayEnabled(value) {
+    const nextEnabled = Boolean(value);
+    setIsAutoplayEnabled(nextEnabled);
+
+    try {
+      localStorage.setItem("playerAutoplayEnabled", String(nextEnabled));
+    } catch (error) {
+      console.error("Could not save autoplay preference:", error);
+    }
+  }
+
+
+  function changeAutoDownloadLiked(value) {
+    const nextEnabled = Boolean(value);
+    setAutoDownloadLiked(nextEnabled);
+
+    try {
+      localStorage.setItem("playerAutoDownloadLiked", String(nextEnabled));
+    } catch (error) {
+      console.error("Could not save auto-download preference:", error);
+    }
+  }
+
+
   /*
    * SONG FINISHED
    */
 
-  function handleEnded() {
+  async function handleEnded() {
 
-    if (isCrossfadingRef.current) {
+    if (
+      isCrossfadingRef.current ||
+      isTransitioningRef.current
+    ) {
       return;
     }
 
-    nextSong();
+    if (isLooping) {
+      const activeAudio = audioRef.current;
+
+      if (!activeAudio) {
+        return;
+      }
+
+      isTransitioningRef.current = true;
+
+      try {
+        activeAudio.currentTime = 0;
+        setCurrentTime(0);
+        await activeAudio.play();
+        setIsPlaying(true);
+      } catch (error) {
+        setIsPlaying(false);
+      } finally {
+        isTransitioningRef.current = false;
+      }
+
+      return;
+    }
+
+    await nextSong();
 
   }
 
@@ -2296,6 +2554,16 @@ export function PlayerProvider({
       value={{
 
         currentSong,
+
+        activeSidebar,
+
+        setActiveSidebar,
+
+        autoOpenSidebar,
+
+        isAutoplayEnabled,
+
+        autoDownloadLiked,
 
         isPlaying,
 
@@ -2333,6 +2601,8 @@ export function PlayerProvider({
 
         playbackUnavailable,
 
+        playbackMessage,
+
         volume,
 
         crossfadeDuration,
@@ -2340,6 +2610,10 @@ export function PlayerProvider({
         streamQuality,
 
         isReplayGainEnabled,
+
+        layoutDensity,
+
+        accentColor,
 
         playSong,
 
@@ -2363,6 +2637,8 @@ export function PlayerProvider({
 
         toggleLike,
 
+        toggleLikeSong,
+
         seek,
 
         changeVolume,
@@ -2372,6 +2648,16 @@ export function PlayerProvider({
         changeStreamQuality,
 
         changeReplayGainEnabled,
+
+        changeLayoutDensity,
+
+        changeAccentColor,
+
+        changeAutoOpenSidebar,
+
+        changeAutoplayEnabled,
+
+        changeAutoDownloadLiked,
 
         resetPlayer,
 

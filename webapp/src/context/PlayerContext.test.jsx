@@ -61,6 +61,12 @@ const catalogSong = {
   availability: { libraryAvailable: false },
 };
 
+const catalogSongWithPreview = {
+  ...catalogSong,
+  id: "external_deezer_43",
+  previewUrl: "https://cdns-preview-a.dzcdn.net/stream.mp3",
+};
+
 const replayGainSong = {
   id: "replay-gain-song",
   title: "Normalized song",
@@ -90,16 +96,28 @@ function PlayerHarness() {
     isLooping,
     queue,
     queueIndex,
+    recentlyPlayed,
     isPreview,
     previewDurationSeconds,
     playbackUnavailable,
     currentSong,
+    isPlaying,
     crossfadeDuration,
     changeCrossfadeDuration,
     streamQuality,
     changeStreamQuality,
     isReplayGainEnabled,
     changeReplayGainEnabled,
+    layoutDensity,
+    changeLayoutDensity,
+    autoOpenSidebar,
+    changeAutoOpenSidebar,
+    isAutoplayEnabled,
+    changeAutoplayEnabled,
+    autoDownloadLiked,
+    changeAutoDownloadLiked,
+    activeSidebar,
+    setActiveSidebar,
   } = usePlayer();
 
   return (
@@ -112,6 +130,9 @@ function PlayerHarness() {
       </button>
       <button onClick={() => playSong(catalogSong)}>
         catalog
+      </button>
+      <button onClick={() => playSong(catalogSongWithPreview)}>
+        catalog-with-preview
       </button>
       <button onClick={() => playSong(replayGainSong)}>
         replay-gain-song
@@ -155,6 +176,22 @@ function PlayerHarness() {
       <button onClick={() => changeReplayGainEnabled(true)}>
         enable-replay-gain
       </button>
+      <button onClick={() => changeLayoutDensity("compact")}>
+        compact-layout
+      </button>
+      <button onClick={() => changeAutoOpenSidebar(true)}>
+        enable-auto-open-sidebar
+      </button>
+      <button onClick={() => changeAutoplayEnabled(false)}>
+        disable-autoplay
+      </button>
+      <button onClick={() => changeAutoDownloadLiked(true)}>
+        enable-auto-download-liked
+      </button>
+      <button onClick={() => setActiveSidebar("now-playing")}>open-now-playing</button>
+      <button onClick={() => setActiveSidebar("queue")}>open-queue</button>
+      <button onClick={() => setActiveSidebar("invalid")}>open-invalid</button>
+      <div data-testid="active-sidebar">{activeSidebar}</div>
       <div data-testid="shuffle-enabled">
         {String(isShuffleEnabled)}
       </div>
@@ -166,6 +203,9 @@ function PlayerHarness() {
       </div>
       <div data-testid="queue-index">
         {queueIndex}
+      </div>
+      <div data-testid="recently-played">
+        {recentlyPlayed.map((song) => song.id).join(",")}
       </div>
       <div data-testid="is-preview">
         {String(isPreview)}
@@ -179,6 +219,9 @@ function PlayerHarness() {
       <div data-testid="current-song">
         {currentSong?.id || "none"}
       </div>
+      <div data-testid="is-playing">
+        {String(isPlaying)}
+      </div>
       <div data-testid="crossfade-duration">
         {crossfadeDuration}
       </div>
@@ -188,12 +231,24 @@ function PlayerHarness() {
       <div data-testid="replay-gain-enabled">
         {String(isReplayGainEnabled)}
       </div>
+      <div data-testid="layout-density">
+        {layoutDensity}
+      </div>
+      <div data-testid="auto-open-sidebar">
+        {String(autoOpenSidebar)}
+      </div>
+      <div data-testid="autoplay-enabled">
+        {String(isAutoplayEnabled)}
+      </div>
+      <div data-testid="auto-download-liked">
+        {String(autoDownloadLiked)}
+      </div>
     </>
   );
 }
 
 
-function renderPlayer() {
+function renderPlayer({ recentHistory = [] } = {}) {
   getCurrentSession.mockResolvedValue({
     authenticated: true,
     user: {
@@ -205,7 +260,7 @@ function renderPlayer() {
   });
 
   getRandomSongs.mockResolvedValue([]);
-  getRecentlyPlayed.mockResolvedValue([]);
+  getRecentlyPlayed.mockResolvedValue(recentHistory);
   getStarred.mockResolvedValue([]);
   getUserSettings.mockResolvedValue([]);
   getSilenceAnalysis.mockResolvedValue(null);
@@ -232,6 +287,37 @@ function renderPlayer() {
 beforeEach(() => {
   localStorage.clear();
   jest.clearAllMocks();
+  global.fetch = jest.fn(async () => ({
+    ok: true,
+    json: async () => ({ results: [] }),
+  }));
+});
+
+
+test("caps and validates recently played history received from the server", async () => {
+  const recentHistory = Array.from({ length: 55 }, (_, index) => ({
+    id: `history-${index}`,
+  }));
+
+  renderPlayer({ recentHistory });
+
+  await waitFor(() => {
+    expect(screen.getByTestId("recently-played")).toHaveTextContent("history-49");
+  });
+
+  const hydratedIds = screen.getByTestId("recently-played").textContent.split(",");
+  expect(hydratedIds).toHaveLength(50);
+  expect(hydratedIds).not.toContain("history-50");
+});
+
+test("ignores malformed recently played history received from the server", async () => {
+  renderPlayer({ recentHistory: { items: [] } });
+
+  await waitFor(() => {
+    expect(getRecentlyPlayed).toHaveBeenCalled();
+  });
+
+  expect(screen.getByTestId("recently-played")).toHaveTextContent("");
 });
 
 
@@ -255,6 +341,28 @@ test("direct playback creates a single-song queue and replaces an old queue", as
     expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
   });
 });
+
+test("playing the active track toggles playback without rebuilding its queue", async () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("album-start"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  });
+
+  getStreamUrl.mockClear();
+  HTMLMediaElement.prototype.pause.mockClear();
+  fireEvent.click(screen.getByText("direct"));
+
+  expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledTimes(1);
+  expect(getStreamUrl).not.toHaveBeenCalled();
+  expect(screen.getByTestId("queue")).toHaveTextContent(
+    "song-1,song-2,song-3"
+  );
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+});
+
 
 test("selected normalized source reaches the stream URL helper", async () => {
   renderPlayer();
@@ -291,6 +399,108 @@ test("album queues honor their start index and support next and previous", async
   await waitFor(() => {
     expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
   });
+});
+
+
+test("duplicate ended events advance the queue only once", async () => {
+  const { container } = renderPlayer();
+
+  fireEvent.click(screen.getByText("album-start"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  });
+
+  recordRecentlyPlayed.mockClear();
+  const audio = container.querySelector("audio");
+  fireEvent.ended(audio);
+  fireEvent.ended(audio);
+
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
+  });
+
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
+  expect(recordRecentlyPlayed).toHaveBeenCalledTimes(1);
+  expect(recordRecentlyPlayed).toHaveBeenCalledWith("song-2");
+});
+
+
+test("looped endings replay the active track while manual next still advances", async () => {
+  const { container } = renderPlayer();
+
+  fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => {
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  });
+
+  fireEvent.click(screen.getByText("loop"));
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 42,
+  });
+
+  getStreamUrl.mockClear();
+  fireEvent.ended(audio);
+
+  await waitFor(() => {
+    expect(audio.currentTime).toBe(0);
+  });
+
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+  expect(getStreamUrl).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByText("next"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
+  });
+});
+
+
+test("a depleted queue stops without fetching random tracks when autoplay is disabled", async () => {
+  const { container } = renderPlayer();
+
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => {
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  });
+
+  fireEvent.click(screen.getByText("disable-autoplay"));
+  getRandomSongs.mockClear();
+  fireEvent.ended(container.querySelector("audio"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("none");
+  });
+
+  expect(screen.getByTestId("queue")).toHaveTextContent("");
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("-1");
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("false");
+  expect(getRandomSongs).not.toHaveBeenCalled();
+});
+
+
+test("a depleted queue fetches another track only when autoplay is enabled", async () => {
+  const { container } = renderPlayer();
+  getRandomSongs.mockResolvedValue([songs[1]]);
+
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => {
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  });
+
+  getRandomSongs.mockClear();
+  fireEvent.ended(container.querySelector("audio"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
+  });
+
+  expect(getRandomSongs).toHaveBeenCalledTimes(1);
 });
 
 
@@ -400,6 +610,46 @@ test("ReplayGain adjusts the newly loaded track volume when enabled", async () =
   });
 
   expect(container.querySelector("audio").volume).toBeCloseTo(10 ** (-6 / 20));
+});
+
+
+test("layout density is global, persistent, and marks the document for shared track rows", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("compact-layout"));
+
+  expect(screen.getByTestId("layout-density")).toHaveTextContent("compact");
+  expect(localStorage.getItem("playerLayoutDensity")).toBe("compact");
+  expect(document.documentElement.dataset.layoutDensity).toBe("compact");
+});
+
+test("sidebar state accepts only the supported views", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("open-now-playing"));
+  expect(screen.getByTestId("active-sidebar")).toHaveTextContent("now-playing");
+
+  fireEvent.click(screen.getByText("open-queue"));
+  expect(screen.getByTestId("active-sidebar")).toHaveTextContent("queue");
+
+  fireEvent.click(screen.getByText("open-invalid"));
+  expect(screen.getByTestId("active-sidebar")).toHaveTextContent("none");
+});
+
+
+test("queue behavior preferences are global and persist locally", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("enable-auto-open-sidebar"));
+  fireEvent.click(screen.getByText("disable-autoplay"));
+  fireEvent.click(screen.getByText("enable-auto-download-liked"));
+
+  expect(screen.getByTestId("auto-open-sidebar")).toHaveTextContent("true");
+  expect(screen.getByTestId("autoplay-enabled")).toHaveTextContent("false");
+  expect(screen.getByTestId("auto-download-liked")).toHaveTextContent("true");
+  expect(localStorage.getItem("playerAutoOpenSidebar")).toBe("true");
+  expect(localStorage.getItem("playerAutoplayEnabled")).toBe("false");
+  expect(localStorage.getItem("playerAutoDownloadLiked")).toBe("true");
 });
 
 
@@ -537,6 +787,20 @@ test("a track missing from the library transparently plays an external preview",
 
   expect(screen.getByTestId("preview-duration")).toHaveTextContent("30");
   expect(screen.getByTestId("unavailable")).toHaveTextContent("false");
+});
+
+test("an embedded external preview plays directly before source resolution", async () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("catalog-with-preview"));
+
+  await waitFor(() => {
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+  });
+
+  expect(getPlayableSources).not.toHaveBeenCalled();
+  expect(getStreamUrl).not.toHaveBeenCalled();
+  expect(screen.getByTestId("is-preview")).toHaveTextContent("true");
 });
 
 

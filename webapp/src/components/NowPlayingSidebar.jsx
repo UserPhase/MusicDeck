@@ -17,6 +17,8 @@ import {
   formatDuration,
 } from "../utils/formatDuration";
 
+import AudioBadge from "./AudioBadge";
+
 
 function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   const [lyrics, setLyrics] = useState(null);
@@ -24,8 +26,8 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   const [isLoadingLyrics, setIsLoadingLyrics] = useState(false);
   const [isLoadingBiography, setIsLoadingBiography] = useState(false);
   const [isBiographyExpanded, setIsBiographyExpanded] = useState(false);
-  const { currentSong, queue = [] } = usePlayer();
-  const nextTrack = queue[0];
+  const { currentSong, queue = [], queueIndex = -1 } = usePlayer();
+  const nextTrack = queue[queueIndex + 1] || null;
 
   useEffect(() => {
     let isCurrentRequest = true;
@@ -58,12 +60,9 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   if (!isOpen) return null;
 
   return (
-    <aside className="right-sidebar now-playing-sidebar" aria-label="Now Playing">
-      <header className="queue-sidebar-header">
-        <div>
-          <span className="queue-sidebar-kicker">Playback</span>
-          <h2>Now Playing</h2>
-        </div>
+    <aside className="right-sidebar now-playing-sidebar sidebar-panel" aria-label="Now Playing">
+      <header className="sidebar-panel-header">
+        <h2>Now Playing</h2>
         <button className="queue-sidebar-close" type="button" onClick={onClose} aria-label="Close Now Playing sidebar">×</button>
       </header>
 
@@ -79,6 +78,15 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
               <div className="right-sidebar-song-kicker">Playing now</div>
               <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>
               <p>{currentSong.artist || "Unknown artist"}</p>
+              <AudioBadge
+                type={
+                  currentSong.isPreview || currentSong.previewUrl
+                    ? "preview"
+                    : currentSong.audioType || currentSong.metadata?.codec || currentSong.source?.quality?.codec
+                }
+                bitrate={currentSong.bitrate || currentSong.metadata?.bitrate || currentSong.source?.quality?.bitrate}
+                className="right-sidebar-audio-badge"
+              />
             </section>
 
             <section className="right-sidebar-metadata-section" aria-labelledby="now-playing-lyrics-title">

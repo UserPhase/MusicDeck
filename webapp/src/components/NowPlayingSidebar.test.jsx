@@ -18,7 +18,11 @@ test("keeps the next queue preview visible and hands off to the queue sidebar", 
   const onOpenQueue = jest.fn();
   usePlayer.mockReturnValue({
     currentSong: { id: "current", title: "Current", artist: "Artist" },
-    queue: [{ id: "next", title: "Next Track", artist: "Artist", duration: 120 }],
+    queueIndex: 0,
+    queue: [
+      { id: "current", title: "Current", artist: "Artist" },
+      { id: "next", title: "Next Track", artist: "Artist", duration: 120 },
+    ],
   });
 
   render(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={onOpenQueue} />);

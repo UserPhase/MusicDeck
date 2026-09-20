@@ -10,8 +10,10 @@
  * @property {number|null} duration
  * @property {number|null} track
  * @property {string|null} coverArt
+ * @property {string|null} coverUrl
  * @property {Object|null} artwork
  * @property {string|null} streamUrl
+ * @property {string|null} previewUrl
  * @property {Object|null} availability
  * @property {Object|undefined} source
  * @property {string|undefined} provider
@@ -134,6 +136,14 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     object(track.artwork) ||
     object(wrapper.artwork) ||
     null;
+  const deezerArtist =
+    object(track.artist)?.name ||
+    object(wrapper.artist)?.name ||
+    null;
+  const deezerAlbum =
+    object(track.album) ||
+    object(wrapper.album) ||
+    null;
   const replayGain =
     object(track.replayGain) ||
     object(wrapper.replayGain) ||
@@ -153,6 +163,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     ),
     artist: String(first(
       typeof track.artist === "string" ? track.artist : null,
+      deezerArtist,
       track.artistName,
       track.Artists?.[0],
       track.AlbumArtist,
@@ -164,6 +175,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     albumId: first(metadata.albumId, track.albumId, track.AlbumId, wrapper.albumId, wrapper.AlbumId),
     album: String(first(
       typeof track.album === "string" ? track.album : null,
+      deezerAlbum?.title,
       track.albumName,
       track.collectionName,
       track.Album,
@@ -181,8 +193,23 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
       wrapper.artworkId,
       wrapper.coverArt
     ),
+    coverUrl: first(
+      track.coverUrl,
+      deezerAlbum?.cover_xl,
+      deezerAlbum?.cover_medium,
+      deezerAlbum?.cover,
+      wrapper.coverUrl,
+      artwork?.url
+    ),
     artwork,
     streamUrl: first(track.streamUrl, wrapper.streamUrl),
+    previewUrl: first(
+      track.previewUrl,
+      track.preview,
+      wrapper.previewUrl,
+      wrapper.preview,
+      metadata.previewUrl
+    ),
     availability,
     source: normalizedSource,
     provider,

@@ -72,12 +72,34 @@ test("normalizes raw iTunes Search fields", () => {
     artistName: "iTunes artist",
     collectionName: "iTunes album",
     trackTimeMillis: 215000,
+    previewUrl: "https://audio-ssl.itunes.apple.com/preview.m4a",
   }, "search")).toMatchObject({
     id: "123",
     title: "iTunes song",
     artist: "iTunes artist",
     album: "iTunes album",
     duration: 215,
+    previewUrl: "https://audio-ssl.itunes.apple.com/preview.m4a",
     origin: "search",
+  });
+});
+
+test("flattens raw Deezer artist, album, artwork, and preview fields", () => {
+  expect(normalizeTrackData({
+    id: 42,
+    title: "Deezer song",
+    artist: { name: "Artist" },
+    album: {
+      title: "Deezer album",
+      cover_xl: "https://cdn.example.test/deezer-xl.jpg",
+      cover_medium: "https://cdn.example.test/deezer-medium.jpg",
+    },
+    preview: "https://cdns-preview-a.dzcdn.net/stream.mp3",
+  }, "search")).toMatchObject({
+    id: "42",
+    artist: "Artist",
+    album: "Deezer album",
+    coverUrl: "https://cdn.example.test/deezer-xl.jpg",
+    previewUrl: "https://cdns-preview-a.dzcdn.net/stream.mp3",
   });
 });

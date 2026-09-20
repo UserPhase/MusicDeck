@@ -60,28 +60,46 @@ function isIncluded(item: UnifiedSearchResult, types?: SearchOptions["types"]) {
   return !types || types.includes(item.type);
 }
 
-function searchIdentity(value: string | null) {
-  return (value || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+export function searchIdentity(value: string | null) {
+  const fallback = String(value || "").trim().toLocaleLowerCase();
+  const identity = fallback
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .match(/[\p{L}\p{N}]+/gu)
+    ?.join(" ")
     .trim();
+
+  return identity || fallback || "unknown";
 }
 
 /** Deezer results are passed first, so an exact normalized title/artist
  * collision keeps Deezer and drops the supplementary iTunes copy. */
 export function dedupeKeylessSearchResults(items: UnifiedSearchResult[]) {
-  const seenTracks = new Set<string>();
+  const result: UnifiedSearchResult[] = [];
+  const trackIndexes = new Map<string, number>();
 
-  return items.filter((item) => {
-    if (item.type !== "track") return true;
+  for (const item of items) {
+    if (item.type !== "track") {
+      result.push(item);
+      continue;
+    }
 
     const key = `${searchIdentity(item.title)}::${searchIdentity(item.artist)}`;
-    if (seenTracks.has(key)) return false;
-    seenTracks.add(key);
-    return true;
-  });
+    const existingIndex = trackIndexes.get(key);
+    if (existingIndex === undefined) {
+      trackIndexes.set(key, result.length);
+      result.push(item);
+      continue;
+    }
+
+    // Deezer is inserted first and remains the canonical result. iTunes can
+    // still enrich it when Deezer did not publish a preview for the track.
+    if (!result[existingIndex].previewUrl && item.previewUrl) {
+      result[existingIndex] = { ...result[existingIndex], previewUrl: item.previewUrl };
+    }
+  }
+
+  return result;
 }
 
 class LibrarySearchProvider implements SearchProvider {
@@ -210,6 +228,7 @@ class DeezerSearchProvider implements SearchProvider {
               // scdn.co images are proxied -- raw external CDN URLs are
               // never returned to the client.
               artwork: this.artwork(item.album?.cover_big || item.album?.cover_medium),
+              previewUrl: typeof item.preview === "string" ? item.preview : null,
               provider: "external" as const,
               source: { kind: "external" as const, count: 0 },
               availability: null,
@@ -319,6 +338,7 @@ class DeezerSearchProvider implements SearchProvider {
         artist: typeof item.artistName === "string" ? item.artistName : null,
         album: typeof item.collectionName === "string" ? item.collectionName : null,
         artwork: this.itunesArtwork(item.artworkUrl100),
+        previewUrl: typeof item.previewUrl === "string" ? item.previewUrl : null,
         provider: "external",
         source: { kind: "external", count: 0, externalAvailable: true },
         availability: null,

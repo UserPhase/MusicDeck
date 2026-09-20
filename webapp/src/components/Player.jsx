@@ -10,6 +10,8 @@ import {
   getCoverUrl,
 } from "../api/musicdeck";
 
+import AudioBadge from "./AudioBadge";
+
 
 function formatTime(seconds) {
 
@@ -70,6 +72,9 @@ function Player({
     isPreview,
     previewDurationSeconds,
     playbackUnavailable,
+    playbackMessage,
+
+    streamQuality,
 
   } = usePlayer();
 
@@ -90,6 +95,12 @@ function Player({
   return (
 
     <footer className="player">
+
+      {playbackMessage && (
+        <div className="player-toast" role="status" aria-live="polite">
+          {playbackMessage}
+        </div>
+      )}
 
 
       {/* ================================================= */}
@@ -132,19 +143,28 @@ function Player({
               : "Nothing playing"}
 
 
-            {isPreview && (
-
-              <span
-                className="now-badge now-badge-preview"
-                title={
-                  previewDurationSeconds
-                    ? `Preview only (${Math.round(previewDurationSeconds)}s), not the full track`
-                    : "Preview only, not the full track"
+            {currentSong && (
+              <AudioBadge
+                type={
+                  isPreview
+                    ? "preview"
+                    : currentSong.audioType ||
+                      currentSong.metadata?.codec ||
+                      currentSong.source?.quality?.codec
                 }
-              >
-                Preview
-              </span>
-
+                bitrate={
+                  currentSong.bitrate ||
+                  currentSong.metadata?.bitrate ||
+                  currentSong.source?.quality?.bitrate ||
+                  (streamQuality === "original" ? undefined : streamQuality)
+                }
+                className="now-audio-badge"
+                title={
+                  isPreview && previewDurationSeconds
+                    ? `Preview only (${Math.round(previewDurationSeconds)}s), not the full track`
+                    : undefined
+                }
+              />
             )}
 
 

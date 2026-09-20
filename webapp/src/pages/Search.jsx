@@ -21,6 +21,7 @@ import PlaylistCover from "../components/PlaylistCover";
 import SourceMenu from "../components/SourceMenu";
 import SourceIndicator from "../components/SourceIndicator";
 import TrackDownloadButton from "../components/TrackDownloadButton";
+import TrackLikeButton from "../components/TrackLikeButton";
 import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
 import {
   EmptyState,
@@ -801,6 +802,8 @@ function Search() {
                           sources={song.source?.options}
                           onSelect={playSongFromSource}
                         />
+
+                        <TrackLikeButton song={song} />
 
                         <button
                           type="button"
