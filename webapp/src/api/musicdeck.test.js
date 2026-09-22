@@ -209,6 +209,8 @@ test("stream and artwork URLs never include backend credentials", () => {
   expect(getStreamUrl("track-1", { id: "playable_1" })).toBe("/api/tracks/track-1/stream?playableSource=playable_1");
   expect(getStreamUrl("track-1", null, "128")).toBe("/api/tracks/track-1/stream?maxBitRate=128");
   expect(getStreamUrl("track-1", { id: "playable_1" }, "320")).toBe("/api/tracks/track-1/stream?playableSource=playable_1&maxBitRate=320");
+  expect(getStreamUrl("track-1", null, "256")).toBe("/api/tracks/track-1/stream?maxBitRate=256");
+  expect(getStreamUrl("track-1", null, "192")).toBe("/api/tracks/track-1/stream?maxBitRate=192");
   expect(getCoverUrl("art-1")).toBe("/api/artwork/art-1");
 
   // Thumbnail hints are forwarded to the artwork proxy, and external artwork

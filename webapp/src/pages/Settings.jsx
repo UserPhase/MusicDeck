@@ -40,6 +40,8 @@ function Settings() {
     changeCrossfadeDuration,
     streamQuality: globalStreamQuality = "original",
     changeStreamQuality,
+    downloadQuality: globalDownloadQuality = "320kbps",
+    changeDownloadQuality,
     isReplayGainEnabled: globalReplayGainEnabled = false,
     changeReplayGainEnabled,
     layoutDensity: globalLayoutDensity = "comfortable",
@@ -58,6 +60,7 @@ function Settings() {
     globalCrossfadeDuration,
   );
   const [streamQuality, setStreamQuality] = useState(globalStreamQuality);
+  const [downloadQuality, setDownloadQuality] = useState(globalDownloadQuality);
   const [isReplayGainEnabled, setIsReplayGainEnabled] = useState(
     globalReplayGainEnabled,
   );
@@ -85,6 +88,8 @@ function Settings() {
   const initialAudioPreferences = useRef({
     streamQuality: globalStreamQuality,
     changeStreamQuality,
+    downloadQuality: globalDownloadQuality,
+    changeDownloadQuality,
     replayGainEnabled: globalReplayGainEnabled,
     changeReplayGainEnabled,
   });
@@ -170,6 +175,27 @@ function Settings() {
           setStreamQuality(nextStreamQuality);
           initialAudioPreferences.current.changeStreamQuality?.(nextStreamQuality);
 
+          const nextDownloadQuality = [
+            "lossless",
+            "320kbps",
+            "256kbps",
+            "192kbps",
+            "128kbps",
+          ].includes(getSetting(
+            settings,
+            "playback.downloadQuality",
+            initialAudioPreferences.current.downloadQuality,
+          ))
+            ? getSetting(
+                settings,
+                "playback.downloadQuality",
+                initialAudioPreferences.current.downloadQuality,
+              )
+            : "320kbps";
+
+          setDownloadQuality(nextDownloadQuality);
+          initialAudioPreferences.current.changeDownloadQuality?.(nextDownloadQuality);
+
           const nextReplayGainEnabled = Boolean(
             getSetting(
               settings,
@@ -245,6 +271,7 @@ function Settings() {
         "playback.silenceTrim.minSilenceSeconds": Number(silenceMinSeconds),
         "playback.crossfadeDuration": Number(crossfadeDuration),
         "playback.streamQuality": streamQuality,
+        "playback.downloadQuality": downloadQuality,
         "playback.replayGain.enabled": isReplayGainEnabled,
         "ui.layoutDensity": layoutDensity,
         "ui.accentColor": accentColor,
@@ -285,6 +312,20 @@ function Settings() {
     if (!changeStreamQuality) {
       try {
         localStorage.setItem("playerStreamQuality", nextQuality);
+      } catch {
+        // Saving to the backend remains available if browser storage is blocked.
+      }
+    }
+  }
+
+  function handleDownloadQualityChange(event) {
+    const nextQuality = event.target.value;
+    setDownloadQuality(nextQuality);
+    changeDownloadQuality?.(nextQuality);
+
+    if (!changeDownloadQuality) {
+      try {
+        localStorage.setItem("playerDownloadQuality", nextQuality);
       } catch {
         // Saving to the backend remains available if browser storage is blocked.
       }
@@ -515,6 +556,23 @@ function Settings() {
                 <option value="128">128 kbps</option>
                 <option value="320">320 kbps</option>
                 <option value="original">Original/Lossless</option>
+              </select>
+            </label>
+          </article>
+
+          <article className="settings-row">
+            <div className="settings-row-copy">
+              <h3>Download Quality</h3>
+              <p>Choose the format used when saving music for offline playback.</p>
+            </div>
+            <label className="settings-select-control">
+              <span>Download quality</span>
+              <select value={downloadQuality} onChange={handleDownloadQualityChange}>
+                <option value="lossless">Lossless (FLAC / Original)</option>
+                <option value="320kbps">320 kbps (High Quality MP3)</option>
+                <option value="256kbps">256 kbps (Medium)</option>
+                <option value="192kbps">192 kbps (Standard)</option>
+                <option value="128kbps">128 kbps (Data Saver)</option>
               </select>
             </label>
           </article>

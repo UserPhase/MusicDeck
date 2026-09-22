@@ -4,10 +4,6 @@ import {
 } from "react";
 
 import {
-  Link,
-} from "react-router-dom";
-
-import {
   usePlayer,
 } from "../context/PlayerContext";
 
@@ -17,12 +13,8 @@ import {
   setMediaRating,
 } from "../api/musicdeck";
 
-import AvailabilityHint from "../components/AvailabilityHint";
-import SourceMenu from "../components/SourceMenu";
-import TrackDownloadButton from "../components/TrackDownloadButton";
-import TrackLikeButton from "../components/TrackLikeButton";
-import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
-import TrackDownloadStatus from "../components/TrackDownloadStatus";
+import TrackListHeader from "../components/TrackListHeader";
+import TrackRow from "../components/TrackRow";
 import {
   EmptyState,
   ErrorState,
@@ -34,27 +26,14 @@ import {
   addSongToPlaylist as addSongToPlaylistRequest,
 } from "../api/playlists";
 
-import {
-  formatDuration,
-} from "../utils/formatDuration";
-
-
 function Tracks() {
 
   const {
     playContext,
     playSongFromSource,
-    currentSong,
-    isPlaying,
-    togglePlay,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
-    if (currentSong && String(currentSong.id) === String(song.id)) {
-      togglePlay();
-      return;
-    }
-
     playContext(songs, index, {
       type: "collection",
       id: "library-tracks",
@@ -305,42 +284,31 @@ useEffect(() => {
     <section className="library-section">
 
 
-      {/* HEADER */}
-
-      <div className="library-section-header">
-
-        <h2>
-          Tracks
-        </h2>
-
+      <div className="library-track-toolbar">
+        <div className="search-mode" aria-label="Library filters">
+          <button
+            type="button"
+            className={`search-mode-option ${filters.favoritesOnly ? "active" : ""}`}
+            aria-pressed={filters.favoritesOnly}
+            onClick={() => setFilters((current) => ({ ...current, favoritesOnly: !current.favoritesOnly }))}
+          >
+            Favorites
+          </button>
+          <button
+            type="button"
+            className={`search-mode-option ${filters.unplayedOnly ? "active" : ""}`}
+            aria-pressed={filters.unplayedOnly}
+            onClick={() => setFilters((current) => ({ ...current, unplayedOnly: !current.unplayedOnly }))}
+          >
+            Unplayed
+          </button>
+        </div>
 
         {!loadingSongs && (
-
-          <span>
-            {songs.length} songs
+          <span className="library-track-count">
+            {songs.length} {songs.length === 1 ? "song" : "songs"}
           </span>
-
         )}
-
-      </div>
-
-      <div className="search-mode" aria-label="Library filters">
-        <button
-          type="button"
-          className={`search-mode-option ${filters.favoritesOnly ? "active" : ""}`}
-          aria-pressed={filters.favoritesOnly}
-          onClick={() => setFilters((current) => ({ ...current, favoritesOnly: !current.favoritesOnly }))}
-        >
-          Favorites
-        </button>
-        <button
-          type="button"
-          className={`search-mode-option ${filters.unplayedOnly ? "active" : ""}`}
-          aria-pressed={filters.unplayedOnly}
-          onClick={() => setFilters((current) => ({ ...current, unplayedOnly: !current.unplayedOnly }))}
-        >
-          Unplayed
-        </button>
       </div>
 
 
@@ -373,6 +341,8 @@ useEffect(() => {
 
         <div className="track-list">
 
+          <TrackListHeader />
+
           {songs.length === 0 && (
 
             <EmptyState>
@@ -383,169 +353,15 @@ useEffect(() => {
 
           {songs.map(
             (song, index) => (
-
-            <div
-              className={
-                `track${
-                  currentSong && String(currentSong.id) === String(song.id)
-                    ? ` is-current-track${isPlaying ? " is-playing" : ""}`
-                    : ""
-                }`
-              }
-              onClick={(event) => {
-                if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song, index);
-                }
-              }}
+            <TrackRow
               key={song.id}
-            >
-
-
-              {/* NUMBER / PLAY */}
-
-              <div className="track-number">
-
-                <TrackPlaybackIndicator
-                  index={index}
-                  isCurrentTrack={
-                    Boolean(currentSong) &&
-                    String(currentSong.id) === String(song.id)
-                  }
-                  isPlaying={isPlaying}
-                />
-
-
-                <button
-                  className="track-play"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleTrackPlayback(song, index);
-                  }}
-                  aria-label={
-                    `Play ${song.title}`
-                  }
-                >
-                  ▶
-                </button>
-
-              </div>
-
-
-              {/* SONG + ARTIST */}
-
-              <div className="track-info">
-
-                <div className="track-title">
-                  <TrackDownloadStatus
-                    isDownloaded={song.isDownloaded}
-                    availability={song.availability}
-                    source={song.source}
-                  />
-                  {song.title}
-                  <AvailabilityHint availability={song.availability} />
-                </div>
-
-
-                {song.artistId ? (
-
-                  <Link
-                    to={
-                      `/artist/${song.artistId}`
-                    }
-                    className="track-artist"
-                  >
-                    {song.artist}
-                  </Link>
-
-                ) : (
-
-                  <div className="track-artist">
-                    {song.artist}
-                  </div>
-
-                )}
-
-              </div>
-
-
-              {/* ALBUM */}
-
-              {song.albumId ? (
-
-                <Link
-                  to={
-                    `/album/${song.albumId}`
-                  }
-                  className="track-album"
-                >
-                  {song.album}
-                </Link>
-
-              ) : (
-
-                <div className="track-album">
-                  {song.album}
-                </div>
-
-              )}
-
-
-              {/* DOWNLOAD */}
-
-              <TrackDownloadButton song={song} />
-
-
-              {/* DURATION */}
-
-              <div className="track-duration">
-
-                {formatDuration(
-                  song.duration
-                )}
-
-              </div>
-
-
-              {/* MENU */}
-
-              <div
-                className="track-menu-container"
-                onClick={(event) =>
-                  event.stopPropagation()
-                }
-              >
-
-                <SourceMenu
-                  song={song}
-                  sources={song.sources}
-                  onSelect={playSongFromSource}
-                />
-
-                <TrackLikeButton song={song} />
-
-                <button
-                  className="track-menu"
-                  aria-label="More options"
-                onMouseDown={(event) => {
-                  event.stopPropagation();
-                }}
-
-                onClick={() =>
-                  togglePlaylistMenu(song)
-                }
-                >
-                  ⋯
-                </button>
-
-
-                {playlistMenuSong?.id ===
-                  song.id && (
-
-                  <div className="playlist-menu"
-                    onMouseDown={(event) => {
-                      event.stopPropagation();
-                    }}
-              >
+              song={song}
+              index={index}
+              onPlay={handleTrackPlayback}
+              onSelectSource={playSongFromSource}
+              onToggleMenu={togglePlaylistMenu}
+              menu={playlistMenuSong?.id === song.id ? (
+                <div className="playlist-menu">
 
                     <div className="playlist-menu-title">
                       Track actions
@@ -624,14 +440,9 @@ useEffect(() => {
                       </div>
 
                     )}
-
-                  </div>
-
-                )}
-
-              </div>
-
-            </div>
+                </div>
+              ) : null}
+            />
 
           ))}
 

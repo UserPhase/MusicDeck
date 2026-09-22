@@ -39,13 +39,15 @@ test("rejects invalid values before writing any preference", () => {
 test("accepts a complete valid settings backup", () => {
   const preferences = validateSettingsBackup(backup({
     playerLayoutDensity: "compact",
-    playerAccentColor: "#1ed760",
+    playerAccentColor: "#10B981",
     playerAutoplayEnabled: "false",
+    playerDownloadQuality: "256kbps",
   }));
 
   expect(preferences).toEqual({
     playerLayoutDensity: "compact",
-    playerAccentColor: "#1ed760",
+    playerAccentColor: "#10B981",
     playerAutoplayEnabled: "false",
+    playerDownloadQuality: "256kbps",
   });
 });

@@ -22,7 +22,7 @@ function CompactTrackRow({ song, index, variant = "queue" }) {
     <div className={`queue-sidebar-track queue-sidebar-track-${variant}`} role="listitem">
       <span className="queue-sidebar-track-index">{index + 1}</span>
       <span className="queue-sidebar-track-cover" aria-hidden="true">
-        {coverUrl ? <img src={coverUrl} alt="" /> : <span>♫</span>}
+        {coverUrl ? <img src={coverUrl} alt="" width="32" height="32" loading="lazy" /> : <span>♫</span>}
       </span>
       <span className="queue-sidebar-track-info">
         <span className="queue-sidebar-track-title">{song.title || "Unknown title"}</span>

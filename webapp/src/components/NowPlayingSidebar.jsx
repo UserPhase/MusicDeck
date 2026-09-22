@@ -73,7 +73,7 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
           <>
             <section className="right-sidebar-song-info" aria-labelledby="now-playing-title">
               <div className="right-sidebar-now-cover">
-                {currentSong.coverArt ? <img src={getCoverUrl(currentSong.coverArt, 512)} alt="" /> : <span aria-hidden="true">♫</span>}
+                {currentSong.coverArt ? <img src={getCoverUrl(currentSong.coverArt, 512)} alt="" width="512" height="512" /> : <span aria-hidden="true">♫</span>}
               </div>
               <div className="right-sidebar-song-kicker">Playing now</div>
               <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>

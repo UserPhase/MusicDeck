@@ -1,11 +1,31 @@
 import { useState, useEffect, useRef } from "react";
 import { createAcquisition, getAcquisition } from "../api/musicdeck";
 
+function ServerIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+      <ellipse cx="12" cy="5" rx="7" ry="3" />
+      <path d="M5 5v6c0 1.66 3.13 3 7 3s7-1.34 7-3V5" />
+      <path d="M5 11v6c0 1.66 3.13 3 7 3s7-1.34 7-3v-6" />
+    </svg>
+  );
+}
+
+function CloudDownloadIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M7 18h10a4 4 0 0 0 .5-7.97A6 6 0 0 0 6.1 8.4 4.8 4.8 0 0 0 7 18Z" />
+      <path d="M12 11v6" />
+      <path d="m9.75 14.75 2.25 2.25 2.25-2.25" />
+    </svg>
+  );
+}
+
 /**
  * Download button for tracks positioned between album and track duration.
  * Triggers acquisition via spotDL and provides real-time progress feedback.
  */
-function TrackDownloadButton({ song, className = "" }) {
+function TrackDownloadButton({ song, className = "", completedPlaceholder = false }) {
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
@@ -26,8 +46,8 @@ function TrackDownloadButton({ song, className = "" }) {
     return null;
   }
 
-  // Already in the library (or otherwise fully streamable) — show a static
-  // checkmark instead of an actionable download button.
+  // Already in the library (or otherwise fully streamable) — show a neutral
+  // server indicator instead of an actionable spotDL control.
   const alreadyInLibrary =
     Boolean(song.availability?.libraryAvailable) || song.source?.kind === "library";
 
@@ -45,15 +65,7 @@ function TrackDownloadButton({ song, className = "" }) {
           aria-label={`${titleText} already downloaded`}
           title="Already downloaded"
         >
-          <svg
-            width="15"
-            height="15"
-            viewBox="0 0 16 16"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z" />
-          </svg>
+          <ServerIcon />
         </span>
       </div>
     );
@@ -171,6 +183,14 @@ function TrackDownloadButton({ song, className = "" }) {
 
   const isWorking = status === "queued" || status === "downloading" || status === "discovering" || status === "processing" || status === "importing";
 
+  if (status === "completed" && completedPlaceholder) {
+    return (
+      <div className={`track-download-container ${className}`.trim()} aria-hidden="true">
+        <span className="track-server-placeholder">{"\u2063"}</span>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`track-download-container ${className}`.trim()}
@@ -199,15 +219,7 @@ function TrackDownloadButton({ song, className = "" }) {
             <circle cx="8" cy="8" r="6" strokeDasharray="28" strokeDashoffset="10" strokeLinecap="round" />
           </svg>
         ) : status === "completed" ? (
-          <svg
-            width="15"
-            height="15"
-            viewBox="0 0 16 16"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z" />
-          </svg>
+          <ServerIcon />
         ) : status === "failed" ? (
           <svg
             width="15"
@@ -218,17 +230,7 @@ function TrackDownloadButton({ song, className = "" }) {
           >
             <path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM7.25 5a.75.75 0 0 1 1.5 0v3.5a.75.75 0 0 1-1.5 0V5zm.75 6.5a.875.875 0 1 1 0-1.75.875.875 0 0 1 0 1.75z" />
           </svg>
-        ) : (
-          <svg
-            width="15"
-            height="15"
-            viewBox="0 0 16 16"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M8 1.5a.75.75 0 0 1 .75.75v7.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.22 2.22V2.25A.75.75 0 0 1 8 1.5zM2.5 12a.75.75 0 0 1 .75.75v.5c0 .414.336.75.75.75h8a.75.75 0 0 0 .75-.75v-.5a.75.75 0 0 1 1.5 0v.5A2.25 2.25 0 0 1 12 15.5H4A2.25 2.25 0 0 1 1.75 13.25v-.5A.75.75 0 0 1 2.5 12z" />
-          </svg>
-        )}
+        ) : <CloudDownloadIcon />}
       </button>
     </div>
   );

@@ -343,7 +343,7 @@ export function getStreamUrl(songId, source, streamQuality = "original") {
     params.set("source", source);
   }
 
-  if (streamQuality === "128" || streamQuality === "320") {
+  if (["128", "192", "256", "320"].includes(streamQuality)) {
     params.set("maxBitRate", streamQuality);
   }
 

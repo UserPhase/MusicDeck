@@ -4,19 +4,11 @@ import {
 } from "react";
 
 import {
-  Link,
-} from "react-router-dom";
-
-import {
   getStarred,
 } from "../api/musicdeck";
 
-import AvailabilityHint from "../components/AvailabilityHint";
-import SourceMenu from "../components/SourceMenu";
-import TrackDownloadButton from "../components/TrackDownloadButton";
-import TrackLikeButton from "../components/TrackLikeButton";
-import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
-import TrackDownloadStatus from "../components/TrackDownloadStatus";
+import TrackListHeader from "../components/TrackListHeader";
+import TrackRow from "../components/TrackRow";
 
 import {
   getPlaylists,
@@ -26,11 +18,6 @@ import {
 import {
   usePlayer,
 } from "../context/PlayerContext";
-
-import {
-  formatDuration,
-} from "../utils/formatDuration";
-
 
 function Liked() {
 
@@ -56,17 +43,9 @@ function Liked() {
     playContext,
     playQueue,
     playSongFromSource,
-    currentSong,
-    isPlaying,
-    togglePlay,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
-    if (currentSong && String(currentSong.id) === String(song.id)) {
-      togglePlay();
-      return;
-    }
-
     playContext(songs, index, {
       type: "collection",
       id: "liked-songs",
@@ -425,6 +404,8 @@ function Liked() {
 
       <div className="track-list">
 
+        <TrackListHeader />
+
         {songs.length === 0 ? (
 
           <div className="library-empty">
@@ -435,166 +416,15 @@ function Liked() {
 
           songs.map(
             (song, index) => (
-
-            <div
-              className={
-                `track${currentSong && String(currentSong.id) === String(song.id) ? ` is-current-track${isPlaying ? " is-playing" : ""}` : ""}`
-              }
-              onClick={(event) => {
-                if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song, index);
-                }
-              }}
+            <TrackRow
               key={`${song.id}-${index}`}
-            >
-
-
-              {/* NUMBER / PLAY */}
-
-              <div className="track-number">
-
-                <TrackPlaybackIndicator
-                  index={index}
-                  isCurrentTrack={Boolean(currentSong) && String(currentSong.id) === String(song.id)}
-                  isPlaying={isPlaying}
-                />
-
-
-                <button
-                  className="track-play"
-
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleTrackPlayback(song, index);
-                  }}
-
-                  aria-label={
-                    `Play ${song.title}`
-                  }
-                >
-                  ▶
-                </button>
-
-              </div>
-
-
-              {/* SONG */}
-
-              <div className="track-info">
-
-                <div className="track-title">
-                  <TrackDownloadStatus
-                    isDownloaded={song.isDownloaded}
-                    availability={song.availability}
-                    source={song.source}
-                  />
-                  {song.title}
-                  <AvailabilityHint availability={song.availability} />
-                </div>
-
-
-                {song.artistId ? (
-
-                  <Link
-                    to={
-                      `/artist/${song.artistId}`
-                    }
-                    className="track-artist"
-                  >
-                    {song.artist}
-                  </Link>
-
-                ) : (
-
-                  <div className="track-artist">
-                    {song.artist ||
-                      "Unknown artist"}
-                  </div>
-
-                )}
-
-              </div>
-
-
-              {/* ALBUM */}
-
-              {song.albumId ? (
-
-                <Link
-                  to={
-                    `/album/${song.albumId}`
-                  }
-                  className="track-album"
-                >
-                  {song.album}
-                </Link>
-
-              ) : (
-
-                <div className="track-album">
-                  {song.album ||
-                    "Unknown album"}
-                </div>
-
-              )}
-
-
-              {/* DOWNLOAD */}
-
-              <TrackDownloadButton song={song} />
-
-
-              {/* DURATION */}
-
-              <div className="track-duration">
-
-                {formatDuration(
-                  song.duration
-                )}
-
-              </div>
-
-
-              {/* MENU */}
-
-              <div
-                className="track-menu-container"
-                onClick={(event) =>
-                  event.stopPropagation()
-                }
-              >
-
-                <SourceMenu
-                  song={song}
-                  sources={song.sources}
-                  onSelect={playSongFromSource}
-                />
-
-                <TrackLikeButton song={song} />
-
-                <button
-                  className="track-menu"
-                  aria-label="More options"
-                  onMouseDown={(event) => {
-                    event.stopPropagation();
-                  }}
-                  onClick={() =>
-                    togglePlaylistMenu(song)
-                  }
-                >
-                  ⋯
-                </button>
-
-
-                {playlistMenuSong?.id ===
-                  song.id && (
-
-                  <div
-                    className="playlist-menu"
-                    onMouseDown={(event) => {
-                      event.stopPropagation();
-                    }}
-                  >
+              song={song}
+              index={index}
+              onPlay={handleTrackPlayback}
+              onSelectSource={playSongFromSource}
+              onToggleMenu={togglePlaylistMenu}
+              menu={playlistMenuSong?.id === song.id ? (
+                <div className="playlist-menu">
 
                     <div className="playlist-menu-title">
                       Add to playlist
@@ -647,14 +477,9 @@ function Liked() {
                       </div>
 
                     )}
-
-                  </div>
-
-                )}
-
-              </div>
-
-            </div>
+                </div>
+              ) : null}
+            />
 
           )
 

@@ -1,13 +1,10 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 
-import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
-import SourceMenu from "../components/SourceMenu";
-import TrackDownloadButton from "../components/TrackDownloadButton";
-import TrackLikeButton from "../components/TrackLikeButton";
-import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
-import TrackDownloadStatus from "../components/TrackDownloadStatus";
+import CollectionDownloadButton from "../components/CollectionDownloadButton";
+import TrackListHeader from "../components/TrackListHeader";
+import TrackRow from "../components/TrackRow";
 
 import {
   getPlaylist,
@@ -18,9 +15,6 @@ import {
 } from "../api/playlists";
 
 import { usePlayer } from "../context/PlayerContext";
-
-import { formatDuration } from "../utils/formatDuration";
-
 
 function Playlist() {
 
@@ -69,17 +63,12 @@ function Playlist() {
     playContext,
     playQueue,
     playSongFromSource,
-    currentSong,
-    isPlaying,
-    togglePlay,
+    downloadQuality,
+    isShuffleEnabled,
+    toggleShuffle,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
-    if (currentSong && String(currentSong.id) === String(song.id)) {
-      togglePlay();
-      return;
-    }
-
     playContext(
       songs,
       index,
@@ -455,7 +444,9 @@ async function handleRemoveSong(
 
   return (
 
-    <div className="playlist-page">
+    <div
+      className="playlist-page detail-hero-gradient"
+    >
 
 
       {/* BACK */}
@@ -481,61 +472,6 @@ async function handleRemoveSong(
 
           </div>
 
-
-        {/* COVER ART MODE */}
-
-        <div className="playlist-cover-actions">
-
-          <label
-            className="playlist-cover-action"
-            htmlFor="playlist-cover-upload"
-          >
-
-            {artworkBusy
-              ? "Updating cover…"
-              : playlist.coverMode === "custom"
-                ? "Change cover"
-                : "Upload cover"}
-
-          </label>
-
-
-          <input
-            id="playlist-cover-upload"
-            className="playlist-cover-input"
-            type="file"
-            accept="image/png,image/jpeg,image/webp,image/gif"
-            disabled={artworkBusy}
-            onChange={handleCoverUpload}
-          />
-
-
-          {playlist.coverMode === "custom" && (
-
-            <button
-              type="button"
-              className="playlist-cover-action"
-              disabled={artworkBusy}
-              onClick={handleCoverReset}
-            >
-              Remove custom cover
-            </button>
-
-          )}
-
-
-          {artworkError && (
-
-            <div
-              className="error playlist-cover-error"
-              role="alert"
-            >
-              {artworkError}
-            </div>
-
-          )}
-
-        </div>
 
         </div>
 
@@ -571,7 +507,11 @@ async function handleRemoveSong(
 
           </div>
 
-          <div className="playlist-actions">
+        </div>
+
+      </div>
+
+      <div className="detail-action-row playlist-actions">
 
 
             <button
@@ -588,11 +528,66 @@ async function handleRemoveSong(
 
             </button>
 
+            <button
+              type="button"
+              className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}
+              aria-label="Toggle shuffle"
+              aria-pressed={Boolean(isShuffleEnabled)}
+              onClick={toggleShuffle}
+            >
+              ⇄
+            </button>
+
+            <CollectionDownloadButton
+              tracks={songs}
+              quality={downloadQuality}
+              label="playlist"
+            />
+
+            <div className="playlist-cover-actions">
+              <label
+                className="playlist-cover-action"
+                htmlFor="playlist-cover-upload"
+              >
+                {artworkBusy
+                  ? "Updating cover…"
+                  : playlist.coverMode === "custom"
+                    ? "Change cover"
+                    : "Upload cover"}
+              </label>
+
+              <input
+                id="playlist-cover-upload"
+                className="playlist-cover-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                disabled={artworkBusy}
+                onChange={handleCoverUpload}
+              />
+
+              {playlist.coverMode === "custom" && (
+                <button
+                  type="button"
+                  className="playlist-cover-action"
+                  disabled={artworkBusy}
+                  onClick={handleCoverReset}
+                >
+                  Remove custom cover
+                </button>
+              )}
+
+              {artworkError && (
+                <div className="error playlist-cover-error" role="alert">
+                  {artworkError}
+                </div>
+              )}
+            </div>
+
 
 <div className="playlist-options">
 
   <button
-    className="playlist-action"
+    className="detail-secondary-action playlist-action"
     aria-label="More options"
     onClick={(event) => {
       event.stopPropagation();
@@ -677,16 +672,14 @@ async function handleRemoveSong(
 </div>
 
 
-          </div>
-
-        </div>
-
       </div>
 
 
       {/* SONG LIST */}
 
       <div className="track-list">
+
+        <TrackListHeader />
 
         {songs.length === 0 ? (
 
@@ -697,153 +690,18 @@ async function handleRemoveSong(
         ) : (
 
           songs.map((song, index) => (
-
-            <div
-              className={
-                `track${currentSong && String(currentSong.id) === String(song.id) ? ` is-current-track${isPlaying ? " is-playing" : ""}` : ""}`
-              }
-              onClick={(event) => {
-                if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song, index);
-                }
-              }}
+            <TrackRow
               key={`${song.id}-${index}`}
-            >
-
-
-              {/* NUMBER / PLAY */}
-
-              <div className="track-number">
-
-                <TrackPlaybackIndicator
-                  index={index}
-                  isCurrentTrack={Boolean(currentSong) && String(currentSong.id) === String(song.id)}
-                  isPlaying={isPlaying}
-                />
-
-
-                <button
-                  className="track-play"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleTrackPlayback(song, index);
-                  }}
-                  aria-label={
-                    `Play ${song.title}`
-                  }
-                >
-                  ▶
-                </button>
-
-              </div>
-
-              <div className="track-info">
-
-                <div className="track-title">
-                  <TrackDownloadStatus
-                    isDownloaded={song.isDownloaded}
-                    availability={song.availability}
-                    source={song.source}
-                  />
-                  {song.title}
-                  <AvailabilityHint availability={song.availability} />
-                </div>
-
-                {song.artistId ? (
-
-                  <Link
-                    to={
-                      `/artist/${song.artistId}`
-                    }
-                    className="track-artist"
-                  >
-                    {song.artist}
-                  </Link>
-
-                ) : (
-
-                  <div className="track-artist">
-                    {song.artist}
-                  </div>
-
-                )}
-
-              </div>
-
-              {song.albumId ? (
-
-                <Link
-                  to={`/album/${song.albumId}`}
-                  className="track-album"
-                >
-                  {song.album}
-                </Link>
-
-              ) : (
-
-                <div className="track-album">
-                  {song.album}
-                </div>
-
-              )}
-
-              <TrackDownloadButton song={song} />
-
-              <div className="track-duration">
-
-                {formatDuration(
-                  song.duration
-                )}
-
-              </div>
-
-
-              {/* MENU */}
-
-              <div
-                className="track-menu-container"
-                ref={menuRef}
-              >
-
-                <SourceMenu
-                  song={song}
-                  sources={song.sources}
-                  onSelect={playSongFromSource}
-                />
-
-                <TrackLikeButton song={song} />
-
-                <button
-                  className="track-menu"
-                  aria-label="More options"
-
-                  onClick={(event) => {
-
-                    event.stopPropagation();
-
-                    setMenuSongId(
-                      menuSongId === song.id
-                        ? null
-                        : song.id
-                    );
-
-                  }}
-                >
-                  ⋯
-                </button>
-
-
-                {/* MENU FOR THIS SONG ONLY */}
-
-                {menuSongId === song.id && (
-
-                  <div
-                    className="playlist-menu"
-
-                    onClick={(event) =>
-                      event.stopPropagation()
-                    }
-                  >
+              song={song}
+              index={index}
+              actionsRef={menuRef}
+              onPlay={handleTrackPlayback}
+              onSelectSource={playSongFromSource}
+              onToggleMenu={(selectedSong) => {
+                setMenuSongId(menuSongId === selectedSong.id ? null : selectedSong.id);
+              }}
+              menu={menuSongId === song.id ? (
+                <div className="playlist-menu">
 
                     <button
                       className="playlist-menu-item"
@@ -865,14 +723,9 @@ async function handleRemoveSong(
                       </span>
 
                     </button>
-
-                  </div>
-
-                )}
-
-              </div>
-
-            </div>
+                </div>
+              ) : null}
+            />
 
           ))
 

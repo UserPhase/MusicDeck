@@ -230,7 +230,7 @@ function Home() {
   }, []);
 
   return (
-    <div className="home-page">
+    <div className="home-page home-hero-gradient">
       <section className="home-greeting" aria-labelledby="home-greeting-title">
         <div>
           <p className="home-kicker">MusicDeck</p>

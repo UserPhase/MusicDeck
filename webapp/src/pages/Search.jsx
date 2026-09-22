@@ -18,11 +18,9 @@ import {
 
 import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
-import SourceMenu from "../components/SourceMenu";
 import SourceIndicator from "../components/SourceIndicator";
-import TrackDownloadButton from "../components/TrackDownloadButton";
-import TrackLikeButton from "../components/TrackLikeButton";
-import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
+import TrackListHeader from "../components/TrackListHeader";
+import TrackRow from "../components/TrackRow";
 import {
   EmptyState,
   ErrorState,
@@ -37,11 +35,6 @@ import {
 import {
   usePlayer,
 } from "../context/PlayerContext";
-
-import {
-  formatDuration,
-} from "../utils/formatDuration";
-
 
 function Search() {
 
@@ -84,17 +77,9 @@ function Search() {
     playContext,
     playSongFromSource,
     playQueue,
-    currentSong,
-    isPlaying,
-    togglePlay,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
-    if (currentSong && String(currentSong.id) === String(song.id)) {
-      togglePlay();
-      return;
-    }
-
     playContext(results.track, index, {
       type: "search",
       id: query,
@@ -667,170 +652,25 @@ function Search() {
 
               <div className="track-list">
 
+                <TrackListHeader />
+
                 {results.track.map(
                   (song, index) => (
-
-                    <div
+                    <TrackRow
                       key={song.id}
-                      className={
-                        `track${currentSong && String(currentSong.id) === String(song.id) ? ` is-current-track${isPlaying ? " is-playing" : ""}` : ""}`
-                      }
-                      onClick={(event) => {
-                        if (!event.target.closest("a, button, input")) {
-                          handleTrackPlayback(song, index);
-                        }
-                      }}
-                    >
-
-
-                      {/* NUMBER / PLAY */}
-
-                      <div className="track-number">
-
-                        <TrackPlaybackIndicator
-                          index={index}
-                          isCurrentTrack={Boolean(currentSong) && String(currentSong.id) === String(song.id)}
-                          isPlaying={isPlaying}
-                        />
-
-
-                        <button
-                          type="button"
-                          className="track-play"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleTrackPlayback(song, index);
-                          }}
-                          aria-label={
-                            song.source?.kind === "external"
-                              ? `Play preview of ${song.title}`
-                              : `Play ${song.title}`
-                          }
-                        >
-                          ▶
-                        </button>
-
-                      </div>
-
-
-                      {/* SONG INFO */}
-
-                      <div className="track-info">
-
-                        <div className="track-title">
-                          {song.title}
-                          <AvailabilityHint availability={song.availability} />
-                          <SourceIndicator source={song.source} />
-                        </div>
-
-
-                        {song.metadata.artistId ? (
-
-                          <Link
-                            to={
-                              `/artist/${song.metadata.artistId}`
-                            }
-                            className="track-artist"
-                          >
-                            {song.artist ||
-                              "Unknown artist"}
-                          </Link>
-
-                        ) : (
-
-                          <div className="track-artist">
-                            {song.artist ||
-                              "Unknown artist"}
-                          </div>
-
-                        )}
-
-                      </div>
-
-
-                      {/* ALBUM */}
-
-                      {song.metadata.albumId ? (
-
-                        <Link
-                          to={
-                            `/album/${song.metadata.albumId}`
-                          }
-                          className="track-album"
-                        >
-                          {song.album ||
-                            "Unknown album"}
-                        </Link>
-
-                      ) : (
-
-                        <div className="track-album">
-                          {song.album ||
-                            "Unknown album"}
-                        </div>
-
-                      )}
-
-
-                      {/* DOWNLOAD */}
-
-                      <TrackDownloadButton song={song} />
-
-
-                      {/* DURATION */}
-
-                      <div className="track-duration">
-
-                        {formatDuration(
-                          song.metadata.durationSeconds
-                        )}
-
-                      </div>
-
-
-                      {/* MENU */}
-
-                      <div
-                        className="track-menu-container"
-                        onClick={(event) =>
-                          event.stopPropagation()
-                        }
-                      >
-
-                        <SourceMenu
-                          song={song}
-                          sources={song.source?.options}
-                          onSelect={playSongFromSource}
-                        />
-
-                        <TrackLikeButton song={song} />
-
-                        <button
-                          type="button"
-                          className="track-menu"
-                          aria-label={
-                            `More options for ${song.title}`
-                          }
-                          onMouseDown={(event) => {
-                            event.stopPropagation();
-                          }}
-                          onClick={() =>
-                            togglePlaylistMenu(song)
-                          }
-                        >
-                          ⋯
-                        </button>
-
-
-                        {playlistMenuSong?.id ===
-                          song.id && (
-
-                          <div
-                            className="playlist-menu"
-                            onMouseDown={(event) => {
-                              event.stopPropagation();
-                            }}
-                          >
+                      song={song}
+                      index={index}
+                      showDownloadStatus={false}
+                      showSourceIndicator
+                      artistId={song.metadata?.artistId}
+                      albumId={song.metadata?.albumId}
+                      duration={song.metadata?.durationSeconds}
+                      sources={song.source?.options}
+                      onPlay={handleTrackPlayback}
+                      onSelectSource={playSongFromSource}
+                      onToggleMenu={togglePlaylistMenu}
+                      menu={playlistMenuSong?.id === song.id ? (
+                        <div className="playlist-menu">
 
                             <div className="playlist-menu-title">
                               Add to playlist
@@ -895,14 +735,9 @@ function Search() {
                               </div>
 
                             )}
-
-                          </div>
-
-                        )}
-
-                      </div>
-
-                    </div>
+                        </div>
+                      ) : null}
+                    />
 
                   )
                 )}

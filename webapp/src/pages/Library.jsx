@@ -4,11 +4,10 @@ function Library() {
   return (
     <div className="library">
 
-      <div className="library-header">
+      <header className="library-header">
         <h1>Library</h1>
-      </div>
 
-      <div className="library-actions">
+        <nav className="library-actions" aria-label="Library categories">
 
         <NavLink
           to="/library/playlists"
@@ -46,7 +45,8 @@ function Library() {
           Tracks
         </NavLink>
 
-      </div>
+        </nav>
+      </header>
 
       <div className="library-content">
         <Outlet />

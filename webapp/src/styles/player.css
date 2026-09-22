@@ -7,19 +7,19 @@
 .now-info { min-width: 0; margin-left: 12px; }
 .now-title { font-size: 13px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .audio-badge { display: inline-flex; align-items: center; width: fit-content; padding: 2px 6px; border: 1px solid transparent; border-radius: 6px; font-size: 10px; font-weight: 700; line-height: 1; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
-.audio-badge-preview { border-color: rgb(245 158 11 / 20%); background: rgb(245 158 11 / 10%); color: #fbbf24; }
-.audio-badge-lossless { border-color: rgb(16 185 129 / 20%); background: rgb(16 185 129 / 10%); color: #34d399; }
-.audio-badge-high { border-color: rgb(6 182 212 / 20%); background: rgb(6 182 212 / 10%); color: #22d3ee; }
-.audio-badge-standard { border-color: transparent; background: #27272a; color: #a1a1aa; }
+.audio-badge-preview { border-color: color-mix(in srgb, var(--badge-preview) 20%, transparent); background: color-mix(in srgb, var(--badge-preview) 10%, transparent); color: var(--badge-preview); }
+.audio-badge-lossless { border-color: color-mix(in srgb, var(--badge-lossless) 20%, transparent); background: color-mix(in srgb, var(--badge-lossless) 10%, transparent); color: var(--badge-lossless); }
+.audio-badge-high { border-color: color-mix(in srgb, var(--badge-high) 20%, transparent); background: color-mix(in srgb, var(--badge-high) 10%, transparent); color: var(--badge-high); }
+.audio-badge-standard { border-color: transparent; background: var(--nav-active); color: var(--text-muted); }
 .now-audio-badge { margin-left: 8px; vertical-align: middle; }
 .now-badge { margin-left: 8px; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; vertical-align: middle; }
-.now-badge-unavailable { background: rgba(255, 122, 122, 0.16); color: #ff9a9a; }
+.now-badge-unavailable { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger-text); }
 .now-artist { margin-top: 4px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .heart { margin-left: 14px; flex-shrink: 0; border: none; background: transparent; color: var(--text-muted); font-size: 18px; cursor: pointer; transition: color 0.15s ease; }
 .heart:hover { color: var(--text); }
 .controls { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-width: 0; }
 .control-buttons { display: flex; align-items: center; justify-content: center; gap: 20px; }
-.control { border: none; background: transparent; color: #737985; font-size: 17px; cursor: pointer; transition: color 0.15s ease; }
+.control { border: none; background: transparent; color: var(--text-subtle); font-size: 17px; cursor: pointer; transition: color 0.15s ease; }
 .control:hover { color: var(--text); }
 .shuffle-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
 .shuffle-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
@@ -28,13 +28,14 @@
 .loop-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .loop-control.active { color: var(--accent); }
 .control:disabled { cursor: not-allowed; opacity: 0.45; }
-.control:disabled:hover { color: #737985; }
-.play-button { width: 34px; height: 34px; display: grid; place-items: center; border: none; border-radius: 50%; background: var(--accent); color: #08090c; font-size: 14px; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease; }
+.control:disabled:hover { color: var(--text-subtle); }
+.play-button { width: 34px; height: 34px; display: grid; place-items: center; border: none; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 14px; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease; }
 .play-button:hover { background: var(--accent-hover); transform: scale(1.05); }
+.control:focus-visible, .play-button:focus-visible, .heart:focus-visible, .player-queue-button:focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
 .progress-container { display: flex; align-items: center; gap: 9px; width: 100%; }
 .time { width: 30px; flex-shrink: 0; color: var(--text-muted); font-size: 10px; }
 .time:last-child { text-align: right; }
-.progress { height: 4px; flex: 1; min-width: 0; overflow: hidden; background: #252936; border-radius: 10px; cursor: pointer; }
+.progress { height: 4px; flex: 1; min-width: 0; overflow: hidden; background: var(--border-hover); border-radius: 10px; cursor: pointer; }
 .progress-bar { width: 0%; height: 100%; background: var(--accent); border-radius: inherit; }
 .player-queue { position: relative; display: flex; align-items: center; }
 .player-queue-button { border: none; padding: 8px 0; background: transparent; color: var(--text-secondary); font-size: 13px; white-space: nowrap; cursor: pointer; transition: color 0.15s ease; }
@@ -42,7 +43,7 @@
 .player-queue-panel { position: absolute; right: 0; bottom: calc(100% + 12px); width: 320px; max-height: 420px; display: flex; flex-direction: column; overflow: hidden; background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35); z-index: 1000; }
 .player-queue-tabs { display: flex; flex-shrink: 0; border-bottom: 1px solid var(--border); }
 .player-queue-context { display: flex; flex-shrink: 0; align-items: center; gap: 10px; padding: 12px; border-bottom: 1px solid var(--border); }
-.player-queue-context-cover { width: 44px; height: 44px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 6px; background: linear-gradient(135deg, #242936, #171b24); }
+.player-queue-context-cover { width: 44px; height: 44px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); }
 .player-queue-context-cover img { width: 100%; height: 100%; object-fit: cover; }
 .player-queue-context-cover .playlist-cover-icon { font-size: 20px; }
 .player-queue-context-info { min-width: 0; }

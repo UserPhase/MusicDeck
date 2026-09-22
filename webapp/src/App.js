@@ -210,16 +210,17 @@ function AuthenticatedApp() {
                   }`
                 }
               >
-                <button
-                  className={`main-now-playing-toggle${activeSidebar === "now-playing" ? " active" : ""}`}
-                  type="button"
-                  onClick={() => setActiveSidebar((current) => current === "now-playing" ? "none" : "now-playing")}
-                  aria-pressed={activeSidebar === "now-playing"}
-                  aria-label="Toggle Now Playing sidebar"
-                >
-                  <span aria-hidden="true">♫</span>
-                  Now Playing
-                </button>
+                {activeSidebar === "none" && (
+                  <button
+                    className="main-now-playing-toggle"
+                    type="button"
+                    onClick={() => setActiveSidebar("now-playing")}
+                    aria-label="Open Now Playing sidebar"
+                  >
+                    <span aria-hidden="true">♫</span>
+                    Now Playing
+                  </button>
+                )}
                 <Routes>
                   <Route path="/" element={<Home />} />
                   <Route path="/login" element={<Navigate to="/" replace />} />

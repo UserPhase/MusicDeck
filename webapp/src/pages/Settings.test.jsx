@@ -45,6 +45,7 @@ test("loads and updates user settings", async () => {
     { key: "playback.silenceTrim.minSilenceSeconds", value: "0.5" },
     { key: "playback.crossfadeDuration", value: "3" },
     { key: "playback.streamQuality", value: "\"original\"" },
+    { key: "playback.downloadQuality", value: "\"320kbps\"" },
     { key: "playback.replayGain.enabled", value: "false" },
     { key: "ui.layoutDensity", value: "\"comfortable\"" },
     { key: "ui.autoOpenSidebar", value: "false" },
@@ -69,8 +70,12 @@ test("loads and updates user settings", async () => {
   fireEvent.change(screen.getByRole("combobox", { name: /streaming quality/i }), {
     target: { value: "320" },
   });
+  fireEvent.change(screen.getByRole("combobox", { name: /download quality/i }), {
+    target: { value: "256kbps" },
+  });
   fireEvent.click(screen.getByRole("checkbox", { name: /volume normalization/i }));
   expect(localStorage.getItem("playerStreamQuality")).toBe("320");
+  expect(localStorage.getItem("playerDownloadQuality")).toBe("256kbps");
   expect(localStorage.getItem("playerReplayGainEnabled")).toBe("true");
   fireEvent.click(screen.getByRole("radio", { name: /compact/i }));
   expect(localStorage.getItem("playerLayoutDensity")).toBe("compact");
@@ -89,6 +94,7 @@ test("loads and updates user settings", async () => {
       "playback.silenceTrim.minSilenceSeconds": 0.5,
       "playback.crossfadeDuration": 7,
       "playback.streamQuality": "320",
+      "playback.downloadQuality": "256kbps",
       "playback.replayGain.enabled": true,
       "ui.layoutDensity": "compact",
       "ui.accentColor": "#10B981",

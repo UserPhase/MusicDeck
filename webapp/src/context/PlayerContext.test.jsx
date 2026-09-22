@@ -106,6 +106,8 @@ function PlayerHarness() {
     changeCrossfadeDuration,
     streamQuality,
     changeStreamQuality,
+    downloadQuality,
+    changeDownloadQuality,
     isReplayGainEnabled,
     changeReplayGainEnabled,
     layoutDensity,
@@ -173,6 +175,9 @@ function PlayerHarness() {
       <button onClick={() => changeStreamQuality("320")}>
         quality-320
       </button>
+      <button onClick={() => changeDownloadQuality("256kbps")}>
+        download-quality-256
+      </button>
       <button onClick={() => changeReplayGainEnabled(true)}>
         enable-replay-gain
       </button>
@@ -227,6 +232,9 @@ function PlayerHarness() {
       </div>
       <div data-testid="stream-quality">
         {streamQuality}
+      </div>
+      <div data-testid="download-quality">
+        {downloadQuality}
       </div>
       <div data-testid="replay-gain-enabled">
         {String(isReplayGainEnabled)}
@@ -594,6 +602,17 @@ test("stream quality is global, persistent, and applied to newly loaded streams"
   await waitFor(() => {
     expect(getStreamUrl).toHaveBeenCalledWith("song-1", null, "320");
   });
+});
+
+
+test("download quality is global and persists independently from stream quality", () => {
+  renderPlayer();
+
+  fireEvent.click(screen.getByText("download-quality-256"));
+
+  expect(screen.getByTestId("download-quality")).toHaveTextContent("256kbps");
+  expect(screen.getByTestId("stream-quality")).toHaveTextContent("original");
+  expect(localStorage.getItem("playerDownloadQuality")).toBe("256kbps");
 });
 
 

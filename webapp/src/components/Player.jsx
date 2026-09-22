@@ -114,6 +114,8 @@ function Player({
           <div className="now-cover">
 
             <img
+              width="56"
+              height="56"
               src={
                 currentSong.coverArt
                   ? getCoverUrl(

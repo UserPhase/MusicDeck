@@ -4,6 +4,7 @@ const PRESERVED_LOCAL_STORAGE_KEYS = new Set([
   "playerVolume",
   "playerCrossfadeDuration",
   "playerStreamQuality",
+  "playerDownloadQuality",
   "playerReplayGainEnabled",
   "playerLayoutDensity",
   "playerAccentColor",

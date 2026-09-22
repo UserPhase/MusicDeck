@@ -14,9 +14,9 @@ module.exports = {
           border: "var(--border-glass)",
         },
         command: {
-          app: "#09090B",
-          panel: "#120C1A",
-          violet: "#A855F7",
+          app: "var(--bg-app)",
+          panel: "var(--bg-panel)",
+          violet: "var(--accent)",
         },
       },
     },

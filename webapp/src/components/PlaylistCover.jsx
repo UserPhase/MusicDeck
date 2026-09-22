@@ -84,6 +84,10 @@ function PlaylistCover({
     <img
       src={url}
 
+      width={size || undefined}
+
+      height={size || undefined}
+
       alt={
         `${playlist?.name ||
           playlist?.title ||

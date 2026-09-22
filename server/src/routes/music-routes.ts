@@ -882,7 +882,7 @@ export async function registerMusicRoutes(
     const preferredSource = typeof query.source === "string" && query.source ? query.source : undefined;
     const playableSource = typeof query.playableSource === "string" && query.playableSource ? query.playableSource : undefined;
     const requestedBitRate = Number(query.maxBitRate);
-    const maxBitRate = requestedBitRate === 128 || requestedBitRate === 320
+    const maxBitRate = [128, 192, 256, 320].includes(requestedBitRate)
       ? requestedBitRate
       : undefined;
 

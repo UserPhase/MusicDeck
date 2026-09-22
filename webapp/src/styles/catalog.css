@@ -1,5 +1,45 @@
 .playlist-grid, .album-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 20px; }
 .home-page { max-width: var(--content-wide); margin: 0 auto; }
+.home-hero-gradient {
+  position: relative;
+  isolation: isolate;
+  width: calc(100% + var(--main-padding-x) + var(--main-padding-x));
+  max-width: none;
+  margin: calc(0px - var(--main-padding-top)) calc(0px - var(--main-padding-x)) 0;
+  padding: var(--main-padding-top) var(--main-padding-x) 0;
+}
+.home-hero-gradient::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0 0 auto;
+  width: 100%;
+  height: 460px;
+  background-image:
+    radial-gradient(
+      ellipse 90% 285px at 50% 0,
+      color-mix(in srgb, var(--ambient-glow) 5%, transparent) 0%,
+      color-mix(in srgb, var(--ambient-glow) 2%, transparent) 54%,
+      transparent 100%
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--ambient-glow) 5%, transparent) 0%,
+      color-mix(in srgb, var(--ambient-glow) 2%, transparent) 44%,
+      transparent 100%
+    );
+  background-repeat: no-repeat;
+  background-size: 100% 460px;
+  background-position: center top;
+  content: "";
+  pointer-events: none;
+}
+.home-hero-gradient > * {
+  position: relative;
+  z-index: 1;
+  width: min(100%, var(--content-wide));
+  margin-left: auto;
+  margin-right: auto;
+}
 .home-greeting { display: flex; align-items: flex-end; justify-content: space-between; min-height: 88px; margin-bottom: 34px; }
 .home-kicker { margin-bottom: 8px; color: var(--text-secondary); font-size: var(--font-xs); font-weight: var(--weight-bold); text-transform: uppercase; letter-spacing: 1px; }
 .home-greeting h1 { color: var(--text); font-size: 34px; line-height: 1.1; font-weight: 750; letter-spacing: -0.4px; }
@@ -24,10 +64,10 @@
 .search-result-type { margin-top: var(--space-1); color: var(--text-secondary); font-size: var(--font-sm); }
 .playlist-card { display: block; padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .playlist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.playlist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: linear-gradient(135deg, #242936, #171b24); display: flex; align-items: center; justify-content: center; }
+.playlist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); display: flex; align-items: center; justify-content: center; }
 .playlist-cover img { width: 100%; height: 100%; object-fit: cover; }
 .playlist-cover-icon { color: var(--text-secondary); font-size: 52px; line-height: 1; }
-.search-result-cover { position: relative; aspect-ratio: 1; margin-bottom: var(--space-2); overflow: hidden; border-radius: 6px; background: linear-gradient(135deg, #242936, #171b24); display: flex; align-items: center; justify-content: center; }
+.search-result-cover { position: relative; aspect-ratio: 1; margin-bottom: var(--space-2); overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); display: flex; align-items: center; justify-content: center; }
 .search-result-cover img { width: 100%; height: 100%; object-fit: cover; }
 .search-result-cover .playlist-cover-icon { font-size: 44px; }
 .playlist-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -35,7 +75,7 @@
 .playlist-empty { color: var(--text-secondary); padding: 20px 0; }
 .album { padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .album:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.album-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: #171b24; }
+.album-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); }
 .album-cover img { width: 100%; height: 100%; object-fit: cover; }
 .album-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .album-artist { display: inline-block; color: var(--text-secondary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }
@@ -44,13 +84,13 @@
 .availability-hint { display: inline-block; margin-left: 8px; color: var(--text-secondary); font-size: 11px; letter-spacing: 0.2px; opacity: 0.85; }
 .source-indicator { display: inline-block; margin-left: var(--space-2); color: var(--text-secondary); font-size: var(--font-xs); opacity: 0.85; }
 .recommendation-reason { margin: -4px 12px 8px 76px; color: var(--text-secondary); font-size: var(--font-xs); }
-.play-overlay { position: absolute; right: 10px; bottom: 10px; width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #08090c; font-size: 16px; opacity: 0; transform: translateY(5px); transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease; }
+.play-overlay { position: absolute; right: 10px; bottom: 10px; width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 16px; opacity: 0; transform: translateY(5px); transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease; }
 .album:hover .play-overlay { opacity: 1; transform: translateY(0); }
 .play-overlay:hover { background: var(--accent-hover); }
 .artist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 20px; }
 .artist { display: block; padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .artist:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.artist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: #171b24; }
+.artist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); }
 .artist-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .artist-cover-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 40px; }
 .artist-name { color: var(--text); font-size: 14px; font-weight: 650; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -59,7 +99,7 @@
 .recent-item:hover { background: var(--card-hover); border-color: var(--border-hover); }
 .recent-cover { position: relative; width: 64px; height: 64px; min-width: 64px; min-height: 64px; flex-shrink: 0; overflow: hidden; }
 .recent-cover img { display: block; width: 100%; height: 100%; object-fit: cover; }
-.recent-play { position: absolute; left: 50%; top: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; padding: 0; transform: translate(-50%, -50%) scale(0.9); border: none; border-radius: 50%; background: var(--accent); color: #000; font-size: 12px; cursor: pointer; opacity: 0; transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease; z-index: 2; }
+.recent-play { position: absolute; left: 50%; top: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; padding: 0; transform: translate(-50%, -50%) scale(0.9); border: none; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 12px; cursor: pointer; opacity: 0; transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease; z-index: 2; }
 .recent-item:hover .recent-play { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 .recent-play:hover { background: var(--accent-hover); transform: translate(-50%, -50%) scale(1.05); }
 .recent-info { min-width: 0; padding: 0 12px; }
@@ -69,7 +109,7 @@
 .artist-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
 .artist-card { padding: 12px; background: var(--card); border: 1px solid transparent; border-radius: 9px; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .artist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.artist-card-cover { width: 100%; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: #171b24; }
+.artist-card-cover { width: 100%; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); }
 .artist-card-cover img { width: 100%; height: 100%; object-fit: cover; }
 .artist-card-name { color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .artist-card-meta { margin-top: 5px; color: var(--text-secondary); font-size: 12px; }

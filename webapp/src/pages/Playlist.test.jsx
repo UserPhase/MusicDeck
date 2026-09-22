@@ -118,7 +118,7 @@ test("clicking the active playlist track toggles playback without rebuilding its
   };
 
   renderPlaylist(playlist, { currentSong: playlist.entry[0], isPlaying: true });
-  fireEvent.click(await screen.findByRole("button", { name: "Play First" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Pause First" }));
 
   expect(togglePlay).toHaveBeenCalledTimes(1);
   expect(playContext).not.toHaveBeenCalled();

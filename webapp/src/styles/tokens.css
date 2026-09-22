@@ -7,13 +7,17 @@
   --bg-card: rgba(24, 24, 27, 0.6);
   --border-glass: rgba(255, 255, 255, 0.1);
   --black: var(--bg-app); --background: var(--bg-app);
-  --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: #211f27;
-  --text: #f5f7fa; --text-secondary: rgb(255 255 255 / 60%); --text-muted: #a1a1aa;
+  --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: rgb(255 255 255 / 8%);
+  --text: #f5f7fa; --text-secondary: rgb(255 255 255 / 60%); --text-muted: #a1a1aa; --text-subtle: #71717a;
   --border: var(--border-glass); --border-hover: rgba(255, 255, 255, 0.16);
   --layout-divider: var(--border-glass);
   --color-accent: #A855F7; --accent: var(--color-accent); --accent-hover: color-mix(in srgb, var(--color-accent) 82%, white);
   --ambient-glow: #C12C91;
-  --nav-background: #101014; --nav-hover: #1a181f; --nav-active: #29252e;
+  --nav-background: rgb(16 16 20 / 85%); --nav-hover: rgb(255 255 255 / 5%); --nav-active: rgb(39 39 42 / 60%);
+  --control-surface: rgb(9 9 11 / 82%); --placeholder-surface: rgb(24 24 27 / 85%);
+  --danger: #ef6b73; --danger-text: #ff9aa0; --danger-text-strong: #ffd4d7;
+  --status-failed: #e06565; --entity-artist: #8ed8bd; --entity-playlist: #e8b76a;
+  --badge-preview: #fbbf24; --badge-lossless: #34d399; --badge-high: #22d3ee;
   --sidebar-width: 280px; --right-sidebar-width: 300px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
 
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
@@ -34,7 +38,8 @@
   --border-glass: rgba(18, 24, 39, 0.12);
   --black: var(--bg-app); --background: #edf2f8;
   --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: #e8eef7;
-  --text: #121827; --text-secondary: #536073; --text-muted: #768196;
+  --text: #121827; --text-secondary: #536073; --text-muted: #768196; --text-subtle: #8b96a8;
   --border: var(--border-glass); --border-hover: #cbd6e5;
   --nav-background: #f8faff; --nav-hover: #eef3fa; --nav-active: #e2eaff;
+  --control-surface: rgb(255 255 255 / 82%); --placeholder-surface: #eef3fa;
 }

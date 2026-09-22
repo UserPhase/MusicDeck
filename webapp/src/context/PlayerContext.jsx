@@ -393,6 +393,18 @@ export function PlayerProvider({
 
   const streamQualityRef = useRef(streamQuality);
 
+  const [downloadQuality, setDownloadQuality] = useState(() => {
+    try {
+      const saved = localStorage.getItem("playerDownloadQuality");
+      return ["lossless", "320kbps", "256kbps", "192kbps", "128kbps"].includes(saved)
+        ? saved
+        : "320kbps";
+    } catch (error) {
+      console.error("Could not load download quality:", error);
+      return "320kbps";
+    }
+  });
+
 
   const [
     isReplayGainEnabled,
@@ -585,6 +597,21 @@ export function PlayerProvider({
             );
           } catch (error) {
             console.error("Could not save streaming quality:", error);
+          }
+        }
+
+        if (
+          ["lossless", "320kbps", "256kbps", "192kbps", "128kbps"].includes(
+            map["playback.downloadQuality"]
+          )
+        ) {
+          const nextDownloadQuality = map["playback.downloadQuality"];
+          setDownloadQuality(nextDownloadQuality);
+
+          try {
+            localStorage.setItem("playerDownloadQuality", nextDownloadQuality);
+          } catch (error) {
+            console.error("Could not save download quality:", error);
           }
         }
 
@@ -2425,6 +2452,22 @@ export function PlayerProvider({
   }
 
 
+  function changeDownloadQuality(value) {
+    const nextQuality =
+      ["lossless", "320kbps", "256kbps", "192kbps", "128kbps"].includes(value)
+        ? value
+        : "320kbps";
+
+    setDownloadQuality(nextQuality);
+
+    try {
+      localStorage.setItem("playerDownloadQuality", nextQuality);
+    } catch (error) {
+      console.error("Could not save download quality:", error);
+    }
+  }
+
+
   function changeReplayGainEnabled(value) {
     const nextEnabled = Boolean(value);
 
@@ -2609,6 +2652,8 @@ export function PlayerProvider({
 
         streamQuality,
 
+        downloadQuality,
+
         isReplayGainEnabled,
 
         layoutDensity,
@@ -2646,6 +2691,8 @@ export function PlayerProvider({
         changeCrossfadeDuration,
 
         changeStreamQuality,
+
+        changeDownloadQuality,
 
         changeReplayGainEnabled,
 

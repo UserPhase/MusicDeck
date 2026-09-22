@@ -14,12 +14,8 @@ import {
   getCoverUrl,
 } from "../api/musicdeck";
 
-import AvailabilityHint from "../components/AvailabilityHint";
-import SourceMenu from "../components/SourceMenu";
-import SourceIndicator from "../components/SourceIndicator";
-import TrackDownloadButton from "../components/TrackDownloadButton";
-import TrackLikeButton from "../components/TrackLikeButton";
-import TrackPlaybackIndicator from "../components/TrackPlaybackIndicator";
+import TrackListHeader from "../components/TrackListHeader";
+import TrackRow from "../components/TrackRow";
 
 import {
   getPlaylists,
@@ -29,11 +25,6 @@ import {
 import {
   usePlayer,
 } from "../context/PlayerContext";
-
-import {
-  formatDuration,
-} from "../utils/formatDuration";
-
 
 function Artist() {
 
@@ -55,22 +46,15 @@ function Artist() {
   const [error, setError] =
     useState(null);
 
-
   const {
     playContext,
     playQueue,
     playSongFromSource,
-    currentSong,
-    isPlaying,
-    togglePlay,
+    isShuffleEnabled,
+    toggleShuffle,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
-    if (currentSong && String(currentSong.id) === String(song.id)) {
-      togglePlay();
-      return;
-    }
-
     playContext(songs, index, {
       type: "artist",
       id: artist.id,
@@ -450,7 +434,9 @@ function Artist() {
 
   return (
 
-    <div className="artist-page">
+    <div
+      className="artist-page detail-hero-gradient"
+    >
 
 
       {/* BACK */}
@@ -475,6 +461,8 @@ function Artist() {
           {artist.coverArt ? (
 
             <img
+              width="210"
+              height="210"
               src={
                 getCoverUrl(
                   artist.coverArt
@@ -529,7 +517,11 @@ function Artist() {
           </div>
 
 
-          <div className="artist-actions">
+        </div>
+
+      </div>
+
+      <div className="detail-action-row artist-actions">
 
             <button
               className="artist-play"
@@ -549,9 +541,15 @@ function Artist() {
 
             </button>
 
-          </div>
-
-        </div>
+            <button
+              type="button"
+              className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}
+              aria-label="Toggle shuffle"
+              aria-pressed={Boolean(isShuffleEnabled)}
+              onClick={toggleShuffle}
+            >
+              ⇄
+            </button>
 
       </div>
 
@@ -655,6 +653,8 @@ function Artist() {
 
         <div className="track-list">
 
+          <TrackListHeader />
+
           {songs.length === 0 && (
 
             <div className="library-empty">
@@ -665,164 +665,17 @@ function Artist() {
 
           {songs.map(
             (song, index) => (
-
-            <div
-              className={
-                `track${currentSong && String(currentSong.id) === String(song.id) ? ` is-current-track${isPlaying ? " is-playing" : ""}` : ""}`
-              }
-              onClick={(event) => {
-                if (!event.target.closest("a, button, input")) {
-                  handleTrackPlayback(song, index);
-                }
-              }}
+            <TrackRow
               key={`${song.id}-${index}`}
-            >
-
-
-              {/* NUMBER / PLAY */}
-
-              <div className="track-number">
-
-                <TrackPlaybackIndicator
-                  index={index}
-                  isCurrentTrack={Boolean(currentSong) && String(currentSong.id) === String(song.id)}
-                  isPlaying={isPlaying}
-                />
-
-
-                <button
-                  className="track-play"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleTrackPlayback(song, index);
-                  }}
-                  aria-label={
-                    `Play ${song.title}`
-                  }
-                >
-                  ▶
-                </button>
-
-              </div>
-
-
-              {/* SONG INFO */}
-
-              <div className="track-info">
-
-                <div className="track-title">
-                  {song.title}
-                  <AvailabilityHint availability={song.availability} />
-                  <SourceIndicator source={song.source} />
-                </div>
-
-
-                {song.artistId ? (
-
-                  <Link
-                    to={
-                      `/artist/${song.artistId}`
-                    }
-                    className="track-artist"
-                  >
-                    {song.artist}
-                  </Link>
-
-                ) : (
-
-                  <div className="track-artist">
-                    {song.artist}
-                  </div>
-
-                )}
-
-              </div>
-
-
-              {/* ALBUM */}
-
-              {song.albumId ? (
-
-                <Link
-                  to={
-                    `/album/${song.albumId}`
-                  }
-                  className="track-album"
-                >
-                  {song.album}
-                </Link>
-
-              ) : (
-
-                <div className="track-album">
-                  {song.album}
-                </div>
-
-              )}
-
-
-              {/* DOWNLOAD */}
-
-              <TrackDownloadButton song={song} />
-
-
-              {/* DURATION */}
-
-              <div className="track-duration">
-
-                {formatDuration(
-                  song.duration
-                )}
-
-              </div>
-
-
-              {/* MENU */}
-
-              <div
-                className="track-menu-container"
-
-                onMouseDown={(event) =>
-                  event.stopPropagation()
-                }
-              >
-
-                <SourceMenu
-                  song={song}
-                  sources={song.sources}
-                  onSelect={playSongFromSource}
-                />
-
-                <TrackLikeButton song={song} />
-
-                <button
-                  className="track-menu"
-                  aria-label="More options"
-
-                  onClick={() => {
-
-                    togglePlaylistMenu(
-                      song
-                    );
-
-                  }}
-                >
-                  ⋯
-                </button>
-
-
-                {/* PLAYLIST MENU */}
-
-                {playlistMenuSong?.id ===
-                  song.id && (
-
-                  <div
-                    className="playlist-menu"
-
-                    onMouseDown={(event) =>
-                      event.stopPropagation()
-                    }
-                  >
+              song={song}
+              index={index}
+              showDownloadStatus={false}
+              showSourceIndicator
+              onPlay={handleTrackPlayback}
+              onSelectSource={playSongFromSource}
+              onToggleMenu={togglePlaylistMenu}
+              menu={playlistMenuSong?.id === song.id ? (
+                <div className="playlist-menu">
 
                     <div className="playlist-menu-title">
                       Add to playlist
@@ -879,14 +732,9 @@ function Artist() {
                       </div>
 
                     )}
-
-                  </div>
-
-                )}
-
-              </div>
-
-            </div>
+                </div>
+              ) : null}
+            />
 
           ))}
 
