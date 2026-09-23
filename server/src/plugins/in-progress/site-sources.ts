@@ -607,7 +607,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
         errorMessage: "Invalid base URL",
       };
       this.lastDiagnostic = diag;
-      console.log(`[SiteDiscovery] Site source failed:\nsite = ${this.site.name}\nurl = ${this.site.baseUrl}\nreason = invalid base URL`);
       const err = new Error(`Site source "${this.site.name}" is misconfigured`);
       (err as any).failure = "network_error";
       (err as any).site = this.site.name;
@@ -619,7 +618,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
     const supportsSpotify = this.site.inputMode === "spotify-url" || this.site.inputMode === "either" || Boolean(this.site.spotifySearchPath) || this.site.searchPath.includes("{spotifyUrl}") || this.site.searchPath.includes("{spotifyId}");
 
     if (requiresSpotify && !hasSpotifyInput) {
-      console.log(`[SiteDiscovery] site "${this.site.name}" requires Spotify URL input, but no Spotify URL was provided. Skipping.`);
       return [];
     }
 
@@ -644,7 +642,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
         errorMessage: "Missing {query}, {spotifyUrl}, or {spotifyId} in search path",
       };
       this.lastDiagnostic = diag;
-      console.log(`[SiteDiscovery] Site source failed:\nsite = ${this.site.name}\nurl = ${this.site.baseUrl}\nreason = misconfigured search template`);
       const err = new Error(`Site source "${this.site.name}" is misconfigured`);
       (err as any).failure = "network_error";
       (err as any).site = this.site.name;
@@ -661,7 +658,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
       spotifyTrackId: options?.spotifyTrackId,
     } : undefined;
 
-    console.log(`[PublicSource]\ndiscovery started\nsearch query = "${query}"${useSpotifySearch ? `\nspotifyUrl = "${options?.spotifyTrackUrl}"` : ""}`);
 
     const pathsToTry = this.site.workingSearchPath
       ? [this.site.workingSearchPath]
@@ -740,11 +736,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
       }
     }
 
-    if (pathsToTry.length > 1) {
-      const attemptsSummary = attemptLogs.map((a, idx) => `  attempt ${idx + 1}: ${a.path} -> ${a.httpStatus ? a.httpStatus : a.error}`).join("\n");
-      console.log(`[SiteDiscovery] site "${this.site.name}" search attempts:\n${attemptsSummary}`);
-    }
-
     if (!response || !response.ok) {
       const failure: SiteDiscoveryFailure = lastFailure || "network_error";
       let diagStatus: SiteDiscoveryStatus = "http_failure";
@@ -781,14 +772,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
         attemptedPaths: attemptLogs,
       };
 
-      console.log(
-        `[SiteDiscovery] Site source failed:\n` +
-        `site = ${this.site.name}\n` +
-        `url = ${lastUrl}\n` +
-        `status = ${lastStatus || "N/A"}\n` +
-        `failure = ${failure}\n` +
-        `reason = ${lastError || "search endpoint failed"}`
-      );
 
       const err = new Error(`Site source "${this.site.name}" is unavailable: ${lastError || "search endpoint failed"}`);
       (err as any).failure = failure;
@@ -824,7 +807,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
           errorMessage: reason,
           attemptedPaths: attemptLogs,
         };
-        console.log(`[SiteDiscovery] Site source failed:\nsite = ${this.site.name}\nurl = ${lastUrl}\nstatus = ${response.status}\nfailure = parse_error\nreason = ${reason}`);
         const parseErr = new Error(`Site source "${this.site.name}" returned invalid JSON`);
         (parseErr as any).failure = "parse_error";
         (parseErr as any).httpStatus = response.status;
@@ -852,7 +834,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
           errorMessage: reason,
           attemptedPaths: attemptLogs,
         };
-        console.log(`[SiteDiscovery] Site source failed:\nsite = ${this.site.name}\nurl = ${lastUrl}\nstatus = ${response.status}\nfailure = network_error\nreason = ${reason}`);
         const readErr = new Error(`Site source "${this.site.name}" failed reading response`);
         (readErr as any).failure = "network_error";
         (readErr as any).httpStatus = response.status;
@@ -882,15 +863,6 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
           errorMessage: reason,
           attemptedPaths: attemptLogs,
         };
-        console.log(
-          `[SiteDiscovery] site = ${this.site.name}\n` +
-          `status = 200\n` +
-          `responseType = html\n` +
-          `mediaLinksFound = 0\n` +
-          `magnetLinksFound = 0\n` +
-          `candidatesAfterRelevance = 0\n` +
-          `reason = ${reason}`
-        );
         return [];
       }
     }
@@ -905,24 +877,7 @@ export class SiteDiscoveryProvider implements SourceDiscoveryProvider {
       })
       .slice(0, Math.max(1, Math.min(options?.limit || 10, 25)));
 
-    console.log(
-      `[PublicSource]\n` +
-      `search URL = ${lastUrl}\n` +
-      `search status = ${response?.status || 200}\n` +
-      `response type = ${this.site.responseType}\n` +
-      `raw results = ${rawCandidates.length}\n` +
-      `candidates before filtering = ${rawCandidates.length}\n` +
-      `candidates after filtering = ${matchingCandidates.length}`
-    );
 
-    console.log(
-      `[SiteDiscovery] site = ${this.site.name}\n` +
-      `status = ${response?.status || 200}\n` +
-      `responseType = ${this.site.responseType}\n` +
-      `mediaLinksFound = ${mediaLinksFound}\n` +
-      `magnetLinksFound = ${magnetLinksFound}\n` +
-      `candidatesAfterRelevance = ${matchingCandidates.length}`
-    );
 
     if (matchingCandidates.length > 0) {
       this.lastDiagnostic = {
@@ -1512,7 +1467,6 @@ export function createSiteSourcesPlugin(): MusicDeckPlugin {
         sitesMap.set(site.id, site);
         context.sourceDiscovery!.register(new SiteDiscoveryProvider(site, fetchImpl));
         context.sourceDiscovery!.configure(`site-${site.id}`, true);
-        console.log(`[PublicSource]\nprovider registered = true\nprovider id = site-${site.id}\nprovider enabled = true\ndiscovery provider registered = true`);
       }
 
       if (sites.length > 0) {

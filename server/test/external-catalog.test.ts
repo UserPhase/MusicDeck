@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { closeTestServer, createFakeBackend, createTestServer, login } from "./helpers.js";
+import { DeezerExternalCatalogProvider } from "../src/domain/external-catalog.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;
 
@@ -514,6 +515,25 @@ describe("Deezer external artwork", () => {
 });
 
 describe("External catalog detail navigation", () => {
+  test("paginates a prolific Deezer artist's albums past the initial response", async () => {
+    const fetchImpl = vi.fn(async (input: URL | string) => {
+      const url = new URL(String(input));
+      let body: unknown = {};
+      if (url.pathname === "/artist/7743172") body = { id: 7743172, name: "Besomorph" };
+      if (url.pathname === "/artist/7743172/top") body = { data: [] };
+      if (url.pathname === "/artist/7743172/albums") body = url.searchParams.get("index") === "100"
+        ? { total: 101, data: [{ id: 999, title: "Apologize" }] }
+        : { total: 101, data: Array.from({ length: 100 }, (_, index) => ({
+          id: index + 1, title: index === 37 ? "LSD" : `Release ${index}`,
+        })) };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as typeof fetch;
+
+    const detail = await new DeezerExternalCatalogProvider(fetchImpl).getArtist("external_deezer_artist_7743172");
+    expect(detail?.albums).toHaveLength(101);
+    expect(detail?.albums.map((album) => album.title)).toContain("Apologize");
+  });
+
   function deezerDetailFetch(input: URL | string) {
     const url = new URL(String(input));
 
@@ -937,7 +957,7 @@ describe("Catalog completeness through the album/artist API", () => {
     expect(tracksResponse.json().tracks.every((t: any) => !t.availability?.libraryAvailable)).toBe(true);
   });
 
-  test("artist page shows mixed local/external albums, including a catalog-only album with zero local tracks", async () => {
+  test("local artist albums remain bound to the exact artist ID instead of a name-matched external catalog", async () => {
     current = await createTestServer(setupCompleteness(), {}, undefined, completenessFetch as typeof fetch);
     current.externalCatalog.configure(true, CREDENTIALS);
     const { cookie } = await login(current.app);
@@ -953,10 +973,174 @@ describe("Catalog completeness through the album/artist API", () => {
 
     expect(albumsResponse.statusCode).toBe(200);
     const albums = albumsResponse.json().albums;
-    expect(albums.some((a: any) => a.title === CATALOG_ALBUM_NAME && a.source?.kind === "library")).toBe(true);
-    const catalogOnly = albums.find((a: any) => a.title === "Innuendo (Deluxe)");
-    expect(catalogOnly).toBeTruthy();
-    expect(catalogOnly.source?.kind).toBe("external");
+    expect(albums).toHaveLength(1);
+    expect(albums[0]).toMatchObject({ name: CATALOG_ALBUM_NAME, artistId });
+    expect(albums.some((album: any) => album.name === "Innuendo (Deluxe)")).toBe(false);
+  });
+
+  test("artist routes discard same-name-prefix albums and tracks with another artist ID", async () => {
+    const backend = createFakeBackend({
+      listArtists: vi.fn(async () => [LOCAL_ARTIST]),
+      getArtist: vi.fn(async () => LOCAL_ARTIST),
+      getArtistAlbums: vi.fn(async () => [
+        LOCAL_ALBUM,
+        { ...LOCAL_ALBUM, id: "queen-naija-album", name: "Ghetto Fairytales 2", artistId: "queen-naija-id" },
+      ]),
+      getArtistTracks: vi.fn(async () => [
+        ...LOCAL_TRACKS,
+        { ...LOCAL_TRACKS[0], id: "queen-naija-song", title: "Roarrr", artistId: "queen-naija-id" },
+      ]),
+    });
+    current = await createTestServer(backend);
+    const { cookie } = await login(current.app);
+    const artists = await current.app.inject({ method: "GET", url: "/api/artists", headers: { cookie } });
+    const artistId = artists.json().artists[0].id;
+    const [albumsResponse, tracksResponse] = await Promise.all([
+      current.app.inject({ method: "GET", url: `/api/artists/${artistId}/albums`, headers: { cookie } }),
+      current.app.inject({ method: "GET", url: `/api/artists/${artistId}/tracks`, headers: { cookie } }),
+    ]);
+
+    expect(albumsResponse.statusCode).toBe(200);
+    expect(albumsResponse.json().albums).toEqual([expect.objectContaining({ name: CATALOG_ALBUM_NAME, artistId })]);
+    expect(tracksResponse.statusCode).toBe(200);
+    expect(tracksResponse.json().tracks).toHaveLength(3);
+    expect(tracksResponse.json().tracks.every((track: any) => track.artistId === artistId)).toBe(true);
+  });
+
+  test("iTunes artist overview rejects same-name collisions while Deezer supplies portrait separately", async () => {
+    const reply = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), {
+      status: 200, headers: { "content-type": "application/json" },
+    }));
+    const deezerFetch = vi.fn((input: URL | string) => {
+      const url = new URL(String(input));
+      if (url.hostname === "itunes.apple.com" && url.pathname === "/search") return reply({ results: [
+        { wrapperType: "collection", collectionId: 101, artistId: 100, artistName: "Queen", collectionName: CATALOG_ALBUM_NAME },
+        { wrapperType: "collection", collectionId: 202, artistId: 200, artistName: "Queen", collectionName: "Ghetto Fairytales 2" },
+      ] });
+      if (url.hostname === "itunes.apple.com" && url.pathname === "/lookup") return reply({ results:
+        url.searchParams.get("entity") === "album" ? [
+          { wrapperType: "artist", artistId: 100, artistName: "Queen" },
+          { wrapperType: "collection", collectionId: 101, artistId: 100, artistName: "Queen", collectionName: CATALOG_ALBUM_NAME },
+          { wrapperType: "collection", collectionId: 102, artistId: 100, artistName: "Queen", collectionName: "A Night at the Opera", artworkUrl100: "https://is1-ssl.mzstatic.com/image/thumb/correct/100x100bb.jpg" },
+          { wrapperType: "collection", collectionId: 105, artistId: 100, artistName: "GEMS", collectionName: "GLOW With GEMS" },
+        ] : [
+          { wrapperType: "track", kind: "song", trackId: 103, artistId: 100, artistName: "Queen", trackName: "Bohemian Rhapsody", trackTimeMillis: 180000, collectionName: CATALOG_ALBUM_NAME },
+          { wrapperType: "track", kind: "song", trackId: 104, artistId: 100, artistName: "Queen", trackName: "Don't Stop Me Now", trackTimeMillis: 210000, collectionName: "A Night at the Opera" },
+          { wrapperType: "track", kind: "song", trackId: 105, artistId: 100, artistName: "GEMS", trackName: "Unrelated Song", trackTimeMillis: 210000, collectionName: "GLOW With GEMS" },
+          { wrapperType: "track", kind: "song", trackId: 203, artistId: 200, artistName: "Queen", trackName: "Roarrr", trackTimeMillis: 180000 },
+        ] });
+      if (url.pathname === "/search/artist") return reply({ data: [
+        { id: 200, name: "Queen", picture_xl: "https://cdn-images.dzcdn.net/images/artist/wrong.jpg" },
+        { id: 100, name: "Queen", picture_xl: "https://cdn-images.dzcdn.net/images/artist/correct.jpg" },
+        { id: 300, name: "Queen Naija", picture_xl: "https://cdn-images.dzcdn.net/images/artist/other.jpg" },
+      ] });
+      if (url.pathname === "/artist/200") return reply({ id: 200, name: "Queen", picture_xl: "https://cdn-images.dzcdn.net/images/artist/wrong.jpg" });
+      if (url.pathname === "/artist/100") return reply({ id: 100, name: "Queen", picture_xl: "https://cdn-images.dzcdn.net/images/artist/correct.jpg" });
+      if (url.pathname === "/artist/200/albums") return reply({ data: [
+        { id: 202, title: "Ghetto Fairytales 2", artist: { id: 200 }, cover_xl: "https://cdn-images.dzcdn.net/images/cover/wrong.jpg" },
+      ] });
+      if (url.pathname === "/artist/100/albums") return reply({ data: [
+        { id: 101, title: CATALOG_ALBUM_NAME, artist: { id: 100 } },
+        { id: 102, title: "A Night at the Opera", artist: { id: 100 }, cover_xl: "https://cdn-images.dzcdn.net/images/cover/correct.jpg" },
+        { id: 105, title: "GLOW With GEMS" },
+        { id: 202, title: "Ghetto Fairytales 2", artist: { id: 200 } },
+      ] });
+      if (url.pathname === "/artist/200/top") return reply({ data: [
+        { id: 203, title: "Roarrr", duration: 180, artist: { id: 200, name: "Queen" } },
+      ] });
+      if (url.pathname === "/artist/100/top") return reply({ data: [
+        { id: 103, title: "Bohemian Rhapsody", duration: 180, artist: { id: 100, name: "Queen" }, album: { id: 101, title: CATALOG_ALBUM_NAME } },
+        { id: 104, title: "Don't Stop Me Now", duration: 210, artist: { id: 100, name: "Queen" }, album: { id: 102, title: "A Night at the Opera" } },
+        { id: 105, title: "Unrelated Song", duration: 210, artist: { id: 100, name: "Queen" }, album: { id: 105, title: "GLOW With GEMS" } },
+        { id: 203, title: "Roarrr", duration: 180, artist: { id: 200, name: "Queen" } },
+      ] });
+      return reply({ data: [] });
+    });
+    current = await createTestServer(setupCompleteness(), {}, undefined, deezerFetch as typeof fetch);
+    const { cookie } = await login(current.app);
+    const artists = await current.app.inject({ method: "GET", url: "/api/artists", headers: { cookie } });
+    const artistId = artists.json().artists[0].id;
+    const overview = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/overview`, headers: { cookie },
+    });
+
+    expect(overview.statusCode).toBe(200);
+    const data = overview.json();
+    expect(data.localAlbumCount).toBe(1);
+    expect(data.localSongCount).toBe(3);
+    expect(data.albums.map((album: any) => album.name || album.title)).toEqual([
+      CATALOG_ALBUM_NAME, "A Night at the Opera",
+    ]);
+    expect(data.albums[1].artistId).toBe(artistId);
+    expect(data.topTracks[0].id).toBe(data.tracks[0].id);
+    expect(data.topTracks.some((track: any) => track.title === "Don't Stop Me Now")).toBe(true);
+    expect(data.topTracks.some((track: any) => track.title === "Roarrr")).toBe(false);
+    expect(data.topTracks.some((track: any) => track.title === "Unrelated Song")).toBe(false);
+    expect(data.artist.imageUrl).toBeNull();
+    const portrait = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/portrait`, headers: { cookie },
+    });
+    const artworkId = portrait.json().imageUrl.split("/").pop();
+    expect(current.externalCatalog.getArtwork(artworkId)).toBe("https://cdn-images.dzcdn.net/images/artist/correct.jpg");
+    expect(portrait.headers["cache-control"]).toBe("no-store");
+    const beforePurge = deezerFetch.mock.calls.length;
+    const purge = await current.app.inject({
+      method: "POST", url: `/api/artists/${artistId}/portrait/purge`, headers: { cookie },
+    });
+    expect(purge.statusCode).toBe(200);
+    await current.app.inject({ method: "GET", url: `/api/artists/${artistId}/portrait`, headers: { cookie } });
+    expect(deezerFetch.mock.calls.length).toBeGreaterThan(beforePurge);
+    expect(deezerFetch.mock.calls.filter(([input]) => new URL(String(input)).hostname === "musicbrainz.org")).toHaveLength(0);
+  });
+
+  test("local artist overview skips external lookups and shares its snapshot with enrichment", async () => {
+    const backend = setupCompleteness();
+    const externalFetch = vi.fn(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    current = await createTestServer(backend, {}, undefined, externalFetch as typeof fetch);
+    const { cookie } = await login(current.app);
+    const artists = await current.app.inject({ method: "GET", url: "/api/artists", headers: { cookie } });
+    const artistId = artists.json().artists[0].id;
+
+    const local = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/overview?scope=local`, headers: { cookie },
+    });
+    expect(local.statusCode).toBe(200);
+    expect(local.headers["server-timing"]).toContain("artist-snapshot;dur=");
+    expect(local.json()).toMatchObject({
+      localAlbumCount: 1, localSongCount: 3, externalEnrichmentAvailable: true,
+    });
+    expect(local.json().albums).toHaveLength(1);
+    expect(externalFetch).not.toHaveBeenCalled();
+
+    const complete = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/overview`, headers: { cookie },
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(backend.getArtistTracks).toHaveBeenCalledTimes(1);
+    expect(externalFetch).toHaveBeenCalled();
+  });
+
+  test("artist overview never sends the full discography to a ten-row page", async () => {
+    const fortyTracks = Array.from({ length: 40 }, (_, index) => localTrack(`track-${index}`, `Song ${index}`));
+    const artist = { ...LOCAL_ARTIST, songCount: 40 };
+    const album = { ...LOCAL_ALBUM, songCount: 40 };
+    const backend = createFakeBackend({
+      listArtists: vi.fn(async () => [artist]),
+      getArtist: vi.fn(async () => artist),
+      getArtistAlbums: vi.fn(async () => [album]),
+      getArtistTracks: vi.fn(async () => fortyTracks),
+    });
+    current = await createTestServer(backend);
+    const { cookie } = await login(current.app);
+    const artists = await current.app.inject({ method: "GET", url: "/api/artists", headers: { cookie } });
+    const artistId = artists.json().artists[0].id;
+    const response = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/overview?scope=local`, headers: { cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().localSongCount).toBe(40);
+    expect(response.json().tracks).toHaveLength(10);
+    expect(response.json().topTracks).toHaveLength(10);
   });
 
   // Regression test for the exact reported bug: with no Spotify credentials

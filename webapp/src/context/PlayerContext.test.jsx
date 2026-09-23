@@ -24,7 +24,7 @@ import {
   getUserSettings,
   getSilenceAnalysis,
   getPlayableSources,
-  recordRecentlyPlayed,
+  recordListeningEvent,
 } from "../api/musicdeck";
 
 
@@ -37,7 +37,7 @@ jest.mock("../api/musicdeck", () => ({
   getUserSettings: jest.fn(),
   getSilenceAnalysis: jest.fn(),
   getPlayableSources: jest.fn(),
-  recordRecentlyPlayed: jest.fn(),
+  recordListeningEvent: jest.fn(),
   starSong: jest.fn(),
   unstarSong: jest.fn(),
 }));
@@ -273,7 +273,7 @@ function renderPlayer({ recentHistory = [] } = {}) {
   getUserSettings.mockResolvedValue([]);
   getSilenceAnalysis.mockResolvedValue(null);
   getPlayableSources.mockResolvedValue({ sources: [], selectedSource: null });
-  recordRecentlyPlayed.mockResolvedValue(undefined);
+  recordListeningEvent.mockResolvedValue(undefined);
   getStreamUrl.mockImplementation(
     (songId) => `/stream/${songId}`
   );
@@ -305,6 +305,7 @@ beforeEach(() => {
 test("caps and validates recently played history received from the server", async () => {
   const recentHistory = Array.from({ length: 55 }, (_, index) => ({
     id: `history-${index}`,
+    playedAt: new Date().toISOString(),
   }));
 
   renderPlayer({ recentHistory });
@@ -316,6 +317,15 @@ test("caps and validates recently played history received from the server", asyn
   const hydratedIds = screen.getByTestId("recently-played").textContent.split(",");
   expect(hydratedIds).toHaveLength(50);
   expect(hydratedIds).not.toContain("history-50");
+});
+
+test("drops listening history older than 45 days during hydration", async () => {
+  renderPlayer({ recentHistory: [
+    { id: "old", playedAt: new Date(Date.now() - 46 * 86_400_000).toISOString() },
+    { id: "current", playedAt: new Date().toISOString() },
+  ] });
+  await waitFor(() => expect(screen.getByTestId("recently-played")).toHaveTextContent("current"));
+  expect(screen.getByTestId("recently-played")).not.toHaveTextContent("old");
 });
 
 test("ignores malformed recently played history received from the server", async () => {
@@ -419,7 +429,7 @@ test("duplicate ended events advance the queue only once", async () => {
     expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
   });
 
-  recordRecentlyPlayed.mockClear();
+  recordListeningEvent.mockClear();
   const audio = container.querySelector("audio");
   fireEvent.ended(audio);
   fireEvent.ended(audio);
@@ -429,8 +439,42 @@ test("duplicate ended events advance the queue only once", async () => {
   });
 
   expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
-  expect(recordRecentlyPlayed).toHaveBeenCalledTimes(1);
-  expect(recordRecentlyPlayed).toHaveBeenCalledWith("song-2");
+  expect(recordListeningEvent).toHaveBeenCalledTimes(1);
+  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 1);
+});
+
+test("scrobbles a local track once after half its duration, not on play start", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  expect(recordListeningEvent).not.toHaveBeenCalled();
+
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 89 });
+  fireEvent.timeUpdate(audio);
+  expect(recordListeningEvent).not.toHaveBeenCalled();
+  audio.currentTime = 90;
+  fireEvent.timeUpdate(audio);
+  fireEvent.timeUpdate(audio);
+
+  expect(recordListeningEvent).toHaveBeenCalledTimes(1);
+  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 0.5);
+  expect(screen.getByTestId("recently-played")).toHaveTextContent("song-1");
+});
+
+test("qualifies a long track at four minutes without waiting for halfway", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "duration", { configurable: true, value: 1000 });
+  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 239 });
+  fireEvent.timeUpdate(audio);
+  expect(recordListeningEvent).not.toHaveBeenCalled();
+  audio.currentTime = 240;
+  fireEvent.timeUpdate(audio);
+  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 0.24);
 });
 
 
@@ -870,5 +914,6 @@ test("preview playback stops at the preview endpoint", async () => {
   fireEvent.timeUpdate(audio);
 
   expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
+  expect(recordListeningEvent).not.toHaveBeenCalled();
 });
 

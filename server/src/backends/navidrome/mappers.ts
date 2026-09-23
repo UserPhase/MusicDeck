@@ -51,6 +51,9 @@ export function mapTrack(song: any): Track {
     albumId: id(song.albumId),
     albumName: song.album || "Unknown album",
     durationSeconds: typeof song.duration === "number" ? song.duration : null,
+    playCount: typeof song.playCount === "number" ? song.playCount : null,
+    lastPlayedAt: typeof song.played === "string" ? song.played : null,
+    addedAt: typeof song.created === "string" ? song.created : null,
     trackNumber: typeof song.track === "number" ? song.track : null,
     artworkId: id(song.coverArt),
     artworkUrl: artworkUrl(id(song.coverArt)),
@@ -89,6 +92,7 @@ export function mapArtist(artist: any): Artist {
     artworkId: artId,
     artworkUrl: artworkUrl(artId),
     albumCount: typeof artist.albumCount === "number" ? artist.albumCount : artist.album?.length || 0,
+    songCount: typeof artist.songCount === "number" ? artist.songCount : null,
     identityHints: identityHints(artist),
   };
 }

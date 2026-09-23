@@ -487,7 +487,7 @@ class RealDebridDriver implements DebridDriver {
     return { id: torrentId, status: files.length > 0 ? "ready" : "failed", files };
   }
 
-  async resolveTrack(result: UnifiedSearchResult): Promise<DebridJob> {
+  async resolveTrack(): Promise<DebridJob> {
     // Real-Debrid has no title/artist search; track resolution flows through
     // the discovery pipeline (a scraper supplies the magnet) into fetchUrl.
     return { id: "rd-unsupported", status: "failed" };
@@ -689,19 +689,14 @@ export class DebridCloudSourceProvider implements SourceProvider {
             : submission;
 
     let cached = this.containerJobCache.get(containerKey);
-    let jobReused = false;
-    let containerSubmitted = false;
     let job: DebridJob | null = null;
 
     if (cached && cached.expiresAt > Date.now() && cached.files.length > 0) {
-      jobReused = true;
       job = { id: cached.jobId, status: "ready", files: cached.files };
     } else if (cached?.inFlight) {
       // Concurrent in-flight request for the same container
-      jobReused = true;
       job = await cached.inFlight;
     } else {
-      containerSubmitted = true;
       const inFlightPromise = (async () => {
         return this.driver().fetchUrl(submission, options?.target);
       })();
@@ -755,7 +750,6 @@ export class DebridCloudSourceProvider implements SourceProvider {
       );
     }
 
-    const selectedFile = matching[0];
     const playableSources: PlayableSource[] = [];
 
     for (const file of matching) {
@@ -782,15 +776,6 @@ export class DebridCloudSourceProvider implements SourceProvider {
       });
     }
 
-    console.log(
-      `[Debrid]\n` +
-      `  container submitted = ${containerSubmitted}\n` +
-      `  job reused = ${jobReused}\n` +
-      `  files enumerated = ${jobReused ? "cache hit" : audio.length}\n` +
-      `  matching files = ${matching.length}\n` +
-      `  selected = ${selectedFile?.name || "none"}\n` +
-      `  playable sources = ${playableSources.length}`
-    );
 
     return playableSources;
   }

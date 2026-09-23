@@ -1,5 +1,6 @@
 import type { ProviderRegistry, RegisteredProvider } from "../backends/registry.js";
 import type { StreamProvider, StreamResult } from "../backends/stream-provider.js";
+import { hasPlaybackScrobbler } from "../backends/playback-scrobbler.js";
 import type { LibraryService, SourceRef } from "./library.js";
 
 /**
@@ -141,5 +142,17 @@ export class SourceResolver {
    * unknown IDs from unavailable sources). */
   hasSource(libraryItemId: string): boolean {
     return this.candidateSources(libraryItemId).length > 0;
+  }
+
+  /** Scrobble the mapped Navidrome source, never the MusicDeck library ID. */
+  async scrobbleTrack(libraryItemId: string, playedAt = Date.now()): Promise<boolean> {
+    const candidate = this.candidateSources(libraryItemId).find(({ provider }) =>
+      provider.type === "navidrome" && hasPlaybackScrobbler(provider.provider)
+    );
+    if (!candidate) return false;
+    const provider = candidate.provider.provider;
+    if (!hasPlaybackScrobbler(provider)) return false;
+    await provider.scrobbleTrack(candidate.source.providerItemId, playedAt);
+    return true;
   }
 }

@@ -410,12 +410,12 @@ export class CatalogService {
     );
   }
 
-  async getArtist(artistId: string): Promise<Artist | null> {
+  async getArtist(artistId: string, options?: { includeArtistInfo?: boolean }): Promise<Artist | null> {
     const source = this.library.getPrimarySource(artistId);
     if (!source) {
       return null;
     }
-    const artist = await this.primary().getArtist(source.providerItemId);
+    const artist = await this.primary().getArtist(source.providerItemId, options);
     return artist ? this.withStableId(artist, "artist", source.connectionId) : null;
   }
 
@@ -425,8 +425,8 @@ export class CatalogService {
       return [];
     }
     const albums = await this.primary().getArtistAlbums(source.providerItemId);
-    return albums.map((album) =>
-      this.withStableAlbumArtistId(this.withStableId(album, "album", source.connectionId), source.connectionId)
+    return albums.filter((album) => !album.artistId || album.artistId === source.providerItemId).map((album) =>
+      ({ ...this.withStableId(album, "album", source.connectionId), artistId })
     );
   }
 
@@ -436,7 +436,7 @@ export class CatalogService {
       return [];
     }
     const tracks = await this.primary().getArtistTracks(source.providerItemId);
-    return tracks.map((track) =>
+    return tracks.filter((track) => track.artistId === source.providerItemId).map((track) =>
       this.withDetailAvailability(
         this.stamp(track, "track", source.connectionId),
         source.connectionId
@@ -456,6 +456,22 @@ export class CatalogService {
           source.connectionId
         )
       : null;
+  }
+
+  async getArtistTopTracks(artistId: string, limit = 10): Promise<Track[]> {
+    const source = this.library.getPrimarySource(artistId);
+    if (!source) return [];
+    const provider = this.primary();
+    const tracks = provider.getArtistTopTracks
+      ? await provider.getArtistTopTracks(source.providerItemId, limit)
+      : (await provider.getArtistTracks(source.providerItemId))
+          .sort((left, right) => (right.playCount || 0) - (left.playCount || 0))
+          .slice(0, limit);
+    return tracks.filter((track) => track.artistId === source.providerItemId)
+      .slice(0, limit)
+      .map((track) => this.withDetailAvailability(
+        this.stamp(track, "track", source.connectionId), source.connectionId
+      ));
   }
 
   private metadataProviderForTrack(trackId: string): {

@@ -477,18 +477,11 @@ export class SpotifyTrackResolver {
    * Performs public Spotify web search without requiring login or API credentials.
    */
   public async searchPublicWeb(target: UnifiedSearchResult): Promise<SpotifyResolveResult | null> {
-    const trackTitle = target.title;
     const trackArtist = target.artist || "Unknown";
 
-    console.log(
-      `[SpotifyResolver]\nmode = public-web\ntrack = ${trackTitle}\nartist = ${trackArtist}\nstatus = searching`
-    );
 
     const query = [target.artist, target.title].filter(Boolean).join(" ").trim();
     if (!query) {
-      console.log(
-        `[SpotifyResolver]\nmode = public-web\nstatus = unavailable\nreason = empty search query\nfallback = text`
-      );
       return null;
     }
 
@@ -503,9 +496,6 @@ export class SpotifyTrackResolver {
       });
 
       if (!res.ok) {
-        console.log(
-          `[SpotifyResolver]\nmode = public-web\nstatus = unavailable\nreason = public page returned HTTP ${res.status}\nfallback = text`
-        );
         return null;
       }
 
@@ -513,9 +503,6 @@ export class SpotifyTrackResolver {
       const candidates = parsePublicSpotifySearchResults(html);
 
       if (candidates.length === 0) {
-        console.log(
-          `[SpotifyResolver]\nmode = public-web\nstatus = unavailable\nreason = public page did not expose a reliable match\nfallback = text`
-        );
         return null;
       }
 
@@ -532,9 +519,6 @@ export class SpotifyTrackResolver {
 
       if (bestMatch) {
         const canonicalUrl = buildCanonicalSpotifyTrackUrl(bestMatch.candidate.id);
-        console.log(
-          `[SpotifyResolver]\nmode = public-web\nstatus = matched\nspotifyTrackId = ${bestMatch.candidate.id}\nconfidence = ${bestMatch.confidence}`
-        );
         return {
           url: canonicalUrl,
           trackId: bestMatch.candidate.id,
@@ -549,14 +533,8 @@ export class SpotifyTrackResolver {
         };
       }
 
-      console.log(
-        `[SpotifyResolver]\nmode = public-web\nstatus = unavailable\nreason = candidates did not meet match verification criteria\nfallback = text`
-      );
       return null;
-    } catch (err: any) {
-      console.log(
-        `[SpotifyResolver]\nmode = public-web\nstatus = unavailable\nreason = ${err instanceof Error ? err.message : String(err)}\nfallback = text`
-      );
+    } catch {
       return null;
     }
   }
@@ -565,26 +543,16 @@ export class SpotifyTrackResolver {
    * Performs official Spotify Web API search with OAuth access token or client credentials.
    */
   public async searchWebApi(target: UnifiedSearchResult): Promise<SpotifyResolveResult | null> {
-    const trackTitle = target.title;
     const trackArtist = target.artist || "Unknown";
 
     const token = await this.getToken();
     if (!token) {
-      console.log(
-        `[SpotifyResolver]\nmode = web-api\nstatus = unavailable\nreason = no Spotify Web API credentials configured\nfallback = text`
-      );
       return null;
     }
 
-    console.log(
-      `[SpotifyResolver]\nmode = web-api\ntrack = ${trackTitle}\nartist = ${trackArtist}\nstatus = searching`
-    );
 
     const query = [target.artist, target.title].filter(Boolean).join(" ").trim();
     if (!query) {
-      console.log(
-        `[SpotifyResolver]\nmode = web-api\nstatus = unavailable\nreason = empty search query\nfallback = text`
-      );
       return null;
     }
 
@@ -602,9 +570,6 @@ export class SpotifyTrackResolver {
       });
 
       if (!res.ok) {
-        console.log(
-          `[SpotifyResolver]\nmode = web-api\nstatus = unavailable\nreason = API returned HTTP ${res.status}\nfallback = text`
-        );
         return null;
       }
 
@@ -624,9 +589,6 @@ export class SpotifyTrackResolver {
 
       if (bestMatch) {
         const canonicalUrl = buildCanonicalSpotifyTrackUrl(bestMatch.candidate.id);
-        console.log(
-          `[SpotifyResolver]\nmode = web-api\nstatus = matched\nspotifyTrackId = ${bestMatch.candidate.id}\nconfidence = ${bestMatch.confidence}`
-        );
         return {
           url: canonicalUrl,
           trackId: bestMatch.candidate.id,
@@ -641,14 +603,8 @@ export class SpotifyTrackResolver {
         };
       }
 
-      console.log(
-        `[SpotifyResolver]\nmode = web-api\nstatus = unavailable\nreason = no reliable match found in Spotify Web API\nfallback = text`
-      );
       return null;
-    } catch (err: any) {
-      console.log(
-        `[SpotifyResolver]\nmode = web-api\nstatus = unavailable\nreason = ${err instanceof Error ? err.message : String(err)}\nfallback = text`
-      );
+    } catch {
       return null;
     }
   }
@@ -682,9 +638,6 @@ export class SpotifyTrackResolver {
       const trackId = extractSpotifyTrackId(options.manualUrl);
       if (trackId) {
         const canonicalUrl = buildCanonicalSpotifyTrackUrl(trackId);
-        console.log(
-          `[SpotifyResolver]\ntrack = ${trackTitle}\nartist = ${trackArtist}\nspotify lookup = success (manual URL)\nspotify track id = ${trackId}\nconfidence = high`
-        );
         return {
           url: canonicalUrl,
           trackId,
@@ -711,9 +664,6 @@ export class SpotifyTrackResolver {
 
     if (existingId) {
       const canonicalUrl = buildCanonicalSpotifyTrackUrl(existingId);
-      console.log(
-        `[SpotifyResolver]\ntrack = ${trackTitle}\nartist = ${trackArtist}\nspotify lookup = success (existing metadata)\nspotify track id = ${existingId}\nconfidence = high`
-      );
       return {
         url: canonicalUrl,
         trackId: existingId,

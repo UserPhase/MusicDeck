@@ -541,11 +541,6 @@ export class SourceProviderRegistry {
                   ? (available.length === 1 ? available[0] : undefined)
                   : (best || (available.length === 1 ? available[0] : undefined));
 
-    console.log(
-      `[SourceProviderRegistry] resolve summary for "${result.title}" - "${result.artist || ""}": ` +
-      `providers = ${providers.length}, playable sources = ${sources.filter((s) => s.type !== "preview").length}, ` +
-      `preview sources = ${sources.filter((s) => s.type === "preview").length}, degraded = ${outcomes.some((o) => !o.ok)}`
-    );
 
     return {
       sources,

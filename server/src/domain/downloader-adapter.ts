@@ -1,6 +1,6 @@
 import type { UnifiedSearchResult } from "./search.js";
 import type { SourceCandidate } from "./source-discovery.js";
-import type { AcquiredFile, AcquisitionResult } from "./acquisition.js";
+import type { AcquiredFile } from "./acquisition.js";
 
 export type DownloadRequest = {
   spotifyTrackUrl?: string;

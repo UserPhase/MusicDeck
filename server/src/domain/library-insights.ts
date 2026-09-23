@@ -160,7 +160,7 @@ export class LibraryInsightsService {
     }));
   }
 
-  async health(userId: string) {
+  async health(_userId: string) {
     const [tracksResult, albumsResult, artistsResult] = await Promise.all([
       this.catalog.listTracks(),
       this.catalog.listAlbums(1000),
@@ -168,7 +168,6 @@ export class LibraryInsightsService {
     ]);
 
     const issues: LibraryHealthIssue[] = [];
-    const albumsById = new Map(albumsResult.items.map((album) => [album.id, album]));
     const trackCounts = new Map<string, number>();
 
     for (const track of tracksResult.items) {

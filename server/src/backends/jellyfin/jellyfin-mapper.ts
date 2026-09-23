@@ -120,6 +120,7 @@ export function mapJellyfinArtist(item: any): Artist {
     name: item.Name || "Unknown artist",
     artworkId: artId,
     artworkUrl: artId ? `/api/artwork/${encodeURIComponent(artId)}` : null,
+    imageUrl: artId ? `/api/artwork/${encodeURIComponent(artId)}` : null,
     albumCount: typeof item.ChildCount === "number" ? item.ChildCount : 0,
     identityHints: identityHints(item, "MusicBrainzArtist"),
   };

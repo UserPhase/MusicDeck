@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Profiler } from "react";
 import { MemoryRouter } from "react-router-dom";
 
 import TrackRow from "./TrackRow";
@@ -25,9 +26,7 @@ jest.mock("../utils/downloadManager", () => ({
 }));
 
 jest.mock("./TrackDownloadButton", () => () => <span data-testid="download" />);
-jest.mock("./TrackDownloadStatus", () => () => <span data-testid="download-status" />);
 jest.mock("./TrackLikeButton", () => () => <button type="button">Like</button>);
-jest.mock("./SourceMenu", () => () => <button type="button">Sources</button>);
 
 
 const song = {
@@ -50,6 +49,22 @@ beforeEach(() => {
   mockDownloadToDevice.mockResolvedValue({ trackId: song.id });
   mockIsDownloadedToDevice.mockReset();
   mockIsDownloadedToDevice.mockResolvedValue(false);
+});
+
+test("hovering a track does not re-render the row", async () => {
+  const onRender = jest.fn();
+  const onPlay = jest.fn();
+  const { container } = render(
+    <MemoryRouter>
+      <Profiler id="track" onRender={onRender}>
+        <TrackRow song={song} index={0} onPlay={onPlay} />
+      </Profiler>
+    </MemoryRouter>
+  );
+  await waitFor(() => expect(mockIsDownloadedToDevice).toHaveBeenCalled());
+  const rendersBeforeHover = onRender.mock.calls.length;
+  fireEvent.mouseOver(container.querySelector(".track"));
+  expect(onRender).toHaveBeenCalledTimes(rendersBeforeHover);
 });
 
 

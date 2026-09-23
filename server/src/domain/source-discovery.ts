@@ -538,32 +538,16 @@ export class SourcePipelineRegistry {
       return [];
     }
 
-    const startTime = Date.now();
-    const discoveryFailures: Array<{ name: string; failure: string }> = [];
-    let successfulDiscoveries = 0;
-    let failedDiscoveries = 0;
-
     const discoverySettled = await Promise.allSettled(
       discovery.map(async (provider) => {
-        const provStart = Date.now();
         try {
           const candidates = await withTimeout(
             provider.search(result, { limit: options.limit }),
             5000,
             []
           );
-          console.log(`[SourcePipeline] discovery "${provider.name}" (${provider.id}) returned ${candidates.length} candidates in ${Date.now() - provStart}ms`);
-          successfulDiscoveries += 1;
           return candidates;
-        } catch (err: any) {
-          failedDiscoveries += 1;
-          const statusPart = err?.httpStatus ? ` (${err.httpStatus})` : "";
-          const failureType = err?.failure || "error";
-          discoveryFailures.push({
-            name: provider.name,
-            failure: `${failureType}${statusPart}`,
-          });
-          console.log(`[SourcePipeline] discovery "${provider.name}" (${provider.id}) failed in ${Date.now() - provStart}ms: ${err instanceof Error ? err.message : String(err)}`);
+        } catch {
           return [];
         }
       })
@@ -577,11 +561,6 @@ export class SourcePipelineRegistry {
     }
 
     // Candidate expansion stage (Detail resolution & Container/Item enumeration)
-    let detailResolutions = 0;
-    let containersExpanded = 0;
-    let filesEnumerated = 0;
-    let matchingFiles = 0;
-
     const expandedCandidates: SourceCandidate[] = [];
     for (const candidate of allCandidates) {
       // Check if candidate is a detail link
@@ -597,7 +576,6 @@ export class SourcePipelineRegistry {
               5000,
               []
             );
-            detailResolutions++;
             break;
           } catch {
             // Error isolation per detail provider
@@ -627,8 +605,6 @@ export class SourcePipelineRegistry {
               6000,
               []
             );
-            containersExpanded++;
-            filesEnumerated += enumerated.length;
             break;
           } catch {
             // Error isolation per container provider
@@ -636,12 +612,7 @@ export class SourcePipelineRegistry {
         }
 
         if (enumerated && enumerated.length > 0) {
-          for (const item of enumerated) {
-            if (matchesCandidate(result, item)) {
-              matchingFiles++;
-            }
-            expandedCandidates.push(item);
-          }
+          expandedCandidates.push(...enumerated);
           // Also keep the container candidate in case downstream resolvers handle containers
           expandedCandidates.push(candidate);
           continue;
@@ -672,22 +643,16 @@ export class SourcePipelineRegistry {
     const maxSources = Math.max(1, Math.min(options.limit || 10, 25));
     const sources: PlayableSource[] = [];
     const seenSources = new Set<string>();
-    let resolversAttempted = 0;
-    let failedCandidates = 0;
-
     for (const candidate of rankedCandidates) {
       if (sources.length >= maxSources) {
         break;
       }
-      let candidateResolved = false;
       for (const resolver of resolvers) {
-        const resStart = Date.now();
         try {
           if (resolver.canResolve && !(await resolver.canResolve(candidate))) {
             continue;
           }
 
-          resolversAttempted += 1;
           const resolved = await withTimeout(
             resolver.resolve(candidate, { target: result, limit: options.limit }),
             8000,
@@ -704,40 +669,13 @@ export class SourcePipelineRegistry {
               type: "external",
               label: source.label || resolver.name,
             });
-            candidateResolved = true;
             if (sources.length >= maxSources) {
               break;
             }
           }
-          console.log(`[SourcePipeline] resolver "${resolver.name}" resolved candidate in ${Date.now() - resStart}ms (sources: ${resolved.length})`);
-        } catch (err) {
-          console.log(`[SourcePipeline] resolver "${resolver.name}" failed for candidate in ${Date.now() - resStart}ms: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-      if (!candidateResolved) {
-        failedCandidates += 1;
+        } catch { /* Try the next resolver. */ }
       }
     }
-
-    let summaryLog =
-      `[SourcePipeline] summary for "${result.title}" - "${result.artist || ""}":\n` +
-      `discovery providers = ${discovery.length}\n` +
-      `search results = ${allCandidates.length}\n` +
-      `detail resolutions = ${detailResolutions}\n` +
-      `containers expanded = ${containersExpanded}\n` +
-      `files enumerated = ${filesEnumerated}\n` +
-      `matching files = ${matchingFiles}\n` +
-      `matching candidates = ${uniqueCandidates.length}\n` +
-      `resolvers attempted = ${resolversAttempted}\n` +
-      `playable sources = ${sources.length}\n` +
-      `failed candidates = ${failedCandidates}\n` +
-      `totalDuration = ${Date.now() - startTime}ms`;
-
-    if (discoveryFailures.length > 0) {
-      summaryLog += "\n\nfailures:\n" + discoveryFailures.map((f) => `  ${f.name} = ${f.failure}`).join("\n");
-    }
-
-    console.log(summaryLog);
 
     return sources.sort(compareSourceQuality);
   }

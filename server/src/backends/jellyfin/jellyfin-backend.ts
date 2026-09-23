@@ -136,6 +136,18 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     }, mapJellyfinTrack);
   }
 
+  async getArtistTopTracks(artistId: string, limit = 10): Promise<Track[]> {
+    return this.listItems({
+      ArtistIds: artistId,
+      IncludeItemTypes: "Audio",
+      Recursive: true,
+      SortBy: "PlayCount",
+      SortOrder: "Descending",
+      StartIndex: 0,
+      Limit: Math.max(1, Math.min(10, Math.trunc(limit))),
+    }, mapJellyfinTrack);
+  }
+
   async listTracks(): Promise<Track[]> {
     return this.listItems({
       IncludeItemTypes: "Audio",

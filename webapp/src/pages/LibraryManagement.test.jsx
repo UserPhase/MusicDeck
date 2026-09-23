@@ -82,12 +82,12 @@ test("applies composable track filters and sets ratings", async () => {
 
   expect(await screen.findByText("Song")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Favorites" }));
-  fireEvent.change(screen.getByLabelText(/rating/i), { target: { value: "5" } });
+  fireEvent.click(screen.getByRole("button", { name: "Unplayed" }));
 
   await waitFor(() => {
     expect(filterLibraryTracks).toHaveBeenCalledWith([
       { field: "favorite", op: "boolean", value: true },
-      { field: "rating", op: "gte", value: 5 },
+      { field: "played", op: "boolean", value: false },
     ]);
   });
   expect(await screen.findByText("Song")).toBeInTheDocument();

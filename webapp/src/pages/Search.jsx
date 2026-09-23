@@ -650,7 +650,7 @@ function Search() {
               </div>
 
 
-              <div className="track-list">
+              <div className="track-list" role="table" aria-label="Search tracks">
 
                 <TrackListHeader />
 

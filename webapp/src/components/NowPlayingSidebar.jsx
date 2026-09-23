@@ -1,13 +1,15 @@
 import {
   useEffect,
+  useMemo,
+  useRef,
   useState,
 } from "react";
 
 import {
   getCoverUrl,
-  getTrackArtistBiography,
   getTrackLyrics,
 } from "../api/musicdeck";
+import { useArtistBiography } from "../hooks/useArtistBiography";
 
 import {
   usePlayer,
@@ -18,44 +20,58 @@ import {
 } from "../utils/formatDuration";
 
 import AudioBadge from "./AudioBadge";
+import ArtistBiography from "./ArtistBiography";
+import { activeLrcIndex, parseLrc } from "../utils/lrc";
 
 
 function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   const [lyrics, setLyrics] = useState(null);
-  const [biography, setBiography] = useState(null);
   const [isLoadingLyrics, setIsLoadingLyrics] = useState(false);
-  const [isLoadingBiography, setIsLoadingBiography] = useState(false);
-  const [isBiographyExpanded, setIsBiographyExpanded] = useState(false);
-  const { currentSong, queue = [], queueIndex = -1 } = usePlayer();
+  const { currentSong, currentTime = 0, duration = 0, queue = [], queueIndex = -1 } = usePlayer();
   const nextTrack = queue[queueIndex + 1] || null;
+  const trackId = currentSong?.id;
+  const songTitle = currentSong?.title;
+  const songArtist = currentSong?.artist;
+  const artistId = currentSong?.artistId || currentSong?.metadata?.artistId || songArtist;
+  const { biography, loading: isLoadingBiography } = useArtistBiography({
+    artistId, artistName: songArtist, trackId, enabled: isOpen && Boolean(trackId),
+  });
+  const songAlbum = currentSong?.album;
+  const lyricDuration = Math.round(Number(currentSong?.duration || currentSong?.metadata?.durationSeconds || duration) || 0);
+  const lyricLines = useMemo(() => lyrics?.isSynced === false ? []
+    : Array.isArray(lyrics?.syncedLyrics) ? lyrics.syncedLyrics : parseLrc(lyrics?.syncedLyrics),
+  [lyrics?.syncedLyrics, lyrics?.isSynced]);
+  const activeLine = lyrics?.isSynced === false ? -1 : activeLrcIndex(lyricLines, Number(currentTime));
+  const lineRefs = useRef([]);
 
   useEffect(() => {
     let isCurrentRequest = true;
-    const trackId = currentSong?.id;
-
     setLyrics(null);
-    setBiography(null);
-    setIsBiographyExpanded(false);
-
-    if (!isOpen || !trackId) {
+    if (!trackId) {
       setIsLoadingLyrics(false);
-      setIsLoadingBiography(false);
       return () => { isCurrentRequest = false; };
     }
-
     setIsLoadingLyrics(true);
-    setIsLoadingBiography(true);
-
-    Promise.allSettled([getTrackLyrics(trackId), getTrackArtistBiography(trackId)]).then(([lyricsResult, biographyResult]) => {
+    getTrackLyrics(trackId, {
+      title: songTitle, artist: songArtist, album: songAlbum, duration: lyricDuration,
+    }).then((result) => {
       if (!isCurrentRequest) return;
-      setLyrics(lyricsResult.status === "fulfilled" ? lyricsResult.value : null);
-      setBiography(biographyResult.status === "fulfilled" ? biographyResult.value : null);
+      setLyrics(result);
       setIsLoadingLyrics(false);
-      setIsLoadingBiography(false);
+    }).catch(() => {
+      if (isCurrentRequest) { setLyrics(null); setIsLoadingLyrics(false); }
     });
-
     return () => { isCurrentRequest = false; };
-  }, [currentSong?.id, isOpen]);
+  }, [trackId, songTitle, songArtist, songAlbum, lyricDuration]);
+
+  useEffect(() => {
+    if (!isOpen || lyrics?.isSynced === false || activeLine < 0) return;
+    const element = lineRefs.current[activeLine];
+    if (typeof element?.scrollIntoView !== "function") return;
+    const reducedMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    element.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+  }, [activeLine, isOpen, trackId, lyrics?.isSynced]);
 
   if (!isOpen) return null;
 
@@ -91,19 +107,24 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
 
             <section className="right-sidebar-metadata-section" aria-labelledby="now-playing-lyrics-title">
               <div className="right-sidebar-section-heading"><h3 id="now-playing-lyrics-title">Lyrics</h3><span aria-hidden="true">♪</span></div>
-              <div className="right-sidebar-lyrics" tabIndex={lyrics ? 0 : undefined}>
-                {isLoadingLyrics ? <span className="right-sidebar-metadata-state">Finding lyrics…</span> : lyrics || <span className="right-sidebar-metadata-state">No lyrics available for this track.</span>}
+              <div className={`right-sidebar-lyrics${lyricLines.length ? " right-sidebar-lyrics--synced" : ""}`} tabIndex={lyrics ? 0 : undefined}>
+                {isLoadingLyrics ? <span className="right-sidebar-metadata-state">Finding lyrics…</span>
+                  : lyricLines.length ? <div className="right-sidebar-lyric-lines" aria-label="Synchronized lyrics">
+                    {lyricLines.map((line, index) => <p key={`${line.time}-${index}`}
+                      ref={(element) => { lineRefs.current[index] = element; }}
+                      className={`right-sidebar-lyric-line${index === activeLine ? " is-active" : ""}`}
+                      aria-current={index === activeLine ? "true" : undefined}>
+                      {line.text || <span aria-label="Instrumental break">♪</span>}
+                    </p>)}
+                  </div> : lyrics?.plainLyrics ? <div className="right-sidebar-lyrics-plain">{lyrics.plainLyrics}</div>
+                  : <span className="right-sidebar-metadata-state">Lyrics not available for this track.</span>}
               </div>
             </section>
 
             <section className="right-sidebar-metadata-section" aria-labelledby="now-playing-artist-title">
               <div className="right-sidebar-section-heading"><h3 id="now-playing-artist-title">About the artist</h3><span aria-hidden="true">✦</span></div>
-              {isLoadingBiography ? <p className="right-sidebar-metadata-state">Finding the artist story…</p> : biography ? (
-                <>
-                  <div className={`right-sidebar-biography${isBiographyExpanded ? " expanded" : ""}`}>{biography}</div>
-                  {biography.length > 280 && <button className="right-sidebar-read-more" type="button" onClick={() => setIsBiographyExpanded((expanded) => !expanded)} aria-expanded={isBiographyExpanded}>{isBiographyExpanded ? "Show less" : "Read more"}</button>}
-                </>
-              ) : <p className="right-sidebar-metadata-state">No artist biography is available yet.</p>}
+              <ArtistBiography biography={biography} loading={isLoadingBiography}
+                emptyText="No artist biography is available yet." />
             </section>
           </>
         )}

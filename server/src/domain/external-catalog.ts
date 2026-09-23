@@ -433,10 +433,14 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     }
 
     let response: Response;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4500);
     try {
-      response = await this.fetchImpl(url);
+      response = await this.fetchImpl(url, { signal: controller.signal });
     } catch (error) {
       throw new Error(`External catalog (Deezer) catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      clearTimeout(timeout);
     }
 
     let bodyText: string;
@@ -477,7 +481,9 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       subtitle: artistName,
       artist: artistName,
       album: item.album?.title || albumName || null,
-      artwork: this.artwork(item.album?.cover_big || item.album?.cover_medium || albumArtwork),
+      artwork: this.artwork(item.album?.cover_xl || item.album?.cover_big || item.album?.cover_medium || albumArtwork),
+      previewUrl: typeof item.preview === "string" && /^https:\/\/(?:[^/]+\.)?dzcdn\.net\//i.test(item.preview)
+        ? item.preview : null,
       provider: "external",
       source: { kind: "external", count: 0 },
       availability: null,
@@ -502,7 +508,7 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       subtitle: artistName,
       artist: artistName,
       album: null,
-      artwork: this.artwork(item.cover_big || item.cover_medium),
+      artwork: this.artwork(item.cover_xl || item.cover_big || item.cover_medium),
       provider: "external",
       source: { kind: "external", count: 0 },
       availability: null,
@@ -520,7 +526,7 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       subtitle: "Artist",
       artist: item.name || null,
       album: null,
-      artwork: this.artwork(item.picture_big || item.picture_medium),
+      artwork: this.artwork(item.picture_xl || item.picture_big || item.picture_medium),
       provider: "external",
       source: { kind: "external", count: 0 },
       availability: null,
@@ -529,19 +535,8 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     };
   }
 
-  /**
-   * Deezer's generic `/search` endpoint only ever returns track results, so
-   * this alone can never satisfy `findMatchingExternalAlbum`/
-   * `findMatchingExternalArtist` (which filter for `type === "album"` /
-   * `"artist"`). Without albums/artists in the result set, the local
-   * album/artist catalog-completeness merge in music-routes.ts silently
-   * falls back to local-only data whenever only Deezer (keyless) is
-   * available -- i.e. whenever Spotify credentials are not configured.
-   * Querying the dedicated `/search/album` and `/search/artist` endpoints
-   * alongside `/search` (tracks) mirrors `DeezerSearchProvider` in
-   * search-provider-registry.ts and keeps every result type available for
-   * matching.
-   */
+  /** The generic Deezer search yields tracks; use type-specific endpoints for
+   * albums and artists so keyless catalog lookups return all entity types. */
   async search(query: string, options: { limit?: number } = {}): Promise<UnifiedSearchResult[]> {
     const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
     const [trackPayload, albumPayload, artistPayload] = await Promise.all([
@@ -563,6 +558,16 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     return [...tracks, ...albums, ...artists];
   }
 
+  async searchArtists(query: string, limit = 15): Promise<UnifiedSearchResult[]> {
+    const payload = await this.request<{ data?: any[] }>("/search/artist", {
+      q: query,
+      limit: String(Math.min(Math.max(limit, 1), 25)),
+    });
+    return (payload.data || [])
+      .map((item) => this.artist(item))
+      .filter((item): item is UnifiedSearchResult => Boolean(item));
+  }
+
   async getAlbum(id: string): Promise<ExternalAlbumDetail | null> {
     if (!/^external_deezer_album_[0-9]+$/.test(id)) return null;
     const albumId = id.slice("external_deezer_album_".length);
@@ -576,7 +581,7 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     if (album?.id == null) return null;
 
     const artistName = deezerArtistName(album) || album.artist?.name || "Unknown artist";
-    const artworkUrl = album.cover_big || album.cover_medium;
+    const artworkUrl = album.cover_xl || album.cover_big || album.cover_medium;
     const tracks = (album.tracks?.data || [])
       .map((item: any) => this.track(item, album.title, id, artworkUrl))
       .filter((item: UnifiedSearchResult | null): item is UnifiedSearchResult => Boolean(item));
@@ -601,13 +606,13 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     const artistId = id.slice("external_deezer_artist_".length);
 
     let artist: any;
-    let albumPayload: { data?: any[] };
+    let albumPayload: { data?: any[]; total?: number };
     let topTracksPayload: { data?: any[] };
     try {
       [artist, albumPayload, topTracksPayload] = await Promise.all([
         this.request<any>(`/artist/${artistId}`),
-        this.request<{ data?: any[] }>(`/artist/${artistId}/albums`, { limit: "25" }),
-        this.request<{ data?: any[] }>(`/artist/${artistId}/top`, { limit: "10" }),
+        this.request<{ data?: any[]; total?: number }>(`/artist/${artistId}/albums`, { limit: "100" }),
+        this.request<{ data?: any[] }>(`/artist/${artistId}/top`, { limit: "50" }),
       ]);
     } catch {
       return null;
@@ -615,25 +620,38 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
 
     if (!artist?.name) return null;
 
-    const albums = (albumPayload.data || []).flatMap((item) => {
-      if (item?.id == null) return [];
+    // Deezer pages artist discographies. The first 50 entries can omit valid
+    // singles, especially for prolific collaborators; bound pagination so an
+    // artist page stays responsive while including later releases.
+    const albumItems: any[] = [...(albumPayload.data || [])];
+    while (albumItems.length > 0 && albumItems.length < Math.min(albumPayload.total || albumItems.length, 300)) {
+      const page = await this.request<{ data?: any[] }>(`/artist/${artistId}/albums`, {
+        limit: "100", index: String(albumItems.length),
+      }).catch(() => null);
+      if (!page?.data?.length) break;
+      albumItems.push(...page.data);
+    }
+
+    const albums = albumItems.flatMap((item) => {
+      if (item?.id == null || (item.artist?.id != null && String(item.artist.id) !== artistId)) return [];
       return [{
         id: `external_deezer_album_${item.id}`,
         title: item.title || "Unknown album",
         year: year(item.release_date),
-        artworkId: this.artworkTokens ? this.artworkTokens.token(item.cover_big || item.cover_medium, ["dzcdn.net"]) : null,
+        artworkId: this.artworkTokens ? this.artworkTokens.token(item.cover_xl || item.cover_big || item.cover_medium, ["dzcdn.net"]) : null,
         identity: identity("album", [item.title, artist.name]),
       }];
     });
 
     const tracks = (topTracksPayload.data || [])
+      .filter((item) => item.artist?.id != null && String(item.artist.id) === artistId)
       .map((item) => this.track(item))
       .filter((item): item is UnifiedSearchResult => Boolean(item));
 
     return {
       id,
       name: artist.name,
-      artworkId: this.artworkTokens ? this.artworkTokens.token(artist.picture_big || artist.picture_medium, ["dzcdn.net"]) : null,
+      artworkId: this.artworkTokens ? this.artworkTokens.token(artist.picture_xl || artist.picture_big || artist.picture_medium, ["dzcdn.net"]) : null,
       albums,
       tracks,
       identity: identity("artist", [artist.name]),
@@ -657,7 +675,7 @@ export class ExternalCatalogRegistry {
   readonly deezerProvider: DeezerExternalCatalogProvider;
   private readonly providers: ExternalCatalogProvider[];
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch, db?: Db) {
+  constructor(readonly fetchImpl: typeof fetch = fetch, db?: Db) {
     this.provider = new SpotifyExternalCatalogProvider(() => this.config, fetchImpl, this.artworkTokens, db);
     this.deezerProvider = new DeezerExternalCatalogProvider(fetchImpl, this.artworkTokens);
     this.providers = [this.provider, this.deezerProvider];

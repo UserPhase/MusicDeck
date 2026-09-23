@@ -182,6 +182,16 @@ describe("JellyfinBackend requests", () => {
     await expect(backend.getTrack("missing")).resolves.toBeNull();
   });
 
+  test("requests only ten artist tracks sorted by play count", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ Items: [] }));
+    await makeBackend(fetchImpl).getArtistTopTracks("jf-artist-1", 10);
+    const url = new URL(String((fetchImpl.mock.calls[0] as any[])[0]));
+    expect(url.searchParams.get("ArtistIds")).toBe("jf-artist-1");
+    expect(url.searchParams.get("Limit")).toBe("10");
+    expect(url.searchParams.get("SortBy")).toBe("PlayCount");
+    expect(url.searchParams.get("SortOrder")).toBe("Descending");
+  });
+
   test("reads lyrics and follows the track artist to its biography", async () => {
     const fetchImpl = vi.fn(async (url: URL) => {
       const requestUrl = String(url);

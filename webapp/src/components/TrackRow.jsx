@@ -1,4 +1,4 @@
-import { isValidElement, useEffect, useState } from "react";
+import { isValidElement, memo, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { usePlayer } from "../context/PlayerContext";
@@ -87,7 +87,7 @@ function TrackRow({
       await downloadToDevice(song.id, downloadQuality);
       setOfflineStatus("downloaded");
     } catch (error) {
-      console.warn("Could not download track to this device:", error);
+      console.error("Could not download track to this device:", error);
       setOfflineStatus("not-downloaded");
     }
   }
@@ -137,12 +137,13 @@ function TrackRow({
   return (
     <div
       className={rowClassName}
+      role="row"
       tabIndex={0}
       aria-label={`${song.title || "Unknown title"} by ${resolvedArtist}`}
       onClick={handleRowClick}
       onKeyDown={handleRowKeyDown}
     >
-      <div className="track-number">
+      <div className="track-number" role="cell">
         <TrackPlaybackIndicator
           index={index}
           isCurrentTrack={isCurrentTrack}
@@ -162,7 +163,7 @@ function TrackRow({
         </button>
       </div>
 
-      <div className="track-info">
+      <div className="track-info" role="cell">
         <div className="track-title">
           {song.title || "Unknown title"}
           <AvailabilityHint availability={song.availability} />
@@ -180,17 +181,19 @@ function TrackRow({
 
       {showAlbum && (
         resolvedAlbumId ? (
-          <Link to={`/album/${resolvedAlbumId}`} className="track-album">
-            {resolvedAlbum}
-          </Link>
+          <div className="track-album" role="cell">
+            <Link to={`/album/${resolvedAlbumId}`} className="track-album-link">
+              {resolvedAlbum}
+            </Link>
+          </div>
         ) : (
-          <div className="track-album">{resolvedAlbum}</div>
+          <div className="track-album" role="cell">{resolvedAlbum}</div>
         )
       )}
 
-      {!showAlbum && <div className="track-album" aria-hidden="true" />}
+      {!showAlbum && <div className="track-album" role="cell" aria-hidden="true" />}
 
-      <div className="track-server-status">
+      <div className="track-server-status" role="cell">
         {isServerSynced ? (
           <span className="track-server-placeholder" aria-hidden="true">{"\u2063"}</span>
         ) : (
@@ -198,12 +201,13 @@ function TrackRow({
         )}
       </div>
 
-      <div className="track-duration">
+      <div className="track-duration" role="cell">
         {formatDuration(resolvedDuration)}
       </div>
 
       <div
         className="track-row-actions"
+        role="cell"
         ref={actionsRef}
         onClick={(event) => event.stopPropagation()}
         onMouseDown={(event) => event.stopPropagation()}
@@ -236,4 +240,4 @@ function TrackRow({
 }
 
 
-export default TrackRow;
+export default memo(TrackRow);

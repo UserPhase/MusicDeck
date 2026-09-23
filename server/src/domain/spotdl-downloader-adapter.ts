@@ -383,7 +383,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
 
       if (result.exitCode !== 0) {
         const fullOutput = `${result.stdout}\n${result.stderr}`;
-        const classifiedCode = classifySpotDLError(fullOutput, result.exitCode);
+        const classifiedCode = classifySpotDLError(fullOutput);
         return {
           status: "failed",
           files: [],
@@ -409,7 +409,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
           status: "failed",
           files: [],
           error: {
-            code: classifySpotDLError(fullOutput, 0),
+            code: classifySpotDLError(fullOutput),
             message: reason
               ? `spotDL could not obtain audio for this track: ${reason}`
               : "spotDL completed but produced no valid audio files in output directory",
@@ -584,7 +584,7 @@ export function parseSpotDLProgress(line: string): Partial<DownloadProgress> | n
   return Object.keys(result).length > 0 ? result : null;
 }
 
-export function classifySpotDLError(output: string, exitCode: number | null = null): DownloadErrorCode {
+export function classifySpotDLError(output: string): DownloadErrorCode {
   const lower = output.toLowerCase();
 
   if (lower.includes("cancel") || lower.includes("aborted")) {

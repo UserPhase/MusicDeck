@@ -9,8 +9,8 @@ import {
 
 import {
   getArtists,
-  getCoverUrl,
 } from "../api/musicdeck";
+import ArtistAvatar from "../components/ArtistAvatar";
 
 
 function Artists() {
@@ -178,30 +178,7 @@ function Artists() {
 
             {/* ARTIST IMAGE */}
 
-            <div className="artist-cover">
-
-              {artist.coverArt ? (
-
-                <img
-                  src={
-                    getCoverUrl(
-                      artist.coverArt
-                    )
-                  }
-                  alt={
-                    `${artist.name} cover`
-                  }
-                />
-
-              ) : (
-
-                <div className="artist-cover-placeholder">
-                  ♪
-                </div>
-
-              )}
-
-            </div>
+            <ArtistAvatar artist={artist} className="artist-cover" allowAlbumTileFallback />
 
 
             {/* ARTIST NAME */}

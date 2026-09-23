@@ -53,7 +53,7 @@ function Tracks() {
     useState(null);
 
   const [filters, setFilters] =
-    useState({ favoritesOnly: false, unplayedOnly: false, minimumRating: "" });
+    useState({ favoritesOnly: false, unplayedOnly: false });
 
 
   const [
@@ -121,7 +121,6 @@ useEffect(() => {
         const activeFilters = [
           filters.favoritesOnly ? { field: "favorite", op: "boolean", value: true } : null,
           filters.unplayedOnly ? { field: "played", op: "boolean", value: false } : null,
-          filters.minimumRating ? { field: "rating", op: "gte", value: Number(filters.minimumRating) } : null,
         ].filter(Boolean);
 
         const data = activeFilters.length > 0
@@ -339,7 +338,7 @@ useEffect(() => {
       {!loadingSongs &&
         !songError && (
 
-        <div className="track-list">
+        <div className="track-list" role="table" aria-label="Tracks">
 
           <TrackListHeader />
 

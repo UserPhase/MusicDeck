@@ -15,13 +15,12 @@ import {
   type DownloaderAdapter,
   type DownloadRequest,
   type DownloadContext,
-  type DownloadResult,
   type DownloadProgress,
   type DownloadStage,
   type DownloaderCapabilities,
 } from "./downloader-adapter.js";
 import type { ProcessRunner } from "./process-runner.js";
-import { SpotDLDownloaderAdapter, type SpotDLDiagnosticResult } from "./spotdl-downloader-adapter.js";
+import { SpotDLDownloaderAdapter } from "./spotdl-downloader-adapter.js";
 
 export type AcquisitionJobStatus =
   | "queued"
@@ -381,7 +380,6 @@ export function extractZipSafely(
 
     const compressionMethod = zipBuffer.readUInt16LE(offset + 8);
     const compressedSize = zipBuffer.readUInt32LE(offset + 18);
-    const uncompressedSize = zipBuffer.readUInt32LE(offset + 22);
     const fileNameLength = zipBuffer.readUInt16LE(offset + 26);
     const extraFieldLength = zipBuffer.readUInt16LE(offset + 28);
 
@@ -1155,14 +1153,11 @@ export class AcquisitionService {
           }
         } catch {}
 
-        const inputStrategy = spotifyTrackUrl ? "spotify-url" : "text";
-        console.log(`[Acquisition]\ninput strategy = ${inputStrategy}\ntrack = "${result.title}"${result.artist ? ` by "${result.artist}"` : ""}, discovery started`);
 
         let discoveredCandidates = (await this.sourcePipeline?.discover(result, {
           spotifyTrackUrl,
           spotifyTrackId,
         })) || [];
-        console.log(`[Acquisition] candidates found = ${discoveredCandidates.length}`);
 
         // A downloader adapter (e.g. spotDL) can acquire a track directly from
         // a resolved Spotify identity, or via its own text/query search
@@ -1186,7 +1181,6 @@ export class AcquisitionService {
           const downloaderCandidate = this.buildDownloaderCandidate(result, spotifyTrackUrl, spotifyTrackId, job.sourceProvider);
           if (downloaderCandidate) {
             discoveredCandidates = [downloaderCandidate];
-            console.log(`[Acquisition] synthesized direct downloader candidate (provider=${downloaderCandidate.provider})`);
           }
         }
 
@@ -1221,7 +1215,6 @@ export class AcquisitionService {
           }
         }
 
-        console.log(`[Acquisition] acquireable candidates = ${candidateProviderPairs.length}`);
 
         if (candidateProviderPairs.length === 0) {
           this.updateJobInDb(jobId, {
@@ -1351,8 +1344,6 @@ export class AcquisitionService {
         selectedCandidate = pair.candidate;
         selectedProvider = pair.provider;
 
-        console.log(`[Acquisition] selected provider = ${selectedProvider.id}, selected candidate kind = ${selectedCandidate.kind || "file"}`);
-        console.log(`[Acquisition] download started for candidate: ${selectedCandidate.id}`);
 
         this.updateJobInDb(jobId, {
           status: "downloading",
@@ -1370,7 +1361,6 @@ export class AcquisitionService {
         } catch (err) {
           lastError = err;
           if (controller.signal.aborted) throw err;
-          console.log(`[Acquisition] provider ${selectedProvider.id} failed for candidate ${selectedCandidate.id}: ${err instanceof Error ? err.message : String(err)}, trying next if available`);
         }
       }
 
@@ -1382,7 +1372,6 @@ export class AcquisitionService {
       // 4. Processing & Validation stage
       this.updateJobInDb(jobId, { status: "processing", stage: "processing" });
       this.emitEvent("acquisition.processing", { jobId, userId: job.userId, status: "processing", stage: "processing", autoPlay: job.autoPlay });
-      console.log(`[Acquisition] validating audio files...`);
 
       const validatedFiles: AcquiredFile[] = [];
       for (const file of acquisitionResult.files) {
@@ -1396,7 +1385,6 @@ export class AcquisitionService {
       // 5. Importing stage
       this.updateJobInDb(jobId, { status: "importing", stage: "importing" });
       this.emitEvent("acquisition.importing", { jobId, userId: job.userId, status: "importing", stage: "importing", autoPlay: job.autoPlay });
-      console.log(`[Acquisition] importing to library root: ${this.baseMusicDir}`);
 
       const downloadDir = this.getDownloadDirectory();
       const importedFiles: Array<{ path: string; title?: string; artist?: string; album?: string; size?: number; status: string }> = [];
@@ -1436,7 +1424,6 @@ export class AcquisitionService {
         if (!stat.isFile() || stat.size === 0) {
           throw new Error(`Imported audio file was not written to MUSIC_ROOT: ${destPath}`);
         }
-        console.log(`[Acquisition] imported file: ${destPath}`);
         importedFiles.push({
           path: destPath,
           title: trackTitle,

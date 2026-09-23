@@ -30,6 +30,11 @@ export type Track = {
   albumId: string | null;
   albumName: string;
   durationSeconds: number | null;
+  /** Provider aggregate; not a 45-day count. */
+  playCount?: number | null;
+  /** Provider's most recent play, when exposed by Subsonic. */
+  lastPlayedAt?: string | null;
+  addedAt?: string | null;
   trackNumber: number | null;
   artworkId: string | null;
   artworkUrl: string | null;
@@ -62,7 +67,11 @@ export type Artist = {
   name: string;
   artworkId: string | null;
   artworkUrl: string | null;
+  /** Artist portrait from getArtist/getArtistInfo2; never album artwork. */
+  imageUrl?: string | null;
   albumCount: number;
+  /** Provider's ID-scoped total, when exposed without loading every song. */
+  songCount?: number | null;
   identityHints?: IdentityHints;
 };
 

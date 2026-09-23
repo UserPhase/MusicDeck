@@ -9,6 +9,14 @@ export type NavidromeConfig = {
   password: string;
 };
 
+type ArtistDetailResponse = {
+  artist?: { id: string; name?: string; artistImageUrl?: unknown; coverArt?: string; songCount?: number; album?: any[] };
+};
+
+type ArtistInfoResponse = {
+  artistInfo2?: { largeImageUrl?: unknown; mediumImageUrl?: unknown };
+};
+
 /**
  * Navidrome provides every current capability: catalog reads, media
  * streaming/artwork, and provider-side user-data sync (favorites,
@@ -19,6 +27,7 @@ export class NavidromeBackend implements MusicBackend {
   private readonly username: string;
   private readonly password: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly artistDetails = new Map<string, { expiresAt: number; value: Promise<ArtistDetailResponse> }>();
 
   constructor(config: NavidromeConfig, fetchImpl: typeof fetch = fetch) {
     this.baseUrl = config.url.replace(/\/$/, "");
@@ -65,8 +74,8 @@ export class NavidromeBackend implements MusicBackend {
     return url;
   }
 
-  private async request(endpoint: string, params: Record<string, unknown> = {}) {
-    const response = await this.fetchImpl(this.buildUrl(endpoint, params));
+  private async request<T = any>(endpoint: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
+    const response = await this.fetchImpl(this.buildUrl(endpoint, params), signal ? { signal } : undefined);
 
     if (!response.ok) {
       throw new Error(`Navidrome returned ${response.status}`);
@@ -86,12 +95,24 @@ export class NavidromeBackend implements MusicBackend {
       throw new Error(result?.error?.message || "Navidrome API error");
     }
 
-    return result;
+    return result as T;
   }
 
   private async getAlbumRaw(albumId: string) {
     const result = await this.request("getAlbum", { id: albumId });
     return result.album || null;
+  }
+
+  private getArtistDetail(artistId: string): Promise<ArtistDetailResponse> {
+    const cached = this.artistDetails.get(artistId);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const value = this.request<ArtistDetailResponse>("getArtist", { id: artistId }).catch((error) => {
+      this.artistDetails.delete(artistId);
+      throw error;
+    });
+    this.artistDetails.set(artistId, { expiresAt: Date.now() + 15_000, value });
+    if (this.artistDetails.size > 100) this.artistDetails.delete(this.artistDetails.keys().next().value!);
+    return value;
   }
 
   async listAlbums(limit = 500): Promise<Album[]> {
@@ -119,20 +140,63 @@ export class NavidromeBackend implements MusicBackend {
     return artists.map(mapArtist);
   }
 
-  async getArtist(artistId: string): Promise<Artist | null> {
-    const result = await this.request("getArtist", { id: artistId });
-    return result.artist ? mapArtist(result.artist) : null;
+  async getArtist(artistId: string, options?: { includeArtistInfo?: boolean }): Promise<Artist | null> {
+    const [result, info] = await Promise.all([
+      this.getArtistDetail(artistId),
+      options?.includeArtistInfo === false
+        ? Promise.resolve(null)
+        : this.request<ArtistInfoResponse>("getArtistInfo2", { id: artistId, count: 0, includeNotPresent: false }).catch(() => null),
+    ]);
+    if (!result.artist) return null;
+    const imageUrl = [
+      result.artist.artistImageUrl,
+      info?.artistInfo2?.mediumImageUrl,
+      info?.artistInfo2?.largeImageUrl,
+    ].find((image): image is string => typeof image === "string" && /^https:\/\//i.test(image)) || null;
+    return { ...mapArtist(result.artist), imageUrl };
   }
 
   async getArtistAlbums(artistId: string): Promise<Album[]> {
-    const result = await this.request("getArtist", { id: artistId });
-    return (result.artist?.album || []).map(mapAlbum);
+    const result = await this.getArtistDetail(artistId);
+    return (result.artist?.album || [])
+      .filter((album: any) => !album.artistId || String(album.artistId) === artistId)
+      .map(mapAlbum);
+  }
+
+  async getArtistTopTracks(artistId: string, limit = 10): Promise<Track[]> {
+    const count = Math.max(1, Math.min(10, Math.trunc(limit)));
+    // Navidrome accepts an artist ID here. Its top-songs source is optional;
+    // search3 is a bounded fallback for servers without that integration.
+    try {
+      const result = await this.request("getTopSongs", { id: artistId, count }, AbortSignal.timeout(1_200));
+      const songs = (result.topSongs?.song || [])
+        .filter((song: any) => String(song.artistId || "") === artistId)
+        .slice(0, count);
+      if (songs.length) return songs.map(mapTrack);
+    } catch {
+      // The optional server-side top-songs integration may not be configured.
+    }
+    const detail = await this.getArtistDetail(artistId);
+    if (!detail.artist?.name) return [];
+    try {
+      const result = await this.request("search3", {
+        query: detail.artist.name, artistCount: 0, albumCount: 0, songCount: count,
+      });
+      return (result.searchResult3?.song || [])
+        .filter((song: any) => String(song.artistId || "") === artistId)
+        .slice(0, count)
+        .map(mapTrack);
+    } catch {
+      return [];
+    }
   }
 
   async getArtistTracks(artistId: string): Promise<Track[]> {
     const albums = await this.getArtistAlbums(artistId);
     const albumResults = await Promise.all(albums.map((album) => this.getAlbumRaw(album.id)));
-    return albumResults.flatMap((album) => (album?.song || []).map(mapTrack));
+    return albumResults.flatMap((album) => (album?.song || [])
+      .filter((song: any) => String(song.artistId || "") === artistId)
+      .map(mapTrack));
   }
 
   async listTracks(): Promise<Track[]> {
@@ -144,6 +208,10 @@ export class NavidromeBackend implements MusicBackend {
   async getTrack(trackId: string): Promise<Track | null> {
     const result = await this.request("getSong", { id: trackId });
     return result.song ? mapTrack(result.song) : null;
+  }
+
+  async scrobbleTrack(trackId: string, playedAt = Date.now()): Promise<void> {
+    await this.request("scrobble", { id: trackId, time: playedAt, submission: true });
   }
 
   async getLyrics(trackId: string): Promise<string | null> {

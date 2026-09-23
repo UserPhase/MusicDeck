@@ -16,9 +16,11 @@ export interface CatalogProvider {
   getAlbum(albumId: string): Promise<Album | null>;
   getAlbumTracks(albumId: string): Promise<Track[]>;
   listArtists(): Promise<Artist[]>;
-  getArtist(artistId: string): Promise<Artist | null>;
+  getArtist(artistId: string, options?: { includeArtistInfo?: boolean }): Promise<Artist | null>;
   getArtistAlbums(artistId: string): Promise<Album[]>;
   getArtistTracks(artistId: string): Promise<Track[]>;
+  /** Bounded artist-page preview; providers must filter by the exact artist ID. */
+  getArtistTopTracks?(artistId: string, limit: number): Promise<Track[]>;
   listTracks(): Promise<Track[]>;
   getTrack(trackId: string): Promise<Track | null>;
   /** Optional provider-native metadata used by the Now Playing context panel. */

@@ -30,7 +30,7 @@ function CollectionDownloadButton({ tracks = [], quality = "320kbps", label = "c
         await downloadToDevice(eligibleTracks[index].id, quality);
       } catch (error) {
         failed += 1;
-        console.warn("Could not download collection track:", error);
+        console.error("Could not download collection track:", error);
       } finally {
         setBatch({
           status: "downloading",
@@ -92,4 +92,3 @@ function CollectionDownloadButton({ tracks = [], quality = "320kbps", label = "c
 }
 
 export default CollectionDownloadButton;
-

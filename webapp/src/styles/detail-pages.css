@@ -9,25 +9,25 @@
 .playlist-page.detail-hero-gradient,
 .artist-page.detail-hero-gradient {
   --hero-glow-x: 28%;
-  --detail-content-width: min(100%, 1100px);
-  width: calc(100% + var(--main-padding-x) + var(--main-padding-x));
+  --detail-content-width: var(--content-rail-width, 100%);
+  width: 100%;
   max-width: none;
-  margin: calc(0px - var(--main-padding-top)) calc(0px - var(--main-padding-x)) 0;
+  margin: calc(0px - var(--main-padding-top)) 0 0;
   padding: var(--main-padding-top) var(--main-padding-x) 0;
   border-radius: calc(var(--panel-radius) - 1px) calc(var(--panel-radius) - 1px) 0 0;
 
-  /* A bright cover pool dissolves into a nearly imperceptible vertical tail. */
+  /* Cool violet lighting gives artwork a stage without turning the page burgundy. */
   background-image:
     radial-gradient(
       ellipse 1080px 205px at calc(var(--hero-glow-x) + 50px) 225px,
-      color-mix(in srgb, var(--ambient-glow) 24%, transparent) 0%,
-      color-mix(in srgb, var(--ambient-glow) 21%, transparent) 54%,
+      rgb(168 85 247 / 20%) 0%,
+      rgb(168 85 247 / 11%) 54%,
       transparent 100%
     ),
     linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--ambient-glow) 7%, transparent) 0%,
-      color-mix(in srgb, var(--ambient-glow) 30%, transparent) 38%,
+      rgb(168 85 247 / 14%) 0%,
+      rgb(168 85 247 / 5%) 38%,
       transparent 100%
     );
   background-repeat: no-repeat;
@@ -36,12 +36,13 @@
 }
 .album-page.detail-hero-gradient,
 .artist-page.detail-hero-gradient { --hero-glow-x: calc(50% - min(420px, 38vw)); }
-.playlist-page.detail-hero-gradient { --hero-glow-x: calc(50% - min(420px, 38vw)); --detail-content-width: min(100%, 1100px); }
+.playlist-page.detail-hero-gradient { --hero-glow-x: calc(50% - min(420px, 38vw)); }
 .album-page.detail-hero-gradient > .album-back,
 .album-page.detail-hero-gradient > .album-header,
 .album-page.detail-hero-gradient > .track-list,
 .artist-page.detail-hero-gradient > .artist-back,
 .artist-page.detail-hero-gradient > .artist-header,
+.artist-page.detail-hero-gradient > .artist-about,
 .artist-page.detail-hero-gradient > .artist-albums,
 .artist-page.detail-hero-gradient > .artist-tracks { width: var(--detail-content-width); margin-left: auto; margin-right: auto; }
 .playlist-page.detail-hero-gradient > .playlist-back,
@@ -111,9 +112,29 @@
 .artist-page-cover img { width: 100%; height: 100%; object-fit: cover; }
 .artist-page-info h1 { font-size: 40px; font-weight: 750; letter-spacing: -1px; }
 .artist-meta { margin-top: 10px; color: var(--text-secondary); font-size: 13px; }
+.artist-about { margin-bottom: 2.75rem; }
+.artist-about .artist-biography { max-width: 48rem; }
+.artist-tracks-empty { display: grid; place-items: center; min-height: 10rem; border-top: 1px solid var(--border); color: var(--text-secondary); font-size: 0.875rem; text-align: center; }
+.artist-page-loading .artist-header { align-items: center; }
+.artist-skeleton { background: linear-gradient(105deg, rgb(255 255 255 / 5%) 8%, rgb(255 255 255 / 11%) 27%, rgb(255 255 255 / 5%) 46%); background-size: 220% 100%; animation: artist-skeleton-pulse 1.8s ease-in-out infinite; }
+.artist-skeleton-back { width: 4rem; height: 0.8rem; border-radius: 0.3rem; }
+.artist-skeleton-info { display: grid; gap: 0.9rem; width: min(30rem, 52%); }
+.artist-skeleton-kicker { width: 4.5rem; height: 0.65rem; border-radius: 0.25rem; }
+.artist-skeleton-name { width: 80%; height: 2.8rem; border-radius: 0.45rem; }
+.artist-skeleton-meta { width: 9rem; height: 0.8rem; border-radius: 0.3rem; }
+.artist-skeleton-section-title { width: 12rem; height: 1.35rem; margin-bottom: 1.1rem; border-radius: 0.3rem; }
+.artist-skeleton-albums { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1rem; margin-bottom: 3rem; }
+.artist-skeleton-album { aspect-ratio: 1; border-radius: 0.6rem; }
+.artist-skeleton-rows { display: grid; gap: 0.35rem; }
+.artist-skeleton-row { height: 3.4rem; border-radius: 0.35rem; }
+@keyframes artist-skeleton-pulse { to { background-position-x: -220%; } }
+@media (max-width: 900px) { .artist-skeleton-albums { grid-template-columns: repeat(3, minmax(0, 1fr)); } .artist-skeleton-album:nth-child(n+4) { display: none; } }
+@media (max-width: 620px) { .artist-page-loading .artist-header { align-items: flex-start; gap: 1rem; } .artist-page-loading .artist-page-cover { width: 7.5rem; height: 7.5rem; } .artist-skeleton-info { width: min(14rem, 52%); } .artist-skeleton-name { height: 1.8rem; } .artist-skeleton-albums { grid-template-columns: repeat(2, minmax(0, 1fr)); } .artist-skeleton-album:nth-child(n+3) { display: none; } }
+@media (prefers-reduced-motion: reduce) { .artist-skeleton { animation: none; } }
 .artist-section { margin-bottom: 45px; }
-.artist-section-header { margin-bottom: 15px; }
+.artist-section-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 15px; }
 .artist-section-header h2 { font-size: 21px; }
+.artist-enrichment-status { color: var(--text-secondary); font-size: 0.75rem; font-weight: 550; }
 .liked-header { display: flex; align-items: center; gap: 22px; margin-bottom: 22px; }
 .liked-icon { width: 110px; height: 110px; display: grid; place-items: center; border-radius: 10px; background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 68%, black)); color: var(--bg-app); font-size: 42px; }
 .liked-label { color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; margin-bottom: 6px; }

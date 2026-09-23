@@ -2,253 +2,121 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Home from "./Home";
-import {
-  getAlbum,
-  getCoverUrl,
-  getExplore,
-  getRandomAlbums,
-  getRandomSongs,
-  getRecommendations,
-  getStarred,
-} from "../api/musicdeck";
-import {
-  getPlaylists,
-} from "../api/playlists";
+import { getAlbum, getAlbums, getArtistPortrait, getArtistTracks, getArtists, getCoverUrl, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
 
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
+  getAlbums: jest.fn(),
+  getArtistTracks: jest.fn(),
+  getArtists: jest.fn(),
+  getArtistPortrait: jest.fn(async () => null),
   getCoverUrl: jest.fn(),
-  getExplore: jest.fn(),
-  getRandomAlbums: jest.fn(),
-  getRandomSongs: jest.fn(),
+  getRecentlyAddedSongs: jest.fn(),
   getRecommendations: jest.fn(),
-  getStarred: jest.fn(),
 }));
 
-jest.mock("../api/playlists", () => ({
-  getPlaylists: jest.fn(),
-}));
-
-jest.mock("../context/AuthContext", () => ({
-  useAuth: jest.fn(),
-}));
-
-jest.mock("../context/PlayerContext", () => ({
-  usePlayer: jest.fn(),
-}));
+jest.mock("../context/AuthContext", () => ({ useAuth: jest.fn() }));
+jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
+const album = { id: "album-1", name: "Discovery", artist: "Daft Punk", coverArt: "art-1" };
+const song = { id: "track-1", title: "Digital Love", artist: "Daft Punk", artistId: "artist-1", coverArt: "art-1", duration: 241 };
+const artist = { id: "artist-1", name: "Daft Punk", coverArt: "artist-art", playCount: 0 };
 
-const album = {
-  id: "album-1",
-  name: "Discovery",
-  artist: "Daft Punk",
-  coverArt: "art-1",
-};
-
-const song = {
-  id: "track-1",
-  title: "Digital Love",
-  artist: "Daft Punk",
-  artistId: "artist-1",
-  coverArt: "art-1",
-};
-
-const favorite = {
-  id: "track-liked",
-  title: "One More Time",
-  artist: "Daft Punk",
-  artistId: "artist-1",
-  coverArt: "art-liked",
-};
-
-const playlist = {
-  id: "playlist-1",
-  name: "Evening Drive",
-  songCount: 12,
-  coverArt: "mdplart_sig1_mdpl_1",
-  coverMode: "collage",
-};
-
-function renderHome({
-  session = { displayName: "Sam", username: "sam" },
-  recentlyPlayed = [song],
-  randomAlbums = [album],
-  randomSongs = [song],
-  favorites = [favorite],
-  playlists = [playlist],
-  recommendations = [],
-  favoritesReject = false,
-  playlistsReject = false,
-} = {}) {
+function renderHome({ recentlyPlayed = [song], albums = [album], artists = [artist], recommendations = [song] } = {}) {
   jest.clearAllMocks();
-
-  getCoverUrl.mockImplementation((id, size) =>
-    id ? `/api/artwork/${id}${size ? `?size=${size}` : ""}` : null
-  );
-
-  useAuth.mockReturnValue({ session });
-  usePlayer.mockReturnValue({
-    playSong,
-    playQueue,
-    recentlyPlayed,
-  });
-
-  getRandomAlbums.mockResolvedValue(randomAlbums);
-  getRandomSongs.mockResolvedValue(randomSongs);
-  getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
-  getRecommendations.mockResolvedValue({ sections: recommendations, degraded: false });
-  if (favoritesReject) {
-    getStarred.mockRejectedValue(new Error("Favorites unavailable"));
-  } else {
-    getStarred.mockResolvedValue(favorites);
-  }
-  if (playlistsReject) {
-    getPlaylists.mockRejectedValue(new Error("Playlists unavailable"));
-  } else {
-    getPlaylists.mockResolvedValue(playlists);
-  }
+  getCoverUrl.mockImplementation((id) => id ? `/api/artwork/${id}` : null);
+  useAuth.mockReturnValue({ session: { displayName: "Sam", username: "sam" } });
+  usePlayer.mockReturnValue({ playSong, playQueue, recentlyPlayed });
+  getAlbums.mockResolvedValue(albums);
+  getRecentlyAddedSongs.mockResolvedValue([song]);
+  getArtists.mockResolvedValue(artists);
+  getArtistPortrait.mockResolvedValue(null);
+  getArtistTracks.mockResolvedValue([song]);
+  getRecommendations.mockResolvedValue({ sections: [{ id: "mix", items: recommendations }] });
   getAlbum.mockResolvedValue({ song: [song] });
 
-  return render(
-    <MemoryRouter>
-      <Home />
-    </MemoryRouter>
-  );
+  return render(<MemoryRouter><Home /></MemoryRouter>);
 }
 
 async function waitForHome() {
-  expect(await screen.findByRole("heading", { name: /discover albums/i })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Discover Albums" })).toBeInTheDocument();
 }
 
-test("greets the authenticated user by display name", async () => {
+test("renders the artist shelves and discovery sections with a personalized greeting", async () => {
   renderHome();
 
-  expect(screen.getByRole("heading", { name: /welcome back, sam/i })).toBeInTheDocument();
-  await waitForHome();
-});
-
-test("greets with a sensible fallback", async () => {
-  renderHome({ session: null });
-
-  expect(screen.getByRole("heading", { name: /welcome back, there/i })).toBeInTheDocument();
-  await waitForHome();
-});
-
-test("renders Continue Listening from PlayerContext without another recent request", async () => {
-  renderHome({ recentlyPlayed: [song] });
-
+  expect(screen.getByRole("heading", { name: "Welcome back, Sam" })).toBeInTheDocument();
   await waitForHome();
 
-  expect(screen.getByRole("heading", { name: /continue listening/i })).toBeInTheDocument();
-  expect(screen.getAllByText("Digital Love").length).toBeGreaterThan(0);
+  [
+    "Continue Listening",
+    "Recently Added Albums",
+    "Discover Artists",
+    "Recently Added Songs",
+    "Discover Tracks",
+    "Discover Albums",
+    "Unexplored Artists",
+    "Try Something Different",
+  ].forEach((heading) => expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument());
 });
 
-test("renders favorites when available", async () => {
-  renderHome({ favorites: [favorite] });
+test("plays an artist through its fetched tracks", async () => {
+  renderHome();
+  await waitForHome();
 
-  expect(await screen.findByRole("heading", { name: /your favorites/i })).toBeInTheDocument();
-  expect(screen.getByText("One More Time")).toBeInTheDocument();
-});
-
-test("omits favorites when empty", async () => {
-  renderHome({ favorites: [] });
-
+  fireEvent.click(screen.getAllByRole("button", { name: /play daft punk/i })[0]);
   await waitFor(() => {
-    expect(screen.queryByRole("heading", { name: /your favorites/i })).toBeNull();
+    expect(getArtistTracks).toHaveBeenCalledWith("artist-1");
+    expect(playQueue).toHaveBeenCalledWith([song], 0);
   });
 });
 
-test("renders playlists when available", async () => {
-  renderHome({ playlists: [playlist] });
-
-  expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
-  expect(screen.getByText("Evening Drive")).toBeInTheDocument();
-});
-
-test("Home playlist cards render the resolved playlist artwork as a thumbnail", async () => {
-  renderHome({ playlists: [playlist] });
-
-  expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
-
-  const cover = screen.getByAltText("Evening Drive cover");
-
-  expect(cover).toHaveAttribute(
-    "src",
-    "/api/artwork/mdplart_sig1_mdpl_1?size=300"
-  );
-});
-
-test("Home playlist cards fall back to the placeholder without artwork", async () => {
-  const { container } = renderHome({
-    playlists: [{ ...playlist, coverArt: null, coverMode: null }],
-  });
-
-  expect(await screen.findByRole("heading", { name: /your playlists/i })).toBeInTheDocument();
-  expect(screen.queryByAltText("Evening Drive cover")).toBeNull();
-  expect(container.querySelector(".playlist-cover-icon")).toBeInTheDocument();
-});
-
-test("omits playlists when empty", async () => {
-  renderHome({ playlists: [] });
-
-  await waitFor(() => {
-    expect(screen.queryByRole("heading", { name: /your playlists/i })).toBeNull();
-  });
-});
-
-test("renders personalized recommendation sections with explanations", async () => {
-  renderHome({
-    recommendations: [{
-      id: "favorites-mix",
-      title: "Made for you",
-      items: [{ ...song, metadata: { recommendationReason: "From your favorites" } }],
-    }],
-  });
-
-  expect(await screen.findByRole("heading", { name: /made for you/i })).toBeInTheDocument();
-  expect(screen.getByText("From your favorites")).toBeInTheDocument();
-});
-
-test("renders Discover Albums and Try Something Different from random data", async () => {
+test("plays a continued-listening track", async () => {
   renderHome();
-
-  expect(await screen.findByRole("heading", { name: /discover albums/i })).toBeInTheDocument();
-  expect(await screen.findByText("Discovery")).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: /try something different/i })).toBeInTheDocument();
-  expect(screen.getAllByText("Digital Love").length).toBeGreaterThan(0);
-});
-
-test("optional-section failure does not prevent other Home content", async () => {
-  const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
-
-  renderHome({ favoritesReject: true });
-
   await waitForHome();
 
-  expect(screen.getByRole("heading", { name: /continue listening/i })).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: /discover albums/i })).toBeInTheDocument();
-  expect(await screen.findByText(/could not load favorites/i)).toBeInTheDocument();
-
-  consoleError.mockRestore();
-});
-
-test("existing playback actions remain functional", async () => {
-  renderHome();
-
-  await waitForHome();
-
-  fireEvent.click(screen.getAllByRole("button", { name: /play digital love/i })[0]);
+  fireEvent.click(screen.getAllByRole("button", { name: /digital love/i })[0]);
   expect(playSong).toHaveBeenCalledWith(song);
+});
 
-  expect(await screen.findByText("Discovery")).toBeInTheDocument();
+test("plays an album through its fetched queue", async () => {
+  renderHome();
+  await screen.findAllByText("Discovery");
+
   fireEvent.click(screen.getAllByRole("button", { name: /play discovery/i })[0]);
-
   await waitFor(() => {
     expect(getAlbum).toHaveBeenCalledWith("album-1");
     expect(playQueue).toHaveBeenCalledWith([song], 0);
+  });
+});
+
+test("keeps the listening hero useful when history is empty", async () => {
+  renderHome({ recentlyPlayed: [] });
+  await waitForHome();
+
+  await waitFor(() => {
+    const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
+    expect(section.querySelectorAll(".home-continue-card")).toHaveLength(1);
+  });
+});
+
+test("ranks local discover albums and artists from listening-based recommendations", async () => {
+  const secondAlbum = { id: "album-2", name: "Homework", artist: "Daft Punk", coverArt: "art-2" };
+  const secondArtist = { id: "artist-2", name: "Justice", coverArt: "art-3" };
+  renderHome({
+    albums: [album, secondAlbum],
+    artists: [artist, secondArtist],
+    recommendations: [{ ...song, metadata: { albumId: "album-2", artistId: "artist-2" } }],
+  });
+
+  await waitFor(() => {
+    const albumSection = screen.getByRole("heading", { name: "Discover Albums" }).closest("section");
+    const artistSection = screen.getByRole("heading", { name: "Discover Artists" }).closest("section");
+    expect(albumSection.querySelector(".album-title")).toHaveTextContent("Homework");
+    expect(artistSection.querySelector(".home-artist-card a")).toHaveTextContent("Justice");
   });
 });

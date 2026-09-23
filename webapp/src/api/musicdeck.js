@@ -37,7 +37,7 @@ async function request(path, options = {}) {
 }
 
 function toSong(track) {
-  return normalizeTrackData(track);
+  return { ...normalizeTrackData(track), playedAt: track.playedAt || null, playCount: track.playCount || 0 };
 }
 
 function toAlbum(album, songs) {
@@ -76,6 +76,7 @@ function toArtist(artist, albums) {
     id: artist.id,
     name: artist.name,
     coverArt: artist.artworkId,
+    imageUrl: typeof artist.imageUrl === "string" ? artist.imageUrl : null,
     albumCount: isExternal ? artist.albums.length : artist.albumCount,
     availability: artist.availability || null,
     source: isExternal ? { kind: "external", count: 0 } : undefined,
@@ -351,10 +352,32 @@ export function getStreamUrl(songId, source, streamQuality = "original") {
   return query ? `${base}?${query}` : base;
 }
 
-export async function getTrackLyrics(songId) {
+export async function getTrackLyrics(songId, song = null) {
   if (!songId) return null;
-  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/lyrics`);
-  return typeof data.lyrics === "string" ? data.lyrics : null;
+  const duration = Number(song?.duration ?? song?.metadata?.durationSeconds);
+  const params = new URLSearchParams();
+  if (song?.title && song?.artist && Number.isFinite(duration) && duration > 0) {
+    params.set("track_name", song.title);
+    params.set("artist_name", song.artist);
+    if (song.album) params.set("album_name", song.album);
+    params.set("duration", String(Math.round(duration)));
+  }
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/lyrics${suffix}`);
+  const parsedLines = Array.isArray(data.syncedLyrics)
+    ? data.syncedLyrics.filter((line) => Number.isFinite(line?.time) && typeof line?.text === "string")
+    : null;
+  const syncedLyrics = parsedLines ? (parsedLines.length ? parsedLines : null)
+    : typeof data.syncedLyrics === "string" && data.syncedLyrics.trim() ? data.syncedLyrics : null;
+  return {
+    syncedLyrics,
+    plainLyrics: typeof data.plainLyrics === "string" ? data.plainLyrics
+      : !syncedLyrics && typeof data.lyrics === "string" ? data.lyrics : null,
+    isSynced: data.isSynced === false ? false : Boolean(syncedLyrics),
+    provider: ["lrclib", "lyricsovh", "none"].includes(data.provider) ? data.provider : "none",
+    instrumental: data.instrumental === true,
+  };
 }
 
 export async function getTrackArtistBiography(songId) {
@@ -504,8 +527,45 @@ export async function sendRecommendationFeedback(feedback) {
 export async function recordListeningEvent(trackId, eventType, completionRatio) {
   return request("/api/listening-events", {
     method: "POST",
+    keepalive: true,
     body: JSON.stringify({ trackId, eventType, completionRatio }),
   });
+}
+
+export async function getArtistOverview(artistId, { scope } = {}) {
+  const suffix = scope === "local" ? "?scope=local" : "";
+  const data = await request(`/api/artists/${encodeURIComponent(artistId)}/overview${suffix}`);
+  return {
+    artist: toArtist(data.artist, (data.albums || []).map(toAlbum)),
+    tracks: (data.tracks || []).map(toSong),
+    topTracks: (data.topTracks || []).map(toSong),
+    localAlbumCount: data.localAlbumCount,
+    localSongCount: data.localSongCount,
+    externalEnrichmentAvailable: Boolean(data.externalEnrichmentAvailable),
+  };
+}
+
+export async function getArtistPortrait(artistId, options = {}) {
+  const params = new URLSearchParams();
+  if (options.skipNative) params.set("skipNative", "1");
+  if (options.skipDeezer) params.set("skipDeezer", "1");
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  const data = await request(`/api/artists/${encodeURIComponent(artistId)}/portrait${suffix}`);
+  return typeof data.imageUrl === "string" && data.imageUrl.trim()
+    ? { url: data.imageUrl, source: data.imageSource || "native",
+      kind: data.imageKind || "artist" } : null;
+}
+
+export async function getMusicBrainzArtistPortrait(artistId) {
+  const data = await request(`/api/artists/${encodeURIComponent(artistId)}/portrait/musicbrainz`);
+  return typeof data.imageUrl === "string" && data.imageUrl.trim()
+    ? { url: data.imageUrl, source: "musicbrainz", kind: "artist" } : null;
+}
+
+export async function getRecentlyAddedSongs(limit = 6) {
+  const data = await request(`/api/tracks/recently-added?limit=${encodeURIComponent(limit)}`);
+  return (data.tracks || []).map(toSong);
 }
 
 export async function filterLibraryTracks(filters = [], limit = 200) {
@@ -670,6 +730,10 @@ export async function getStarred() {
   return (data.tracks || []).map((track) =>
     normalizeTrackData(track, "liked")
   );
+}
+
+export async function getExternalCharts() {
+  return request("/api/discovery/external");
 }
 
 export async function getRecentlyPlayed() {

@@ -13,6 +13,7 @@ import {
   clearAuthSession,
   getAuthSession,
 } from "../api/session";
+import { artistOverviewQueryClient } from "../api/artistOverviewQuery";
 
 
 const AuthContext =
@@ -71,6 +72,7 @@ export function AuthProvider({
 
 
   async function signOut() {
+    artistOverviewQueryClient.clear();
     setSession(null);
     setStatus("unauthenticated");
 

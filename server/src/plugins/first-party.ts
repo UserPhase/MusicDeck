@@ -1,18 +1,10 @@
 import type { MusicDeckPlugin, MusicDeckPluginContext } from "./plugin-registry.js";
-import type { PlayableSource, SourceProvider } from "../domain/playable-sources.js";
-import type { UnifiedSearchResult } from "../domain/search.js";
-import { matchContainerFile, normalizeMusicText, versionSignature } from "../domain/music-identity.js";
-import { SpotDLDownloaderAdapter, writeCookiesFile } from "../domain/spotdl-downloader-adapter.js";
+import { writeCookiesFile, type SpotDLDownloaderAdapter } from "../domain/spotdl-downloader-adapter.js";
 
 function required(context: MusicDeckPluginContext, key: string) {
   const value = context.settings.get<string>(key);
   if (!value) throw new Error("Plugin is misconfigured");
   return value;
-}
-
-async function json<T>(response: Response, failure = "Plugin unavailable"): Promise<T> {
-  if (!response.ok) throw new Error(failure);
-  return response.json() as Promise<T>;
 }
 
 function trackPayload(payload: Record<string, unknown>) {

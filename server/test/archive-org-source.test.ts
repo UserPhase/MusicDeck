@@ -330,6 +330,12 @@ function archiveMockFetch(input: URL | RequestInfo | string, init?: RequestInit)
 
   if (url.hostname === "archive.org" && url.pathname === "/advancedsearch.php") {
     const q = url.searchParams.get("q") || "";
+    if (q === "mediatype:audio") {
+      return Promise.resolve(new Response(JSON.stringify(SEARCH_RESPONSE_QUEEN), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }
     if (q.includes("Bohemian") || q.includes("Queen")) {
       return Promise.resolve(new Response(JSON.stringify(SEARCH_RESPONSE_QUEEN), {
         status: 200,

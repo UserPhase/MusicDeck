@@ -11,7 +11,7 @@ import {
   getStreamUrl,
   getRecentlyPlayed,
   getStarred,
-  recordRecentlyPlayed,
+  recordListeningEvent,
   starSong,
   unstarSong,
   getRandomSongs,
@@ -35,6 +35,7 @@ const PlayerContext =
 
 const VALID_SIDEBARS = new Set(["none", "now-playing", "queue"]);
 const MAX_RECENTLY_PLAYED = 50;
+const LISTENING_WINDOW_MS = 45 * 24 * 60 * 60 * 1000;
 
 function normalizeSidebar(value) {
   return VALID_SIDEBARS.has(value) ? value : "none";
@@ -42,7 +43,10 @@ function normalizeSidebar(value) {
 
 function normalizeRecentlyPlayed(value) {
   return Array.isArray(value)
-    ? value.slice(0, MAX_RECENTLY_PLAYED)
+    ? value.filter((song) => {
+        const playedAt = Date.parse(song?.playedAt);
+        return Number.isFinite(playedAt) && playedAt >= Date.now() - LISTENING_WINDOW_MS;
+      }).slice(0, MAX_RECENTLY_PLAYED)
     : [];
 }
 
@@ -88,6 +92,7 @@ export function PlayerProvider({
   } = useAuth();
   const playbackRequestRef =
     useRef(0);
+  const listeningSessionRef = useRef(null);
 
   /*
    * CURRENT SONG
@@ -755,6 +760,7 @@ export function PlayerProvider({
 
   function resetPlayer() {
     playbackRequestRef.current += 1;
+    listeningSessionRef.current = null;
     isTransitioningRef.current = false;
 
     cancelCrossfade();
@@ -839,7 +845,14 @@ export function PlayerProvider({
           await getRecentlyPlayed();
 
         if (!cancelled) {
-          setRecentlyPlayed(normalizeRecentlyPlayed(songs));
+          setRecentlyPlayed((current) => {
+            const byId = new Map();
+            for (const song of [...normalizeRecentlyPlayed(current), ...normalizeRecentlyPlayed(songs)]) {
+              const key = String(song.id);
+              if (!byId.has(key) || Date.parse(song.playedAt) > Date.parse(byId.get(key).playedAt)) byId.set(key, song);
+            }
+            return [...byId.values()].sort((a, b) => Date.parse(b.playedAt) - Date.parse(a.playedAt)).slice(0, MAX_RECENTLY_PLAYED);
+          });
         }
 
       } catch (error) {
@@ -937,8 +950,9 @@ export function PlayerProvider({
           );
 
 
+        const previous = current.find((recentSong) => String(recentSong.id) === String(song.id));
         const updated = [
-          song,
+          { ...song, playedAt: new Date().toISOString(), playCount: (previous?.playCount || 0) + 1 },
           ...withoutSong,
         ].slice(0, MAX_RECENTLY_PLAYED);
 
@@ -1328,6 +1342,7 @@ export function PlayerProvider({
 
     setPreviewSource(preview);
     previewSourceRef.current = preview;
+    listeningSessionRef.current = null;
     setPlaybackUnavailable(false);
 
 
@@ -1402,13 +1417,9 @@ export function PlayerProvider({
         requestId === playbackRequestRef.current
       ) {
         setIsPlaying(true);
-        addToRecentlyPlayed(song);
-        recordRecentlyPlayed(song.id).catch((error) => {
-          console.error(
-            "Could not record recently played:",
-            error
-          );
-        });
+        if (!preview && isLibraryPlayable(song)) {
+          listeningSessionRef.current = { trackId: song.id, qualified: false };
+        }
       }
 
     } catch (error) {
@@ -1464,6 +1475,18 @@ export function PlayerProvider({
       ...song,
       ...(typeof source === "object" ? { playableSource: source } : { sourceId: source }),
     });
+  }
+
+  function qualifyCurrentListen(song, position, totalDuration, completed = false) {
+    const session = listeningSessionRef.current;
+    if (!session || session.qualified || String(session.trackId) !== String(song?.id)) return;
+    const durationSeconds = Number(totalDuration) || Number(song?.duration) || Number(song?.metadata?.durationSeconds) || 0;
+    const threshold = durationSeconds > 0 ? Math.min(durationSeconds / 2, 240) : 240;
+    if (!completed && position < threshold) return;
+    session.qualified = true;
+    addToRecentlyPlayed(song);
+    recordListeningEvent(String(song.id), "complete", durationSeconds > 0 ? Math.min(1, position / durationSeconds) : 1)
+      .catch((error) => console.error("Could not record listening event:", error));
   }
 
   function toggleLike() {
@@ -1792,6 +1815,7 @@ export function PlayerProvider({
 
   function stopPlaybackAtQueueEnd() {
     playbackRequestRef.current += 1;
+    listeningSessionRef.current = null;
 
     if (audioRef.current) {
       audioRef.current.pause();
@@ -2032,6 +2056,10 @@ export function PlayerProvider({
         return;
       }
 
+      if (!previewSourceRef.current) {
+        qualifyCurrentListen(currentSong, outgoingAudio.currentTime || 0, outgoingAudio.duration || 0, true);
+      }
+
       audioRef.current = incomingAudio;
       applyDeckVolume(incomingAudio);
 
@@ -2057,13 +2085,8 @@ export function PlayerProvider({
       setIsPlaying(true);
       trimBoundsRef.current = null;
 
-      addToRecentlyPlayed(nextTrack);
-      recordRecentlyPlayed(nextTrack.id).catch((error) => {
-        console.error(
-          "Could not record recently played:",
-          error
-        );
-      });
+      listeningSessionRef.current = !incomingPreview && isLibraryPlayable(nextTrack)
+        ? { trackId: nextTrack.id, qualified: false } : null;
 
       if (
         silenceTrimSettings.enabled &&
@@ -2230,6 +2253,9 @@ export function PlayerProvider({
     setCurrentTime(
       activeAudio.currentTime
     );
+    if (!previewSourceRef.current) {
+      qualifyCurrentListen(currentSong, activeAudio.currentTime, activeAudio.duration);
+    }
 
     /*
      * A preview is only a fragment of the real recording: stop at the
@@ -2350,6 +2376,7 @@ export function PlayerProvider({
 
     audioRef.current.currentTime =
       newTime;
+    setCurrentTime(newTime);
 
   }
 
@@ -2563,6 +2590,10 @@ export function PlayerProvider({
       return;
     }
 
+    if (!previewSourceRef.current && audioRef.current) {
+      qualifyCurrentListen(currentSong, audioRef.current.currentTime || 0, audioRef.current.duration || 0, true);
+    }
+
     if (isLooping) {
       const activeAudio = audioRef.current;
 
@@ -2577,6 +2608,7 @@ export function PlayerProvider({
         setCurrentTime(0);
         await activeAudio.play();
         setIsPlaying(true);
+        listeningSessionRef.current = { trackId: currentSong?.id, qualified: false };
       } catch (error) {
         setIsPlaying(false);
       } finally {

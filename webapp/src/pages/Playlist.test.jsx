@@ -33,7 +33,6 @@ jest.mock("../context/PlayerContext", () => ({
   usePlayer: jest.fn(),
 }));
 
-jest.mock("../components/SourceMenu", () => () => null);
 jest.mock("../components/TrackDownloadButton", () => () => null);
 jest.mock("../components/AvailabilityHint", () => () => null);
 

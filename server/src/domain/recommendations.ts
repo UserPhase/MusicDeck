@@ -4,6 +4,7 @@ import type { CatalogService } from "./catalog.js";
 import { toTrackSearchResult, type UnifiedSearchResult } from "./search.js";
 import type { Available } from "./catalog.js";
 import type { Track } from "../types.js";
+import { canUseProviderHistory, listeningWindowStart } from "./recently-played.js";
 
 export type RecommendationKind =
   | "continue-listening"
@@ -76,7 +77,7 @@ function clampLimit(limit: number) {
 function reasonFor(kind: RecommendationKind, entry?: TasteEntry) {
   if (kind === "continue-listening") return "Recently played";
   if (kind === "favorites-mix") return "From your favorites";
-  if (kind === "forgotten-favorites") return "You have not played this recently";
+  if (kind === "forgotten-favorites") return entry?.artistName ? `A deep cut from ${entry.artistName}` : "A deep cut from your library";
   if (kind === "discover") return entry?.artistName ? `Because you listen to ${entry.artistName}` : "Discover something new";
   if (kind === "similar-artists") return entry?.artistName ? `Similar to ${entry.artistName}` : "Similar artists";
   return "Recommended for you";
@@ -124,6 +125,8 @@ function diversify(items: UnifiedSearchResult[], limit: number, maxPerArtist = 2
 }
 
 export class RecommendationService {
+  private readonly tasteCache = new Map<string, { expiresAt: number; entries: TasteEntry[] }>();
+  private readonly libraryCache = new Map<string, { expiresAt: number; promise: Promise<Array<Available<Track>>> }>();
   constructor(
     private readonly db: Db,
     private readonly catalog: CatalogService
@@ -131,6 +134,8 @@ export class RecommendationService {
 
   recordListeningEvent(userId: string, trackId: string, eventType: "play" | "skip" | "complete", completionRatio?: unknown) {
     dbInsertEvent(this.db, userId, trackId, eventType, parseRatio(completionRatio));
+    this.tasteCache.delete(userId);
+    this.libraryCache.delete(userId);
   }
 
   setFeedback(userId: string, action: FeedbackAction, itemType: "track" | "artist" | "album", itemId: string) {
@@ -147,6 +152,8 @@ export class RecommendationService {
         weight = excluded.weight,
         updated_at = excluded.updated_at
     `).run(userId, itemType, itemId, action, weight, new Date().toISOString(), new Date().toISOString());
+    this.libraryCache.delete(userId);
+    this.tasteCache.delete(userId);
   }
 
   private feedback(userId: string) {
@@ -166,7 +173,10 @@ export class RecommendationService {
     };
   }
 
-  private async taste(userId: string) {
+  private taste(userId: string, libraryTracks: Array<Available<Track>>) {
+    const cached = this.tasteCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) return cached.entries;
+    const cutoff = listeningWindowStart();
     const favoriteRows = this.db.prepare(
       "SELECT track_id FROM favorites WHERE user_id = ?"
     ).all(userId) as Array<{ track_id: string }>;
@@ -175,15 +185,22 @@ export class RecommendationService {
     const recentRows = this.db.prepare(`
       SELECT track_id, COUNT(*) AS playCount, MAX(played_at) AS lastPlayedAt
       FROM recently_played
-      WHERE user_id = ?
+      WHERE user_id = ? AND played_at >= ?
       GROUP BY track_id
-    `).all(userId) as Array<{ track_id: string; playCount: number; lastPlayedAt: string }>;
+    `).all(userId, cutoff) as Array<{ track_id: string; playCount: number; lastPlayedAt: string }>;
 
     const eventRows = this.db.prepare(`
-      SELECT track_id, event_type AS eventType, completion_ratio AS completionRatio
+      SELECT track_id,
+        SUM(CASE event_type WHEN 'complete' THEN 2 * COALESCE(completion_ratio, 1)
+          WHEN 'skip' THEN -2 ELSE 1 END) AS scoreDelta,
+        SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completedCount,
+        MAX(CASE WHEN event_type = 'complete' THEN created_at END) AS lastCompletedAt
       FROM listening_events
-      WHERE user_id = ?
-    `).all(userId) as Array<{ track_id: string; eventType: string; completionRatio: number | null }>;
+      WHERE user_id = ? AND created_at >= ?
+      GROUP BY track_id
+    `).all(userId, cutoff) as Array<{
+      track_id: string; scoreDelta: number; completedCount: number; lastCompletedAt: string | null;
+    }>;
 
     const byTrack = new Map<string, {
       score: number;
@@ -201,81 +218,100 @@ export class RecommendationService {
       });
     }
 
-    for (const trackId of favorites) {
-      const existing = byTrack.get(trackId) || { score: 0, playCount: 0, favorite: true, lastPlayedAt: null };
-      byTrack.set(trackId, {
+    for (const event of eventRows) {
+      const existing = byTrack.get(event.track_id) || { score: 0, playCount: 0, favorite: favorites.has(event.track_id), lastPlayedAt: null };
+      byTrack.set(event.track_id, {
         ...existing,
-        score: existing.score + 6,
-        favorite: true,
+        // A qualified event and its recently_played row describe the same
+        // listen. Take the fuller count instead of double-counting it.
+        score: (event.completedCount ? 0 : existing.score) + event.scoreDelta,
+        playCount: Math.max(existing.playCount, event.completedCount),
+        lastPlayedAt: event.lastCompletedAt && (!existing.lastPlayedAt || event.lastCompletedAt > existing.lastPlayedAt)
+          ? event.lastCompletedAt : existing.lastPlayedAt,
       });
     }
 
-    for (const event of eventRows) {
-      const existing = byTrack.get(event.track_id) || { score: 0, playCount: 0, favorite: favorites.has(event.track_id), lastPlayedAt: null };
-      const delta = event.eventType === "complete"
-        ? 2 * (event.completionRatio ?? 1)
-        : event.eventType === "skip"
-          ? -2
-          : 1;
-      byTrack.set(event.track_id, {
-        ...existing,
-        score: existing.score + delta,
-        playCount: existing.playCount + (event.eventType === "play" ? 1 : 0),
+    // Subsonic exposes only the last play and all-time count, not a dated
+    // scrobble log. Use a recent provider timestamp as a coarse seed for
+    // listens made in other clients; local qualified events remain precise.
+    for (const track of canUseProviderHistory(this.db) ? libraryTracks : []) {
+      if (!track.lastPlayedAt) continue;
+      const playedAt = Date.parse(track.lastPlayedAt);
+      if (!Number.isFinite(playedAt) || playedAt < Date.parse(cutoff)) continue;
+      const existing = byTrack.get(track.id);
+      if (existing) {
+        if (!existing.lastPlayedAt || playedAt > Date.parse(existing.lastPlayedAt)) {
+          byTrack.set(track.id, { ...existing, lastPlayedAt: track.lastPlayedAt });
+        }
+        continue;
+      }
+      byTrack.set(track.id, {
+        score: 2, playCount: 1, favorite: favorites.has(track.id), lastPlayedAt: track.lastPlayedAt,
       });
     }
 
     const tracks: TasteEntry[] = [];
+    const catalogById = new Map(libraryTracks.map((track) => [track.id, track]));
     for (const [trackId, stats] of byTrack) {
-      try {
-        const track = await this.catalog.getTrack(trackId);
-        if (!track) continue;
-        tracks.push({
-          trackId,
-          score: stats.score,
-          playCount: stats.playCount,
-          favorite: stats.favorite,
-          lastPlayedAt: stats.lastPlayedAt,
-          artistId: track.artistId,
-          artistName: track.artistName,
-          albumId: track.albumId,
-          albumName: track.albumName,
-        });
-      } catch {
-        // Skip tracks whose provider is temporarily unavailable.
-      }
+      const track = catalogById.get(trackId);
+      if (!track) continue;
+      tracks.push({
+        trackId,
+        score: stats.score,
+        playCount: stats.playCount,
+        favorite: stats.favorite,
+        lastPlayedAt: stats.lastPlayedAt,
+        artistId: track.artistId,
+        artistName: track.artistName,
+        albumId: track.albumId,
+        albumName: track.albumName,
+      });
     }
-
+    this.tasteCache.set(userId, { entries: tracks, expiresAt: Date.now() + 30_000 });
     return tracks;
   }
 
   private async libraryTracks(userId: string): Promise<Array<Available<Track>>> {
-    const result = await this.catalog.listTracks();
-    const feedback = this.feedback(userId);
-    return result.items.filter((track) =>
-      !feedback.blockedItems.has(track.id)
-      && !(track.artistId && feedback.blockedArtists.has(track.artistId))
-      && !(track.albumId && feedback.blockedAlbums.has(track.albumId))
-    );
+    const cached = this.libraryCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) return cached.promise;
+    const promise = this.catalog.listTracks().then((result) => {
+      const feedback = this.feedback(userId);
+      return result.items.filter((track) =>
+        !feedback.blockedItems.has(track.id)
+        && !(track.artistId && feedback.blockedArtists.has(track.artistId))
+        && !(track.albumId && feedback.blockedAlbums.has(track.albumId))
+      );
+    }).catch((error) => {
+      this.libraryCache.delete(userId);
+      throw error;
+    });
+    this.libraryCache.set(userId, { expiresAt: Date.now() + 30_000, promise });
+    return promise;
   }
 
   async recommend(context: RecommendationContext): Promise<UnifiedSearchResult[]> {
     const limit = clampLimit(context.limit);
-    const [tracks, taste] = await Promise.all([
-      this.libraryTracks(context.userId),
-      this.taste(context.userId),
-    ]);
+    const tracks = await this.libraryTracks(context.userId);
+    const taste = this.taste(context.userId, tracks);
     const tasteByTrack = new Map(taste.map((entry) => [entry.trackId, entry]));
-    const topArtists = [...taste.values()]
-      .sort((left, right) => right.score - left.score)
-      .map((entry) => entry.artistId)
-      .filter(Boolean)
-      .slice(0, 5);
-    const topAlbums = [...taste.values()]
-      .sort((left, right) => right.score - left.score)
-      .map((entry) => entry.albumId)
-      .filter(Boolean)
-      .slice(0, 5);
+    const favoriteIds = new Set((this.db.prepare("SELECT track_id FROM favorites WHERE user_id = ?")
+      .all(context.userId) as Array<{ track_id: string }>).map((row) => row.track_id));
+    const ranked = (key: "artistId" | "albumId") => [...taste.reduce((totals, entry) => {
+      const id = entry[key];
+      if (id) totals.set(id, (totals.get(id) || 0) + Math.max(0, entry.score));
+      return totals;
+    }, new Map<string, number>())].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id]) => id);
+    const topArtists = ranked("artistId");
+    const topAlbums = ranked("albumId");
     const feedback = this.feedback(context.userId);
+    const providerHistoryIsPersonal = canUseProviderHistory(this.db);
+    const lifetimeRows = context.kind === "discover" || context.kind === "forgotten-favorites"
+      ? this.db.prepare(`
+          SELECT track_id, COUNT(*) AS playCount FROM listening_events
+          WHERE user_id = ? AND event_type = 'complete' GROUP BY track_id
+        `).all(context.userId) as Array<{ track_id: string; playCount: number }>
+      : [];
+    const localLifetime = new Map(lifetimeRows.map((row) => [row.track_id, row.playCount]));
 
     let candidates: Array<{ track: Available<Track>; entry?: TasteEntry; score: number }> = [];
 
@@ -285,28 +321,38 @@ export class RecommendationService {
         ? (Date.now() - new Date(entry.lastPlayedAt).getTime()) / 86_400_000
         : Number.POSITIVE_INFINITY;
       let score = entry?.score || 0;
+      const lifetimePlays = Math.max(
+        providerHistoryIsPersonal ? (track.playCount || 0) : 0,
+        localLifetime.get(track.id) || 0,
+        entry?.playCount || 0
+      );
+      const matchesArtist = Boolean(track.artistId && topArtists.includes(track.artistId));
+      const matchesAlbum = Boolean(track.albumId && topAlbums.includes(track.albumId));
 
       if (context.kind === "continue-listening") {
-        score = entry?.lastPlayedAt ? 10 - Math.min(ageDays, 10) : -100;
+        score = entry?.lastPlayedAt && ageDays <= 45 ? 45 - ageDays : -100;
       } else if (context.kind === "favorites-mix") {
-        score = entry?.favorite ? 20 + score : -100;
+        score = favoriteIds.has(track.id) ? 20 + score : -100;
       } else if (context.kind === "forgotten-favorites") {
-        score = (entry?.favorite || (entry?.playCount || 0) >= 2) && ageDays > 30 ? 15 + Math.min(ageDays / 30, 10) : -100;
+        const affinity = (matchesArtist ? 10 : 0) + (matchesAlbum ? 3 : 0);
+        score = affinity && lifetimePlays <= 1
+          ? affinity + (lifetimePlays === 0 ? 3 : 0)
+          : taste.length === 0 && lifetimePlays === 0 ? 1 : -100;
       } else if (context.kind === "discover") {
-        score = (entry?.playCount || 0) === 0
-          ? (topArtists.includes(track.artistId) ? 8 : 2) + (topAlbums.includes(track.albumId) ? 3 : 0)
+        score = lifetimePlays === 0
+          ? (matchesArtist ? 8 : 2) + (matchesAlbum ? 3 : 0)
           : -100;
       } else if (context.kind === "radio-artist" || context.kind === "similar-artists") {
-        score = track.artistId === context.seed?.artistId || track.artistName === context.seed?.artist ? 10 : topArtists.includes(track.artistId) ? 4 : 0;
+        score = track.artistId === context.seed?.artistId || track.artistName === context.seed?.artist ? 10 : matchesArtist ? 4 : 0;
       } else if (context.kind === "radio-album") {
-        score = track.albumId === context.seed?.albumId || track.albumName === context.seed?.album ? 10 : topAlbums.includes(track.albumId) ? 4 : 0;
+        score = track.albumId === context.seed?.albumId || track.albumName === context.seed?.album ? 10 : matchesAlbum ? 4 : 0;
       } else if (context.kind === "radio-track" || context.kind === "similar-tracks") {
         if (track.id === context.seed?.id) continue;
         score = track.artistId === context.seed?.artistId || track.artistName === context.seed?.artist
           ? 8
           : track.albumId === context.seed?.albumId || track.albumName === context.seed?.album
             ? 6
-            : topArtists.includes(track.artistId) ? 3 : 1;
+            : matchesArtist ? 3 : 1;
       }
 
       score += feedback.weightFor(track.id);

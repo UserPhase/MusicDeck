@@ -1,3 +1,4 @@
+import { memo } from "react";
 import AvailabilityHint from "./AvailabilityHint";
 
 function AlbumCard({
@@ -75,4 +76,4 @@ function AlbumCard({
 }
 
 
-export default AlbumCard;
+export default memo(AlbumCard);

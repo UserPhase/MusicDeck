@@ -1,5 +1,8 @@
 import {
+  memo,
+  useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -9,10 +12,12 @@ import {
 } from "react-router-dom";
 
 import {
-  getArtist,
-  getAlbum,
   getCoverUrl,
 } from "../api/musicdeck";
+import { fetchArtistOverview } from "../api/artistOverviewQuery";
+import ArtistAvatar from "../components/ArtistAvatar";
+import ArtistBiography from "../components/ArtistBiography";
+import { useArtistBiography } from "../hooks/useArtistBiography";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
@@ -25,10 +30,45 @@ import {
 import {
   usePlayer,
 } from "../context/PlayerContext";
+import { useAuth } from "../context/AuthContext";
+
+const ArtistAlbumCard = memo(function ArtistAlbumCard({ album }) {
+  return (
+    <Link to={`/album/${album.id}`} className="album">
+      <div className="album-cover">
+        {album.coverArt ? (
+          <img src={getCoverUrl(album.coverArt, 300)} alt={`${album.name} cover`} loading="lazy" decoding="async" />
+        ) : <div className="album-cover-placeholder">♪</div>}
+      </div>
+      <div className="album-title">{album.name}</div>
+      {album.year && <div className="album-artist">{album.year}</div>}
+      {album.source?.kind === "external" && (
+        <div className="album-artist album-not-downloaded">Not downloaded</div>
+      )}
+    </Link>
+  );
+}, (previous, next) => ["id", "name", "coverArt", "year"].every(
+  (field) => previous.album[field] === next.album[field]
+) && previous.album.source?.kind === next.album.source?.kind);
+
+function ArtistBiographySection({ artist, songs }) {
+  const localTrackId = songs.find((song) => song.id && song.source?.kind !== "external"
+    && !String(song.id).startsWith("external_"))?.id;
+  const { biography, loading } = useArtistBiography({
+    artistId: artist.id, artistName: artist.name, trackId: localTrackId,
+  });
+  return (
+    <section className="artist-about" aria-labelledby="artist-about-title">
+      <div className="artist-section-header"><h2 id="artist-about-title">About {artist.name}</h2></div>
+      <ArtistBiography biography={biography} loading={loading} />
+    </section>
+  );
+}
 
 function Artist() {
 
   const { id } = useParams();
+  const userId = useAuth()?.session?.id;
 
 
   const [artist, setArtist] =
@@ -40,8 +80,17 @@ function Artist() {
   const [songs, setSongs] =
     useState([]);
 
+  const [songCount, setSongCount] =
+    useState(0);
+
+  const [albumCount, setAlbumCount] =
+    useState(0);
+
   const [loading, setLoading] =
     useState(true);
+
+  const [enriching, setEnriching] =
+    useState(false);
 
   const [error, setError] =
     useState(null);
@@ -54,14 +103,15 @@ function Artist() {
     toggleShuffle,
   } = usePlayer();
 
-  function handleTrackPlayback(song, index) {
+  const handleTrackPlayback = useCallback((song, index) => {
+    if (!artist) return;
     playContext(songs, index, {
       type: "artist",
       id: artist.id,
       name: artist.name,
       coverArt: artist.coverArt,
     });
-  }
+  }, [artist, playContext, songs]);
 
 
   /*
@@ -84,6 +134,10 @@ function Artist() {
     playlistsLoading,
     setPlaylistsLoading,
   ] = useState(false);
+  const playlistMenuSongRef = useRef(null);
+  const playlistsRef = useRef([]);
+  playlistMenuSongRef.current = playlistMenuSong;
+  playlistsRef.current = playlists;
 
 
   /*
@@ -125,84 +179,63 @@ function Artist() {
   useEffect(() => {
     let cancelled = false;
 
+    function showOverview(overview) {
+      const artistData = overview.artist;
+      if (!artistData || String(artistData.id) !== String(id)) {
+        throw new Error("Artist not found.");
+      }
+      if (cancelled) return;
+
+      const artistAlbums = (artistData.album || []).filter((album) =>
+        !album.artistId || String(album.artistId) === String(id)
+      );
+      const artistSongs = (Array.isArray(overview.tracks) ? overview.tracks : [])
+        .filter((song) => {
+          const songArtistId = song.artistId || song.metadata?.artistId;
+          return !songArtistId || String(songArtistId) === String(id);
+        });
+      const rankedSongs = Array.isArray(overview.topTracks)
+        ? overview.topTracks
+        : artistSongs.slice().sort((left, right) => (right.playCount || 0) - (left.playCount || 0));
+      const popularSongs = rankedSongs.filter((song) => {
+        const songArtistId = song.artistId || song.metadata?.artistId;
+        return !songArtistId || String(songArtistId) === String(id);
+      }).slice(0, 10);
+
+      setArtist(artistData);
+      setAlbums(artistAlbums);
+      setSongs(popularSongs);
+      setSongCount(typeof overview.localSongCount === "number" && artistData.source?.kind !== "external"
+        ? overview.localSongCount : artistSongs.length);
+      setAlbumCount(typeof overview.localAlbumCount === "number" && artistData.source?.kind !== "external"
+        ? overview.localAlbumCount : artistAlbums.length);
+    }
+
     async function loadArtist() {
 
       try {
 
         setLoading(true);
+        setEnriching(false);
         setError(null);
 
+        const isExternal = id.startsWith("external_") || id.startsWith("extdetail_");
+        const initial = await fetchArtistOverview(id, isExternal ? undefined : "local", userId);
+        if (cancelled) return;
+        showOverview(initial);
+        setLoading(false);
 
-        /*
-         * Get artist
-         */
-
-        const artistData =
-          await getArtist(id);
-
-
-        if (!artistData) {
-
-          throw new Error(
-            "Artist not found."
-          );
-
-        }
-
-
-        if (cancelled) {
-          return;
-        }
-
-        setArtist(
-          artistData
-        );
-
-
-        /*
-         * Get artist albums
-         */
-
-        const artistAlbums =
-          artistData.album || [];
-
-
-        setAlbums(
-          artistAlbums
-        );
-
-
-        /*
-         * Library artists derive songs from their albums. External detail
-         * payloads already provide provider-neutral popular tracks.
-         */
-
-        const artistSongs = Array.isArray(artistData.tracks)
-          ? artistData.tracks
-          : (await Promise.all(
-            artistAlbums
-              // Catalog-only albums merged in from the external catalog
-              // (zero local tracks) don't have a local track listing to
-              // fetch — skip them here; they still render on the page via
-              // `albums`, they just don't contribute to the derived
-              // "popular tracks" list below.
-              .filter((album) => album.source?.kind !== "external")
-              .map((album) =>
-                getAlbum(album.id).catch((err) => {
-                  console.error("Could not load album tracks:", err);
-                  return null;
-                })
-              )
-          )).flatMap(
-            (album) =>
-              album?.song || []
-          );
-
-
-        if (!cancelled) {
-          setSongs(
-            artistSongs
-          );
+        if (initial.externalEnrichmentAvailable) {
+          setEnriching(true);
+          try {
+            const complete = await fetchArtistOverview(id, undefined, userId);
+            if (!cancelled) showOverview(complete);
+          } catch (enrichmentError) {
+            // The ID-scoped local page remains usable if the keyless catalog is slow or unavailable.
+            console.error("Could not load more artist releases:", enrichmentError);
+          } finally {
+            if (!cancelled) setEnriching(false);
+          }
         }
 
       } catch (err) {
@@ -237,14 +270,14 @@ function Artist() {
       cancelled = true;
     };
 
-  }, [id]);
+  }, [id, userId]);
 
 
   /*
    * Load playlists
    */
 
-  async function loadPlaylists() {
+  const loadPlaylists = useCallback(async () => {
 
     try {
 
@@ -272,21 +305,21 @@ function Artist() {
 
     }
 
-  }
+  }, []);
 
 
   /*
    * Open / close playlist menu
    */
 
-  async function togglePlaylistMenu(song) {
+  const togglePlaylistMenu = useCallback(async (song) => {
 
     /*
      * Clicking the same menu closes it.
      */
 
     if (
-      playlistMenuSong?.id === song.id
+      playlistMenuSongRef.current?.id === song.id
     ) {
 
       setPlaylistMenuSong(null);
@@ -309,14 +342,14 @@ function Artist() {
      */
 
     if (
-      playlists.length === 0
+      playlistsRef.current.length === 0
     ) {
 
       await loadPlaylists();
 
     }
 
-  }
+  }, [loadPlaylists]);
 
 
   /*
@@ -384,10 +417,27 @@ function Artist() {
 
     return (
 
-      <div className="artist-page">
-
-        <div className="loading">
-          Loading artist...
+      <div className="artist-page detail-hero-gradient artist-page-loading" aria-label="Loading artist" aria-busy="true">
+        <div className="artist-back artist-skeleton artist-skeleton-back" />
+        <div className="artist-header">
+          <div className="artist-page-cover artist-skeleton" />
+          <div className="artist-page-info artist-skeleton-info">
+            <div className="artist-skeleton artist-skeleton-kicker" />
+            <div className="artist-skeleton artist-skeleton-name" />
+            <div className="artist-skeleton artist-skeleton-meta" />
+          </div>
+        </div>
+        <div className="artist-albums">
+          <div className="artist-skeleton artist-skeleton-section-title" />
+          <div className="artist-skeleton-albums">
+            {Array.from({ length: 5 }, (_, index) => <div className="artist-skeleton artist-skeleton-album" key={index} />)}
+          </div>
+        </div>
+        <div className="artist-tracks">
+          <div className="artist-skeleton artist-skeleton-section-title" />
+          <div className="artist-skeleton-rows">
+            {Array.from({ length: 10 }, (_, index) => <div className="artist-skeleton artist-skeleton-row" key={index} />)}
+          </div>
         </div>
 
       </div>
@@ -395,7 +445,6 @@ function Artist() {
     );
 
   }
-
 
   /*
    * Error
@@ -431,7 +480,6 @@ function Artist() {
 
   }
 
-
   return (
 
     <div
@@ -456,32 +504,7 @@ function Artist() {
 
         {/* IMAGE */}
 
-        <div className="artist-page-cover">
-
-          {artist.coverArt ? (
-
-            <img
-              width="210"
-              height="210"
-              src={
-                getCoverUrl(
-                  artist.coverArt
-                )
-              }
-              alt={
-                `${artist.name}`
-              }
-            />
-
-          ) : (
-
-            <div className="artist-page-placeholder">
-              ♪
-            </div>
-
-          )}
-
-        </div>
+        <ArtistAvatar key={id} artist={artist} className="artist-page-cover" enableMusicBrainzFallback />
 
 
         {/* INFO */}
@@ -500,19 +523,21 @@ function Artist() {
 
           <div className="artist-meta">
 
-            {albums.length}{" "}
+            {albumCount}{" "}
 
-            {albums.length === 1
+            {albumCount === 1
               ? "album"
               : "albums"}
 
             {" · "}
 
-            {songs.length}{" "}
+            {songCount}{" "}
 
-            {songs.length === 1
+            {songCount === 1
               ? "song"
               : "songs"}
+
+            {artist.source?.kind !== "external" && " in library"}
 
           </div>
 
@@ -554,9 +579,12 @@ function Artist() {
       </div>
 
 
+      <ArtistBiographySection artist={artist} songs={songs} />
+
+
       {/* ALBUMS */}
 
-      {albums.length > 0 && (
+      {(albums.length > 0 || enriching) && (
 
         <section className="artist-albums">
 
@@ -566,70 +594,14 @@ function Artist() {
               Albums
             </h2>
 
+            {enriching && <span className="artist-enrichment-status" role="status">Finding more releases…</span>}
+
           </div>
 
 
           <div className="album-grid">
 
-            {albums.map(
-              (album) => (
-
-              <Link
-                key={album.id}
-                to={`/album/${album.id}`}
-                className="album"
-              >
-
-                <div className="album-cover">
-
-                  {album.coverArt ? (
-
-                    <img
-                      src={
-                        getCoverUrl(
-                          album.coverArt
-                        )
-                      }
-                      alt={
-                        `${album.name} cover`
-                      }
-                    />
-
-                  ) : (
-
-                    <div className="album-cover-placeholder">
-                      ♪
-                    </div>
-
-                  )}
-
-                </div>
-
-
-                <div className="album-title">
-                  {album.name}
-                </div>
-
-
-                {album.year && (
-
-                  <div className="album-artist">
-                    {album.year}
-                  </div>
-
-                )}
-
-                {album.source?.kind === "external" && (
-
-                  <div className="album-artist album-not-downloaded">
-                    Not downloaded
-                  </div>
-
-                )}
-
-              </Link>
-
-            ))}
+            {albums.map((album) => <ArtistAlbumCard key={album.id} album={album} />)}
 
           </div>
 
@@ -644,21 +616,19 @@ function Artist() {
 
         <div className="artist-section-header">
 
-          <h2>
-            Tracks
-          </h2>
+          <h2>Top 10 Popular Tracks</h2>
 
         </div>
 
 
-        <div className="track-list">
+        <div className="track-list" role="table" aria-label="Artist tracks">
 
           <TrackListHeader />
 
-          {songs.length === 0 && (
+          {songs.length === 0 && !enriching && (
 
-            <div className="library-empty">
-              No tracks yet.
+            <div className="artist-tracks-empty" role="row">
+              <span role="cell">No tracks yet.</span>
             </div>
 
           )}

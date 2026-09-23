@@ -677,7 +677,7 @@ async function handleRemoveSong(
 
       {/* SONG LIST */}
 
-      <div className="track-list">
+      <div className="track-list" role="table" aria-label="Playlist tracks">
 
         <TrackListHeader />
 

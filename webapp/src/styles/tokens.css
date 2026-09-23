@@ -12,7 +12,8 @@
   --border: var(--border-glass); --border-hover: rgba(255, 255, 255, 0.16);
   --layout-divider: var(--border-glass);
   --color-accent: #A855F7; --accent: var(--color-accent); --accent-hover: color-mix(in srgb, var(--color-accent) 82%, white);
-  --ambient-glow: #C12C91;
+  /* Page lighting uses the same cool violet as playback, never a competing burgundy. */
+  --ambient-glow: #A855F7;
   --nav-background: rgb(16 16 20 / 85%); --nav-hover: rgb(255 255 255 / 5%); --nav-active: rgb(39 39 42 / 60%);
   --control-surface: rgb(9 9 11 / 82%); --placeholder-surface: rgb(24 24 27 / 85%);
   --danger: #ef6b73; --danger-text: #ff9aa0; --danger-text-strong: #ffd4d7;

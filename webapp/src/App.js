@@ -115,6 +115,15 @@ function AuthenticatedApp() {
     }
   });
   const isSidebarOpen = activeSidebar !== "none";
+  const isDetailPage = /^\/(?:album|artist|playlist)\/[^/]+/.test(location.pathname);
+  const isSongPage = isDetailPage || [
+    "/library/tracks",
+    "/liked",
+    "/search",
+  ].includes(location.pathname);
+  const isWideContentPage = isSongPage || ["/", "/explore"].includes(location.pathname) ||
+    /^\/library\/(?:playlists|albums|artists)$/.test(location.pathname);
+  const isHomePage = location.pathname === "/";
 
   const toggleTheme = useCallback(() => {
     setTheme((currentTheme) => currentTheme === "dark" ? "light" : "dark");
@@ -221,27 +230,29 @@ function AuthenticatedApp() {
                     Now Playing
                   </button>
                 )}
-                <Routes>
-                  <Route path="/" element={<Home />} />
-                  <Route path="/login" element={<Navigate to="/" replace />} />
-                  <Route path="/library" element={<Library />}>
-                    <Route index element={<Navigate to="playlists" replace />} />
-                    <Route path="tracks" element={<Tracks />} />
-                    <Route path="albums" element={<Albums />} />
-                    <Route path="artists" element={<Artists />} />
-                    <Route path="playlists" element={<Playlists />} />
-                    <Route path="health" element={<LibraryHealth />} />
-                  </Route>
-                  <Route path="/album/:id" element={<Album />} />
-                  <Route path="/artist/:id" element={<Artist />} />
-                  <Route path="/playlist/:id" element={<Playlist />} />
-                  <Route path="/liked" element={<Liked />} />
-                  <Route path="/search" element={<Search />} />
-                  <Route path="/explore" element={<Explore />} />
-                  <Route path="/profile" element={<Profile />} />
-                  <Route path="/settings" element={<Settings />} />
-                  <Route path="*" element={<Navigate to="/" replace />} />
-                </Routes>
+                <div className={`main-content${isDetailPage ? " main-content--detail" : ""}${isHomePage ? " main-content--home" : ""}${isWideContentPage ? " main-content--wide" : ""}`}>
+                  <Routes>
+                    <Route path="/" element={<Home />} />
+                    <Route path="/login" element={<Navigate to="/" replace />} />
+                    <Route path="/library" element={<Library />}>
+                      <Route index element={<Navigate to="playlists" replace />} />
+                      <Route path="tracks" element={<Tracks />} />
+                      <Route path="albums" element={<Albums />} />
+                      <Route path="artists" element={<Artists />} />
+                      <Route path="playlists" element={<Playlists />} />
+                      <Route path="health" element={<LibraryHealth />} />
+                    </Route>
+                    <Route path="/album/:id" element={<Album />} />
+                    <Route path="/artist/:id" element={<Artist />} />
+                    <Route path="/playlist/:id" element={<Playlist />} />
+                    <Route path="/liked" element={<Liked />} />
+                    <Route path="/search" element={<Search />} />
+                    <Route path="/explore" element={<Explore />} />
+                    <Route path="/profile" element={<Profile />} />
+                    <Route path="/settings" element={<Settings />} />
+                    <Route path="*" element={<Navigate to="/" replace />} />
+                  </Routes>
+                </div>
               </main>
               <QueueSidebar
                 isOpen={activeSidebar === "queue"}

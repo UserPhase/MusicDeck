@@ -139,7 +139,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     databasePath: readDbPath(),
     backend: readBackend(),
     navidrome: {
-      url: readEnv("NAVIDROME_URL", "http://192.168.2.38:4533"),
+      url: readEnv("NAVIDROME_URL", "http://localhost:4533"),
       username: readEnv("NAVIDROME_USERNAME"),
       password: readSecret("NAVIDROME_PASSWORD"),
     },

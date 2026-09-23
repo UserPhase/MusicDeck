@@ -9,7 +9,7 @@ import type { LibraryService } from "../domain/library.js";
 import { SourceResolver, SourceUnavailableError } from "../domain/source-resolver.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
 import { parsePlaylistArtworkId, resolveArtworkSize } from "../domain/playlist-artwork.js";
-import { toAlbumSearchResult, toArtistSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
+import { toArtistSearchResult, toLegacySearchResponse, toTrackSearchResult } from "../domain/search.js";
 import type { UnifiedSearchResult } from "../domain/search.js";
 import type { SearchProviderRegistry } from "../domain/search-provider-registry.js";
 import { deduplicateSearchGroups } from "../domain/search-deduplication.js";
@@ -19,11 +19,16 @@ import type { RecommendationRegistry, RecommendationKind } from "../domain/recom
 import type { LibraryInsightsService, LibraryFilter } from "../domain/library-insights.js";
 import type { AcquisitionService } from "../domain/acquisition.js";
 import type { SilenceAnalysisService } from "../domain/silence-analysis.js";
+import type { Album, Artist, Track } from "../types.js";
+import { DeezerDiscoveryService } from "../domain/deezer-discovery.js";
+import { ItunesArtistCatalog, itunesReleaseKey, sameItunesRecording } from "../domain/itunes-artist-catalog.js";
+import { ArtistImageResolver, isNativeArtistPicture } from "../domain/artist-image.js";
+import { MusicBrainzAvatarWorker } from "../domain/musicbrainz-avatar-worker.js";
+import { LyricsService, parseLrcLines, type LyricsTrack } from "../domain/lyrics-service.js";
 import {
   findMatchingExternalAlbum,
   findMatchingExternalArtist,
   mergeAlbumTracks,
-  mergeArtistAlbums,
 } from "../domain/catalog-merge.js";
 
 const sourceRequestSchema = z.object({
@@ -48,10 +53,15 @@ const sourceRequestSchema = z.object({
 import { addRecentlyPlayed, listRecentlyPlayed } from "../domain/recently-played.js";
 import { listFavoriteTracks, setTrackFavorite } from "../domain/favorites.js";
 import { listUserSettings } from "../domain/settings.js";
-import { getPrimaryConnectionId } from "../domain/connections.js";
 import { sendError } from "../utils/http.js";
 
 const trackIdPattern = /^[^/]+$/;
+const lyricsQuerySchema = z.object({
+  track_name: z.string().trim().min(1).max(300),
+  artist_name: z.string().trim().min(1).max(300),
+  album_name: z.string().trim().max(300).optional(),
+  duration: z.coerce.number().finite().positive().max(86_400),
+});
 
 function parseTypes(value: unknown) {
   if (typeof value !== "string" || !value) {
@@ -103,6 +113,47 @@ export async function registerMusicRoutes(
   acquisition?: AcquisitionService,
   silenceAnalysis?: SilenceAnalysisService
 ) {
+  const deezerDiscovery = new DeezerDiscoveryService();
+  const itunesArtistCatalog = new ItunesArtistCatalog(externalCatalog.fetchImpl, externalCatalog.artwork);
+  const artistImages = new ArtistImageResolver(externalCatalog.fetchImpl);
+  const musicBrainzAvatars = new MusicBrainzAvatarWorker(db, externalCatalog.fetchImpl);
+  const lyricsService = new LyricsService(externalCatalog.fetchImpl);
+  const artistSnapshotCache = new Map<string, {
+    expiresAt: number;
+    value: Promise<{ artist: Artist | null; localAlbums: Album[]; localTracks: Track[] }>;
+  }>();
+
+  function localArtistSnapshot(artistId: string) {
+    const cached = artistSnapshotCache.get(artistId);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+    const value = Promise.all([
+      catalog.getArtist(artistId, { includeArtistInfo: false }),
+      catalog.getArtistAlbums(artistId),
+      catalog.getArtistTopTracks(artistId, 10),
+    ]).then(([artist, localAlbums, localTracks]) => ({ artist, localAlbums, localTracks }))
+      .catch((error) => {
+        artistSnapshotCache.delete(artistId);
+        throw error;
+      });
+    artistSnapshotCache.set(artistId, { expiresAt: Date.now() + 15_000, value });
+    if (artistSnapshotCache.size > 100) artistSnapshotCache.delete(artistSnapshotCache.keys().next().value!);
+    return value;
+  }
+
+  app.get("/api/discovery/external", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    try {
+      const charts = await deezerDiscovery.getCharts();
+      reply.header("Cache-Control", "private, max-age=300");
+      return charts;
+    } catch {
+      return sendError(reply, 502, "External charts are temporarily unavailable", "EXTERNAL_DISCOVERY_UNAVAILABLE");
+    }
+  });
+
   app.get("/api/library/random-albums", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -313,7 +364,17 @@ export async function registerMusicRoutes(
     }
 
     recommendations.local.recordListeningEvent(user.id, parsed.data.trackId, parsed.data.eventType, parsed.data.completionRatio);
-    return reply.code(201).send({ ok: true });
+    if (parsed.data.eventType !== "complete") return reply.code(201).send({ ok: true });
+
+    addRecentlyPlayed(db, user.id, parsed.data.trackId);
+    // A local provider outage must not discard the listening event or break playback.
+    try {
+      const scrobbled = await sourceResolver.scrobbleTrack(parsed.data.trackId);
+      return reply.code(201).send({ ok: true, scrobbled });
+    } catch (error) {
+      request.log.warn({ error }, "Could not scrobble qualified play");
+      return reply.code(201).send({ ok: true, scrobbled: false });
+    }
   });
 
   app.get("/api/albums", async (request, reply) => {
@@ -453,7 +514,9 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External catalog is not available for this user");
       }
 
-      const album = await externalCatalog.getAlbum(albumId);
+      const album = albumId.startsWith("external_itunes_album_")
+        ? await itunesArtistCatalog.getAlbum(albumId)
+        : await externalCatalog.getAlbum(albumId);
       if (!album) {
         return sendError(reply, 404, "Album not found");
       }
@@ -488,7 +551,9 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External catalog is not available for this user");
       }
 
-      const album = await externalCatalog.getAlbum(albumId);
+      const album = albumId.startsWith("external_itunes_album_")
+        ? await itunesArtistCatalog.getAlbum(albumId)
+        : await externalCatalog.getAlbum(albumId);
       if (!album) {
         return sendError(reply, 404, "Album not found");
       }
@@ -514,6 +579,137 @@ export async function registerMusicRoutes(
     return { artists: result.items, degraded: result.degraded };
   });
 
+  app.get("/api/artists/:artistId/overview", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const { artistId } = request.params as { artistId: string };
+    const { scope } = request.query as { scope?: string };
+    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
+    if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) {
+      if (!externalAllowed) return sendError(reply, 403, "External catalog is not available for this user");
+      const artist = await externalCatalog.getArtist(artistId);
+      return artist ? {
+        artist,
+        albums: artist.albums,
+        tracks: artist.tracks.slice(0, 10),
+        topTracks: artist.tracks.slice(0, 10),
+        localAlbumCount: 0,
+        localSongCount: 0,
+      } : sendError(reply, 404, "Artist not found");
+    }
+
+    // The local provider's stable artist ID is the authority for counts and
+    // membership. iTunes metadata can only supplement it after corroboration.
+    const snapshotStartedAt = performance.now();
+    const { artist, localAlbums, localTracks } = await localArtistSnapshot(artistId);
+    const snapshotMs = performance.now() - snapshotStartedAt;
+    if (!artist) return sendError(reply, 404, "Artist not found");
+
+    const enrichmentStartedAt = performance.now();
+    const itunes = externalAllowed && scope !== "local"
+      ? await itunesArtistCatalog.resolve(artist, localAlbums, localTracks)
+      : null;
+    reply.header("server-timing", `artist-snapshot;dur=${snapshotMs.toFixed(1)}, artist-enrichment;dur=${(performance.now() - enrichmentStartedAt).toFixed(1)}`);
+    const albumKeys = new Set(localAlbums.map((album) => itunesReleaseKey(album.name)));
+    const externalAlbums = itunes?.albums.filter((album) => {
+      const key = itunesReleaseKey(album.title);
+      if (albumKeys.has(key)) return false;
+      albumKeys.add(key);
+      return true;
+    })
+      .map((album) => ({ ...album, artist: artist.name, artistId })) || [];
+    const localPopular = localTracks.slice().sort((left, right) =>
+      (right.playCount || 0) - (left.playCount || 0)
+    );
+    const seen = new Set<string>();
+    const popular = (itunes?.tracks || []).flatMap((track) => {
+      const local = localPopular.find((candidate) => sameItunesRecording(candidate, track, artist));
+      const result = local || {
+        ...track,
+        metadata: { ...track.metadata, artistId },
+      };
+      if (seen.has(result.id)) return [];
+      seen.add(result.id);
+      return [result];
+    });
+    for (const track of localPopular) {
+      if (popular.length >= 10) break;
+      if (seen.has(track.id)) continue;
+      seen.add(track.id);
+      popular.push(track);
+    }
+
+    return {
+      // Provider coverArt/artistImageUrl may contain a stale album cover.
+      // Portraits are resolved by the separate, verified endpoint only.
+      artist: { ...artist, imageUrl: null },
+      albums: [...localAlbums, ...externalAlbums],
+      tracks: localTracks.slice(0, 10),
+      topTracks: popular.slice(0, 10),
+      localAlbumCount: localAlbums.length,
+      localSongCount: artist.songCount ?? localAlbums.reduce((total, album) => total + album.songCount, 0),
+      externalEnrichmentAvailable: scope === "local" && externalAllowed,
+    };
+  });
+
+  // Portrait enrichment is intentionally separate from the artist overview:
+  // Deezer can be slow, but must never delay the discography or top tracks.
+  app.get("/api/artists/:artistId/portrait", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const { artistId } = request.params as { artistId: string };
+    const { skipNative, skipDeezer } = request.query as { skipNative?: string; skipDeezer?: string };
+    reply.header("Cache-Control", "no-store");
+    if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) {
+      return { imageUrl: null };
+    }
+    const { artist, localAlbums, localTracks } = await localArtistSnapshot(artistId);
+    if (!artist) return sendError(reply, 404, "Artist not found");
+    if (skipNative !== "1") {
+      const native = isNativeArtistPicture(artist.imageUrl || null, localAlbums)
+        ? artist.imageUrl : (await catalog.getArtist(artistId, { includeArtistInfo: true }).catch(() => null))?.imageUrl;
+      if (isNativeArtistPicture(native || null, localAlbums)) {
+        return { imageUrl: native, imageSource: "native", imageKind: "artist" };
+      }
+    }
+    if (user.role !== "admin" && !user.externalSearchEnabled) return { imageUrl: null };
+    const verified = await artistImages.resolve({ artist, albums: localAlbums, tracks: localTracks },
+      { skipDeezer: skipDeezer === "1" });
+    const artworkId = verified
+      ? externalCatalog.artwork.token(verified.pictureUrl,
+        verified.providerId.startsWith("itunes:") ? [".mzstatic.com"] : [".dzcdn.net"])
+      : null;
+    return { imageUrl: artworkId ? `/api/artwork/external/${encodeURIComponent(artworkId)}` : null,
+      imageSource: verified?.providerId.startsWith("itunes:") ? "itunes" : verified ? "deezer" : null,
+      imageKind: verified?.kind || null };
+  });
+
+  // This endpoint is called by the avatar after mount, never by the overview.
+  // Its own response may take seconds while the already-rendered page remains usable.
+  app.get("/api/artists/:artistId/portrait/musicbrainz", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const { artistId } = request.params as { artistId: string };
+    reply.header("Cache-Control", "no-store");
+    if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) return { imageUrl: null };
+    if (user.role !== "admin" && !user.externalSearchEnabled) return { imageUrl: null };
+    const { artist } = await localArtistSnapshot(artistId);
+    if (!artist) return sendError(reply, 404, "Artist not found");
+    const imageUrl = await musicBrainzAvatars.resolve(artist);
+    return { imageUrl, imageSource: imageUrl ? "musicbrainz" : null, imageKind: imageUrl ? "artist" : null };
+  });
+
+  app.post("/api/artists/:artistId/portrait/purge", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (user.role !== "admin") return sendError(reply, 403, "Admin access required");
+    const { artistId } = request.params as { artistId: string };
+    artistImages.purgeArtistImageCache(artistId);
+    musicBrainzAvatars.purge(artistId);
+    return { purged: true, artistId };
+  });
+
   app.get("/api/artists/:artistId", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -529,72 +725,9 @@ export async function registerMusicRoutes(
       return artist ? { artist } : sendError(reply, 404, "Artist not found");
     }
 
-    const artist = await catalog.getArtist(artistId);
-    return artist ? { artist } : sendError(reply, 404, "Artist not found");
+    const artist = await catalog.getArtist(artistId, { includeArtistInfo: false });
+    return artist ? { artist: { ...artist, imageUrl: null } } : sendError(reply, 404, "Artist not found");
   });
-
-  // Best-effort catalog completeness for a local artist: finds the matching
-  // external (Spotify) artist by normalized name and merges its known albums
-  // with the locally known albums, so albums with zero downloaded tracks
-  // still remain visible. Falls back to local-only data on any failure.
-  async function resolveArtistCatalogAlbums(
-    user: { role: string; externalSearchEnabled: boolean },
-    artistId: string,
-    localArtist: { name: string }
-  ) {
-    const localAlbums = await catalog.getArtistAlbums(artistId);
-    const stampedLocal = localAlbums.map((album) =>
-      toAlbumSearchResult({
-        ...album,
-        availability: {
-          state: "available",
-          connectionId: "library",
-          sourceCount: 1,
-          availableSourceCount: 1,
-          libraryAvailable: true,
-        },
-      })
-    );
-
-    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
-    if (!externalCatalog.isEnabled() || !externalAllowed) {
-      return stampedLocal;
-    }
-
-    try {
-      const results = await externalCatalog.search(localArtist.name, { limit: 10 });
-      const match = findMatchingExternalArtist(results, localArtist.name);
-      if (!match) {
-        return stampedLocal;
-      }
-
-      const detail = await externalCatalog.getArtist(match.id);
-      if (!detail) {
-        return stampedLocal;
-      }
-
-      const catalogAlbums: UnifiedSearchResult[] = detail.albums.map((album) => ({
-        type: "album",
-        id: album.id,
-        title: album.title,
-        subtitle: localArtist.name,
-        artist: localArtist.name,
-        album: null,
-        artwork: album.artworkId
-          ? { id: album.artworkId, url: `/api/artwork/external/${encodeURIComponent(album.artworkId)}` }
-          : null,
-        provider: "external",
-        source: { kind: "external", count: 0 },
-        availability: null,
-        identity: album.identity,
-        metadata: { year: album.year },
-      }));
-
-      return mergeArtistAlbums(stampedLocal, catalogAlbums);
-    } catch {
-      return stampedLocal;
-    }
-  }
 
   app.get("/api/artists/:artistId/albums", async (request, reply) => {
     const user = requireUser(db, request, reply);
@@ -615,7 +748,7 @@ export async function registerMusicRoutes(
       return sendError(reply, 404, "Artist not found");
     }
 
-    return { albums: await resolveArtistCatalogAlbums(user, artistId, artist) };
+    return { albums: await catalog.getArtistAlbums(artistId) };
   });
 
   app.get("/api/artists/:artistId/tracks", async (request, reply) => {
@@ -652,12 +785,52 @@ export async function registerMusicRoutes(
     return track ? { track } : sendError(reply, 404, "Track not found");
   });
 
+  app.get("/api/tracks/recently-added", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const query = request.query as { limit?: string };
+    const limit = Math.max(1, Math.min(Number(query.limit) || 6, 30));
+    const result = await catalog.listTracks();
+    const tracks = result.items.slice().sort((left, right) =>
+      (Date.parse(right.addedAt || "") || 0) - (Date.parse(left.addedAt || "") || 0)
+    ).slice(0, limit);
+    return { tracks, degraded: result.degraded };
+  });
+
   app.get("/api/tracks/:trackId/lyrics", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
     const { trackId } = request.params as { trackId: string };
-    return { lyrics: await catalog.getTrackLyrics(trackId) };
+    const parsed = lyricsQuerySchema.safeParse(request.query);
+    let metadata: LyricsTrack | null = parsed.success ? {
+      title: parsed.data.track_name,
+      artist: parsed.data.artist_name,
+      album: parsed.data.album_name,
+      durationSeconds: parsed.data.duration,
+    } : null;
+    if (!metadata) {
+      const track = await catalog.getTrack(trackId).catch(() => null);
+      if (track?.title && track.artistName && track.durationSeconds) {
+        metadata = { title: track.title, artist: track.artistName,
+          album: track.albumName || undefined, durationSeconds: track.durationSeconds };
+      }
+    }
+    const external = metadata ? await lyricsService.get(trackId, metadata) : null;
+    if (external?.syncedLyrics || external?.plainLyrics) {
+      return { ...external, lyrics: external.syncedLyrics || external.plainLyrics };
+    }
+    const local = await catalog.getTrackLyrics(trackId).catch(() => null);
+    const localLines = typeof local === "string" ? parseLrcLines(local) : [];
+    return {
+      syncedLyrics: localLines.length ? localLines : null,
+      plainLyrics: localLines.length ? null : local,
+      isSynced: localLines.length > 0,
+      provider: "none",
+      instrumental: external?.instrumental || false,
+      lyrics: local,
+    };
   });
 
   app.get("/api/tracks/:trackId/artist-biography", async (request, reply) => {
@@ -987,6 +1160,9 @@ export async function registerMusicRoutes(
     const thumbnailSize = size === undefined ? undefined : resolveArtworkSize(size);
 
     try {
+      // Respect provider cache headers when present; otherwise give the
+      // browser a private cache so revisiting the page does not reload covers.
+      reply.header("cache-control", "private, max-age=3600");
       if (isMusicDeckArtwork) {
         return await sendProxyResponse(reply, await sourceResolver.fetchArtwork(artworkId, thumbnailSize));
       }

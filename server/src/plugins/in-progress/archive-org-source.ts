@@ -1,4 +1,4 @@
-import type { MusicDeckPlugin, MusicDeckPluginContext } from "../plugin-registry.js";
+import type { MusicDeckPlugin } from "../plugin-registry.js";
 import type {
   CandidateResolver,
   SourceCandidate,
@@ -11,7 +11,6 @@ import {
   extractTrackTitleFromPath,
   matchContainerFile,
   normalizeMusicText,
-  versionSignature,
 } from "../../domain/music-identity.js";
 import { validatedPlayableUrl } from "../../domain/source-discovery.js";
 
@@ -476,12 +475,6 @@ export class ArchiveOrgDiscoveryProvider implements SourceDiscoveryProvider {
       })
     );
 
-    console.log(
-      `[ArchiveOrg]\n` +
-      `  itemsFound = ${totalItemsFound}\n` +
-      `  containerRepresentations = ${totalContainerRepresentations}\n` +
-      `  directAudioFiles = ${totalDirectAudioFiles}`
-    );
 
     return candidates;
   }
@@ -595,7 +588,7 @@ export class ArchiveOrgResolver implements CandidateResolver {
 
   async test(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const searchUrl = new URL("https://archive.org/advancedsearch.php?q=Queen%20Bohemian%20Rhapsody&rows=1&output=json");
+      const searchUrl = new URL("https://archive.org/advancedsearch.php?q=mediatype%3Aaudio&rows=1&output=json");
       const res = await this.fetchImpl(searchUrl, { headers: DEFAULT_ARCHIVE_HEADERS });
       return { ok: res.ok, message: res.ok ? "Archive.org is reachable" : "Archive.org is unavailable" };
     } catch {
@@ -632,7 +625,7 @@ export function createArchiveOrgSourcePlugin(): MusicDeckPlugin {
     async test(context) {
       const fetchImpl = (context.network?.fetch || fetch) as typeof fetch;
       try {
-        const searchUrl = new URL("https://archive.org/advancedsearch.php?q=Queen%20Bohemian%20Rhapsody&rows=3&output=json");
+        const searchUrl = new URL("https://archive.org/advancedsearch.php?q=mediatype%3Aaudio&rows=3&output=json");
         const res = await fetchImpl(searchUrl, { headers: DEFAULT_ARCHIVE_HEADERS });
         if (!res.ok) {
           return { ok: false, message: `Archive.org search returned HTTP ${res.status}` };

@@ -29,7 +29,7 @@ test("rejects malformed and untrusted preview URLs", async () => {
 
 test("aborts a stalled iTunes preview lookup and returns null", async () => {
   jest.useFakeTimers();
-  const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+  const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
   const fetchImpl = jest.fn(() => new Promise(() => {}));
 
   const lookup = findItunesPreview(
@@ -42,17 +42,17 @@ test("aborts a stalled iTunes preview lookup and returns null", async () => {
 
   await expect(lookup).resolves.toBeNull();
   expect(fetchImpl.mock.calls[0][1].signal.aborted).toBe(true);
-  expect(warning).toHaveBeenCalledWith(
+  expect(errorLog).toHaveBeenCalledWith(
     "iTunes preview lookup timed out.",
     expect.any(Error)
   );
 
-  warning.mockRestore();
+  errorLog.mockRestore();
   jest.useRealTimers();
 });
 
 test("returns null when the preview lookup fails over the network", async () => {
-  const warning = jest.spyOn(console, "warn").mockImplementation(() => {});
+  const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
   const fetchImpl = jest.fn(async () => {
     throw new Error("network unavailable");
   });
@@ -62,9 +62,9 @@ test("returns null when the preview lookup fails over the network", async () => 
     artist: "Daft Punk",
   }, fetchImpl)).resolves.toBeNull();
 
-  expect(warning).toHaveBeenCalledWith(
+  expect(errorLog).toHaveBeenCalledWith(
     "iTunes preview lookup failed.",
     expect.any(Error)
   );
-  warning.mockRestore();
+  errorLog.mockRestore();
 });

@@ -76,7 +76,7 @@ export async function findItunesPreview(
       ? null
       : match.previewUrl;
   } catch (error) {
-    console.warn(
+    console.error(
       timedOut
         ? "iTunes preview lookup timed out."
         : "iTunes preview lookup failed.",

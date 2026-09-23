@@ -1,11 +1,14 @@
 import {
   getAlbums,
   getArtist,
+  getArtistOverview,
+  getArtistPortrait,
   getCoverUrl,
   getCurrentSession,
   getRecentlyPlayed,
   getPlayableSources,
   getStreamUrl,
+  getTrackLyrics,
   login,
   recordRecentlyPlayed,
   searchNavidrome,
@@ -141,6 +144,99 @@ test("artist albums resolve cover art the same way whether the server returns a 
   // the Album detail page.
   expect(getCoverUrl(artist.album[0].coverArt)).toBe("/api/artwork/art-legacy");
   expect(getCoverUrl(artist.album[1].coverArt)).toBe("/api/artwork/art-merged");
+});
+
+test("lyrics lookup sends exact track metadata and accepts synchronized text", async () => {
+  global.fetch.mockResolvedValue({
+    ok: true, status: 200,
+    json: () => Promise.resolve({ syncedLyrics: "[00:15.22] Hello", plainLyrics: "Hello" }),
+  });
+  await expect(getTrackLyrics("track-1", {
+    title: "Hello", artist: "Artist", album: "Album", duration: 180.4,
+  })).resolves.toEqual({ syncedLyrics: "[00:15.22] Hello", plainLyrics: "Hello",
+    isSynced: true, provider: "none", instrumental: false });
+  expect(global.fetch.mock.calls[0][0]).toContain("track_name=Hello&artist_name=Artist&album_name=Album&duration=180");
+});
+
+test("lyrics lookup keeps title, artist, and duration when album metadata is absent", async () => {
+  global.fetch.mockResolvedValue({
+    ok: true, status: 200,
+    json: () => Promise.resolve({ plainLyrics: "Found without album" }),
+  });
+  await expect(getTrackLyrics("track-no-album", {
+    title: "X Valentine", artist: "GEMS", duration: 188,
+  })).resolves.toEqual({ syncedLyrics: null, plainLyrics: "Found without album",
+    isSynced: false, provider: "none", instrumental: false });
+  expect(global.fetch.mock.calls[0][0]).toContain("track_name=X+Valentine&artist_name=GEMS&duration=188");
+  expect(global.fetch.mock.calls[0][0]).not.toContain("album_name=");
+});
+
+test("lyrics API preserves unsynced lyrics.ovh text and provider state", async () => {
+  global.fetch.mockResolvedValue({
+    ok: true, status: 200,
+    json: () => Promise.resolve({ syncedLyrics: null, plainLyrics: "First line\nSecond line",
+      isSynced: false, provider: "lyricsovh" }),
+  });
+  await expect(getTrackLyrics("ovh-track")).resolves.toEqual({
+    syncedLyrics: null, plainLyrics: "First line\nSecond line", isSynced: false,
+    provider: "lyricsovh", instrumental: false,
+  });
+});
+
+test("lyrics API accepts parsed timed lines and treats an empty line list as unsynced", async () => {
+  global.fetch.mockResolvedValueOnce({
+    ok: true, status: 200,
+    json: () => Promise.resolve({ syncedLyrics: [{ time: 15.22, text: "Hello" }],
+      isSynced: true, provider: "lrclib" }),
+  }).mockResolvedValueOnce({
+    ok: true, status: 200,
+    json: () => Promise.resolve({ syncedLyrics: [], plainLyrics: "Untimed", isSynced: true }),
+  });
+  await expect(getTrackLyrics("timed")).resolves.toMatchObject({
+    syncedLyrics: [{ time: 15.22, text: "Hello" }], isSynced: true, provider: "lrclib",
+  });
+  await expect(getTrackLyrics("untimed")).resolves.toMatchObject({
+    syncedLyrics: null, plainLyrics: "Untimed", isSynced: false,
+  });
+});
+
+test("artist portrait API preserves provider and tile-fallback metadata", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 200,
+    json: () => Promise.resolve({ imageUrl: "/api/artwork/external/itunes-art",
+      imageSource: "itunes", imageKind: "artist-tile-fallback" }) });
+  await expect(getArtistPortrait("artist-1", { skipNative: true, skipDeezer: true })).resolves.toEqual({
+    url: "/api/artwork/external/itunes-art", source: "itunes", kind: "artist-tile-fallback",
+  });
+  expect(global.fetch.mock.calls[0][0]).toContain("/api/artists/artist-1/portrait?skipNative=1&skipDeezer=1");
+});
+
+test("artist overview adapts a verified keyless portrait, undownloaded albums, and popular tracks", async () => {
+  global.fetch.mockResolvedValue({
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve({
+      artist: { id: "queen-id", name: "Queen", imageUrl: "/api/artwork/external/portrait-token", albumCount: 1 },
+      albums: [
+        { id: "local-album", name: "Local Album", artistId: "queen-id", artistName: "Queen" },
+        { id: "external_deezer_album_42", title: "More Queen", artist: "Queen", artistId: "queen-id", artworkId: "cover-token" },
+      ],
+      tracks: [{ id: "local-song", title: "Local Song", artistId: "queen-id", artistName: "Queen" }],
+      topTracks: [{ type: "track", id: "external_deezer_track_43", title: "Popular Song", artist: "Queen", source: { kind: "external", count: 0 }, metadata: { artistId: "queen-id" } }],
+      localAlbumCount: 1,
+      localSongCount: 1,
+    }),
+  });
+
+  const overview = await getArtistOverview("queen-id");
+  expect(overview.artist.imageUrl).toBe("/api/artwork/external/portrait-token");
+  expect(overview.artist.album[1]).toMatchObject({
+    id: "external_deezer_album_42", source: { kind: "external", count: 0 }, coverArt: "cover-token",
+  });
+  expect(overview.topTracks[0]).toMatchObject({ title: "Popular Song", artistId: "queen-id" });
+  expect(global.fetch).toHaveBeenCalledWith("/api/artists/queen-id/overview", expect.any(Object));
+
+  await getArtistOverview("queen-id", { scope: "local" });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/artists/queen-id/overview?scope=local", expect.any(Object));
 });
 
 test("search adapts provider-neutral groups while retaining legacy arrays", async () => {
