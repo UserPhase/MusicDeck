@@ -1,6 +1,8 @@
 import {
   addSongToPlaylist,
   removeSongFromPlaylist,
+  startSpotifyPlaylistImport,
+  getSpotifyPlaylistImport,
 } from "./playlists";
 
 import {
@@ -120,5 +122,18 @@ test("removing a song passes through the intended playlist and index only", asyn
     "playlist-1",
     2
   );
+});
+
+test("starts and polls a Spotify playlist import with session credentials", async () => {
+  global.fetch = jest.fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ job: { id: "job-1", status: "queued" } }) })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ job: { id: "job-1", status: "completed", playlistId: "mdpl_1" } }) });
+
+  await expect(startSpotifyPlaylistImport("https://open.spotify.com/playlist/abc123")).resolves.toMatchObject({ id: "job-1" });
+  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify", expect.objectContaining({
+    method: "POST", credentials: "include", body: JSON.stringify({ playlistUrl: "https://open.spotify.com/playlist/abc123" }),
+  }));
+  await expect(getSpotifyPlaylistImport("job-1")).resolves.toMatchObject({ playlistId: "mdpl_1" });
+  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1", { credentials: "include" });
 });
 

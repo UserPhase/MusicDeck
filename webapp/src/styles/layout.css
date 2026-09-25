@@ -211,6 +211,49 @@ a { color: inherit; }
   .main-content--wide :is(.home-page, .library-page, .search-page, .liked-page, .album-page, .artist-page, .playlist-page) { max-width: none; }
 }
 
+/* Playlist creation keeps the shell's neutral glass and uses violet only as
+   a choice/focus signal. The two paths are equal-weight, not competing CTAs. */
+.playlist-modal-backdrop { position: fixed; z-index: 5000; inset: 0; display: grid; place-items: center; padding: 1.5rem; background: rgb(0 0 0 / 68%); backdrop-filter: blur(8px); }
+.playlist-modal { width: min(34rem, 100%); padding: 1.7rem; border: 1px solid rgb(255 255 255 / 12%); border-radius: 1rem; background: rgb(16 16 19 / 96%); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 55%); color: var(--text); }
+.playlist-modal-heading { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }
+.playlist-modal-eyebrow { color: var(--accent); font-size: .65rem; font-weight: 800; letter-spacing: .13em; }
+.playlist-modal-heading h2 { margin: .4rem 0 0; font-size: 1.45rem; line-height: 1.2; letter-spacing: -.025em; }
+.playlist-modal-close { display: grid; width: 2rem; height: 2rem; place-items: center; border: 1px solid var(--border); border-radius: .5rem; background: rgb(255 255 255 / 4%); color: var(--text-secondary); font-size: 1.4rem; line-height: 1; }
+.playlist-modal-close:hover { background: var(--card-hover); color: var(--text); }
+.playlist-modal-intro { margin: .8rem 0 1.25rem; color: #c4c4cc; font-size: .85rem; line-height: 1.55; }
+.playlist-modal-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; }
+.playlist-modal-option { position: relative; display: grid; justify-items: start; gap: .35rem; min-height: 9rem; padding: 1rem; border: 1px solid rgb(255 255 255 / 10%); border-radius: .8rem; background: rgb(255 255 255 / 4%); color: var(--text); text-align: left; transition: border-color 150ms ease, background 150ms ease, transform 150ms ease; }
+.playlist-modal-option:hover { border-color: color-mix(in srgb, var(--accent) 55%, white 10%); background: color-mix(in srgb, var(--accent) 10%, rgb(255 255 255 / 4%)); transform: translateY(-2px); }
+.playlist-modal-option-icon { display: grid; width: 2rem; height: 2rem; place-items: center; border-radius: .55rem; background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); font-size: 1.3rem; }
+.playlist-modal-option strong { align-self: end; font-size: .88rem; }
+.playlist-modal-option > span:nth-last-child(2) { color: #b3b3bc; font-size: .75rem; }
+.playlist-modal-option-arrow { position: absolute; top: 1rem; right: 1rem; color: #b3b3bc; font-size: .9rem; }
+.playlist-modal-form { display: grid; gap: .55rem; padding-top: 1.4rem; }
+.playlist-modal-form .playlist-modal-intro { margin: -.35rem 0 .7rem; }
+.playlist-modal-form label { margin-top: .45rem; color: var(--text); font-size: .78rem; font-weight: 700; }
+.playlist-modal-form label > span:not(.playlist-modal-optional) { color: var(--accent); }
+.playlist-modal-optional { margin-left: .4rem; color: var(--text-muted); font-size: .7rem; font-weight: 500; }
+.playlist-modal-form input, .playlist-modal-form textarea { width: 100%; padding: .72rem .8rem; border: 1px solid var(--border-hover); border-radius: .55rem; outline: 0; background: rgb(9 9 11 / 80%); color: var(--text); font: inherit; font-size: .85rem; resize: vertical; }
+.playlist-modal-form input::placeholder, .playlist-modal-form textarea::placeholder { color: #92929d; }
+.playlist-modal-form input:focus, .playlist-modal-form textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+.playlist-modal-form input[aria-invalid="true"] { border-color: var(--danger); }
+.playlist-modal-error { margin: .15rem 0; color: var(--danger-text-strong); font-size: .75rem; line-height: 1.4; }
+.playlist-modal-progress { display: flex; align-items: center; gap: .55rem; margin: .35rem 0; color: #d4d4d8; font-size: .75rem; }
+.playlist-modal-spinner { flex: none; width: .9rem; height: .9rem; border: 2px solid rgb(255 255 255 / 25%); border-top-color: var(--accent); border-radius: 50%; animation: playlist-modal-spin 800ms linear infinite; }
+.playlist-modal-actions { display: flex; justify-content: space-between; gap: .75rem; margin-top: 1.25rem; }
+.playlist-modal-back, .playlist-modal-submit { min-height: 2.35rem; padding: .55rem 1rem; border-radius: .55rem; font-size: .78rem; font-weight: 750; }
+.playlist-modal-back { border: 1px solid var(--border-hover); background: transparent; color: var(--text-secondary); }
+.playlist-modal-back:hover { background: var(--card-hover); color: var(--text); }
+.playlist-modal-submit { border: 1px solid transparent; background: var(--accent); color: #16091f; }
+.playlist-modal-submit:hover:not(:disabled) { background: var(--accent-hover); }
+.playlist-modal-submit:disabled { opacity: .65; cursor: wait; }
+.playlist-modal button:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.playlist-notice { position: fixed; z-index: 5001; right: 1.5rem; bottom: calc(var(--player-height) + 1.5rem); max-width: min(24rem, calc(100vw - 3rem)); padding: .75rem 1rem; border: 1px solid var(--border-hover); border-radius: .65rem; background: rgb(24 24 27 / 96%); color: var(--text); box-shadow: 0 .75rem 2rem rgb(0 0 0 / 45%); font-size: .78rem; line-height: 1.4; }
+.playlist-notice--error { border-color: color-mix(in srgb, var(--danger) 55%, transparent); color: var(--danger-text-strong); }
+@keyframes playlist-modal-spin { to { transform: rotate(360deg); } }
+@media (max-width: 36rem) { .playlist-modal { padding: 1.25rem; } .playlist-modal-options { grid-template-columns: 1fr; } .playlist-modal-option { min-height: 6rem; } }
+@media (prefers-reduced-motion: reduce) { .playlist-modal-option, .playlist-modal-spinner { transition: none; animation: none; } }
+
 @media (max-width: 980px) {
   .right-sidebar { width: 260px; }
   .main.right-sidebar-open { right: calc(260px + var(--frame) + 8px); }

@@ -4,11 +4,13 @@ import { z } from "zod";
 import type { Db } from "../db/database.js";
 import { requireUser } from "../auth/authorization.js";
 import type { PlaylistService } from "../domain/playlist-service.js";
+import { parseSpotifyPlaylistUrl, type SpotifyPlaylistImportService } from "../domain/spotify-playlist-import.js";
 import { parseImageDataUrl, MAX_ARTWORK_REQUEST_BYTES } from "../domain/playlist-artwork.js";
 import { sendError } from "../utils/http.js";
 
 const createPlaylistSchema = z.object({
   name: z.string().min(1),
+  description: z.string().max(1000).optional(),
 });
 
 const updatePlaylistSchema = z.object({
@@ -28,7 +30,9 @@ const artworkSchema = z.object({
   image: z.string().min(1),
 });
 
-export async function registerPlaylistRoutes(app: FastifyInstance, db: Db, playlists: PlaylistService) {
+const spotifyImportSchema = z.object({ playlistUrl: z.string().max(2048) });
+
+export async function registerPlaylistRoutes(app: FastifyInstance, db: Db, playlists: PlaylistService, spotifyImporter?: SpotifyPlaylistImportService) {
   app.get("/api/playlists", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -46,8 +50,33 @@ export async function registerPlaylistRoutes(app: FastifyInstance, db: Db, playl
       return sendError(reply, 400, "Invalid playlist request");
     }
 
-    const playlist = await playlists.create(parsed.data.name, user);
+    const playlist = await playlists.create(parsed.data.name, user, parsed.data.description);
     return reply.code(201).send({ playlist });
+  });
+
+  app.post("/api/v1/playlists/import-spotify", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (!spotifyImporter) return sendError(reply, 503, "Spotify playlist import is not configured");
+
+    const parsed = spotifyImportSchema.safeParse(request.body);
+    if (!parsed.success || !parseSpotifyPlaylistUrl(parsed.data.playlistUrl)) {
+      return sendError(reply, 400, "Please enter a valid open.spotify.com/playlist URL");
+    }
+    try {
+      return reply.code(202).send({ job: spotifyImporter.start(parsed.data.playlistUrl, user) });
+    } catch (error) {
+      return sendError(reply, 429, error instanceof Error ? error.message : "Could not queue playlist import");
+    }
+  });
+
+  app.get("/api/v1/playlists/import-spotify/:jobId", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (!spotifyImporter) return sendError(reply, 503, "Spotify playlist import is not configured");
+    const { jobId } = request.params as { jobId: string };
+    const job = spotifyImporter.get(jobId, user.id);
+    return job ? { job } : sendError(reply, 404, "Import job not found");
   });
 
   app.get("/api/playlists/:playlistId", async (request, reply) => {

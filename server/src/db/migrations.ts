@@ -476,6 +476,11 @@ const migrations = [
       VALUES ('deezer-preview', 1, '{}', CURRENT_TIMESTAMP);
     `,
   },
+  {
+    id: 20,
+    name: "remove-lidarr-plugin-configuration",
+    sql: "DELETE FROM plugin_configs WHERE plugin_id = 'lidarr';",
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

@@ -12,6 +12,7 @@ import type { MusicBackend } from "../src/backends/music-backend.js";
 import { ProviderRegistry } from "../src/backends/registry.js";
 import { CatalogService } from "../src/domain/catalog.js";
 import { PlaylistService } from "../src/domain/playlist-service.js";
+import type { SpotifyPlaylistImportService } from "../src/domain/spotify-playlist-import.js";
 import { LibraryService } from "../src/domain/library.js";
 import { SourceResolver } from "../src/domain/source-resolver.js";
 import { SourcePipelineRegistry } from "../src/domain/source-discovery.js";
@@ -153,7 +154,8 @@ export async function createTestServer(
   configOverrides: Partial<AppConfig> = {},
   sourceFetchImpl?: typeof fetch,
   externalFetchImpl?: typeof fetch,
-  pluginFetchImpl?: typeof fetch
+  pluginFetchImpl?: typeof fetch,
+  spotifyImportFactory?: (backend: MusicBackend, playlists: PlaylistService, musicRoot: string) => SpotifyPlaylistImportService,
 ) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "musicdeck-test-"));
   const config = loadConfig({
@@ -251,7 +253,8 @@ export async function createTestServer(
     },
     ffmpegPath: "ffmpeg-test-stub",
   });
-  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis, logger: false });
+  const spotifyPlaylistImport = spotifyImportFactory?.(backend, playlists, config.musicRoot);
+  const app = await buildServer({ config, db, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis, logger: false });
 
   return { app, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, sourcePipeline, externalCatalog, recommendations, libraryInsights, plugins, acquisition, acquisitionProviders, registry, directory, silenceAnalysis };
 }

@@ -135,7 +135,8 @@ function Topbar() {
 
             const results =
               await searchNavidrome(
-                query
+                query,
+                { mode: "library", phase: "local" }
               );
 
 

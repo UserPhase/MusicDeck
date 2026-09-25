@@ -65,6 +65,8 @@ function toAlbum(album, songs) {
     source: external ? { kind: "external", count: 0 } : undefined,
     provider: external ? "external" : undefined,
     identity: album.identity,
+    inLibrary: Boolean(album.inLibrary),
+    localAlbumId: album.localAlbumId || null,
     ...(songs ? { song: songs } : {}),
   };
 }
@@ -106,6 +108,8 @@ function toSearchItem(result) {
     return {
       ...normalizeTrackData(result, "search"),
       subtitle: result.subtitle || null,
+      inLibrary: Boolean(result.inLibrary),
+      localTrackId: result.localTrackId || null,
     };
   }
 
@@ -121,6 +125,8 @@ function toSearchItem(result) {
     source: result.source,
     provider: result.provider,
     metadata: result.metadata || {},
+    inLibrary: Boolean(result.inLibrary),
+    localAlbumId: result.localAlbumId || null,
   };
 }
 
@@ -625,6 +631,9 @@ export async function searchNavidrome(query, options = {}) {
   if (options.mode) {
     params.set("mode", options.mode);
   }
+  if (options.phase) {
+    params.set("phase", options.phase);
+  }
 
   const data = await request(`/api/search?${params.toString()}`);
 
@@ -653,10 +662,10 @@ export async function getPlaylist(playlistId) {
   return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
-export async function createPlaylist(name) {
+export async function createPlaylist(name, description = "") {
   const data = await request("/api/playlists", {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, description }),
   });
 
   return data.playlist ? toPlaylist(data.playlist) : null;
@@ -730,6 +739,19 @@ export async function getStarred() {
   return (data.tracks || []).map((track) =>
     normalizeTrackData(track, "liked")
   );
+}
+
+export async function matchLibraryItems(items) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const batches = [];
+  for (let index = 0; index < items.length; index += 100) {
+    batches.push(items.slice(index, index + 100));
+  }
+  const responses = await Promise.all(batches.map((batch) => request("/api/library/matches", {
+    method: "POST",
+    body: JSON.stringify({ items: batch }),
+  })));
+  return responses.flatMap((data) => data.matches || []);
 }
 
 export async function getExternalCharts() {

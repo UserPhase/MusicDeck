@@ -28,8 +28,29 @@ export async function getPlaylist(playlistId) {
 }
 
 
-export async function createPlaylist(name) {
-  return requestCreatePlaylist(name);
+export async function createPlaylist(name, description = "") {
+  return requestCreatePlaylist(name, description);
+}
+
+export async function startSpotifyPlaylistImport(playlistUrl) {
+  const response = await fetch("/api/v1/playlists/import-spotify", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ playlistUrl }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || "Could not start playlist import.");
+  return data.job;
+}
+
+export async function getSpotifyPlaylistImport(jobId) {
+  const response = await fetch(`/api/v1/playlists/import-spotify/${encodeURIComponent(jobId)}`, {
+    credentials: "include",
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || "Could not check playlist import.");
+  return data.job;
 }
 
 

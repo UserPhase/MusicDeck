@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Search from "./Search";
@@ -181,4 +181,26 @@ test("renders merged library results with a neutral external-source hint", async
   expect(await screen.findByLabelText("Available externally")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Play Digital Love" })).toBeEnabled();
   expect(screen.queryByText(/itunes|navidrome|jellyfin/i)).toBeNull();
+});
+
+test("renders local hits before external lookups finish and marks matched items", async () => {
+  let resolveExternal;
+  searchNavidrome.mockImplementation((_query, options) => options.phase === "local"
+    ? Promise.resolve({ results: {
+      track: [{ id: "local-1", title: "Local hit", artist: "GEMS", provider: "library", source: { kind: "library", count: 1 } }],
+      album: [], artist: [], playlist: [],
+    } })
+    : new Promise((resolve) => { resolveExternal = resolve; }));
+
+  renderSearch();
+  expect(await screen.findByText("Local hit")).toBeInTheDocument();
+  expect(screen.getByText(/looking for more music/i)).toBeInTheDocument();
+
+  await act(async () => resolveExternal({ results: {
+    track: [{ id: "external-1", title: "Matched hit", artist: "GEMS", provider: "external", source: { kind: "external", count: 0 }, inLibrary: true }],
+    album: [{ id: "external-album", title: "Matched album", artist: "GEMS", provider: "external", source: { kind: "external", count: 0 }, inLibrary: true }],
+    artist: [], playlist: [],
+  } }));
+  expect(screen.getAllByLabelText("In your library")).toHaveLength(2);
+  expect(screen.queryByText(/looking for more music/i)).not.toBeInTheDocument();
 });

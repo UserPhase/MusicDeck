@@ -232,6 +232,48 @@ describe("Reverb-Style Downloader Architecture", () => {
       }
     });
 
+    it("requests a bounded playlist M3U using the shared spotDL adapter", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-playlist-"));
+      try {
+        const mockRunner: ProcessRunner = {
+          run: vi.fn().mockImplementation(() => {
+            fs.writeFileSync(path.join(tmpDir, "Artist - Song.flac"), createValidFlacBuffer());
+            fs.writeFileSync(path.join(tmpDir, "playlist.m3u8"), "#EXTM3U\nArtist - Song.flac\n");
+            fs.writeFileSync(path.join(tmpDir, "musicdeck-source.spotdl"), JSON.stringify([
+              { list_position: 1, list_length: 2, url: "https://open.spotify.com/track/one", name: "Song", artist: "Artist", duration: 180 },
+              { list_position: 2, list_length: 2, url: "https://open.spotify.com/track/two", name: "Missing", artist: "Artist", duration: 190 },
+            ]));
+            return {
+              pid: 1234, kill: () => {},
+              promise: Promise.resolve({ exitCode: 0, stdout: "Done", stderr: "" }),
+            };
+          }),
+        };
+        const adapter = new SpotDLDownloaderAdapter({ runner: mockRunner, spotdlPath: "spotdl" });
+        const result = await adapter.download({
+          query: "https://open.spotify.com/playlist/abc123",
+          outputDirectory: tmpDir,
+          playlistM3uName: "playlist.m3u8",
+          filenameTemplate: "{artists} - {title}.{output-ext}",
+          timeoutMs: 600_000,
+        }, { jobId: "playlist-job", tmpDir, signal: new AbortController().signal });
+
+        const [, args, options] = (mockRunner.run as any).mock.calls[0];
+        expect(args).toContain("--m3u");
+        expect(args).toContain("playlist.m3u8");
+        expect(args).toContain("--save-file");
+        expect(args).toContain("--save-errors");
+        expect(args).toContain("--max-retries");
+        expect(args[args.indexOf("--output") + 1]).toBe("{artists} - {title}.{output-ext}");
+        expect(options.timeoutMs).toBe(600_000);
+        expect(result.status).toBe("completed");
+        expect(result.playlistLength).toBe(2);
+        expect(result.playlistTracks).toHaveLength(2);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     it("constructs Reverb-style pipe query '<audio-url>|<spotify-url>' when manual URL and Spotify URL are both present", async () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-pipe-"));
       try {

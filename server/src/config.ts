@@ -30,6 +30,7 @@ export type AppConfig = {
   isProduction: boolean;
     secureCookies: boolean;
   musicRoot: string;
+  spotifyImportSubdir: string;
   acquisitionTmpDir: string;
 };
 
@@ -160,6 +161,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     // MusicDeck's acquisition pipeline will never be visible to Navidrome or
     // playable in the library, even though the download itself succeeded.
     musicRoot: readEnv("MUSICDECK_MUSIC_ROOT", "./data/music"),
+    spotifyImportSubdir: readEnv("MUSICDECK_SPOTIFY_IMPORT_SUBDIR", "Spotify Imports"),
     acquisitionTmpDir: readEnv("MUSICDECK_ACQUISITION_TMP_DIR", "./data/acquisitions/tmp"),
   };
 

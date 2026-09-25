@@ -34,6 +34,9 @@
 .track-play:focus-visible { opacity: 1; pointer-events: auto; outline: var(--focus-ring); outline-offset: 2px; transform: scale(1); }
 .track-info { min-width: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: center; }
 .track-title { min-width: 0; color: var(--text); font-size: 14px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.track-title-with-library-badge { display: flex; align-items: center; }
+.track-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track-title .in-library-badge { flex: none; }
 .track-artist { display: inline-block; max-width: 100%; margin-top: 3px; color: var(--text-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }
 .track-artist:hover { color: var(--text); }
 .track-album { display: block; min-width: 0; margin-left: 0; color: #d4d4d8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; transition: color 0.15s ease; }

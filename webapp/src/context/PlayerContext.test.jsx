@@ -14,6 +14,7 @@ import {
   PlayerProvider,
   usePlayer,
 } from "./PlayerContext";
+import { createQueueSnapshot, queueStorageKey } from "../utils/queuePersistence";
 
 import {
   getCurrentSession,
@@ -102,6 +103,9 @@ function PlayerHarness() {
     playbackUnavailable,
     currentSong,
     isPlaying,
+    currentTime,
+    volume,
+    togglePlay,
     crossfadeDuration,
     changeCrossfadeDuration,
     streamQuality,
@@ -127,6 +131,7 @@ function PlayerHarness() {
       <button onClick={() => playSong(songs[0])}>
         direct
       </button>
+      <button onClick={togglePlay}>toggle-play</button>
       <button onClick={() => playSongFromSource(songs[0], { id: "playable_external", type: "external" })}>
         external
       </button>
@@ -227,6 +232,8 @@ function PlayerHarness() {
       <div data-testid="is-playing">
         {String(isPlaying)}
       </div>
+      <div data-testid="current-time">{currentTime}</div>
+      <div data-testid="volume">{volume}</div>
       <div data-testid="crossfade-duration">
         {crossfadeDuration}
       </div>
@@ -299,6 +306,126 @@ beforeEach(() => {
     ok: true,
     json: async () => ({ results: [] }),
   }));
+});
+
+test("rehydrates the queue and progress without starting audio until Play", async () => {
+  const saved = createQueueSnapshot({
+    currentSong: songs[1], queue: songs, queueIndex: 1,
+    isShuffleEnabled: true, isLooping: true, volume: 0.35, currentTime: 42,
+  });
+  localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(saved));
+  const { container } = renderPlayer();
+
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
+  expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("true");
+  expect(screen.getByTestId("loop-enabled")).toHaveTextContent("true");
+  expect(screen.getByTestId("volume")).toHaveTextContent("0.35");
+  expect(screen.getByTestId("current-time")).toHaveTextContent("42");
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("false");
+  expect(container.querySelector("audio")).not.toHaveAttribute("src");
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  expect(getStreamUrl).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1));
+  expect(container.querySelector("audio")).toHaveAttribute("src", "/stream/song-2");
+  Object.defineProperty(container.querySelector("audio"), "duration", { configurable: true, value: 180 });
+  fireEvent.loadedMetadata(container.querySelector("audio"));
+  expect(container.querySelector("audio").currentTime).toBeCloseTo(42);
+});
+
+test("resumes a previously playing track after restoring its media position", async () => {
+  localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({
+    currentSong: songs[1], queue: songs, queueIndex: 1,
+    volume: 0.35, currentTime: 42.75, wasPlaying: true,
+  })));
+  const { container } = renderPlayer();
+  const audio = container.querySelector("audio");
+
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-2"));
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  fireEvent.loadedMetadata(audio);
+
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1));
+  expect(audio.currentTime).toBeCloseTo(42.75);
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1"))).wasPlaying).toBe(true);
+});
+
+test.each(["click", "keydown"])("retries browser-blocked restore on the first %s", async (interaction) => {
+  localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({
+    currentSong: songs[1], queue: songs, queueIndex: 1,
+    volume: 0.35, currentTime: 42, wasPlaying: true,
+  })));
+  const { container } = renderPlayer();
+  const audio = container.querySelector("audio");
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-2"));
+  const blocked = Object.assign(new Error("Autoplay blocked"), { name: "NotAllowedError" });
+  HTMLMediaElement.prototype.play
+    .mockRejectedValueOnce(blocked)
+    .mockResolvedValue(undefined);
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  fireEvent.loadedMetadata(audio);
+
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("false"));
+  expect(audio.currentTime).toBeCloseTo(42);
+  expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1"))).wasPlaying).toBe(false);
+
+  if (interaction === "click") fireEvent.click(document.body);
+  else fireEvent.keyDown(window, { key: "Space" });
+
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  expect(audio.currentTime).toBeCloseTo(42);
+  fireEvent.click(document.body);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+});
+
+test("does not resume a stale blocked track after the user selects another song", async () => {
+  localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({
+    currentSong: songs[1], queue: songs, queueIndex: 1,
+    volume: 1, currentTime: 42, wasPlaying: true,
+  })));
+  const { container } = renderPlayer();
+  const audio = container.querySelector("audio");
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-2"));
+  HTMLMediaElement.prototype.play.mockRejectedValueOnce(Object.assign(new Error("Blocked"), { name: "NotAllowedError" }));
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  fireEvent.loadedMetadata(audio);
+  await waitFor(() => expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1"))).wasPlaying).toBe(false));
+
+  fireEvent.click(screen.getByRole("button", { name: "direct" }));
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-1"));
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2));
+  fireEvent.click(document.body);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+});
+
+test("persists a paused playback state instead of auto-resuming it", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByRole("button", { name: "direct" }));
+  await waitFor(() => expect(container.querySelector("audio")).toHaveAttribute("src", "/stream/song-1"));
+  fireEvent.play(container.querySelector("audio"));
+  await waitFor(() => expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1"))).wasPlaying).toBe(true));
+  fireEvent.pause(container.querySelector("audio"));
+  await waitFor(() => expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1"))).wasPlaying).toBe(false));
+});
+
+test("saves the audio element's precise position when the page unloads", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByRole("button", { name: "direct" }));
+  const audio = container.querySelector("audio");
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-1"));
+  fireEvent.play(audio);
+  audio.currentTime = 42.75;
+  fireEvent(window, new Event("pagehide"));
+
+  expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1")))).toMatchObject({
+    currentTrackId: "song-1", playbackProgressSeconds: 42.75, wasPlaying: true,
+  });
 });
 
 

@@ -28,6 +28,7 @@ import {
   normalizeAccentColor,
 } from "../utils/accentColors";
 import { findItunesPreview, trustedPreviewUrl } from "../utils/previewPlayback";
+import { createQueueSnapshot, queueStorageKey, readQueueSnapshot } from "../utils/queuePersistence";
 
 
 const PlayerContext =
@@ -89,10 +90,18 @@ export function PlayerProvider({
 
   const {
     isAuthenticated,
+    isLoading: authIsLoading,
+    session,
   } = useAuth();
   const playbackRequestRef =
     useRef(0);
   const listeningSessionRef = useRef(null);
+  const pendingRestoreSeekRef = useRef(null);
+  const restoreRequestRef = useRef(null);
+  const resumeListenerCleanupRef = useRef(null);
+  const queueStorageKeyRef = useRef(null);
+  const [hydratedQueueUserId, setHydratedQueueUserId] = useState(null);
+  const [restorePending, setRestorePending] = useState(false);
 
   /*
    * CURRENT SONG
@@ -475,6 +484,154 @@ export function PlayerProvider({
   ] = useState(false);
 
   const [playbackMessage, setPlaybackMessage] = useState("");
+  const progressSecond = Math.floor(currentTime);
+
+  function cancelRestoreResume() {
+    resumeListenerCleanupRef.current?.();
+    resumeListenerCleanupRef.current = null;
+    restoreRequestRef.current = null;
+    setRestorePending(false);
+  }
+
+  function attemptRestoredPlayback(activeAudio, requestId) {
+    if (restoreRequestRef.current?.requestId !== requestId || audioRef.current !== activeAudio) return;
+
+    let playPromise;
+    try {
+      // Call play synchronously from the click/keydown handler to retain user activation.
+      playPromise = activeAudio.play();
+    } catch (error) {
+      playPromise = Promise.reject(error);
+    }
+
+    Promise.resolve(playPromise).then(() => {
+      if (restoreRequestRef.current?.requestId !== requestId) return;
+      resumeListenerCleanupRef.current?.();
+      resumeListenerCleanupRef.current = null;
+      restoreRequestRef.current = null;
+      setRestorePending(false);
+      setIsPlaying(true);
+    }).catch((error) => {
+      if (restoreRequestRef.current?.requestId !== requestId) return;
+      setIsPlaying(false);
+      setRestorePending(false);
+
+      if (error?.name !== "NotAllowedError" && error?.name !== "AbortError") {
+        restoreRequestRef.current = null;
+        return;
+      }
+
+      if (resumeListenerCleanupRef.current) return;
+      const retry = () => {
+        resumeListenerCleanupRef.current?.();
+        resumeListenerCleanupRef.current = null;
+        attemptRestoredPlayback(activeAudio, requestId);
+      };
+      window.addEventListener("click", retry, { once: true });
+      window.addEventListener("keydown", retry, { once: true });
+      resumeListenerCleanupRef.current = () => {
+        window.removeEventListener("click", retry);
+        window.removeEventListener("keydown", retry);
+      };
+    });
+  }
+
+  useEffect(() => {
+    if (!isAuthenticated || !session?.id) return;
+    const key = queueStorageKey(session.id);
+    queueStorageKeyRef.current = key;
+    const saved = readQueueSnapshot(localStorage, session.id);
+    if (saved) {
+      setQueue(saved.queueItems);
+      setQueueIndex(saved.queueIndex);
+      const song = saved.queueIndex >= 0 ? saved.queueItems[saved.queueIndex] : null;
+      setCurrentSong(song);
+      setCurrentTime(song ? saved.playbackProgressSeconds : 0);
+      setDuration(song?.duration || song?.metadata?.durationSeconds || 0);
+      setIsShuffleEnabled(saved.shuffleEnabled);
+      setIsLooping(saved.repeatMode === "one");
+      setVolume(saved.volume);
+      volumeRef.current = saved.volume;
+
+      if (song && saved.wasPlaying) {
+        const activeAudio = primaryAudioRef.current;
+        audioRef.current = activeAudio;
+        const requestId = ++playbackRequestRef.current;
+        restoreRequestRef.current = { requestId };
+        setRestorePending(true);
+        pendingRestoreSeekRef.current = saved.playbackProgressSeconds;
+        activeAudio.volume = saved.volume;
+
+        const loadRestoredSource = async () => {
+          let source = song.playableSource || song.sourceId || null;
+          let previewUrl = !isLibraryPlayable(song) ? trustedPreviewUrl(song.previewUrl) : null;
+          if (!isLibraryPlayable(song) && !previewUrl && !source) {
+            try {
+              previewUrl = await findItunesPreview(song);
+              if (!previewUrl) {
+                const resolution = await getPlayableSources(song);
+                source = resolution?.selectedSource ||
+                  (resolution?.sources || []).find((candidate) => candidate.availability === "available") || null;
+              }
+            } catch {
+              // An unavailable external preview leaves the restored track paused.
+            }
+          }
+          if (restoreRequestRef.current?.requestId !== requestId) return;
+          if (!isLibraryPlayable(song) && !previewUrl && !source) {
+            cancelRestoreResume();
+            return;
+          }
+          const restoredPreview = previewUrl
+            ? { type: "preview", quality: { durationSeconds: 30 } }
+            : source?.type === "preview" ? source : null;
+          setPreviewSource(restoredPreview);
+          previewSourceRef.current = restoredPreview;
+          activeAudio.src = previewUrl || getStreamUrl(song.id, source, streamQualityRef.current);
+        };
+        loadRestoredSource().catch(() => {
+          if (restoreRequestRef.current?.requestId === requestId) cancelRestoreResume();
+        });
+      }
+    }
+    setHydratedQueueUserId(session.id);
+  }, [isAuthenticated, session?.id]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !session?.id || hydratedQueueUserId !== session.id || restorePending) return;
+    const snapshot = createQueueSnapshot({
+      currentSong, queue, queueIndex, isShuffleEnabled, isLooping, volume, currentTime: progressSecond, wasPlaying: isPlaying,
+    });
+    try {
+      localStorage.setItem(queueStorageKey(session.id), JSON.stringify(snapshot));
+    } catch (error) {
+      console.error("Could not save playback queue:", error);
+    }
+  }, [isAuthenticated, session?.id, hydratedQueueUserId, currentSong, queue, queueIndex, isShuffleEnabled, isLooping, volume, progressSecond, isPlaying, restorePending]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !session?.id || hydratedQueueUserId !== session.id) return undefined;
+    const saveBeforeUnload = () => {
+      const snapshot = createQueueSnapshot({
+        currentSong, queue, queueIndex, isShuffleEnabled, isLooping, volume,
+        currentTime: audioRef.current?.currentTime || currentTime,
+        wasPlaying: isPlaying || restorePending,
+      });
+      try {
+        localStorage.setItem(queueStorageKey(session.id), JSON.stringify(snapshot));
+      } catch (error) {
+        console.error("Could not save playback queue:", error);
+      }
+    };
+    window.addEventListener("pagehide", saveBeforeUnload);
+    return () => window.removeEventListener("pagehide", saveBeforeUnload);
+  }, [isAuthenticated, session?.id, hydratedQueueUserId, currentSong, queue, queueIndex, isShuffleEnabled, isLooping, volume, currentTime, isPlaying, restorePending]);
+
+  useEffect(() => () => {
+    resumeListenerCleanupRef.current?.();
+    resumeListenerCleanupRef.current = null;
+    restoreRequestRef.current = null;
+  }, []);
 
   /* Mirrors previewSource for the timeupdate handler's end-of-preview check. */
   const previewSourceRef = useRef(null);
@@ -759,7 +916,18 @@ export function PlayerProvider({
    */
 
   function resetPlayer() {
+    cancelRestoreResume();
     playbackRequestRef.current += 1;
+    pendingRestoreSeekRef.current = null;
+    if (queueStorageKeyRef.current) {
+      try {
+        localStorage.removeItem(queueStorageKeyRef.current);
+      } catch (error) {
+        console.error("Could not clear playback queue:", error);
+      }
+      queueStorageKeyRef.current = null;
+    }
+    setHydratedQueueUserId(null);
     listeningSessionRef.current = null;
     isTransitioningRef.current = false;
 
@@ -801,6 +969,7 @@ export function PlayerProvider({
   useEffect(() => {
 
     if (!isAuthenticated) {
+      if (authIsLoading) return undefined;
       resetPlayer();
       return undefined;
     }
@@ -874,7 +1043,7 @@ export function PlayerProvider({
       cancelled = true;
     };
 
-  }, [isAuthenticated]);
+  }, [isAuthenticated, authIsLoading]);
 
 
   /*
@@ -1205,7 +1374,7 @@ export function PlayerProvider({
    * PLAY SONG
    */
 
-  async function loadAndPlaySong(song) {
+  async function loadAndPlaySong(song, resumeAtSeconds = 0) {
 
     if (
       !audioRef.current ||
@@ -1215,6 +1384,8 @@ export function PlayerProvider({
       return;
 
     }
+
+    cancelRestoreResume();
 
     cancelCrossfade();
 
@@ -1361,6 +1532,7 @@ export function PlayerProvider({
       replayGainMultiplierForSong(song)
     );
 
+    pendingRestoreSeekRef.current = resumeAtSeconds > 0 ? resumeAtSeconds : null;
     audioRef.current.src =
       streamUrl;
 
@@ -1369,7 +1541,7 @@ export function PlayerProvider({
 
     setCurrentSong(song);
 
-    setCurrentTime(0);
+    setCurrentTime(resumeAtSeconds);
 
     setDuration(0);
 
@@ -1814,6 +1986,7 @@ export function PlayerProvider({
 
 
   function stopPlaybackAtQueueEnd() {
+    cancelRestoreResume();
     playbackRequestRef.current += 1;
     listeningSessionRef.current = null;
 
@@ -2213,6 +2386,8 @@ export function PlayerProvider({
 
     }
 
+    cancelRestoreResume();
+
 
     if (isPlaying) {
 
@@ -2223,6 +2398,11 @@ export function PlayerProvider({
       audioRef.current.pause();
 
     } else {
+
+      if (!audioRef.current.getAttribute("src")) {
+        loadAndPlaySong(currentSong, currentTime);
+        return;
+      }
 
       audioRef.current.play().catch(() => {
         setIsPlaying(false);
@@ -2344,6 +2524,20 @@ export function PlayerProvider({
     setDuration(
       activeAudio.duration
     );
+
+    const restoredPosition = pendingRestoreSeekRef.current;
+    if (restoredPosition !== null) {
+      const maxPosition = Number.isFinite(activeAudio.duration)
+        ? Math.max(0, activeAudio.duration - 0.25)
+        : restoredPosition;
+      activeAudio.currentTime = Math.min(restoredPosition, maxPosition);
+      setCurrentTime(activeAudio.currentTime);
+      pendingRestoreSeekRef.current = null;
+      if (restoreRequestRef.current) {
+        attemptRestoredPlayback(activeAudio, restoreRequestRef.current.requestId);
+      }
+      return;
+    }
 
     // Start playback at the first-audio position when trim bounds are
     // already known (analysis resolved before metadata finished loading).
@@ -2776,6 +2970,7 @@ export function PlayerProvider({
 
         onError={(event) => {
           if (event.currentTarget === audioRef.current) {
+            if (restoreRequestRef.current) cancelRestoreResume();
             setIsPlaying(false);
             setDuration(0);
           }
@@ -2818,6 +3013,7 @@ export function PlayerProvider({
 
         onError={(event) => {
           if (event.currentTarget === audioRef.current) {
+            if (restoreRequestRef.current) cancelRestoreResume();
             setIsPlaying(false);
             setDuration(0);
           }

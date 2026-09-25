@@ -13,6 +13,10 @@ import { toArtistSearchResult, toLegacySearchResponse, toTrackSearchResult } fro
 import type { UnifiedSearchResult } from "../domain/search.js";
 import type { SearchProviderRegistry } from "../domain/search-provider-registry.js";
 import { deduplicateSearchGroups } from "../domain/search-deduplication.js";
+import { CompositeMetadataService } from "../services/CompositeMetadataService.js";
+import { SubsonicAdapter } from "../services/adapters/SubsonicAdapter.js";
+import { DeezerAdapter } from "../services/adapters/DeezerAdapter.js";
+import { iTunesAdapter } from "../services/adapters/iTunesAdapter.js";
 import type { SourceProviderRegistry } from "../domain/source-provider-registry.js";
 import type { ExternalCatalogRegistry } from "../domain/external-catalog.js";
 import type { RecommendationRegistry, RecommendationKind } from "../domain/recommendations.js";
@@ -61,6 +65,15 @@ const lyricsQuerySchema = z.object({
   artist_name: z.string().trim().min(1).max(300),
   album_name: z.string().trim().max(300).optional(),
   duration: z.coerce.number().finite().positive().max(86_400),
+});
+const libraryMatchesSchema = z.object({
+  items: z.array(z.object({
+    id: z.string().min(1).max(200),
+    type: z.enum(["track", "album"]),
+    title: z.string().max(300),
+    artist: z.string().max(300),
+    isrc: z.string().max(32).nullable().optional(),
+  })).max(100),
 });
 
 function parseTypes(value: unknown) {
@@ -118,6 +131,14 @@ export async function registerMusicRoutes(
   const artistImages = new ArtistImageResolver(externalCatalog.fetchImpl);
   const musicBrainzAvatars = new MusicBrainzAvatarWorker(db, externalCatalog.fetchImpl);
   const lyricsService = new LyricsService(externalCatalog.fetchImpl);
+  const metadata = new CompositeMetadataService(
+    new SubsonicAdapter(catalog),
+    [
+      new DeezerAdapter(externalCatalog.fetchImpl, externalCatalog.artwork),
+      new iTunesAdapter(externalCatalog.fetchImpl, externalCatalog.artwork),
+    ],
+    catalog
+  );
   const artistSnapshotCache = new Map<string, {
     expiresAt: number;
     value: Promise<{ artist: Artist | null; localAlbums: Album[]; localTracks: Track[] }>;
@@ -891,7 +912,7 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
-    const query = request.query as { q?: string; types?: string; mode?: string };
+    const query = request.query as { q?: string; types?: string; mode?: string; phase?: string };
     const types = parseTypes(query.types)?.flatMap((type) => {
       if (type === "tracks" || type === "songs") return ["track"] as const;
       if (type === "albums") return ["album"] as const;
@@ -909,6 +930,39 @@ export async function registerMusicRoutes(
     }
 
     const mode = canSearchExternal ? requestedMode : "library";
+    if (query.phase === "local") {
+      const local = await searchProviders.search(query.q || "", { types, mode: "library" });
+      const groups = deduplicateSearchGroups(local.groups);
+      return { ...toLegacySearchResponse(local.groups), results: groups, degraded: local.degraded };
+    }
+
+    if (query.phase === "external") {
+      if (!canSearchExternal || mode === "library") {
+        return { results: { track: [], album: [], artist: [], playlist: [] }, degraded: false };
+      }
+      const keylessEnabled = searchProviders.rawConfig("deezer")?.enabled !== false;
+      const external = keylessEnabled
+        ? await metadata.searchExternal(query.q || "", types)
+        : { groups: { track: [], album: [], artist: [], playlist: [] }, degraded: false };
+      let extra: UnifiedSearchResult[] = [];
+      if (searchProviders.rawConfig("spotify")?.enabled && externalCatalog.isEnabled()) {
+        try {
+          const catalogResults = await externalCatalog.search(query.q || "", { limit: 12 });
+          extra = await metadata.annotateLibraryMatches(catalogResults.filter((item) => item.id.startsWith("external_spotify_")));
+        } catch {
+          // The keyless adapters remain usable when the configured catalog fails.
+        }
+      }
+      return {
+        results: deduplicateSearchGroups({
+          ...external.groups,
+          track: [...external.groups.track, ...extra.filter((item) => item.type === "track")],
+          album: [...external.groups.album, ...extra.filter((item) => item.type === "album")],
+          artist: [...external.groups.artist, ...extra.filter((item) => item.type === "artist")],
+        }),
+        degraded: external.degraded,
+      };
+    }
     const result = await searchProviders.search(query.q || "", { types, mode });
     const shouldSearchExternal = canSearchExternal
       && externalCatalog.isEnabled()
@@ -937,6 +991,36 @@ export async function registerMusicRoutes(
       ...legacy,
       results: normalized,
       degraded: result.degraded,
+    };
+  });
+
+  app.post("/api/library/matches", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const parsed = libraryMatchesSchema.safeParse(request.body);
+    if (!parsed.success) return sendError(reply, 400, "Invalid library match request");
+    const candidates = parsed.data.items.map((item): UnifiedSearchResult => ({
+      id: item.id,
+      type: item.type,
+      title: item.title,
+      subtitle: item.artist,
+      artist: item.artist,
+      album: null,
+      artwork: null,
+      provider: "external",
+      source: { kind: "external", count: 0 },
+      availability: null,
+      metadata: {},
+      ...(item.isrc ? { identityHints: { isrc: item.isrc } } : {}),
+    }));
+    const matched = await metadata.annotateLibraryMatches(candidates);
+    return {
+      matches: matched.map((item) => ({
+        id: item.id,
+        inLibrary: Boolean(item.inLibrary),
+        localTrackId: item.localTrackId || null,
+        localAlbumId: item.localAlbumId || null,
+      })),
     };
   });
 

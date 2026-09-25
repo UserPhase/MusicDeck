@@ -309,18 +309,32 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       };
     }
 
-    const outputTemplate = request.filenameTemplate
-      ? (path.isAbsolute(request.filenameTemplate) ? request.filenameTemplate : path.join(outputDir, request.filenameTemplate))
-      : path.join(outputDir, "{artists} - {title}.{output-ext}");
+    const outputTemplate = request.playlistM3uName
+      ? (request.filenameTemplate || "{artists} - {title}.{output-ext}")
+      : request.filenameTemplate
+        ? (path.isAbsolute(request.filenameTemplate) ? request.filenameTemplate : path.join(outputDir, request.filenameTemplate))
+        : path.join(outputDir, "{artists} - {title}.{output-ext}");
 
     const args: string[] = [
       "--simple-tui",
-      "--audio", "youtube-music", "youtube",
+      "--audio", "youtube-music", "youtube", ...(request.broadenAudioSearch ? ["soundcloud"] : []),
       "--id3-separator", "; ",
       "--log-level", "DEBUG",
       "--output", outputTemplate,
       "--format", this.defaultFormat,
     ];
+
+    if (request.playlistM3uName) {
+      // The caller supplies a fixed basename, never a user-controlled path.
+      if (path.basename(request.playlistM3uName) !== request.playlistM3uName ||
+          !/^[a-zA-Z0-9_-]+\.m3u8?$/.test(request.playlistM3uName)) {
+        return { status: "failed", files: [], error: { code: "invalid-input", message: "Invalid playlist filename" } };
+      }
+      args.push("--m3u", request.playlistM3uName);
+      // Unlike the M3U, spotDL's save-file includes failed downloads too.
+      args.push("--save-file", "musicdeck-source.spotdl", "--save-errors", "musicdeck-errors.txt", "--print-errors");
+      args.push("--max-retries", "5");
+    }
 
     if (this.ffmpegPath && this.ffmpegPath !== "ffmpeg") {
       args.push("--ffmpeg", this.ffmpegPath);
@@ -361,7 +375,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       handle = this.processRunner.run(this.spotdlPath, args, {
         cwd: outputDir,
         signal: context.signal,
-        timeoutMs: this.timeoutMs,
+        timeoutMs: request.timeoutMs || this.timeoutMs,
         onStdoutLine: onProgressLine,
         onStderrLine: onProgressLine,
       });
@@ -396,7 +410,13 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
 
       // Collect downloaded audio files
       const files = scanAudioFiles(outputDir, request);
+      const playlistMetadata = request.playlistM3uName
+        ? readPlaylistMetadata(path.join(outputDir, "musicdeck-source.spotdl"))
+        : {};
       if (files.length === 0) {
+        if (playlistMetadata.playlistTracks?.length) {
+          return { status: "completed", files, ...playlistMetadata };
+        }
         // spotDL can exit 0 even when it failed to actually acquire audio for
         // a specific track (e.g. the YouTube video it matched was removed,
         // is region-locked, or is otherwise unavailable — a real, external
@@ -420,6 +440,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       return {
         status: "completed",
         files,
+        ...playlistMetadata,
       };
     } catch (err: any) {
       if (context.signal.aborted || /abort/i.test(err?.message || "")) {
@@ -515,6 +536,34 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       spotdlPath: this.spotdlPath,
       ffmpegPath: this.ffmpegPath,
     };
+  }
+}
+
+function readPlaylistMetadata(filePath: string): Pick<DownloadResult, "playlistTracks" | "playlistLength"> {
+  try {
+    const payload: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!Array.isArray(payload)) return {};
+    const tracks = payload.flatMap((item: unknown, index) => {
+      if (!item || typeof item !== "object") return [];
+      const song = item as Record<string, unknown>;
+      const position = typeof song.list_position === "number" ? song.list_position : index + 1;
+      if (!Number.isSafeInteger(position) || position < 1 || typeof song.url !== "string") return [];
+      return [{
+        position,
+        url: song.url,
+        title: typeof song.name === "string" ? song.name : "",
+        artist: typeof song.artist === "string" ? song.artist : "",
+        duration: typeof song.duration === "number" ? song.duration : 0,
+      }];
+    });
+    const declared = payload.reduce<number>((max, item: unknown) => {
+      if (!item || typeof item !== "object") return max;
+      const length = (item as Record<string, unknown>).list_length;
+      return typeof length === "number" && Number.isSafeInteger(length) ? Math.max(max, length) : max;
+    }, tracks.length);
+    return { playlistTracks: tracks, playlistLength: declared };
+  } catch {
+    return {};
   }
 }
 

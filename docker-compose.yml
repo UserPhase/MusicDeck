@@ -49,7 +49,7 @@ services:
       # in by musicdeck-web can reach it. This is an internal container
       # address, not a host-exposed port.
       MUSICDECK_HOST: 0.0.0.0
-      MUSICDECK_PORT: 4534
+      MUSICDECK_PORT: 8080
       # Must be the URL LAN clients actually use to reach MusicDeck, e.g.
       # http://192.168.1.50:8080 — never leave this defaulted to localhost
       # in a real deployment.
@@ -81,6 +81,8 @@ services:
       # host folder the selected backend scans (mounted below), so downloads
       # via spotDL/On-Demand Library appear in the library automatically.
       MUSICDECK_MUSIC_ROOT: /music
+      MUSICDECK_SPOTIFY_IMPORT_SUBDIR: "${MUSICDECK_SPOTIFY_IMPORT_SUBDIR:-Spotify Imports}"
+      SPOTDL_AUTO_UPDATE: ${SPOTDL_AUTO_UPDATE:-1}
     volumes:
       - musicdeck-data:/app/data
       - musicdeck-config:/app/config

@@ -7,6 +7,7 @@ import { formatDuration } from "../utils/formatDuration";
 
 import AvailabilityHint from "./AvailabilityHint";
 import SourceIndicator from "./SourceIndicator";
+import InLibraryBadge from "./InLibraryBadge";
 import TrackContextMenu from "./TrackContextMenu";
 import TrackDownloadButton from "./TrackDownloadButton";
 import TrackPlaybackIndicator from "./TrackPlaybackIndicator";
@@ -164,8 +165,9 @@ function TrackRow({
       </div>
 
       <div className="track-info" role="cell">
-        <div className="track-title">
-          {song.title || "Unknown title"}
+        <div className={`track-title ${song.provider === "external" && song.inLibrary ? "track-title-with-library-badge" : ""}`}>
+          <span className="track-title-text">{song.title || "Unknown title"}</span>
+          <InLibraryBadge visible={song.provider === "external" && song.inLibrary} />
           <AvailabilityHint availability={song.availability} />
           {showSourceIndicator && <SourceIndicator source={song.source} />}
         </div>

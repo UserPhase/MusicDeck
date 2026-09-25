@@ -284,7 +284,7 @@ export class PlaylistService {
     return rows.map((row) => this.withOwner(row));
   }
 
-  async create(name: string, user: SessionUser): Promise<Playlist & { ownerUserId: string | null }> {
+  async create(name: string, user: SessionUser, description?: string): Promise<Playlist & { ownerUserId: string | null }> {
     const now = new Date().toISOString();
     const id = createId("mdpl");
     const connectionId = getPrimaryConnectionId(this.db);
@@ -300,10 +300,54 @@ export class PlaylistService {
     this.db.prepare(`
       INSERT INTO playlists
         (id, owner_user_id, name, description, source_connection_id, source_playlist_id, created_at, updated_at)
-      VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
-    `).run(id, user.id, name, connectionId, providerPlaylistId, now, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, user.id, name, description?.trim() || null, connectionId, providerPlaylistId, now, now);
 
     return this.withOwner(this.getRow(id)!, []);
+  }
+
+  /** Adopt a freshly scanned provider playlist without creating a duplicate upstream. */
+  async adoptProviderPlaylist(providerPlaylistId: string, user: SessionUser, name?: string): Promise<Playlist & { ownerUserId: string | null }> {
+    const connectionId = getPrimaryConnectionId(this.db);
+    if (!connectionId) throw new Error("No library connection is available");
+
+    const providerPlaylist = await this.backend.getPlaylist(providerPlaylistId);
+    if (!providerPlaylist || !providerPlaylist.tracks?.length) {
+      throw new Error("Navidrome scanned the files but did not import the playlist tracks. Check playlist auto-import and the M3U paths.");
+    }
+
+    const existing = this.db.prepare(
+      "SELECT id FROM playlists WHERE source_connection_id = ? AND source_playlist_id = ?"
+    ).get(connectionId, providerPlaylistId) as { id: string } | undefined;
+    const id = existing?.id || createId("mdpl");
+    const now = new Date().toISOString();
+    const displayName = name?.trim() || providerPlaylist.name;
+
+    this.db.transaction(() => {
+      if (existing) {
+        this.db.prepare(
+          "UPDATE playlists SET owner_user_id = ?, name = ?, updated_at = ? WHERE id = ?"
+        ).run(user.id, displayName, now, id);
+        this.db.prepare("DELETE FROM playlist_items WHERE playlist_id = ?").run(id);
+      } else {
+        this.db.prepare(`
+          INSERT INTO playlists
+            (id, owner_user_id, name, description, source_connection_id, source_playlist_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, user.id, displayName, providerPlaylist.description, connectionId, providerPlaylistId, now, now);
+      }
+
+      providerPlaylist.tracks!.forEach((track, index) => {
+        const providerTrackId = String(track.id);
+        const libraryTrackId = this.library.ensureId("track", { connectionId, providerItemId: providerTrackId });
+        this.db.prepare(`
+          INSERT INTO playlist_items (id, playlist_id, position, connection_id, provider_track_id, library_track_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(createId("mdpli"), id, index, connectionId, providerTrackId, libraryTrackId, now);
+      });
+    })();
+
+    return this.withOwner(this.getRow(id)!, providerPlaylist.tracks);
   }
 
   async get(playlistId: string): Promise<(Playlist & { ownerUserId: string | null }) | null> {

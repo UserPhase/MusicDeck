@@ -19,6 +19,7 @@ import {
 import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
 import SourceIndicator from "../components/SourceIndicator";
+import InLibraryBadge from "../components/InLibraryBadge";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
 import {
@@ -62,7 +63,8 @@ function Search() {
   const [
     loading,
     setLoading,
-  ] = useState(false);
+  ] = useState(Boolean(query.trim()));
+  const [externalLoading, setExternalLoading] = useState(false);
 
 
   const [
@@ -293,6 +295,7 @@ function Search() {
       });
 
       setLoading(false);
+      setExternalLoading(false);
       setError(null);
 
       return () => {
@@ -302,58 +305,44 @@ function Search() {
     }
 
 
-    async function search() {
+    const empty = { artist: [], album: [], track: [], playlist: [], degraded: false };
+    setResults(empty);
+    setError(null);
+    setLoading(true);
+    setExternalLoading(sourceMode !== "library");
 
-      try {
-
-        setLoading(true);
-        setError(null);
-
-
-        const data =
-          await searchNavidrome(
-            query,
-            { mode: sourceMode }
-          );
-
-
-        if (!cancelled) {
-          setResults({
-            artist: data?.results?.artist || [],
-            album: data?.results?.album || [],
-            track: data?.results?.track || [],
-            playlist: data?.results?.playlist || [],
-            degraded: Boolean(data?.degraded),
-          });
+    function addPhase(data, phase) {
+      if (cancelled) return;
+      setResults((current) => {
+        const next = { ...current, degraded: current.degraded || Boolean(data?.degraded) };
+        for (const type of ["artist", "album", "track", "playlist"]) {
+          const incoming = data?.results?.[type] || [];
+          const existing = current[type].filter((item) => !incoming.some((other) => other.id === item.id));
+          next[type] = phase === "local" ? [...incoming, ...existing] : [...existing, ...incoming];
         }
-
-      } catch (err) {
-
-        console.error(
-          "Search failed:",
-          err
-        );
-
-
-        if (!cancelled) {
-          setError(
-            err.message ||
-            "Could not search your music."
-          );
-        }
-
-      } finally {
-
-        if (!cancelled) {
-          setLoading(false);
-        }
-
-      }
-
+        return next;
+      });
     }
 
+    async function run() {
+      const local = sourceMode === "external" ? null : searchNavidrome(query, { mode: sourceMode, phase: "local" })
+        .then((data) => addPhase(data, "local"))
+        .finally(() => { if (!cancelled) setLoading(false); });
+      const external = sourceMode === "library" ? null : searchNavidrome(query, { mode: sourceMode, phase: "external" })
+        .then((data) => addPhase(data, "external"))
+        .finally(() => {
+          if (!cancelled) {
+            setExternalLoading(false);
+            if (sourceMode === "external") setLoading(false);
+          }
+        });
+      const outcomes = await Promise.allSettled([local, external].filter(Boolean));
+      if (!cancelled && outcomes.every((outcome) => outcome.status === "rejected")) {
+        setError(outcomes[0]?.reason?.message || "Could not search your music.");
+      }
+    }
 
-    search();
+    run();
 
     return () => {
       cancelled = true;
@@ -495,14 +484,18 @@ function Search() {
         </p>
       )}
 
+      {externalLoading && sourceMode === "hybrid" && (
+        <p className="search-external-pending" role="status">Looking for more music…</p>
+      )}
 
-      {!hasResults ? (
+
+      {!hasResults && !externalLoading ? (
 
         <EmptyState>
           No results found.
         </EmptyState>
 
-      ) : (
+      ) : hasResults ? (
 
         <div className="search-groups">
 
@@ -609,8 +602,9 @@ function Search() {
                       </div>
 
 
-                      <div className="album-title">
-                        {album.title}
+                      <div className="album-title search-album-title">
+                        <span className="search-album-title-text">{album.title}</span>
+                        <InLibraryBadge visible={album.provider === "external" && album.inLibrary} />
                       </div>
 
 
@@ -805,7 +799,7 @@ function Search() {
 
         </div>
 
-      )}
+      ) : null}
 
     </div>
 

@@ -4,9 +4,11 @@ import type { PlaylistService } from "./playlist-service.js";
 import { SpotifyAuthClient, SpotifyAuthError, describeSpotifyErrorBody, hasSpotifyCredentials, resolveSpotifyCredentials } from "./spotify-auth.js";
 import { ExternalArtworkTokenStore } from "./external-catalog.js";
 import { classifyPluginError } from "../plugins/plugin-errors.js";
+import { SubsonicAdapter } from "../services/adapters/SubsonicAdapter.js";
+import { DeezerAdapter } from "../services/adapters/DeezerAdapter.js";
+import { iTunesAdapter } from "../services/adapters/iTunesAdapter.js";
 import {
   groupSearchResults,
-  toSearchGroups,
   toPlaylistSearchResult,
   type SearchOptions,
   type SearchProvider,
@@ -115,8 +117,7 @@ class LibrarySearchProvider implements SearchProvider {
       if (type === "artist") return "artists";
       return "playlists";
     });
-    const catalog = await this.catalog.search(query, types);
-    const groups = toSearchGroups(catalog, []);
+    const groups = await new SubsonicAdapter(this.catalog).searchAll(query, types);
 
     return Object.values(groups).flat().filter((item) => isIncluded(item, options.types));
   }
@@ -152,247 +153,45 @@ class DeezerSearchProvider implements SearchProvider {
     private readonly artworkTokens?: ExternalArtworkTokenStore
   ) {}
 
-  private artwork(url: unknown) {
-    const id = this.artworkTokens ? this.artworkTokens.token(url, ["dzcdn.net"]) : null;
-    return id ? { id, url: `/api/artwork/external/${encodeURIComponent(id)}` } : null;
-  }
-
-  private itunesArtwork(url: unknown) {
-    const id = this.artworkTokens ? this.artworkTokens.token(url, ["mzstatic.com"]) : null;
-    return id ? { id, url: `/api/artwork/external/${encodeURIComponent(id)}` } : null;
-  }
-
-  private async get<T>(path: string, params: Record<string, string>): Promise<T> {
-    const url = new URL(`https://api.deezer.com${path}`);
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, value);
-    }
-
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url);
-    } catch (error) {
-      throw new Error(`Deezer catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    let bodyText: string;
-    try {
-      bodyText = await response.text();
-    } catch {
-      throw new Error("Deezer returned invalid data");
-    }
-
-    if (!response.ok) {
-      throw new Error(`Deezer catalog request failed (HTTP ${response.status})`);
-    }
-
-    let payload: any;
-    try {
-      payload = JSON.parse(bodyText);
-    } catch {
-      throw new Error("Deezer returned invalid data");
-    }
-
-    if (payload && typeof payload === "object" && payload.error) {
-      const message = typeof payload.error.message === "string" ? payload.error.message : "unknown error";
-      throw new Error(`Deezer catalog request failed: ${message}`);
-    }
-
-    return payload as T;
-  }
-
-  private async searchDeezer(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
+  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
     const limit = Math.min(Math.max(Number(options.limit || 10), 1), 25);
     const types = (options.types && options.types.length ? options.types : ["track", "album", "artist"])
       .filter((type) => type !== "playlist");
-    if (types.length === 0) {
-      return [];
-    }
+    if (types.length === 0) return [];
 
-    const requests: Promise<UnifiedSearchResult[]>[] = [];
+    const deezer = new DeezerAdapter(this.fetchImpl, this.artworkTokens, limit);
+    const itunes = new iTunesAdapter(this.fetchImpl, this.artworkTokens, 15);
+    const deezerJobs: Promise<UnifiedSearchResult[]>[] = [];
+    if (types.includes("track")) deezerJobs.push(deezer.searchTracks(query));
+    if (types.includes("album")) deezerJobs.push(deezer.searchAlbums(query));
+    if (types.includes("artist")) deezerJobs.push(deezer.searchArtists(query));
 
-    if (types.includes("track")) {
-      requests.push(
-        this.get<{ data?: any[] }>("/search/track", { q: query, limit: String(limit) }).then((payload) =>
-          (payload.data || []).flatMap((item) => {
-            if (item?.id == null) return [];
-            return [{
-              type: "track" as const,
-              id: `external_deezer_track_${item.id}`,
-              title: item.title || "Unknown title",
-              subtitle: item.artist?.name || null,
-              artist: item.artist?.name || null,
-              album: item.album?.title || null,
-              // Deezer's public CDN images (dzcdn.net) are exchanged for an
-              // opaque artwork token here, consistent with how Spotify's
-              // scdn.co images are proxied -- raw external CDN URLs are
-              // never returned to the client.
-              artwork: this.artwork(item.album?.cover_big || item.album?.cover_medium),
-              previewUrl: typeof item.preview === "string" ? item.preview : null,
-              provider: "external" as const,
-              source: { kind: "external" as const, count: 0 },
-              availability: null,
-              metadata: {
-                durationSeconds: typeof item.duration === "number" ? item.duration : null,
-              },
-            }];
-          })
-        )
-      );
-    }
-
-    if (types.includes("album")) {
-      requests.push(
-        this.get<{ data?: any[] }>("/search/album", { q: query, limit: String(limit) }).then((payload) =>
-          (payload.data || []).flatMap((item) => {
-            if (item?.id == null) return [];
-            return [{
-              type: "album" as const,
-              id: `external_deezer_album_${item.id}`,
-              title: item.title || "Unknown album",
-              subtitle: item.artist?.name || null,
-              artist: item.artist?.name || null,
-              album: null,
-              artwork: this.artwork(item.cover_big || item.cover_medium),
-              provider: "external" as const,
-              source: { kind: "external" as const, count: 0 },
-              availability: null,
-              metadata: {},
-            }];
-          })
-        )
-      );
-    }
-
-    if (types.includes("artist")) {
-      requests.push(
-        this.get<{ data?: any[] }>("/search/artist", { q: query, limit: String(limit) }).then((payload) =>
-          (payload.data || []).flatMap((item) => {
-            if (item?.id == null) return [];
-            return [{
-              type: "artist" as const,
-              id: `external_deezer_artist_${item.id}`,
-              title: item.name || "Unknown artist",
-              subtitle: "Artist",
-              artist: item.name || null,
-              album: null,
-              artwork: this.artwork(item.picture_big || item.picture_medium),
-              provider: "external" as const,
-              source: { kind: "external" as const, count: 0 },
-              availability: null,
-              metadata: {},
-            }];
-          })
-        )
-      );
-    }
-
-    const results = await Promise.all(requests);
-    return results.flat().filter((item) => isIncluded(item, options.types));
-  }
-
-  private async searchItunes(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
-    if (options.types && !options.types.includes("track")) {
-      return [];
-    }
-
-    const url = new URL("https://itunes.apple.com/search");
-    url.searchParams.set("term", query);
-    url.searchParams.set("entity", "song");
-    url.searchParams.set("limit", "15");
-
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url);
-    } catch (error) {
-      throw new Error(`iTunes catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    if (!response.ok) {
-      throw new Error(`iTunes catalog request failed (HTTP ${response.status})`);
-    }
-
-    let payload: { results?: any[] };
-    try {
-      payload = await response.json() as { results?: any[] };
-    } catch {
-      throw new Error("iTunes returned invalid data");
-    }
-
-    if (!Array.isArray(payload.results)) {
-      throw new Error("iTunes returned an unexpected response shape");
-    }
-
-    return payload.results.flatMap((item): UnifiedSearchResult[] => {
-      if (item?.trackId == null || typeof item.trackName !== "string") return [];
-
-      const durationSeconds = typeof item.trackTimeMillis === "number"
-        ? Math.round(item.trackTimeMillis / 1000)
-        : null;
-
-      return [{
-        type: "track",
-        id: `external_itunes_${item.trackId}`,
-        title: item.trackName,
-        subtitle: typeof item.artistName === "string" ? item.artistName : null,
-        artist: typeof item.artistName === "string" ? item.artistName : null,
-        album: typeof item.collectionName === "string" ? item.collectionName : null,
-        artwork: this.itunesArtwork(item.artworkUrl100),
-        previewUrl: typeof item.previewUrl === "string" ? item.previewUrl : null,
-        provider: "external",
-        source: { kind: "external", count: 0, externalAvailable: true },
-        availability: null,
-        metadata: {
-          durationSeconds,
-          itunesTrackId: Number(item.trackId),
-        },
-      }];
-    });
-  }
-
-  async search(query: string, options: SearchOptions = {}): Promise<UnifiedSearchResult[]> {
     const [deezerOutcome, itunesOutcome] = await Promise.allSettled([
-      this.searchDeezer(query, options),
-      this.searchItunes(query, options),
+      Promise.all(deezerJobs).then((results) => results.flat()),
+      types.includes("track") ? itunes.searchTracks(query) : Promise.resolve([]),
     ]);
-
-    const deezerResults = deezerOutcome.status === "fulfilled" ? deezerOutcome.value : [];
-    const itunesResults = itunesOutcome.status === "fulfilled" ? itunesOutcome.value : [];
-
     if (deezerOutcome.status === "rejected" && itunesOutcome.status === "rejected") {
-      const deezerError = deezerOutcome.reason instanceof Error
-        ? deezerOutcome.reason.message
-        : String(deezerOutcome.reason);
-      const itunesError = itunesOutcome.reason instanceof Error
-        ? itunesOutcome.reason.message
-        : String(itunesOutcome.reason);
-      throw new Error(`Keyless catalog search failed: ${deezerError}; ${itunesError}`);
+      throw new Error("Keyless catalog search failed");
     }
-
     return dedupeKeylessSearchResults([
-      ...deezerResults,
-      ...itunesResults,
+      ...(deezerOutcome.status === "fulfilled" ? deezerOutcome.value : []),
+      ...(itunesOutcome.status === "fulfilled" ? itunesOutcome.value : []),
     ]);
   }
 
   async test(): Promise<{ ok: boolean; message?: string; status?: string }> {
     try {
-      const payload = await this.get<{ data?: any[] }>("/search/track", { q: "test", limit: "1" });
-      if (!Array.isArray(payload.data)) {
-        return { ok: false, status: "provider_unavailable", message: "Deezer returned an unexpected response shape" };
-      }
+      await new DeezerAdapter(this.fetchImpl, this.artworkTokens, 1).searchTracks("test");
       return { ok: true, message: "Deezer is reachable" };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       return {
         ok: false,
         status: "provider_unavailable",
-        message: `Deezer is unavailable: ${message}`,
+        message: `Deezer is unavailable: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
   }
 }
-
 /**
  * Built-in external catalog search provider backed by Spotify's official
  * Web API (https://api.spotify.com/v1/search) using the client-credentials

@@ -6,6 +6,7 @@ import { describe, expect, test } from "vitest";
 
 import { loadConfig } from "../src/config.js";
 import { openDatabase } from "../src/db/database.js";
+import { runMigrations } from "../src/db/migrations.js";
 
 function tempDbPath() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "musicdeck-migrate-"));
@@ -13,6 +14,23 @@ function tempDbPath() {
 }
 
 describe("migrations", () => {
+  test("removes saved Lidarr credentials without touching other plugins", async () => {
+    const db = await openDatabase(loadConfig({ databasePath: tempDbPath() }));
+    const insert = db.prepare(`
+      INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
+      VALUES (?, 1, ?, '[]', CURRENT_TIMESTAMP)
+    `);
+    insert.run("lidarr", '{"apiKey":"old-secret"}');
+    insert.run("other-plugin", '{}');
+    db.prepare("DELETE FROM schema_migrations WHERE id = 20").run();
+
+    runMigrations(db);
+
+    expect(db.prepare("SELECT plugin_id FROM plugin_configs WHERE plugin_id = 'lidarr'").get()).toBeUndefined();
+    expect(db.prepare("SELECT plugin_id FROM plugin_configs WHERE plugin_id = 'other-plugin'").get()).toBeTruthy();
+    db.close();
+  });
+
   test("fresh installs include Phase 5 domain tables", async () => {
     const databasePath = tempDbPath();
     const db = await openDatabase(loadConfig({

@@ -7,6 +7,7 @@ import type { Db } from "./db/database.js";
 import type { MusicBackend } from "./backends/music-backend.js";
 import { CatalogService } from "./domain/catalog.js";
 import type { PlaylistService } from "./domain/playlist-service.js";
+import type { SpotifyPlaylistImportService } from "./domain/spotify-playlist-import.js";
 import type { LibraryService } from "./domain/library.js";
 import type { SourceResolver } from "./domain/source-resolver.js";
 import type { SearchProviderRegistry } from "./domain/search-provider-registry.js";
@@ -31,6 +32,7 @@ export async function buildServer(options: {
   backend: MusicBackend;
   catalog: CatalogService;
   playlists: PlaylistService;
+  spotifyPlaylistImport?: SpotifyPlaylistImportService;
   library: LibraryService;
   sourceResolver: SourceResolver;
   searchProviders: SearchProviderRegistry;
@@ -110,7 +112,7 @@ export async function buildServer(options: {
   await registerUserRoutes(app, options.db);
   await registerSettingsRoutes(app, options.db);
   await registerMusicRoutes(app, options.db, options.backend, options.catalog, options.library, options.sourceResolver, options.playlists, options.searchProviders, options.sourceProviders, options.externalCatalog, options.recommendations, options.libraryInsights, options.acquisition, options.silenceAnalysis);
-  await registerPlaylistRoutes(app, options.db, options.playlists);
+  await registerPlaylistRoutes(app, options.db, options.playlists, options.spotifyPlaylistImport);
 
   return app;
 }

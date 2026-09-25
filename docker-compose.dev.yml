@@ -70,6 +70,8 @@ services:
       # downloads via spotDL/On-Demand Library will succeed but never show
       # up in either library.
       MUSICDECK_MUSIC_ROOT: /music
+      MUSICDECK_SPOTIFY_IMPORT_SUBDIR: "${MUSICDECK_SPOTIFY_IMPORT_SUBDIR:-Spotify Imports}"
+      SPOTDL_AUTO_UPDATE: ${SPOTDL_AUTO_UPDATE:-1}
     volumes:
       - musicdeck-data:/app/data
       - musicdeck-config:/app/config

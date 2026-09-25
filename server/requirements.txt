@@ -1,0 +1,5 @@
+# Keep the downloader and its fast-moving YouTube/YouTube Music integrations
+# explicit. yt-dlp[default] includes its external JavaScript challenge solver.
+spotdl>=4.5,<5
+yt-dlp[default]>=2026.07.04,<2027
+ytmusicapi>=1.12.1,<2

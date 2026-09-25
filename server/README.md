@@ -20,6 +20,17 @@ The browser authenticates with MusicDeck Server only. Provider credentials stay 
 - npm
 - A running Navidrome or Jellyfin server for real music data
 
+## Spotify playlist import
+
+The sidebar import action queues a spotDL download, writes an M3U under
+`MUSICDECK_SPOTIFY_IMPORT_SUBDIR` (default `Spotify Imports`) inside the shared
+`MUSICDECK_MUSIC_ROOT`, triggers a Navidrome scan, and opens the imported
+playlist. It requires spotDL, Deno, and FFmpeg in the MusicDeck server (included in
+the Docker image) and Navidrome M3U auto-import. If Navidrome restricts
+`ND_PLAYLISTSPATH`, set MusicDeck's relative import subdirectory inside an
+allowed path. The import reports an error if the scan cannot expose the M3U
+and its tracks.
+
 ## Local development
 
 See the root [README](../README.md#local-development) for exact commands. The server runs on `http://localhost:4534` via `npm run dev`, initializes SQLite and applies migrations on startup, and `npm run db:init` initializes the database without starting the server.

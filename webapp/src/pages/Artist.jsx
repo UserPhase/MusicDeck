@@ -13,10 +13,12 @@ import {
 
 import {
   getCoverUrl,
+  matchLibraryItems,
 } from "../api/musicdeck";
 import { fetchArtistOverview } from "../api/artistOverviewQuery";
 import ArtistAvatar from "../components/ArtistAvatar";
 import ArtistBiography from "../components/ArtistBiography";
+import InLibraryBadge from "../components/InLibraryBadge";
 import { useArtistBiography } from "../hooks/useArtistBiography";
 
 import TrackListHeader from "../components/TrackListHeader";
@@ -40,14 +42,17 @@ const ArtistAlbumCard = memo(function ArtistAlbumCard({ album }) {
           <img src={getCoverUrl(album.coverArt, 300)} alt={`${album.name} cover`} loading="lazy" decoding="async" />
         ) : <div className="album-cover-placeholder">♪</div>}
       </div>
-      <div className="album-title">{album.name}</div>
+      <div className="album-title search-album-title">
+        <span className="search-album-title-text">{album.name}</span>
+        <InLibraryBadge visible={album.source?.kind === "external" && album.inLibrary} />
+      </div>
       {album.year && <div className="album-artist">{album.year}</div>}
-      {album.source?.kind === "external" && (
+      {album.source?.kind === "external" && !album.inLibrary && (
         <div className="album-artist album-not-downloaded">Not downloaded</div>
       )}
     </Link>
   );
-}, (previous, next) => ["id", "name", "coverArt", "year"].every(
+}, (previous, next) => ["id", "name", "coverArt", "year", "inLibrary"].every(
   (field) => previous.album[field] === next.album[field]
 ) && previous.album.source?.kind === next.album.source?.kind);
 
@@ -76,6 +81,27 @@ function Artist() {
 
   const [albums, setAlbums] =
     useState([]);
+  const externalAlbumIds = albums.filter((album) => album.source?.kind === "external")
+    .map((album) => album.id).join("|");
+
+  useEffect(() => {
+    const candidates = albums.filter((album) => album.source?.kind === "external");
+    if (candidates.length === 0) return undefined;
+    let cancelled = false;
+    matchLibraryItems(candidates.map((album) => ({
+      id: album.id, type: "album", title: album.name, artist: album.artist || artist?.name || "",
+    }))).then((matches) => {
+      if (cancelled) return;
+      const byId = new Map(matches.map((match) => [match.id, match]));
+      setAlbums((current) => current.map((album) => {
+        const match = byId.get(album.id);
+        return match ? { ...album, inLibrary: match.inLibrary, localAlbumId: match.localAlbumId } : album;
+      }));
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  // The ID set changes only when a new discography arrives, not when badges update.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalAlbumIds, artist?.name]);
 
   const [songs, setSongs] =
     useState([]);

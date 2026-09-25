@@ -10,6 +10,7 @@ import {
   getStreamUrl,
   getTrackLyrics,
   login,
+  matchLibraryItems,
   recordRecentlyPlayed,
   searchNavidrome,
 } from "./musicdeck";
@@ -299,6 +300,21 @@ test("search adapts provider-neutral groups while retaining legacy arrays", asyn
   });
 });
 
+
+test("library match requests are bounded and preserve all batch responses", async () => {
+  global.fetch.mockImplementation(async (_path, options) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ matches: JSON.parse(options.body).items.map((item) => ({ id: item.id, inLibrary: true })) }),
+  }));
+  const items = Array.from({ length: 101 }, (_, index) => ({
+    id: `album-${index}`, type: "album", title: "Album", artist: "Artist",
+  }));
+  expect(await matchLibraryItems(items)).toHaveLength(101);
+  expect(global.fetch).toHaveBeenCalledTimes(2);
+  expect(JSON.parse(global.fetch.mock.calls[0][1].body).items).toHaveLength(100);
+  expect(JSON.parse(global.fetch.mock.calls[1][1].body).items).toHaveLength(1);
+});
 
 test("stream and artwork URLs never include backend credentials", () => {
   expect(getStreamUrl("track-1")).toBe("/api/tracks/track-1/stream");

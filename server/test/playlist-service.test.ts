@@ -64,6 +64,40 @@ describe("MusicDeck-owned playlists", () => {
     expect(detail.json().playlist.ownerUserId).toBeTruthy();
   });
 
+  test("stores the optional description of a blank playlist", async () => {
+    await setup();
+    const { cookie } = await login(current!.app);
+    const response = await current!.app.inject({
+      method: "POST", url: "/api/playlists", headers: { cookie },
+      payload: { name: "Quiet Hours", description: "After midnight" },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(response.json().playlist.description).toBe("After midnight");
+  });
+
+  test("adopts a scanned provider playlist without creating a duplicate", async () => {
+    const backend = createFakeBackend({
+      getPlaylist: vi.fn(async (id: string) => ({
+        id, providerId: id, name: "Spotify import", description: null,
+        artworkId: null, artworkUrl: null, songCount: 1,
+        tracks: [track("new-track")],
+      })),
+    });
+    await setup(backend);
+    const { cookie } = await login(current!.app);
+    const user = current!.db.prepare("SELECT * FROM users WHERE username = ?").get("admin") as any;
+    const playlist = await current!.playlists.adoptProviderPlaylist("nav-import-1", user, "Road Trip");
+
+    expect(playlist.name).toBe("Road Trip");
+    expect(playlist.songCount).toBe(1);
+    expect(backend.createPlaylist).not.toHaveBeenCalled();
+    const response = await current!.app.inject({
+      method: "GET", url: `/api/playlists/${playlist.id}`, headers: { cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().playlist).toMatchObject({ name: "Road Trip", songCount: 1 });
+  });
+
   test("updates name and description", async () => {
     await setup();
     const { cookie, playlistId } = await createPlaylistViaApi();

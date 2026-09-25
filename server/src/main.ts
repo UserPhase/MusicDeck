@@ -6,6 +6,7 @@ import { openDatabase } from "./db/database.js";
 import { buildServer } from "./server.js";
 import { CatalogService } from "./domain/catalog.js";
 import { PlaylistService } from "./domain/playlist-service.js";
+import { SpotifyPlaylistImportService } from "./domain/spotify-playlist-import.js";
 import { LibraryService } from "./domain/library.js";
 import { SourceResolver } from "./domain/source-resolver.js";
 import { SourcePipelineRegistry } from "./domain/source-discovery.js";
@@ -90,6 +91,7 @@ async function start() {
   await plugins.register(createMusicBrainzPlugin());
   await plugins.register(createExternalArtworkPlugin());
   await plugins.register(createSpotDLDownloaderPlugin(spotdlAdapter));
+  const spotifyPlaylistImport = new SpotifyPlaylistImportService(backend, playlists, spotdlAdapter, config.musicRoot, undefined, config.spotifyImportSubdir);
   for (const manifest of plugins.loadInstalledCustomPlugins()) {
     try {
       await plugins.register({ manifest }, "third-party");
@@ -97,7 +99,7 @@ async function start() {
       console.error(`Failed to rehydrate custom plugin ${manifest.id}`, error);
     }
   }
-  const app = await buildServer({ config, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis: new SilenceAnalysisService(db, sourceResolver) });
+  const app = await buildServer({ config, db, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis: new SilenceAnalysisService(db, sourceResolver) });
 
   await app.listen({
     host: config.host,

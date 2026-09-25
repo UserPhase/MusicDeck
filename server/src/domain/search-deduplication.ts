@@ -61,6 +61,9 @@ function mergeResult(current: UnifiedSearchResult, incoming: UnifiedSearchResult
     source: mergeSources(current.source, incoming.source),
     availability: mergeAvailability(current.availability, incoming.availability),
     metadata: { ...secondary.metadata, ...primary.metadata },
+    inLibrary: Boolean(primary.inLibrary || secondary.inLibrary),
+    localTrackId: primary.localTrackId || secondary.localTrackId,
+    localAlbumId: primary.localAlbumId || secondary.localAlbumId,
     identity: deriveCanonicalIdentity(current),
   } satisfies UnifiedSearchResult;
 }

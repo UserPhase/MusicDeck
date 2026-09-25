@@ -19,6 +19,7 @@ import {
   getExplore,
   getRecommendations,
   searchNavidrome,
+  matchLibraryItems,
   setMediaFavorite,
 } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
@@ -38,6 +39,7 @@ jest.mock("../api/musicdeck", () => ({
   getExplore: jest.fn(),
   getRecommendations: jest.fn(async () => ({ sections: [], degraded: false })),
   searchNavidrome: jest.fn(),
+  matchLibraryItems: jest.fn(async () => []),
   setMediaFavorite: jest.fn(),
 }));
 
@@ -76,6 +78,7 @@ beforeEach(() => {
   getMusicBrainzArtistPortrait.mockResolvedValue(null);
   getTrackArtistBiography.mockResolvedValue(null);
   getWikipediaBiography.mockResolvedValue(null);
+  matchLibraryItems.mockResolvedValue([]);
   getArtistOverview.mockImplementation(async (id) => {
     const [artist, tracks] = await Promise.all([getArtist(id), getArtistTracks(id)]);
     const ownAlbums = (artist.album || []).filter((album) => !album.artistId || album.artistId === id);
@@ -138,6 +141,7 @@ test("renders an external album in the shared album page", async () => {
 });
 
 test("renders an external artist in the shared artist page and links albums", async () => {
+  matchLibraryItems.mockResolvedValue([{ id: "external_itunes_album_10", inLibrary: true, localAlbumId: "local-album" }]);
   getArtistTracks.mockResolvedValue([{
     id: "external_itunes_30",
     title: "External Song",
@@ -186,6 +190,8 @@ test("renders an external artist in the shared artist page and links albums", as
     "/album/external_itunes_album_10"
   );
   expect(screen.getByText("External Song")).toBeInTheDocument();
+  expect(await screen.findByLabelText("In your library")).toBeInTheDocument();
+  expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
 });
 
 test("shows the complete catalog tracklist for an album with only some tracks downloaded", async () => {

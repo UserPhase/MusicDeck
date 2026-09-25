@@ -56,7 +56,7 @@ function CommandPalette({ isOpen, onClose, onToggleTheme }) {
     const timeout = window.setTimeout(async () => {
       setIsSearching(true);
       try {
-        const result = await searchNavidrome(trimmedQuery);
+        const result = await searchNavidrome(trimmedQuery, { mode: "library", phase: "local" });
         if (cancelled) return;
 
         setSearchResults([

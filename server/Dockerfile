@@ -23,6 +23,7 @@ WORKDIR /app
 # install Python, FFmpeg, or spotDL on the Docker host:
 #   - python3 + pip: spotDL runtime
 #   - ffmpeg: audio conversion/tagging performed by spotDL
+#   - Deno: yt-dlp's YouTube JavaScript challenge runtime
 #   - ca-certificates: TLS for provider/API/download requests
 #
 # spotDL is installed into a dedicated virtualenv at /opt/spotdl so it cannot
@@ -32,6 +33,7 @@ WORKDIR /app
 ENV SPOTDL_HOME=/opt/spotdl
 ENV PATH="${SPOTDL_HOME}/bin:${PATH}"
 ENV HOME=/app/home
+COPY requirements.txt ./requirements.txt
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -43,7 +45,7 @@ RUN apt-get update \
     ca-certificates \
   && python3 -m venv "${SPOTDL_HOME}" \
   && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir --upgrade pip \
-  && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir spotdl \
+  && "${SPOTDL_HOME}/bin/pip" install --no-cache-dir -r requirements.txt \
   && apt-get purge -y --auto-remove python3-pip \
   && rm -rf /var/lib/apt/lists/*
 
@@ -51,6 +53,12 @@ RUN groupadd --system musicdeck \
   && useradd --system --gid musicdeck --home-dir /app/home musicdeck \
   && mkdir -p /app/home /app/data /app/config /app/cache \
   && chown -R musicdeck:musicdeck /app
+
+# Install Deno under the same HOME used by the non-root runtime. spotDL finds
+# that local binary and passes its path to yt-dlp; no host installation needed.
+RUN gosu musicdeck spotdl --download-deno \
+  && gosu musicdeck python -c "from spotdl.utils.deno import is_deno_installed; assert is_deno_installed()" \
+  && ffmpeg -version > /dev/null
 
 COPY package*.json ./
 COPY --from=deps /app/node_modules ./node_modules

@@ -26,7 +26,7 @@ MusicDeck runs **exactly one** backend, chosen with `MUSIC_BACKEND`
 - A text editor
 
 You do **not** need the MusicDeck source repository, and you do **not** need
-Node.js, Python, FFmpeg, or spotDL installed on the host — the published
+Node.js, Python, FFmpeg, Deno, or spotDL installed on the host — the published
 `musicdeck-server` image already contains them.
 
 ## Files
@@ -212,8 +212,11 @@ Runs the compiled TypeScript MusicDeck API server.
   playlist ownership — all isolated per user (see "Multi-User Accounts")
 - Reads the selected backend's credentials from environment variables
 - Bundles the full acquisition runtime so the host needs nothing installed:
-  Node.js 24, Python 3, FFmpeg/ffprobe, and spotDL (in a dedicated
-  virtualenv at `/opt/spotdl`)
+  Node.js 24, Python 3, FFmpeg/ffprobe, Deno, and spotDL (in a dedicated
+  virtualenv at `/opt/spotdl`). On startup it checks for spotDL, yt-dlp, and
+  ytmusicapi updates at most once per day, with a 60-second limit; network
+  failures leave the image's installed versions in use. Set
+  `SPOTDL_AUTO_UPDATE=0` in `.env` to disable this check.
 
 ### navidrome
 
@@ -464,9 +467,9 @@ npm start
 
 React development uses `http://localhost:3000` and proxies `/api/*` to `http://localhost:4534`.
 
-Note: the Docker image bundles Python, FFmpeg, and spotDL, but a bare
+Note: the Docker image bundles Python, FFmpeg, Deno, and spotDL, but a bare
 `npm run dev` on the host does not. To exercise the acquisition/downloader
-pipeline locally you must install `python3`, `ffmpeg`, and `spotdl` yourself,
+pipeline locally you must install `python3`, `ffmpeg`, `deno`, and `spotdl` yourself,
 or develop against the containerized stack
 (`docker compose -f docker-compose.dev.yml up -d --build`).
 
@@ -516,9 +519,11 @@ Common startup issues:
 - `Set MUSIC_ROOT in .env` (Compose variable error): `MUSIC_ROOT` has no default and must point at a real, existing absolute folder. `NAVIDROME_DATA`/`JELLYFIN_CONFIG`/`JELLYFIN_CACHE` are optional and default to folders created next to `docker-compose.yml` if omitted.
 - Cannot find music: check the `MUSIC_ROOT` host path in `.env` and host file/folder permissions.
 - Downloads via On-Demand Library/spotDL complete successfully but tracks never appear in the library or play: MusicDeck Server and the backend are not sharing the same music folder. In Docker Compose both containers already mount `$MUSIC_ROOT`; for local/manual development, set `MUSICDECK_MUSIC_ROOT` to a path the backend's music folder also resolves to.
-- `spotdl: not found` or FFmpeg errors during acquisition: expected only for
-  local `npm run dev` runs. The Docker image bundles both; verify inside the
-  container with `docker exec musicdeck-server spotdl --version` and
-  `docker exec musicdeck-server ffmpeg -version`.
+- `spotdl: not found`, missing Deno, or FFmpeg errors during acquisition:
+  expected only for local `npm run dev` runs. The Docker image bundles all
+  three; verify inside the container with `docker exec musicdeck-server
+  spotdl --version`, `docker exec musicdeck-server ffmpeg -version`, and
+  `docker exec musicdeck-server python -c "from spotdl.utils.deno import
+  is_deno_installed; print(is_deno_installed())"`.
 
 MusicDeck does not log Navidrome passwords, session secrets, tokens, or authenticated URLs.

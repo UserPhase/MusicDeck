@@ -47,6 +47,9 @@ export type UnifiedSearchResult = {
   availability: Availability | null;
   identity?: CanonicalIdentity;
   providers?: SearchProviderKind[];
+  inLibrary?: boolean;
+  localTrackId?: string;
+  localAlbumId?: string;
   metadata: {
     durationSeconds?: number | null;
     year?: number | null;
@@ -95,6 +98,8 @@ export function toTrackSearchResult(track: Track & { availability: Availability;
     album: track.albumName,
     artwork: artwork(track.artworkId, track.artworkUrl),
     provider: "library",
+    inLibrary: true,
+    localTrackId: track.id,
     source: source(track.availability, track.sources),
     availability: track.availability,
     metadata: {
@@ -116,6 +121,8 @@ export function toAlbumSearchResult(album: Album & { availability: Availability;
     album: null,
     artwork: artwork(album.artworkId, album.artworkUrl),
     provider: "library",
+    inLibrary: true,
+    localAlbumId: album.id,
     source: source(album.availability, album.sources),
     availability: album.availability,
     metadata: {
