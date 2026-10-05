@@ -24,9 +24,11 @@ import {
 } from "../context/AuthContext";
 
 import DownloadsMenu from "./DownloadsMenu";
+import { useImport } from "../context/ImportContext";
 
 
 function Topbar() {
+  const { job: importJob, isMinimized, openProgress } = useImport();
 
   const navigate = useNavigate();
 
@@ -608,6 +610,12 @@ function Topbar() {
         ref={accountRef}
       >
 
+        {user && isMinimized && (importJob?.status === "queued" || importJob?.status === "running") && (
+          <button type="button" className="topbar-import-status" onClick={openProgress} aria-label="Show playlist import progress">
+            <span className="playlist-modal-spinner" aria-hidden="true" />
+            <span>Importing 1 Playlist...</span>
+          </button>
+        )}
         {user && <DownloadsMenu />}
 
         {user ? (

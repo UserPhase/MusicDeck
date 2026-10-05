@@ -1,6 +1,6 @@
 import { usePlayer } from "../context/PlayerContext";
 
-function TrackLikeButton({ song, variant = "icon" }) {
+function TrackLikeButton({ song, variant = "icon", disabled = false, disabledHint = "" }) {
   const { likedSongIds, toggleLikeSong } = usePlayer();
 
   if (!song?.id) return null;
@@ -15,9 +15,11 @@ function TrackLikeButton({ song, variant = "icon" }) {
         className={`playlist-menu-item track-context-menu-item${isLiked ? " is-liked" : ""}`}
         aria-label={`${isLiked ? "Remove" : "Add"} ${song.title || "track"} ${isLiked ? "from" : "to"} liked songs`}
         aria-checked={Boolean(isLiked)}
+        disabled={disabled}
+        title={disabled ? disabledHint : undefined}
         onClick={(event) => {
           event.stopPropagation();
-          toggleLikeSong(song);
+          if (!disabled) toggleLikeSong(song);
         }}
       >
         <span className="track-context-menu-icon" aria-hidden="true">{isLiked ? "♥" : "♡"}</span>
@@ -35,10 +37,11 @@ function TrackLikeButton({ song, variant = "icon" }) {
       className={`track-like${isLiked ? " liked" : ""}`}
       aria-label={`${isLiked ? "Remove" : "Add"} ${song.title || "track"} ${isLiked ? "from" : "to"} liked songs`}
       aria-pressed={Boolean(isLiked)}
+      disabled={disabled}
       title={isLiked ? "Remove from liked songs" : "Add to liked songs"}
       onClick={(event) => {
         event.stopPropagation();
-        toggleLikeSong(song);
+        if (!disabled) toggleLikeSong(song);
       }}
     >
       {isLiked ? "♥" : "♡"}

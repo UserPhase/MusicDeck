@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 
 import Sidebar, { isSpotifyPlaylistUrl } from "./Sidebar";
+import { ImportProvider, useImport } from "../context/ImportContext";
 
 import {
   getPlaylists,
@@ -25,6 +26,14 @@ jest.mock("../api/playlists", () => ({
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(),
 }));
+jest.mock("../context/AuthContext", () => ({ useAuth: () => ({ session: { id: "test-user" } }) }));
+
+function ImportStatusButton() {
+  const { job, isMinimized, openProgress } = useImport();
+  return isMinimized && job?.status === "running"
+    ? <button type="button" onClick={openProgress}>Show playlist import progress</button>
+    : null;
+}
 
 
 function renderSidebar(playlists) {
@@ -40,13 +49,16 @@ function renderSidebar(playlists) {
 
   return render(
     <MemoryRouter>
-      <Sidebar />
-      <LocationProbe />
+      <ImportProvider>
+        <Sidebar />
+        <ImportStatusButton />
+        <LocationProbe />
+      </ImportProvider>
     </MemoryRouter>
   );
 }
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => { jest.clearAllMocks(); sessionStorage.clear(); });
 
 
 test("sidebar playlist entries render the resolved playlist artwork", async () => {
@@ -102,6 +114,7 @@ test("both sidebar actions open the playlist path chooser", async () => {
   await screen.findByText("Add playlist");
   fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[0]);
   expect(screen.getByRole("dialog", { name: "Create New Playlist" })).toBeInTheDocument();
+  expect(screen.getByRole("dialog").closest(".playlist-modal-backdrop").parentElement).toBe(document.body);
   expect(screen.getByRole("button", { name: /blank playlist/i })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /import spotify playlist/i })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Close playlist dialog" }));
@@ -177,10 +190,32 @@ test("keeps the dialog loading while the import job is queued and polls for comp
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
 
-  expect(screen.getByText(/Fetching playlist details and queueing download/i)).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Importing…" })).toBeDisabled();
+  expect(await screen.findByRole("dialog", { name: "Importing Playlist..." })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Run in Background" })).toBeEnabled();
   await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-2"), { timeout: 3000 });
   await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_two"));
+});
+
+test("shows live track progress and reopens a minimized import", async () => {
+  startSpotifyPlaylistImport.mockResolvedValue({ id: "job-live", status: "running", stage: "downloading", expectedCount: 12, downloadedCount: 1, currentTrack: 2, currentTrackName: "2hollis - crush" });
+  getSpotifyPlaylistImport.mockResolvedValue({ id: "job-live", status: "running", stage: "downloading", expectedCount: 12, downloadedCount: 2, currentTrack: 3, currentTrackName: "Next song" });
+  renderSidebar([]);
+  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
+  fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  expect(await screen.findByText("Downloading track 2 of 12")).toBeInTheDocument();
+  expect(screen.getByText("Fetching: 2hollis - crush")).toBeInTheDocument();
+  expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
+  fireEvent.click(screen.getByRole("button", { name: "Run in Background" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByRole("status")).toHaveTextContent("Importing playlist in the background...");
+  await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-live"), { timeout: 3000 });
+  fireEvent.click(screen.getByRole("button", { name: "Show playlist import progress" }));
+  expect(screen.getByRole("dialog", { name: "Importing Playlist..." })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Close playlist dialog" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByRole("button", { name: "Show playlist import progress" })).toBeInTheDocument();
 });
 
 test("keeps the import form available for retry after a backend error", async () => {

@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
-import AlbumCard from "../components/AlbumCard";
-import ArtistAvatar from "../components/ArtistAvatar";
-import { getAlbum, getAlbums, getArtistTracks, getArtists, getCoverUrl, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
+import { DiscoveryArtistCard, DiscoveryAlbumCard } from "../components/DiscoveryCards";
+import TrackRow from "../components/TrackRow";
+import { getAlbum, getAlbums, getArtists, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
-import { formatDuration } from "../utils/formatDuration";
+import { toUnifiedTrack } from "../types/track";
+import useTrackPlaylistMenu from "../hooks/useTrackPlaylistMenu";
 
 const HERO_LIMIT = 6;
 const ALBUM_LIMIT = 7;
@@ -14,22 +15,6 @@ const TRACK_LIMIT = 6;
 
 function displayName(session) {
   return session?.displayName || session?.username || "there";
-}
-
-function trackTitle(track) {
-  return track?.title || track?.name || "Unknown track";
-}
-
-function trackArtist(track) {
-  return track?.artist || track?.metadata?.artist || "Unknown artist";
-}
-
-function trackDuration(track) {
-  return track?.duration || track?.metadata?.durationSeconds;
-}
-
-function artistName(artist) {
-  return artist?.name || artist?.title || "Unknown artist";
 }
 
 function recommendationItems(result) {
@@ -57,14 +42,6 @@ function SectionHeader({ id, title, to, action = "See all" }) {
   );
 }
 
-function Artwork({ cover, className = "" }) {
-  return cover ? (
-    <img className={className} src={cover} alt="" />
-  ) : (
-    <div className={`home-artwork-placeholder ${className}`} aria-hidden="true">♫</div>
-  );
-}
-
 function SectionSkeleton({ variant, count }) {
   return (
     <div className={`home-skeleton-grid home-skeleton-grid--${variant}`} aria-label="Loading section">
@@ -73,71 +50,39 @@ function SectionSkeleton({ variant, count }) {
   );
 }
 
-function ContinueCard({ song, onPlay }) {
-  const title = trackTitle(song);
-  return (
-    <button className="home-continue-card" type="button" onClick={() => onPlay(song)}>
-      <Artwork cover={getCoverUrl(song.coverArt, 128)} className="home-continue-artwork" />
-      <span>{title}</span>
-      <i aria-hidden="true">▶</i>
-    </button>
-  );
+function HomeTracks({ tracks, onPlay, trackMenu, listId, className = "", showArtwork = false }) {
+  return <div className={`home-track-list track-list--compact ${className}`} role="table" aria-label="Songs">
+    {tracks.map((rawSong, index) => {
+      const song = toUnifiedTrack(rawSong, "home");
+      return <TrackRow key={`${song.id}-${index}`} song={song} index={index} showAlbum={false} showArtwork={showArtwork}
+        onPlay={onPlay} onToggleMenu={(selected, event) => trackMenu.toggleMenu(selected, event, listId)}
+        menu={trackMenu.isOpen(song, listId) ? trackMenu.renderMenu(song) : null} />;
+    })}
+  </div>;
 }
 
-function CompactTrackRow({ song, onPlay }) {
-  const title = trackTitle(song);
-  return (
-    <button className="home-track-row" type="button" onClick={() => onPlay(song)} aria-label={`Play ${title}`}>
-      <Artwork cover={getCoverUrl(song.coverArt, 80)} className="home-track-artwork" />
-      <span className="home-track-copy">
-        <strong>{title}</strong>
-        <small>{trackArtist(song)}</small>
-      </span>
-      <time>{formatDuration(trackDuration(song))}</time>
-    </button>
-  );
-}
-
-function CompactTrackList({ title, id, tracks, loading, error, onPlay, to }) {
+function CompactTrackList({ title, id, tracks, loading, error, onPlay, to, trackMenu }) {
   return (
     <section className="home-track-panel" aria-labelledby={id}>
       <SectionHeader id={id} title={title} to={to} />
       {loading ? <SectionSkeleton variant="tracks" count={TRACK_LIMIT} /> : error ? (
         <p className="home-section-state">{error}</p>
       ) : tracks.length ? (
-        <div className="home-track-list">
-          {tracks.map((song) => <CompactTrackRow key={song.id} song={song} onPlay={onPlay} />)}
-        </div>
+        <HomeTracks tracks={tracks} onPlay={onPlay} trackMenu={trackMenu} listId={id} />
       ) : <p className="home-section-state">Nothing to show yet.</p>}
     </section>
   );
 }
 
-function ArtistCard({ artist, onPlay }) {
-  const name = artistName(artist);
-
-  return (
-    <article className="home-artist-card">
-      <div className="home-artist-avatar">
-        <ArtistAvatar artist={artist} allowAlbumTileFallback />
-        <button type="button" className="home-artist-play" onClick={() => onPlay(artist)} aria-label={`Play ${name}`}>
-          ▶
-        </button>
-      </div>
-      {artist.id ? <Link to={`/artist/${artist.id}`}>{name}</Link> : <span>{name}</span>}
-    </article>
-  );
-}
-
-function ArtistShelf({ id, title, artists, loading, error, onPlay, to }) {
+function ArtistShelf({ id, title, artists, loading, error, to }) {
   return (
     <section className="home-section" aria-labelledby={id}>
       <SectionHeader id={id} title={title} to={to} />
       {loading ? <SectionSkeleton variant="artists" count={ALBUM_LIMIT} /> : error ? (
         <p className="home-section-state">{error}</p>
       ) : artists.length ? (
-        <div className="home-artist-row">
-          {artists.map((artist) => <ArtistCard key={artist.id} artist={artist} onPlay={onPlay} />)}
+        <div className="explore-artist-row">
+          {artists.map((artist) => <DiscoveryArtistCard key={artist.id} artist={artist} />)}
         </div>
       ) : <p className="home-section-state">No artists to show yet.</p>}
     </section>
@@ -152,6 +97,8 @@ function Home() {
   const [discoverArtists, setDiscoverArtists] = useState({ items: [], loading: true, error: null });
   const [unexploredArtists, setUnexploredArtists] = useState({ items: [], loading: true, error: null });
   const [deepCuts, setDeepCuts] = useState({ items: [], loading: true, error: null });
+  const [actionMessage, setActionMessage] = useState("");
+  const trackMenu = useTrackPlaylistMenu(setActionMessage);
   const { playSong, playQueue, recentlyPlayed } = usePlayer();
   const { session } = useAuth();
 
@@ -162,15 +109,6 @@ function Home() {
       if (albumSongs.length) playQueue(albumSongs, 0);
     } catch (error) {
       console.error("Could not play album:", error);
-    }
-  }
-
-  async function playArtist(artist) {
-    try {
-      const tracks = await getArtistTracks(artist.id);
-      if (tracks.length) playQueue(tracks, 0);
-    } catch (error) {
-      console.error("Could not play artist:", error);
     }
   }
 
@@ -220,12 +158,12 @@ function Home() {
         </div>
       </section>
 
+      {actionMessage && <p className="home-action-message" role="status">{actionMessage}</p>}
+
       <section className="home-section home-continue" aria-labelledby="continue-listening-title">
         <SectionHeader id="continue-listening-title" title="Continue Listening" />
         {!recentlyPlayed.length && recentTracks.loading ? <SectionSkeleton variant="tracks" count={HERO_LIMIT} /> : continueTracks.length ? (
-          <div className="home-continue-grid">
-            {continueTracks.map((song) => <ContinueCard key={song.id} song={song} onPlay={playSong} />)}
-          </div>
+          <HomeTracks tracks={continueTracks} onPlay={playSong} trackMenu={trackMenu} listId="continue" className="home-continue-grid" showArtwork />
         ) : <p className="home-section-state">Start listening and your recent music will appear here.</p>}
       </section>
 
@@ -234,19 +172,19 @@ function Home() {
         {recentAlbums.loading ? <SectionSkeleton variant="albums" count={ALBUM_LIMIT} /> : recentAlbums.error ? (
           <p className="home-section-state">{recentAlbums.error}</p>
         ) : (
-          <div className="home-album-row">
+          <div className="explore-album-row">
             {recentAlbums.items.map((album) => (
-              <AlbumCard key={album.id} title={album.name || album.title} artist={album.artist || "Unknown artist"} cover={getCoverUrl(album.coverArt, 320)} availability={album.availability} onClick={() => playAlbum(album)} />
+              <DiscoveryAlbumCard key={album.id} album={album} onPlay={playAlbum} />
             ))}
           </div>
         )}
       </section>
 
-      <ArtistShelf id="discover-artists-title" title="Discover Artists" artists={discoverArtists.items} loading={discoverArtists.loading} error={discoverArtists.error} onPlay={playArtist} to="/explore" />
+      <ArtistShelf id="discover-artists-title" title="Discover Artists" artists={discoverArtists.items} loading={discoverArtists.loading} error={discoverArtists.error} to="/explore" />
 
       <section className="home-section home-discovery-split" aria-label="Track discovery">
-        <CompactTrackList id="recent-tracks-title" title="Recently Added Songs" tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error} onPlay={playSong} to="/library/tracks" />
-        <CompactTrackList id="discover-tracks-title" title="Discover Tracks" tracks={discoverTracks.items} loading={discoverTracks.loading} error={discoverTracks.error} onPlay={playSong} to="/explore" />
+        <CompactTrackList id="recent-tracks-title" title="Recently Added Songs" tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error} onPlay={playSong} to="/library/tracks" trackMenu={trackMenu} />
+        <CompactTrackList id="discover-tracks-title" title="Discover Tracks" tracks={discoverTracks.items} loading={discoverTracks.loading} error={discoverTracks.error} onPlay={playSong} to="/explore" trackMenu={trackMenu} />
       </section>
 
       <section className="home-section" aria-labelledby="discover-albums-title">
@@ -254,30 +192,22 @@ function Home() {
         {discoverAlbums.loading ? <SectionSkeleton variant="albums" count={ALBUM_LIMIT} /> : discoverAlbums.error ? (
           <p className="home-section-state">{discoverAlbums.error}</p>
         ) : (
-          <div className="home-album-row">
+          <div className="explore-album-row">
             {discoverAlbums.items.map((album) => (
-              <AlbumCard key={album.id} title={album.title || album.name} artist={album.artist || "Unknown artist"} cover={getCoverUrl(album.coverArt, 320)} availability={album.availability} onClick={() => playAlbum(album)} />
+              <DiscoveryAlbumCard key={album.id} album={album} onPlay={playAlbum} />
             ))}
           </div>
         )}
       </section>
 
-      <ArtistShelf id="unexplored-artists-title" title="Unexplored Artists" artists={unexploredArtists.items} loading={unexploredArtists.loading} error={unexploredArtists.error} onPlay={playArtist} to="/library/artists" />
+      <ArtistShelf id="unexplored-artists-title" title="Unexplored Artists" artists={unexploredArtists.items} loading={unexploredArtists.loading} error={unexploredArtists.error} to="/library/artists" />
 
       <section className="home-section" aria-labelledby="deep-cuts-title">
         <SectionHeader id="deep-cuts-title" title="Try Something Different" to="/library/tracks" action="More tracks" />
         {deepCuts.loading ? <SectionSkeleton variant="deep-cuts" count={TRACK_LIMIT} /> : deepCuts.error ? (
           <p className="home-section-state">{deepCuts.error}</p>
         ) : deepCuts.items.length ? (
-          <div className="home-deep-cuts">
-            {deepCuts.items.map((song) => (
-              <button className="home-deep-cut" type="button" key={song.id} onClick={() => playSong(song)}>
-                <Artwork cover={getCoverUrl(song.coverArt, 320)} className="home-deep-cut-artwork" />
-                <span><strong>{trackTitle(song)}</strong><small>{trackArtist(song)}</small></span>
-                <i aria-hidden="true">▶</i>
-              </button>
-            ))}
-          </div>
+          <HomeTracks tracks={deepCuts.items} onPlay={playSong} trackMenu={trackMenu} listId="deep-cuts" className="home-deep-cuts" />
         ) : <p className="home-section-state">Keep listening to uncover deep cuts from your library.</p>}
       </section>
     </div>

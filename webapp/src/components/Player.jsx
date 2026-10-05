@@ -1,6 +1,5 @@
-import {
-  Link,
-} from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 import {
   usePlayer,
@@ -8,6 +7,7 @@ import {
 
 import {
   getCoverUrl,
+  createAcquisition,
 } from "../api/musicdeck";
 
 import AudioBadge from "./AudioBadge";
@@ -47,6 +47,8 @@ function Player({
   onToggleQueueSidebar,
 }) {
 
+  const [importState, setImportState] = useState("idle");
+
   const {
     currentSong,
     isPlaying,
@@ -78,6 +80,10 @@ function Player({
 
   } = usePlayer();
 
+  useEffect(() => {
+    setImportState("idle");
+  }, [currentSong?.id]);
+
 
   /*
    * PROGRESS
@@ -90,6 +96,30 @@ function Player({
           (currentTime / duration) * 100
         )
       : 0;
+
+  async function importPreviewTrack() {
+    if (!currentSong || importState === "loading") return;
+    setImportState("loading");
+    try {
+      await createAcquisition({
+        result: {
+          id: currentSong.id,
+          type: "track",
+          title: currentSong.title || "",
+          artist: currentSong.artist || "",
+          album: currentSong.album || "",
+          provider: currentSong.provider || "external",
+          source: currentSong.source || { kind: "external", count: 0 },
+          metadata: currentSong.metadata || {},
+        },
+        trackId: currentSong.id,
+        sourceProvider: "spotdl",
+      });
+      setImportState("queued");
+    } catch {
+      setImportState("error");
+    }
+  }
 
 
   return (
@@ -140,9 +170,11 @@ function Player({
 
           <div className="now-title">
 
-            {currentSong
-              ? currentSong.title
-              : "Nothing playing"}
+            <span className="now-title-text">
+              {currentSong
+                ? currentSong.title
+                : "Nothing playing"}
+            </span>
 
 
             {currentSong && (
@@ -167,6 +199,17 @@ function Player({
                     : undefined
                 }
               />
+            )}
+
+            {isPreview && currentSong && (
+              <button
+                type="button"
+                className="now-preview-import"
+                onClick={importPreviewTrack}
+                disabled={importState === "loading" || importState === "queued"}
+              >
+                {importState === "loading" ? "Adding…" : importState === "queued" ? "Import queued" : importState === "error" ? "Retry import" : "Import full song"}
+              </button>
             )}
 
 

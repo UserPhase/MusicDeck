@@ -4,6 +4,9 @@
 .homebutton { width: 44px; height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: center; background: var(--control-surface); border-radius: 50%; color: var(--text-secondary); text-decoration: none; transition: background 0.15s ease, border-color 0.15s ease; }
 .homebutton:hover { background: var(--card); border-color: var(--border-hover); }
 .profile { position: relative; justify-self: end; display: flex; align-items: center; gap: 10px; padding: 5px 12px 5px 6px; background: var(--control-surface); border: 1px solid transparent; border-radius: 22px; color: var(--text-secondary); }
+.topbar-import-status { display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .6rem; border: 1px solid rgb(168 85 247 / 25%); border-radius: 1rem; background: rgb(168 85 247 / 9%); color: var(--text-secondary); font-size: .72rem; white-space: nowrap; cursor: pointer; }
+.topbar-import-status:hover { color: var(--text); background: rgb(168 85 247 / 16%); }
+.topbar-import-status:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
 .downloads-menu-toggle { position: relative; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: 50%; color: var(--text-secondary); cursor: pointer; transition: background 0.15s ease; }
 .downloads-menu-toggle:hover { background: var(--card-hover); }
 .downloads-menu-toggle:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
@@ -57,4 +60,5 @@
 	.search-wrapper, .search { width: 100%; max-width: none; }
 	.search input { min-width: 0; padding: 10px 14px; }
 	.profile { padding-right: 6px; }
+	.topbar-import-status span:last-child { display: none; }
 }

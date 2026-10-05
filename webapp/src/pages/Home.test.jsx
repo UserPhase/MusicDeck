@@ -5,6 +5,8 @@ import Home from "./Home";
 import { getAlbum, getAlbums, getArtistPortrait, getArtistTracks, getArtists, getCoverUrl, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
+import { toUnifiedTrack } from "../types/track";
+import { addSongToPlaylist, getPlaylists } from "../api/playlists";
 
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
@@ -19,6 +21,8 @@ jest.mock("../api/musicdeck", () => ({
 
 jest.mock("../context/AuthContext", () => ({ useAuth: jest.fn() }));
 jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
+jest.mock("../utils/downloadManager", () => ({ isDownloadedToDevice: async () => false, downloadToDevice: jest.fn() }));
+jest.mock("../api/playlists", () => ({ getPlaylists: jest.fn(), addSongToPlaylist: jest.fn() }));
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
@@ -38,6 +42,8 @@ function renderHome({ recentlyPlayed = [song], albums = [album], artists = [arti
   getArtistTracks.mockResolvedValue([song]);
   getRecommendations.mockResolvedValue({ sections: [{ id: "mix", items: recommendations }] });
   getAlbum.mockResolvedValue({ song: [song] });
+  getPlaylists.mockResolvedValue([{ id: "playlist-1", name: "Favorites" }]);
+  addSongToPlaylist.mockResolvedValue({ success: true });
 
   return render(<MemoryRouter><Home /></MemoryRouter>);
 }
@@ -64,23 +70,35 @@ test("renders the artist shelves and discovery sections with a personalized gree
   ].forEach((heading) => expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument());
 });
 
-test("plays an artist through its fetched tracks", async () => {
+test("opens artists using the same linked portrait card as Explore", async () => {
   renderHome();
   await waitForHome();
 
-  fireEvent.click(screen.getAllByRole("button", { name: /play daft punk/i })[0]);
-  await waitFor(() => {
-    expect(getArtistTracks).toHaveBeenCalledWith("artist-1");
-    expect(playQueue).toHaveBeenCalledWith([song], 0);
+  const section = screen.getByRole("heading", { name: "Discover Artists" }).closest("section");
+  const link = await waitFor(() => {
+    const card = section.querySelector(".explore-artist");
+    expect(card).toHaveAttribute("href", "/artist/artist-1");
+    return card;
   });
+  expect(link.querySelector(".explore-artist-image")).toBeInTheDocument();
+  expect(section.querySelector("button")).toBeNull();
 });
 
 test("plays a continued-listening track", async () => {
   renderHome();
   await waitForHome();
 
+  const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
+  expect(section.querySelector(".track-cover-art img")).toHaveAttribute("src", "/api/artwork/art-1");
+  expect(section.querySelector(".track-number-text")).toBeNull();
   fireEvent.click(screen.getAllByRole("button", { name: /digital love/i })[0]);
-  expect(playSong).toHaveBeenCalledWith(song);
+  expect(playSong).toHaveBeenCalledWith(toUnifiedTrack(song, "home"), 0);
+  fireEvent.click(screen.getAllByRole("button", { name: "More options for Digital Love" })[0]);
+  await screen.findByRole("menuitem", { name: "Favorites" });
+  expect(screen.getAllByRole("menu")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("menuitem", { name: "Favorites" }));
+  await waitFor(() => expect(addSongToPlaylist).toHaveBeenCalledWith("playlist-1", "track-1"));
+  expect(playSong).toHaveBeenCalledTimes(1);
 });
 
 test("plays an album through its fetched queue", async () => {
@@ -100,7 +118,7 @@ test("keeps the listening hero useful when history is empty", async () => {
 
   await waitFor(() => {
     const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
-    expect(section.querySelectorAll(".home-continue-card")).toHaveLength(1);
+    expect(section.querySelectorAll(".track")).toHaveLength(1);
   });
 });
 
@@ -116,7 +134,7 @@ test("ranks local discover albums and artists from listening-based recommendatio
   await waitFor(() => {
     const albumSection = screen.getByRole("heading", { name: "Discover Albums" }).closest("section");
     const artistSection = screen.getByRole("heading", { name: "Discover Artists" }).closest("section");
-    expect(albumSection.querySelector(".album-title")).toHaveTextContent("Homework");
-    expect(artistSection.querySelector(".home-artist-card a")).toHaveTextContent("Justice");
+    expect(albumSection.querySelector(".explore-card-name")).toHaveTextContent("Homework");
+    expect(artistSection.querySelector(".explore-artist")).toHaveTextContent("Justice");
   });
 });

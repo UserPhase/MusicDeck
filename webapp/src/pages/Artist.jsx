@@ -13,16 +13,20 @@ import {
 
 import {
   getCoverUrl,
-  matchLibraryItems,
+  createAcquisition,
 } from "../api/musicdeck";
-import { fetchArtistOverview } from "../api/artistOverviewQuery";
 import ArtistAvatar from "../components/ArtistAvatar";
 import ArtistBiography from "../components/ArtistBiography";
 import InLibraryBadge from "../components/InLibraryBadge";
 import { useArtistBiography } from "../hooks/useArtistBiography";
+import { useMergedAlbums } from "../hooks/useMergedAlbums";
+import { useArtistTopTracks } from "../hooks/useArtistTopTracks";
+import { useUniversalArtist } from "../hooks/useUniversalArtist";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
+import AlbumDeleteButton from "../components/AlbumDeleteButton";
+import { useServerDeletion } from "../context/ServerDeletionContext";
 
 import {
   getPlaylists,
@@ -33,10 +37,15 @@ import {
   usePlayer,
 } from "../context/PlayerContext";
 import { useAuth } from "../context/AuthContext";
+import UnifiedAlbumGrid from "../components/Artist/UnifiedAlbumGrid";
 
-const ArtistAlbumCard = memo(function ArtistAlbumCard({ album }) {
+const ArtistAlbumCard = memo(function ArtistAlbumCard({ album, artistRouteId }) {
+  const deletion = useServerDeletion();
+  if (deletion?.deletedAlbums.has(String(album.id))) return null;
+  const external = album.source?.kind === "external";
   return (
-    <Link to={`/album/${album.id}`} className="album">
+    <div className="album-card-shell">
+    <Link to={external ? `/artist/${encodeURIComponent(artistRouteId)}/album/${album.id}` : `/album/${album.id}`} className="album">
       <div className="album-cover">
         {album.coverArt ? (
           <img src={getCoverUrl(album.coverArt, 300)} alt={`${album.name} cover`} loading="lazy" decoding="async" />
@@ -51,6 +60,8 @@ const ArtistAlbumCard = memo(function ArtistAlbumCard({ album }) {
         <div className="album-artist album-not-downloaded">Not downloaded</div>
       )}
     </Link>
+    {!external && <AlbumDeleteButton album={album} />}
+    </div>
   );
 }, (previous, next) => ["id", "name", "coverArt", "year", "inLibrary"].every(
   (field) => previous.album[field] === next.album[field]
@@ -74,6 +85,8 @@ function Artist() {
 
   const { id } = useParams();
   const userId = useAuth()?.session?.id;
+  const universalArtist = useUniversalArtist(id, userId);
+  const topTracksQuery = useArtistTopTracks(universalArtist.apiId, userId);
 
 
   const [artist, setArtist] =
@@ -81,27 +94,7 @@ function Artist() {
 
   const [albums, setAlbums] =
     useState([]);
-  const externalAlbumIds = albums.filter((album) => album.source?.kind === "external")
-    .map((album) => album.id).join("|");
-
-  useEffect(() => {
-    const candidates = albums.filter((album) => album.source?.kind === "external");
-    if (candidates.length === 0) return undefined;
-    let cancelled = false;
-    matchLibraryItems(candidates.map((album) => ({
-      id: album.id, type: "album", title: album.name, artist: album.artist || artist?.name || "",
-    }))).then((matches) => {
-      if (cancelled) return;
-      const byId = new Map(matches.map((match) => [match.id, match]));
-      setAlbums((current) => current.map((album) => {
-        const match = byId.get(album.id);
-        return match ? { ...album, inLibrary: match.inLibrary, localAlbumId: match.localAlbumId } : album;
-      }));
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  // The ID set changes only when a new discography arrives, not when badges update.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [externalAlbumIds, artist?.name]);
+  const { albums: mergedAlbums, isLoadingExternal: isLoadingAlbums } = useMergedAlbums(universalArtist.apiId, userId, albums);
 
   const [songs, setSongs] =
     useState([]);
@@ -115,30 +108,17 @@ function Artist() {
   const [loading, setLoading] =
     useState(true);
 
-  const [enriching, setEnriching] =
-    useState(false);
-
   const [error, setError] =
     useState(null);
+  const [isImportingArtist, setIsImportingArtist] = useState(false);
 
   const {
-    playContext,
     playQueue,
+    playSong,
     playSongFromSource,
     isShuffleEnabled,
     toggleShuffle,
   } = usePlayer();
-
-  const handleTrackPlayback = useCallback((song, index) => {
-    if (!artist) return;
-    playContext(songs, index, {
-      type: "artist",
-      id: artist.id,
-      name: artist.name,
-      coverArt: artist.coverArt,
-    });
-  }, [artist, playContext, songs]);
-
 
   /*
    * Playlist menu
@@ -203,100 +183,59 @@ function Artist() {
    */
 
   useEffect(() => {
-    let cancelled = false;
-
-    function showOverview(overview) {
-      const artistData = overview.artist;
-      if (!artistData || String(artistData.id) !== String(id)) {
-        throw new Error("Artist not found.");
-      }
-      if (cancelled) return;
-
-      const artistAlbums = (artistData.album || []).filter((album) =>
-        !album.artistId || String(album.artistId) === String(id)
-      );
-      const artistSongs = (Array.isArray(overview.tracks) ? overview.tracks : [])
-        .filter((song) => {
-          const songArtistId = song.artistId || song.metadata?.artistId;
-          return !songArtistId || String(songArtistId) === String(id);
-        });
-      const rankedSongs = Array.isArray(overview.topTracks)
-        ? overview.topTracks
-        : artistSongs.slice().sort((left, right) => (right.playCount || 0) - (left.playCount || 0));
-      const popularSongs = rankedSongs.filter((song) => {
-        const songArtistId = song.artistId || song.metadata?.artistId;
-        return !songArtistId || String(songArtistId) === String(id);
-      }).slice(0, 10);
-
-      setArtist(artistData);
-      setAlbums(artistAlbums);
-      setSongs(popularSongs);
-      setSongCount(typeof overview.localSongCount === "number" && artistData.source?.kind !== "external"
-        ? overview.localSongCount : artistSongs.length);
-      setAlbumCount(typeof overview.localAlbumCount === "number" && artistData.source?.kind !== "external"
-        ? overview.localAlbumCount : artistAlbums.length);
+    if (universalArtist.isLoading) {
+      setLoading(true);
+      return;
+    }
+    if (universalArtist.error || !universalArtist.data?.artist) {
+      setError(universalArtist.error?.message || "Artist not found.");
+      setLoading(false);
+      return;
     }
 
-    async function loadArtist() {
+    const overview = universalArtist.data;
+    const artistData = overview.artist;
+    const artistAlbums = (artistData.album || []).filter((album) =>
+      !album.artistId || String(album.artistId) === String(universalArtist.apiId)
+    );
+    const artistSongs = Array.isArray(overview.tracks) ? overview.tracks : [];
+    const rankedSongs = Array.isArray(overview.topTracks) ? overview.topTracks : artistSongs;
 
-      try {
+    setError(null);
+    setArtist(artistData);
+    setAlbums(artistAlbums);
+    setSongs(rankedSongs.slice(0, 10));
+    setSongCount(typeof overview.localSongCount === "number" ? overview.localSongCount : 0);
+    setAlbumCount(typeof overview.localAlbumCount === "number" ? overview.localAlbumCount : artistAlbums.length);
+    setLoading(false);
+  }, [universalArtist.apiId, universalArtist.data, universalArtist.error, universalArtist.isLoading]);
 
-        setLoading(true);
-        setEnriching(false);
-        setError(null);
-
-        const isExternal = id.startsWith("external_") || id.startsWith("extdetail_");
-        const initial = await fetchArtistOverview(id, isExternal ? undefined : "local", userId);
-        if (cancelled) return;
-        showOverview(initial);
-        setLoading(false);
-
-        if (initial.externalEnrichmentAvailable) {
-          setEnriching(true);
-          try {
-            const complete = await fetchArtistOverview(id, undefined, userId);
-            if (!cancelled) showOverview(complete);
-          } catch (enrichmentError) {
-            // The ID-scoped local page remains usable if the keyless catalog is slow or unavailable.
-            console.error("Could not load more artist releases:", enrichmentError);
-          } finally {
-            if (!cancelled) setEnriching(false);
-          }
-        }
-
-      } catch (err) {
-
-        console.error(
-          "Could not load artist:",
-          err
-        );
-
-
-        if (!cancelled) {
-          setError(
-            err.message ||
-            "Could not load artist."
-          );
-        }
-
-      } finally {
-
-        if (!cancelled) {
-          setLoading(false);
-        }
-
-      }
-
+  async function importArtistDiscography() {
+    if (!artist) return;
+    setIsImportingArtist(true);
+    try {
+      await createAcquisition({
+        result: {
+          id: artist.id,
+          type: "artist",
+          title: artist.name,
+          artist: artist.name,
+          provider: "external",
+          source: { kind: "external", count: 0 },
+          metadata: {},
+        },
+        sourceProvider: "spotdl",
+      });
+    } finally {
+      setIsImportingArtist(false);
     }
+  }
 
+  const topTracks = topTracksQuery.data?.length ? topTracksQuery.data : songs;
 
-    loadArtist();
-
-    return () => {
-      cancelled = true;
-    };
-
-  }, [id, userId]);
+  function handleTopTrack(song) {
+    return playSong(song);
+  }
 
 
   /*
@@ -538,7 +477,7 @@ function Artist() {
         <div className="artist-page-info">
 
           <div className="artist-type">
-            ARTIST
+            {universalArtist.isExternal ? "EXTERNAL ARTIST" : "ARTIST"}
           </div>
 
 
@@ -576,18 +515,16 @@ function Artist() {
 
             <button
               className="artist-play"
-              onClick={
-                playArtist
-              }
+              onClick={universalArtist.isExternal ? importArtistDiscography : playArtist}
               disabled={
-                songs.length === 0
+                universalArtist.isExternal ? isImportingArtist : songs.length === 0
               }
             >
 
-              ▶
+              {universalArtist.isExternal ? "☁" : "▶"}
 
               <span>
-                Play
+                {universalArtist.isExternal ? (isImportingArtist ? "Adding…" : "Import Discography") : "Play"}
               </span>
 
             </button>
@@ -610,7 +547,7 @@ function Artist() {
 
       {/* ALBUMS */}
 
-      {(albums.length > 0 || enriching) && (
+      {(mergedAlbums.length > 0 || isLoadingAlbums) && (
 
         <section className="artist-albums">
 
@@ -620,21 +557,21 @@ function Artist() {
               Albums
             </h2>
 
-            {enriching && <span className="artist-enrichment-status" role="status">Finding more releases…</span>}
+            {isLoadingAlbums && <span className="artist-enrichment-status" role="status">Finding more releases…</span>}
 
           </div>
 
 
           <div className="album-grid">
 
-            {albums.map((album) => <ArtistAlbumCard key={album.id} album={album} />)}
+            {albums.map((album) => <ArtistAlbumCard key={album.id} album={album} artistRouteId={id} />)}
+            <UnifiedAlbumGrid albums={mergedAlbums.filter((album) => album.discographySource === "external")} artistId={id} />
 
           </div>
 
         </section>
 
       )}
-
 
       {/* TRACKS */}
 
@@ -651,7 +588,7 @@ function Artist() {
 
           <TrackListHeader />
 
-          {songs.length === 0 && !enriching && (
+          {topTracks.length === 0 && !topTracksQuery.isFetching && (
 
             <div className="artist-tracks-empty" role="row">
               <span role="cell">No tracks yet.</span>
@@ -659,7 +596,7 @@ function Artist() {
 
           )}
 
-          {songs.map(
+          {topTracks.map(
             (song, index) => (
             <TrackRow
               key={`${song.id}-${index}`}
@@ -667,7 +604,7 @@ function Artist() {
               index={index}
               showDownloadStatus={false}
               showSourceIndicator
-              onPlay={handleTrackPlayback}
+              onPlay={handleTopTrack}
               onSelectSource={playSongFromSource}
               onToggleMenu={togglePlaylistMenu}
               menu={playlistMenuSong?.id === song.id ? (
@@ -737,7 +674,6 @@ function Artist() {
         </div>
 
       </section>
-
 
     </div>
 

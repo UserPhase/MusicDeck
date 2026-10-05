@@ -3,6 +3,7 @@ import { closeTestServer, createFakeBackend, createTestServer, login } from "./h
 import { createUser } from "../src/users/users.js";
 import { createId } from "../src/utils/ids.js";
 import type { Track } from "../src/types.js";
+import { getUserById } from "../src/users/users.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;
 
@@ -39,6 +40,17 @@ afterEach(async () => {
 });
 
 describe("MusicDeck-owned playlists", () => {
+  test("reuses a durable import identity and cannot duplicate or change its ownership", async () => {
+    const backend = createFakeBackend({ createPlaylist: vi.fn() }); const context = await setup(backend);
+    const { response } = await login(context.app);
+    const owner = getUserById(context.db, response.json().user.id)!;
+    const first = await context.playlists.create("Imported", owner, "Spotify description", "mdpl_spimp_restart");
+    const second = await context.playlists.create("Retry", owner, "Changed", "mdpl_spimp_restart");
+    expect(second.id).toBe(first.id); expect(second.name).toBe("Imported"); expect(second.description).toBe("Spotify description");
+    expect(context.db.prepare("SELECT COUNT(*) AS count FROM playlists WHERE id = ?").get(first.id)).toEqual({ count: 1 });
+    expect(backend.createPlaylist).not.toHaveBeenCalled();
+    await expect(context.playlists.create("Wrong owner", { ...owner, id: "other" }, undefined, first.id)).rejects.toThrow("another user");
+  });
   test("creates, reads, and owns a MusicDeck playlist", async () => {
     await setup();
     const { playlistId, response } = await createPlaylistViaApi("Focus Mix");
@@ -188,6 +200,22 @@ describe("MusicDeck-owned playlists", () => {
     });
 
     expect(duplicate.json()).toEqual({ added: false });
+  });
+
+  test("links an imported provider track to SQLite once with a stable library ID", async () => {
+    await setup(createFakeBackend({ getTrack: vi.fn(async (id: string) => track(id)) }));
+    const { playlistId } = await createPlaylistViaApi("Imported songs");
+
+    expect(current!.playlists.hasProviderTrack(playlistId, "nav-track-1")).toBe(false);
+    expect(await current!.playlists.addProviderTrack(playlistId, "nav-track-1")).toEqual({ added: true });
+    expect(current!.playlists.hasProviderTrack(playlistId, "nav-track-1")).toBe(true);
+    expect(await current!.playlists.addProviderTrack(playlistId, "nav-track-1")).toEqual({ added: false });
+    const rows = current!.db.prepare(
+      "SELECT provider_track_id, library_track_id FROM playlist_items WHERE playlist_id = ?"
+    ).all(playlistId) as Array<{ provider_track_id: string; library_track_id: string | null }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].provider_track_id).toBe("nav-track-1");
+    expect(rows[0].library_track_id).toMatch(/^md_/);
   });
 
   test("supports tracks from multiple provider connections in one playlist", async () => {

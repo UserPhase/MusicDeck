@@ -32,6 +32,20 @@ const trackFixture = {
   Type: "Audio",
 };
 
+test("Jellyfin exposes the audio path and triggers a library refresh", async () => {
+  const fetchImpl = vi.fn(async (url: URL, init?: RequestInit) => {
+    if (url.pathname.endsWith("/Library/Refresh")) {
+      expect(init?.method).toBe("POST");
+      expect(init?.headers).toMatchObject({ "X-Emby-Token": "test-api-key" });
+      return new Response(null, { status: 204 });
+    }
+    return jsonResponse({ Items: [{ ...trackFixture, Path: "/music/Daft Punk/Discovery/Digital Love.flac" }] });
+  });
+  const backend = makeBackend(fetchImpl);
+  expect(await backend.getTrackFilePath("jf-track-1")).toBe("/music/Daft Punk/Discovery/Digital Love.flac");
+  expect(await backend.scanLibrary()).toEqual({ scanning: true });
+});
+
 describe("Jellyfin mapper", () => {
   test("maps a track with duration conversion and artwork-by-item-id", () => {
     const track = mapJellyfinTrack(trackFixture);

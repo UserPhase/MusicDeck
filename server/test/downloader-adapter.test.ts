@@ -39,6 +39,12 @@ function createValidFlacBuffer(): Buffer {
   return buf;
 }
 
+function createValidMp3Buffer(): Buffer {
+  const buf = Buffer.alloc(128);
+  buf.write("ID3", 0, "ascii");
+  return buf;
+}
+
 function createTestDb(): Database.Database {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
@@ -124,6 +130,8 @@ describe("Reverb-Style Downloader Architecture", () => {
       const progress3 = parseSpotDLProgress(line3);
       expect(progress3).not.toBeNull();
       expect(progress3?.stage).toBe("tagging");
+
+      expect(parseSpotDLProgress("Downloaded Bohemian Rhapsody")).toMatchObject({ percent: 100, stage: "processing" });
     });
 
     it("classifies spotDL error output correctly", () => {
@@ -183,9 +191,8 @@ describe("Reverb-Style Downloader Architecture", () => {
       try {
         const mockRunner: ProcessRunner = {
           run: vi.fn().mockImplementation((command, args, options) => {
-            // Write a dummy flac file into the output directory
-            const outFlac = path.join(tmpDir, "Queen - We Will Rock You.flac");
-            fs.writeFileSync(outFlac, createValidFlacBuffer());
+            const outMp3 = path.join(tmpDir, "Queen - We Will Rock You.mp3");
+            fs.writeFileSync(outMp3, createValidMp3Buffer());
 
             return {
               pid: 1234,
@@ -221,10 +228,13 @@ describe("Reverb-Style Downloader Architecture", () => {
         expect(args).toContain("download");
         expect(args).toContain("https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv");
         expect(args).toContain("--output");
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
+        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "320k"]);
+        expect(args).not.toContain("--embed-metadata");
 
         expect(result.status).toBe("completed");
         expect(result.files.length).toBe(1);
-        expect(result.files[0].path).toBe(path.join(tmpDir, "Queen - We Will Rock You.flac"));
+        expect(result.files[0].path).toBe(path.join(tmpDir, "Queen - We Will Rock You.mp3"));
         expect(result.files[0].title).toBe("We Will Rock You");
         expect(result.files[0].artist).toBe("Queen");
       } finally {
@@ -271,6 +281,111 @@ describe("Reverb-Style Downloader Architecture", () => {
         expect(result.playlistTracks).toHaveLength(2);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("reads playlist metadata without downloading audio", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-metadata-"));
+      try {
+        const runner: ProcessRunner = {
+          run: vi.fn().mockImplementation((_command, _args, options) => {
+            fs.writeFileSync(path.join(options.cwd, "musicdeck-source.spotdl"), JSON.stringify([
+              { list_position: 1, list_length: 1, url: "https://open.spotify.com/track/one", name: "Song", artist: "Artist", duration: 180, isrc: "USABC1234567" },
+            ]));
+            return { pid: 1, kill: () => {}, promise: Promise.resolve({ exitCode: 0, stdout: "Saved 1 song", stderr: "" }) };
+          }),
+        };
+        const adapter = new SpotDLDownloaderAdapter({ runner, spotdlPath: "spotdl" });
+        const result = await adapter.fetchPlaylistTracks("https://open.spotify.com/playlist/abc123",
+          { jobId: "metadata", tmpDir, signal: new AbortController().signal });
+        const args = (runner.run as any).mock.calls[0][1] as string[];
+        expect(args).toContain("save");
+        expect(args).not.toContain("download");
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
+        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "320k"]);
+        expect(result).toMatchObject({ status: "completed", playlistLength: 1, playlistTracks: [{ isrc: "USABC1234567" }] });
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("preserves all playlist entries when artists are serialized as string arrays", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-artist-arrays-"));
+      try {
+        const runner: ProcessRunner = {
+          run: vi.fn().mockImplementation((_command, _args, options) => {
+            fs.writeFileSync(path.join(options.cwd, "musicdeck-source.spotdl"), JSON.stringify(
+              Array.from({ length: 14 }, (_, index) => ({
+                name: `Song ${index + 1}`, url: `https://open.spotify.com/track/track${index + 1}`,
+                artists: ["Artist A", "Artist B"], album_name: "Album", list_position: index + 1, list_length: 14,
+              }))
+            ));
+            return { kill: () => {}, promise: Promise.resolve({ exitCode: 0, stdout: "Saved", stderr: "" }) };
+          }),
+        };
+        const result = await new SpotDLDownloaderAdapter({ runner }).fetchPlaylistTracks(
+          "https://open.spotify.com/playlist/abc123", { jobId: "14-artists", tmpDir, signal: new AbortController().signal });
+        expect(result.playlistLength).toBe(14);
+        expect(result.playlistTracks).toHaveLength(14);
+        expect(result.playlistTracks?.every((track) => track.artist === "Artist A")).toBe(true);
+        expect(result.playlistTracks?.every((track) => JSON.stringify(track.artists) === JSON.stringify(["Artist A", "Artist B"]))).toBe(true);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("reads Spotify playlist title, description, and artwork when app credentials exist", async () => {
+      const fetchImpl = vi.fn(async (url: URL | string) => String(url).includes("accounts.spotify.com")
+        ? new Response(JSON.stringify({ access_token: "test-token" }), { status: 200 })
+        : new Response(JSON.stringify({ name: "Road Trip", description: "Summer songs", images: [{ url: "https://i.scdn.co/image/cover" }] }), { status: 200 }));
+      const adapter = new SpotDLDownloaderAdapter({
+        clientId: "test-id", clientSecret: "test-secret", fetchImpl: fetchImpl as typeof fetch,
+      });
+      expect(await adapter.fetchPlaylistDetails("abc123")).toEqual({
+        title: "Road Trip", description: "Summer songs", artworkUrl: "https://i.scdn.co/image/cover",
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(String(fetchImpl.mock.calls[1][0])).toContain("/v1/playlists/abc123");
+    });
+
+    it("reuses an existing canonical library file during a playlist import", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-shared-library-"));
+      try {
+        const workDir = path.join(root, "Spotify Imports", "job-1");
+        const existing = path.join(root, "Artist", "Album", "Artist - Song.mp3");
+        fs.mkdirSync(path.dirname(existing), { recursive: true });
+        fs.mkdirSync(workDir, { recursive: true });
+        fs.writeFileSync(existing, "original audio");
+        const progress: string[] = [];
+        const runner: ProcessRunner = {
+          run: vi.fn().mockImplementation((_command, _args, options) => {
+            fs.writeFileSync(path.join(workDir, "musicdeck-source.spotdl"), JSON.stringify([
+              { list_position: 1, list_length: 1, url: "https://open.spotify.com/track/one", name: "Song", artist: "Artist", duration: 180 },
+            ]));
+            fs.writeFileSync(path.join(workDir, "playlist.m3u8"), `#EXTM3U\n#EXTINF:180,Artist - Song\n${existing}\n`);
+            options.onStdoutLine?.("Skipping Artist - Song (file already exists)");
+            return { pid: 1, kill: () => {}, promise: Promise.resolve({ exitCode: 0, stdout: "Skipping Artist - Song (file already exists)", stderr: "" }) };
+          }),
+        };
+        const adapter = new SpotDLDownloaderAdapter({ runner, spotdlPath: "spotdl" });
+        const result = await adapter.download({
+          query: "https://open.spotify.com/playlist/abc123",
+          outputDirectory: workDir,
+          libraryRoot: root,
+          filenameTemplate: path.join(root, "{artist}", "{album}", "{artist} - {title}.{output-ext}"),
+          playlistM3uName: "playlist.m3u8",
+        }, { jobId: "job-1", tmpDir: workDir, signal: new AbortController().signal, onProgress: (event) => progress.push(event.message || "") });
+
+        const args = (runner.run as any).mock.calls[0][1] as string[];
+        expect(args[args.indexOf("--output") + 1]).toBe(path.join(root, "{artist}", "{album}", "{artist} - {title}.{output-ext}"));
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
+        expect(args.slice(args.indexOf("--overwrite"), args.indexOf("--overwrite") + 2)).toEqual(["--overwrite", "skip"]);
+        expect(args).toContain("--add-unavailable");
+        expect(result.files).toMatchObject([{ path: existing, playlistPosition: 1 }]);
+        expect(fs.readFileSync(existing, "utf8")).toBe("original audio");
+        expect(progress).toContain("Skipping Artist - Song (file already exists)");
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
       }
     });
 
@@ -493,17 +608,14 @@ describe("Reverb-Style Downloader Architecture", () => {
 
       const mockRunner: ProcessRunner = {
         run: vi.fn().mockImplementation((command, args, options) => {
-          // Identify the output directory from args or options.cwd
-          const outDirIdx = args.indexOf("--output");
-          const outTemplate = outDirIdx >= 0 ? args[outDirIdx + 1] : testTmpDir;
-          const outDir = options?.cwd || (outTemplate.includes("{") ? path.dirname(outTemplate) : outTemplate);
-          const outFlac = path.join(outDir, "Queen - We Will Rock You.flac");
-          fs.writeFileSync(outFlac, createValidFlacBuffer());
+          const outMp3 = path.join(options.cwd, "Queen", "News of the World", "Queen - We Will Rock You.mp3");
+          fs.mkdirSync(path.dirname(outMp3), { recursive: true });
+          fs.writeFileSync(outMp3, createValidMp3Buffer());
 
           if (options?.onStdoutLine) {
             options.onStdoutLine("Downloading We Will Rock You: 50% [2.5MB/s]");
             options.onStdoutLine("Downloading We Will Rock You: 100%");
-            options.onStdoutLine("Converting We Will Rock You to flac");
+            options.onStdoutLine("Converting We Will Rock You to mp3");
           }
 
           return {
@@ -581,7 +693,7 @@ describe("Reverb-Style Downloader Architecture", () => {
       expect(importedPath).toBeDefined();
       expect(fs.existsSync(importedPath!)).toBe(true);
       expect(importedPath).toBe(
-        path.join(testMusicDir, "Queen", "News of the World", "We Will Rock You.flac")
+        path.join(testMusicDir, "Queen", "News of the World", "Queen - We Will Rock You.mp3")
       );
       expect(fs.existsSync(path.join(testTmpDir, job.id))).toBe(false);
 

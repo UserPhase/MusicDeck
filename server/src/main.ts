@@ -19,6 +19,9 @@ import { AcquisitionProviderRegistry, AcquisitionService } from "./domain/acquis
 import { SilenceAnalysisService } from "./domain/silence-analysis.js";
 import { DownloaderAdapterRegistry } from "./domain/downloader-adapter.js";
 import { SpotDLDownloaderAdapter } from "./domain/spotdl-downloader-adapter.js";
+import { AudioTaggerService } from "./services/media/audioTaggerService.js";
+import { SqliteImportJobRepository } from "./infrastructure/persistence/sqliteImportJobRepository.js";
+import { getUserById } from "./users/users.js";
 import { PluginRegistry } from "./plugins/plugin-registry.js";
 import {
   createExternalArtworkPlugin,
@@ -91,7 +94,12 @@ async function start() {
   await plugins.register(createMusicBrainzPlugin());
   await plugins.register(createExternalArtworkPlugin());
   await plugins.register(createSpotDLDownloaderPlugin(spotdlAdapter));
-  const spotifyPlaylistImport = new SpotifyPlaylistImportService(backend, playlists, spotdlAdapter, config.musicRoot, undefined, config.spotifyImportSubdir);
+  const spotifyPlaylistImport = new SpotifyPlaylistImportService(
+    backend, playlists, spotdlAdapter, config.musicRoot, undefined, config.spotifyImportSubdir,
+    new AudioTaggerService({ getTools: () => spotdlAdapter.getMediaToolPaths() }),
+    new SqliteImportJobRepository(db)
+  );
+  spotifyPlaylistImport.resumeInterrupted((userId) => getUserById(db, userId));
   for (const manifest of plugins.loadInstalledCustomPlugins()) {
     try {
       await plugins.register({ manifest }, "third-party");

@@ -9,6 +9,13 @@ function jsonResponse(body: unknown) {
 }
 
 describe("NavidromeBackend", () => {
+  test("passes playlist matching pagination through to Subsonic search", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ "subsonic-response": { status: "ok", searchResult3: { song: [] } } }));
+    const backend = new NavidromeBackend({ url: "http://navidrome.test", username: "listener", password: "secret" }, fetchImpl as any);
+    await backend.search("Song", ["tracks"], { offset: 50, limit: 50 });
+    const endpoint = new URL(String((fetchImpl.mock.calls as unknown as Array<[URL]>)[0][0]));
+    expect(endpoint.searchParams.get("songOffset")).toBe("50"); expect(endpoint.searchParams.get("songCount")).toBe("50");
+  });
   test("loads artist metadata, albums, and ten ID-scoped top songs without album fan-out", async () => {
     const fetchImpl = vi.fn(async (input: URL) => {
       const url = new URL(String(input));
@@ -237,6 +244,23 @@ describe("NavidromeBackend", () => {
     await expect(backend.getArtistBiographyForTrack("track-1")).resolves.toBe("An artist story.");
   });
 
+  test("file management rejects Navidrome's virtual tag path and requests a real path", async () => {
+    const reportedPaths = ["Artist/Album/01 - Song.mp3", "/music/Artist/Album/actual-file.mp3"];
+    const fetchImpl = vi.fn(async (_url: URL) => jsonResponse({
+      "subsonic-response": { status: "ok", song: { path: reportedPaths.shift() } },
+    }));
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test",
+      username: "navidrome-user",
+      password: "navidrome-password",
+    }, fetchImpl as any);
+
+    await expect(backend.getTrackFilePath("track-1")).resolves.toBeNull();
+    await expect(backend.getTrackFilePath("track-1")).resolves.toBe("/music/Artist/Album/actual-file.mp3");
+    const requestUrl = new URL(String(fetchImpl.mock.calls[0][0]));
+    expect(requestUrl.searchParams.get("c")).toBe("MusicDeck File Management");
+  });
+
   test("scanLibrary waits for Navidrome's async scan to finish before resolving", async () => {
     let scanStatusCalls = 0;
     const fetchImpl = vi.fn(async (url: URL) => {
@@ -279,6 +303,21 @@ describe("NavidromeBackend", () => {
     }, fetchImpl as any);
 
     await expect(backend.scanLibrary()).resolves.toEqual({ scanning: false });
+  });
+
+  test("requestLibraryRescan starts a scan and reports a failed request", async () => {
+    const fetchImpl = vi.fn(async (_url: URL) => jsonResponse({ "subsonic-response": { status: "ok" } }));
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test",
+      username: "navidrome-user",
+      password: "navidrome-password",
+    }, fetchImpl as any);
+
+    await expect(backend.requestLibraryRescan()).resolves.toBeUndefined();
+    expect(String(fetchImpl.mock.calls[0][0])).toContain("startScan.view");
+
+    fetchImpl.mockImplementationOnce(async () => new Response("error", { status: 500 }));
+    await expect(backend.requestLibraryRescan()).rejects.toThrow();
   });
 
   test("forwards the selected bitrate cap to the Subsonic stream endpoint", async () => {

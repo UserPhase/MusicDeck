@@ -481,6 +481,24 @@ const migrations = [
     name: "remove-lidarr-plugin-configuration",
     sql: "DELETE FROM plugin_configs WHERE plugin_id = 'lidarr';",
   },
+  {
+    id: 21,
+    name: "persistent-spotify-import-jobs",
+    sql: `
+      CREATE TABLE import_jobs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')),
+        total_tracks INTEGER NOT NULL DEFAULT 0,
+        completed_tracks INTEGER NOT NULL DEFAULT 0,
+        failed_tracks INTEGER NOT NULL DEFAULT 0,
+        manifest_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX import_jobs_status_idx ON import_jobs(status, created_at);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

@@ -20,7 +20,7 @@ import {
   type DownloaderCapabilities,
 } from "./downloader-adapter.js";
 import type { ProcessRunner } from "./process-runner.js";
-import { SpotDLDownloaderAdapter } from "./spotdl-downloader-adapter.js";
+import { SpotDLDownloaderAdapter, SPOTDL_LIBRARY_TEMPLATE } from "./spotdl-downloader-adapter.js";
 
 export type AcquisitionJobStatus =
   | "queued"
@@ -87,6 +87,7 @@ export type AcquisitionContext = {
 
 export type AcquiredFile = {
   path: string;
+  playlistPosition?: number;
   name?: string;
   title?: string;
   artist?: string;
@@ -186,6 +187,7 @@ export class DownloaderAcquisitionProvider implements AcquisitionProvider {
       query: candidate.title ? [candidate.artist, candidate.title].filter(Boolean).join(" - ") : undefined,
       sourceUrl: (candidate.metadata?.acquisitionUrl as string) || (candidate.metadata?.downloadUrl as string) || undefined,
       outputDirectory: context.tmpDir,
+      ...(this.adapter.id === "spotdl" ? { filenameTemplate: SPOTDL_LIBRARY_TEMPLATE } : {}),
       candidate,
     };
 
@@ -1394,11 +1396,13 @@ export class AcquisitionService {
         const artistName = file.artist || selectedCandidate?.artist || result?.artist || "Unknown Artist";
         const albumName = file.album || selectedCandidate?.album || result?.album || "Unknown Album";
         const trackTitle = file.title || selectedCandidate?.title || result?.title || path.basename(file.path, path.extname(file.path));
-        const trackNum = file.trackNumber !== undefined ? `${String(file.trackNumber).padStart(2, "0")} - ` : "";
         const ext = path.extname(file.path) || ".flac";
 
+        const trackNum = file.trackNumber !== undefined ? `${String(file.trackNumber).padStart(2, "0")} - ` : "";
         const fileName = `${trackNum}${trackTitle}${ext}`;
-        const destPath = resolveSafeDestination(downloadDir, artistName, albumName, fileName);
+        const destPath = selectedProvider?.id === "spotdl"
+          ? path.resolve(downloadDir, path.relative(tmpDir, file.path))
+          : resolveSafeDestination(downloadDir, artistName, albumName, fileName);
         const relativeDestPath = path.relative(this.baseMusicDir, destPath);
         if (
           relativeDestPath === "" ||
@@ -1410,13 +1414,16 @@ export class AcquisitionService {
         }
 
         fs.mkdirSync(path.dirname(destPath), { recursive: true });
-        const pendingPath = `${destPath}.musicdeck-importing`;
-        try {
-          fs.copyFileSync(file.path, pendingPath);
-          fs.renameSync(pendingPath, destPath);
-        } finally {
-          if (fs.existsSync(pendingPath)) {
-            fs.rmSync(pendingPath, { force: true });
+        const alreadyPresent = fs.existsSync(destPath) && fs.statSync(destPath).isFile() && fs.statSync(destPath).size > 0;
+        if (!alreadyPresent) {
+          const pendingPath = `${destPath}.musicdeck-importing`;
+          try {
+            fs.copyFileSync(file.path, pendingPath);
+            fs.renameSync(pendingPath, destPath);
+          } finally {
+            if (fs.existsSync(pendingPath)) {
+              fs.rmSync(pendingPath, { force: true });
+            }
           }
         }
 
@@ -1430,7 +1437,7 @@ export class AcquisitionService {
           artist: artistName,
           album: albumName,
           size: stat.size,
-          status: "imported",
+          status: alreadyPresent ? "already_in_library" : "imported",
         });
 
         // Register in LibraryService

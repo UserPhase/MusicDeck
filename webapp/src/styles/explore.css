@@ -49,7 +49,8 @@
 .explore-album-image .explore-artwork { border-radius: .5rem; box-shadow: 0 .75rem 1.5rem rgb(0 0 0 / 24%); }
 .explore-album-image::after { position: absolute; inset: 45% 0 0; border-radius: 0 0 .5rem .5rem; background: linear-gradient(transparent, rgb(0 0 0 / 40%)); content: ""; pointer-events: none; }
 .explore-album-play { position: absolute; z-index: 1; right: .625rem; bottom: .625rem; display: grid; width: 2.5rem; height: 2.5rem; place-items: center; border: 0; border-radius: 50%; background: var(--accent); color: #111; font-size: .75rem; opacity: 0; cursor: pointer; transform: translateY(.35rem); transition: opacity 180ms ease, transform 180ms ease; }
-.explore-album:hover .explore-album-play, .explore-album-play:focus-visible { opacity: 1; transform: translateY(0); }
+.explore-album:hover .explore-album-play, .explore-album:focus-within .explore-album-play { opacity: 1; transform: translateY(0); }
+.explore-album-image .album-admin-actions { top: .625rem; right: .625rem; }
 
 .explore-pulse { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2rem; margin-bottom: 3.25rem; }
 .explore-track-panel { min-width: 0; }

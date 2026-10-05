@@ -23,11 +23,15 @@ export interface CatalogProvider {
   getArtistTopTracks?(artistId: string, limit: number): Promise<Track[]>;
   listTracks(): Promise<Track[]>;
   getTrack(trackId: string): Promise<Track | null>;
+  /** Provider metadata path; server-only and never included in public track JSON. */
+  getTrackFilePath?(trackId: string): Promise<string | null>;
   /** Optional provider-native metadata used by the Now Playing context panel. */
   getLyrics?(trackId: string): Promise<string | null>;
   getArtistBiographyForTrack?(trackId: string): Promise<string | null>;
-  search(query: string, types?: string[]): Promise<SearchResult>;
+  search(query: string, types?: string[], pagination?: { offset: number; limit: number }): Promise<SearchResult>;
   getRandomTracks(limit?: number): Promise<Track[]>;
   getRandomAlbums(limit?: number): Promise<Album[]>;
   scanLibrary?(): Promise<{ count?: number; scanning?: boolean }>;
+  /** Fire a provider scan without waiting for indexing to finish. */
+  requestLibraryRescan?(): Promise<void>;
 }

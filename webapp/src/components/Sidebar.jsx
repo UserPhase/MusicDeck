@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import PlaylistCover from "./PlaylistCover";
@@ -6,9 +7,8 @@ import PlaylistCover from "./PlaylistCover";
 import {
   getPlaylists,
   createPlaylist,
-  startSpotifyPlaylistImport,
-  getSpotifyPlaylistImport,
 } from "../api/playlists";
+import { useImport } from "../context/ImportContext";
 
 export function isSpotifyPlaylistUrl(value) {
   try {
@@ -24,6 +24,7 @@ function Sidebar() {
 
   const location = useLocation();
   const navigate = useNavigate();
+  const { job: importJob, openProgressToken, startImport, minimize } = useImport();
 
   const [playlists, setPlaylists] = useState([]);
 
@@ -37,9 +38,16 @@ function Sidebar() {
   const [notice, setNotice] = useState(null);
   const triggerRef = useRef(null);
   const modalRef = useRef(null);
-  const importAttemptRef = useRef(0);
+  const handledImportRef = useRef(null);
+  const lastOpenTokenRef = useRef(openProgressToken);
 
-  useEffect(() => () => { importAttemptRef.current += 1; }, []);
+  useEffect(() => {
+    if (openProgressToken !== lastOpenTokenRef.current) {
+      lastOpenTokenRef.current = openProgressToken;
+      setModalStep("progress");
+    }
+  }, [openProgressToken]);
+
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -49,9 +57,14 @@ function Sidebar() {
 
   useEffect(() => {
     if (!modalStep) return undefined;
-    if (busy) modalRef.current?.focus();
+    modalRef.current?.focus();
+  }, [modalStep]);
+
+  useEffect(() => {
+    if (!modalStep) return undefined;
     const closeOnEscape = (event) => {
       if (event.key === "Escape" && !busy) {
+        if (modalStep === "progress" && importJob && (importJob.status === "queued" || importJob.status === "running")) minimize();
         setModalStep(null);
         triggerRef.current?.focus();
       } else if (event.key === "Tab") {
@@ -76,7 +89,7 @@ function Sidebar() {
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [modalStep, busy]);
+  }, [modalStep, busy, importJob, minimize]);
 
 
   /*
@@ -113,6 +126,23 @@ function Sidebar() {
   );
 
   useEffect(() => {
+    if (modalStep !== "progress" || !importJob || (importJob.status === "queued" || importJob.status === "running") || handledImportRef.current === importJob.id) return;
+    handledImportRef.current = importJob.id;
+    if ((importJob.status === "completed" || importJob.status === "partial") && importJob.playlistId) {
+      loadPlaylists();
+      window.dispatchEvent(new Event("playlistsChanged"));
+      setModalStep(null);
+      setNotice(importJob.status === "partial"
+        ? { type: "error", text: importJob.error || `Only part of '${importJob.playlistName}' could be imported.` }
+        : { type: "success", text: `Successfully imported '${importJob.playlistName}'!` });
+      navigate(`/playlist/${encodeURIComponent(importJob.playlistId)}`);
+    } else {
+      setNotice({ type: "error", text: importJob.error || "Could not import the Spotify playlist." });
+      setModalStep("import");
+    }
+  }, [importJob, modalStep, loadPlaylists, navigate]);
+
+  useEffect(() => {
 
     loadPlaylists();
 
@@ -147,7 +177,7 @@ function Sidebar() {
 
   function handleAddPlaylist(event) {
     triggerRef.current = event.currentTarget;
-    setModalStep("choose");
+    setModalStep(importJob && (importJob.status === "queued" || importJob.status === "running") ? "progress" : "choose");
     setPlaylistName("");
     setDescription("");
     setPlaylistUrl("");
@@ -156,6 +186,7 @@ function Sidebar() {
 
   function closeModal() {
     if (busy) return;
+    if (modalStep === "progress" && importJob && (importJob.status === "queued" || importJob.status === "running")) minimize();
     setModalStep(null);
     triggerRef.current?.focus();
   }
@@ -194,31 +225,13 @@ function Sidebar() {
     }
     setFormError("");
     setBusy(true);
-    const attempt = ++importAttemptRef.current;
     try {
-      let job = await startSpotifyPlaylistImport(playlistUrl.trim());
-      while ((job.status === "queued" || job.status === "running") && importAttemptRef.current === attempt) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        if (importAttemptRef.current !== attempt) return;
-        job = await getSpotifyPlaylistImport(job.id);
-      }
-      if (importAttemptRef.current !== attempt) return;
-      if ((job.status !== "completed" && job.status !== "partial") || !job.playlistId) {
-        throw new Error(job.error || "Could not import the Spotify playlist.");
-      }
-      await loadPlaylists();
-      window.dispatchEvent(new Event("playlistsChanged"));
-      setModalStep(null);
-      setNotice(job.status === "partial"
-        ? { type: "error", text: job.error || `Only part of '${job.playlistName}' could be imported.` }
-        : { type: "success", text: `Successfully imported '${job.playlistName}'!` });
-      navigate(`/playlist/${encodeURIComponent(job.playlistId)}`);
+      await startImport(playlistUrl.trim());
+      setModalStep("progress");
     } catch (error) {
-      if (importAttemptRef.current === attempt) {
-        setNotice({ type: "error", text: error.message || "Could not import the Spotify playlist." });
-      }
+      setNotice({ type: "error", text: error.message || "Could not import the Spotify playlist." });
     } finally {
-      if (importAttemptRef.current === attempt) setBusy(false);
+      setBusy(false);
     }
   }
 
@@ -307,7 +320,7 @@ function Sidebar() {
           <span className="nav-label">Add playlist</span>
         </button>
       </section>
-      {modalStep && (
+      {modalStep && createPortal(
         <div className="playlist-modal-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) closeModal();
         }}>
@@ -315,7 +328,7 @@ function Sidebar() {
             <div className="playlist-modal-heading">
               <div>
                 <span className="playlist-modal-eyebrow">YOUR LIBRARY / PLAYLISTS</span>
-                <h2 id="playlist-modal-title">{modalStep === "choose" ? "Create New Playlist" : modalStep === "blank" ? "Blank Playlist" : "Import Spotify Playlist"}</h2>
+                <h2 id="playlist-modal-title">{modalStep === "choose" ? "Create New Playlist" : modalStep === "blank" ? "Blank Playlist" : modalStep === "progress" ? "Importing Playlist..." : "Import Spotify Playlist"}</h2>
               </div>
               <button className="playlist-modal-close" type="button" onClick={closeModal} disabled={busy} aria-label="Close playlist dialog">×</button>
             </div>
@@ -350,6 +363,23 @@ function Sidebar() {
                   <button type="submit" className="playlist-modal-submit" disabled={busy}>{busy ? "Creating…" : "Create"}</button>
                 </div>
               </form>
+            ) : modalStep === "progress" ? (
+              <div className="playlist-import-progress" role="status" aria-live="polite">
+                <p className="playlist-modal-intro">{importJob?.playlistName || "Your Spotify playlist"}</p>
+                <div className="playlist-import-counter">
+                  {importJob?.stage === "scanning" ? "Scanning and adding tracks to your library..." : importJob?.expectedCount
+                    ? `Downloading track ${importJob.currentTrack || Math.min((importJob.downloadedCount || 0) + 1, importJob.expectedCount)} of ${importJob.expectedCount}`
+                    : importJob?.downloadedCount ? `Downloading track ${importJob.currentTrack || importJob.downloadedCount + 1}`
+                    : importJob?.stage === "queued" ? "Waiting to start download..." : "Fetching playlist details and queueing download..."}
+                </div>
+                <div className="playlist-import-track">{importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}` : importJob?.stage === "scanning" ? "Adding downloaded tracks to your library..." : "Preparing tracks..."}</div>
+                <div className={`playlist-import-bar${!importJob?.expectedCount ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={importJob?.expectedCount || undefined} aria-valuenow={importJob?.expectedCount ? Math.min(importJob.downloadedCount || 0, importJob.expectedCount) : undefined}>
+                  <span style={{ width: importJob?.expectedCount ? `${Math.min(100, 100 * (importJob.downloadedCount || 0) / importJob.expectedCount)}%` : "35%" }} />
+                </div>
+                <div className="playlist-modal-actions">
+                  <button type="button" className="playlist-modal-submit" onClick={closeModal}>Run in Background</button>
+                </div>
+              </div>
             ) : (
               <form className="playlist-modal-form" onSubmit={handleImportPlaylist} noValidate>
                 <p className="playlist-modal-intro">Paste a public Spotify playlist link. MusicDeck will download its songs and add the playlist to your library.</p>
@@ -364,9 +394,9 @@ function Sidebar() {
               </form>
             )}
           </section>
-        </div>
+        </div>, document.body
       )}
-      {notice && <div className={`playlist-notice playlist-notice--${notice.type}`} role={notice.type === "error" ? "alert" : "status"}>{notice.text}</div>}
+      {notice && createPortal(<div className={`playlist-notice playlist-notice--${notice.type}`} role={notice.type === "error" ? "alert" : "status"}>{notice.text}</div>, document.body)}
     </aside>
 
   );

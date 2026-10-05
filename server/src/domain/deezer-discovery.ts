@@ -55,7 +55,7 @@ export type ExternalTrack = ExternalBase & {
   album: string | null;
   duration: number;
   durationLabel: string;
-  metadata: { durationSeconds: number };
+  metadata: { durationSeconds: number; artistId?: string | null; albumId?: string | null };
 };
 export type ExternalCharts = { artists: ExternalArtist[]; albums: ExternalAlbum[]; tracks: ExternalTrack[] };
 
@@ -66,7 +66,9 @@ function coverArt(...candidates: (string | null | undefined)[]): CoverArt {
 
 function base(id: number, kind: "artist" | "album" | "track", url: string | undefined, image: CoverArt): ExternalBase {
   return {
-    id: `deezer_${kind}_${id}`,
+    // Keep chart entities compatible with the detail catalog route. A chart
+    // artist must be navigable even when it has no local-library counterpart.
+    id: `external_deezer_${kind}_${id}`,
     external: true,
     provider: "deezer",
     source: { kind: "external", count: 0 },
@@ -97,7 +99,11 @@ export function normalizeDeezerChart(input: unknown): ExternalCharts {
       album: item.album?.title || null,
       duration: item.duration,
       durationLabel: `${Math.floor(item.duration / 60)}:${String(item.duration % 60).padStart(2, "0")}`,
-      metadata: { durationSeconds: item.duration },
+      metadata: {
+        durationSeconds: item.duration,
+        artistId: item.artist?.id != null ? `external_deezer_artist_${item.artist.id}` : null,
+        albumId: item.album?.id != null ? `external_deezer_album_${item.album.id}` : null,
+      },
     })),
   };
 }

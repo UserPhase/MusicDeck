@@ -5,13 +5,18 @@
 .now-cover { width: 56px; height: 56px; flex-shrink: 0; overflow: hidden; border-radius: 5px; }
 .now-cover img { width: 100%; height: 100%; object-fit: cover; }
 .now-info { min-width: 0; margin-left: 12px; }
-.now-title { font-size: 13px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.now-title { display: flex; align-items: center; min-width: 0; font-size: 13px; font-weight: 650; white-space: nowrap; }
+.now-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .audio-badge { display: inline-flex; align-items: center; width: fit-content; padding: 2px 6px; border: 1px solid transparent; border-radius: 6px; font-size: 10px; font-weight: 700; line-height: 1; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
-.audio-badge-preview { border-color: color-mix(in srgb, var(--badge-preview) 20%, transparent); background: color-mix(in srgb, var(--badge-preview) 10%, transparent); color: var(--badge-preview); }
+.audio-badge-preview { border-color: #a855f7; background: rgb(88 28 135 / 50%); color: #d8b4fe; }
 .audio-badge-lossless { border-color: color-mix(in srgb, var(--badge-lossless) 20%, transparent); background: color-mix(in srgb, var(--badge-lossless) 10%, transparent); color: var(--badge-lossless); }
 .audio-badge-high { border-color: color-mix(in srgb, var(--badge-high) 20%, transparent); background: color-mix(in srgb, var(--badge-high) 10%, transparent); color: var(--badge-high); }
 .audio-badge-standard { border-color: transparent; background: var(--nav-active); color: var(--text-muted); }
 .now-audio-badge { margin-left: 8px; vertical-align: middle; }
+.now-preview-import { margin-left: 8px; padding: 3px 7px; border: 1px solid rgb(168 85 247 / 55%); border-radius: 999px; background: rgb(88 28 135 / 32%); color: #e9d5ff; font-size: 10px; font-weight: 700; line-height: 1.2; white-space: nowrap; cursor: pointer; transition: background 150ms ease, border-color 150ms ease, color 150ms ease; }
+.now-preview-import:hover:not(:disabled) { border-color: #c084fc; background: rgb(126 34 206 / 44%); color: #fff; }
+.now-preview-import:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.now-preview-import:disabled { cursor: default; opacity: .7; }
 .now-badge { margin-left: 8px; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; vertical-align: middle; }
 .now-badge-unavailable { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger-text); }
 .now-artist { margin-top: 4px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

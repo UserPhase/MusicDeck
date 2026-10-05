@@ -111,6 +111,8 @@ services:
     environment:
       ND_LOGLEVEL: info
       ND_SCANSCHEDULE: 1h
+      # File deletion needs actual filenames, not Navidrome's tag-based Subsonic paths.
+      ND_SUBSONIC_DEFAULTREPORTREALPATH: "true"
       ND_SESSIONTIMEOUT: 24h
     volumes:
       - ${NAVIDROME_DATA:-./navidrome-data}:/data

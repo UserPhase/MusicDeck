@@ -458,6 +458,14 @@ export class CatalogService {
       : null;
   }
 
+  async getTrackFilePath(trackId: string): Promise<string | null> {
+    const source = this.library.getPrimarySource(trackId);
+    if (!source) return null;
+    const entry = this.registry.getByConnectionId(source.connectionId);
+    if (!entry?.enabled || !entry.provider.getTrackFilePath) return null;
+    return entry.provider.getTrackFilePath(source.providerItemId);
+  }
+
   async getArtistTopTracks(artistId: string, limit = 10): Promise<Track[]> {
     const source = this.library.getPrimarySource(artistId);
     if (!source) return [];

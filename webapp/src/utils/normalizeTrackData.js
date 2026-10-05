@@ -86,7 +86,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     normalizedSource?.provider
   ) || undefined;
   const runTimeTicks = number(first(track.RunTimeTicks, wrapper.RunTimeTicks));
-  const duration = number(first(
+  const metadataDuration = number(first(
     metadata.durationSeconds,
     track.durationSeconds,
     track.duration,
@@ -95,6 +95,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     wrapper.duration,
     runTimeTicks === null ? null : runTimeTicks / 10000000
   ));
+  const audioDuration = number(first(track.audioDuration, wrapper.audioDuration, metadata.audioDuration));
   const explicitDownloadState = first(
     track.isDownloaded,
     wrapper.isDownloaded,
@@ -184,7 +185,11 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
       wrapper.collectionName,
       wrapper.Album
     ) || "Unknown album"),
-    duration,
+    // duration is catalog metadata (usually the full recording). The audio
+    // element supplies audioDuration after loading a preview or stream.
+    duration: metadataDuration,
+    metadataDuration,
+    audioDuration,
     track: number(first(track.trackNumber, track.indexNumber, track.IndexNumber, wrapper.trackNumber, wrapper.IndexNumber)),
     coverArt: first(
       artwork?.id,

@@ -1,5 +1,5 @@
 import type { Album, Artist, Track } from "../types.js";
-import type { ExternalArtworkTokenStore, ExternalAlbumDetail } from "./external-catalog.js";
+import type { ExternalArtworkTokenStore, ExternalAlbumDetail, ExternalArtistDetail } from "./external-catalog.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 import type { UnifiedSearchResult } from "./search.js";
 
@@ -19,6 +19,7 @@ type ItunesItem = {
   trackId?: number;
   trackName?: string;
   trackTimeMillis?: number;
+  previewUrl?: string;
   releaseDate?: string;
   primaryGenreName?: string;
   artworkUrl100?: string;
@@ -191,6 +192,7 @@ export class ItunesArtistCatalog {
         type: "track", id: `external_itunes_track_${item.trackId}`,
         title: item.trackName, subtitle: item.artistName || artist.name,
         artist: item.artistName || artist.name, album: item.collectionName || null,
+        previewUrl: item.previewUrl || null,
         artwork: artworkId ? { id: artworkId, url: `/api/artwork/external/${encodeURIComponent(artworkId)}` } : null,
         provider: "external", source: { kind: "external", count: 0 }, availability: null,
         identity: { id: `itunes:track:${item.trackId}`, strength: "provider" },
@@ -202,6 +204,68 @@ export class ItunesArtistCatalog {
       }];
     }).slice(0, 10);
     return { albums, tracks };
+  }
+
+  /**
+   * Resolves an iTunes artist selected from an external search. This path is
+   * intentionally independent of the local-library corroboration used by
+   * resolve(), because an external artist page has no local releases yet.
+   */
+  async getArtist(id: string): Promise<ExternalArtistDetail | null> {
+    if (!/^external_itunes_artist_[0-9]+$/.test(id)) return null;
+    const artistId = id.slice("external_itunes_artist_".length);
+    const [albumsResult, tracksResult] = await Promise.allSettled([
+      this.request("lookup", { id: artistId, entity: "album", limit: "200" }),
+      this.request("lookup", { id: artistId, entity: "song", limit: "50" }),
+    ]);
+    const items = [
+      ...(albumsResult.status === "fulfilled" ? albumsResult.value : []),
+      ...(tracksResult.status === "fulfilled" ? tracksResult.value : []),
+    ];
+    const artistName = items.find((item) => String(item.artistId) === artistId && item.artistName)?.artistName;
+    if (!artistName) return null;
+
+    const seenAlbums = new Set<string>();
+    const albums = items.flatMap((item) => {
+      if (item.collectionId == null || String(item.artistId) !== artistId || !item.collectionName) return [];
+      const key = itunesReleaseKey(item.collectionName);
+      if (seenAlbums.has(key)) return [];
+      seenAlbums.add(key);
+      return [{
+        id: `external_itunes_album_${item.collectionId}`,
+        title: item.collectionName,
+        year: releaseYear(item.releaseDate),
+        artworkId: this.artwork?.token(upscaleItunesArtwork(item.artworkUrl100), [".mzstatic.com"]) || null,
+        identity: { id: `itunes:album:${item.collectionId}`, strength: "provider" as const },
+      }];
+    });
+    const seenTracks = new Set<string>();
+    const tracks = items.flatMap((item): UnifiedSearchResult[] => {
+      if (item.trackId == null || !item.trackName || String(item.artistId) !== artistId || seenTracks.has(String(item.trackId))) return [];
+      seenTracks.add(String(item.trackId));
+      const artworkId = this.artwork?.token(upscaleItunesArtwork(item.artworkUrl100), [".mzstatic.com"]) || null;
+      return [{
+        type: "track", id: `external_itunes_track_${item.trackId}`,
+        title: item.trackName, subtitle: item.artistName || artistName,
+        artist: item.artistName || artistName, album: item.collectionName || null,
+        previewUrl: item.previewUrl || null,
+        artwork: artworkId ? { id: artworkId, url: `/api/artwork/external/${encodeURIComponent(artworkId)}` } : null,
+        provider: "external", source: { kind: "external", count: 0 }, availability: null,
+        identity: { id: `itunes:track:${item.trackId}`, strength: "provider" },
+        metadata: {
+          artistId: id,
+          albumId: item.collectionId != null ? `external_itunes_album_${item.collectionId}` : null,
+          durationSeconds: typeof item.trackTimeMillis === "number" ? Math.round(item.trackTimeMillis / 1000) : null,
+        },
+      }];
+    }).slice(0, 10);
+
+    return {
+      id, name: artistName,
+      artworkId: this.artwork?.token(upscaleItunesArtwork(items.find((item) => String(item.artistId) === artistId)?.artworkUrl100), [".mzstatic.com"]) || null,
+      albums, tracks,
+      identity: { id: `itunes:artist:${artistId}`, strength: "provider" },
+    };
   }
 
   async getAlbum(id: string): Promise<ExternalAlbumDetail | null> {
@@ -228,6 +292,7 @@ export class ItunesArtistCatalog {
         type: "track", id: `external_itunes_track_${item.trackId}`,
         title: item.trackName || "Unknown title", subtitle: item.artistName || null,
         artist: item.artistName || null, album: album.collectionName || null,
+        previewUrl: item.previewUrl || null,
         artwork: artworkId ? { id: artworkId, url: `/api/artwork/external/${encodeURIComponent(artworkId)}` } : null,
         provider: "external", source: { kind: "external", count: 0 }, availability: null,
         identity: { id: `itunes:track:${item.trackId}`, strength: "provider" },

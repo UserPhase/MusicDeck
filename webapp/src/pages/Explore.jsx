@@ -5,17 +5,16 @@ import { getAlbum, getAlbums, getCoverUrl, getExplore, getRecommendations, searc
 import { usePlayer } from "../context/PlayerContext";
 import { externalDiscoveryService } from "../services/externalDiscovery";
 import { extractArtworkColor } from "../utils/extractArtworkColor";
-import { formatDuration } from "../utils/formatDuration";
-import ArtistAvatar from "../components/ArtistAvatar";
+import { toUnifiedTrack } from "../types/track";
+import { DiscoveryArtistCard, DiscoveryAlbumCard, DiscoveryArtwork as Artwork } from "../components/DiscoveryCards";
+import TrackRow from "../components/TrackRow";
+import useTrackPlaylistMenu from "../hooks/useTrackPlaylistMenu";
 
 const SHELF_SIZE = 7;
 const TRACK_SIZE = 6;
 const feedKeys = ["featured", "popularArtists", "popularAlbums", "popularTracks", "discoverTracks", "discoverArtists", "discoverAlbums", "genres"];
 const initialFeeds = () => Object.fromEntries(feedKeys.map((key) => [key, { items: [], loading: true, error: null }]));
 const nameOf = (item) => item?.name || item?.title || "Unknown";
-const itemLink = (item, type) => item.external || item.sample
-  ? `/search?q=${encodeURIComponent(type === "album" ? `${nameOf(item)} ${item.artist || ""}`.trim() : nameOf(item))}`
-  : `/${type}/${encodeURIComponent(item.id)}`;
 
 function recommendedEntities(tracks, catalog, type) {
   const catalogByName = new Map(catalog.map((item) => [nameOf(item).toLowerCase(), item]));
@@ -36,14 +35,6 @@ function recommendedEntities(tracks, catalog, type) {
     seen.add(key);
     return true;
   }).slice(0, SHELF_SIZE);
-}
-
-function Artwork({ item, className = "" }) {
-  const [failed, setFailed] = useState(false);
-  const image = getCoverUrl(item?.coverArt, 360);
-  return <span className={`explore-artwork ${className}`}>
-    {image && !failed ? <img src={image} alt="" onError={() => setFailed(true)} /> : <span className="explore-artwork-fallback" aria-hidden="true">{nameOf(item).slice(0, 1).toUpperCase()}</span>}
-  </span>;
 }
 
 function Header({ id, title, subtitle }) {
@@ -68,10 +59,7 @@ function ArtistShelf({ id, title, subtitle, feed }) {
     <Header id={id} title={title} subtitle={subtitle} />
     <FeedBody feed={feed} shape="circles" count={SHELF_SIZE} empty="No artists to show yet.">
       <div className="explore-artist-row">{feed.items.slice(0, SHELF_SIZE).map((artist) =>
-        <Link className="explore-artist" key={artist.id} to={itemLink(artist, "artist")}>
-          <ArtistAvatar artist={artist} className="explore-artist-image" allowAlbumTileFallback />
-          <span className="explore-card-name">{nameOf(artist)}</span>
-        </Link>
+        <DiscoveryArtistCard key={artist.id} artist={artist} />
       )}</div>
     </FeedBody>
   </section>;
@@ -82,30 +70,29 @@ function AlbumShelf({ id, title, subtitle, feed, onPlay }) {
     <Header id={id} title={title} subtitle={subtitle} />
     <FeedBody feed={feed} shape="squares" count={SHELF_SIZE} empty="No albums to show yet.">
       <div className="explore-album-row">{feed.items.slice(0, SHELF_SIZE).map((album) =>
-        <article className="explore-album" key={album.id}>
-          <div className="explore-album-image">
-            <Link to={itemLink(album, "album")} aria-label={`Open ${nameOf(album)}`}><Artwork item={album} /></Link>
-            <button type="button" onClick={() => onPlay(album)} aria-label={`Play ${nameOf(album)}`} className="explore-album-play">▶</button>
-          </div>
-          <Link className="explore-card-name" to={itemLink(album, "album")}>{nameOf(album)}</Link>
-          <span className="explore-card-subtitle">{album.artist || "Unknown artist"}</span>
-        </article>
+        <DiscoveryAlbumCard key={album.id} album={album} onPlay={onPlay} />
       )}</div>
     </FeedBody>
   </section>;
 }
 
-function TrackPanel({ id, title, subtitle, feed, onPlay }) {
+function TrackPanel({ id, title, subtitle, feed, onPlay, menuSongId, onToggleMenu, renderMenu }) {
   return <section className="explore-track-panel" aria-labelledby={id}>
     <Header id={id} title={title} subtitle={subtitle} />
     <FeedBody feed={feed} shape="tracks" count={TRACK_SIZE} empty="No songs to show yet.">
-      <div className="explore-track-list">{feed.items.slice(0, TRACK_SIZE).map((song) =>
-        <button className="explore-track" type="button" key={song.id} onClick={() => onPlay(song)} aria-label={`Play ${nameOf(song)}`}>
-          <Artwork item={song} className="explore-track-image" />
-          <span className="explore-track-copy"><strong>{nameOf(song)}</strong><small>{song.artist || "Unknown artist"}</small></span>
-          <time>{song.durationLabel || formatDuration(song.duration || song.metadata?.durationSeconds)}</time>
-        </button>
-      )}</div>
+      <div className="explore-track-list track-list--compact" role="table">{feed.items.slice(0, TRACK_SIZE).map((rawSong, index) => {
+        const song = toUnifiedTrack(rawSong, "explore");
+        return <TrackRow
+          className="explore-track-row"
+          key={`${song.id}-${index}`}
+          song={song}
+          index={index}
+          showAlbum={false}
+          onPlay={onPlay}
+          onToggleMenu={onToggleMenu}
+          menu={menuSongId === song.id ? renderMenu(song) : null}
+        />;
+      })}</div>
     </FeedBody>
   </section>;
 }
@@ -131,6 +118,7 @@ function Explore() {
   const [actionMessage, setActionMessage] = useState("");
   const [savingId, setSavingId] = useState(null);
   const [savedIds, setSavedIds] = useState([]);
+  const { menuSongId: playlistMenuSongId, toggleMenu: togglePlaylistMenu, renderMenu: renderTrackMenu } = useTrackPlaylistMenu(setActionMessage);
   const { playSong, playQueue } = usePlayer();
 
   useEffect(() => {
@@ -198,15 +186,7 @@ function Explore() {
 
   async function playTrack(song) {
     setActionMessage("");
-    if (!song.external && !song.sample) { playSong(song); return; }
-    try {
-      const results = await searchNavidrome(nameOf(song), { mode: "library" });
-      const matching = (results.results?.track || []).find((item) => nameOf(item).toLowerCase() === nameOf(song).toLowerCase() && item.artist?.toLowerCase() === song.artist?.toLowerCase());
-      if (!matching) throw new Error(`External track — ${nameOf(song)} is not available in your local library.`);
-      playSong(matching);
-    } catch (error) {
-      setActionMessage(error.message || "Could not play this song.");
-    }
+    playSong(toUnifiedTrack(song, "explore"));
   }
 
   async function saveAlbum(album) {
@@ -255,8 +235,8 @@ function Explore() {
     <ArtistShelf id="explore-popular-artists" title="Artists Popular Externally" subtitle="Deezer charts" feed={feeds.popularArtists} />
     <AlbumShelf id="explore-popular-albums" title="Albums Popular Externally" subtitle="Deezer charts" feed={feeds.popularAlbums} onPlay={playAlbum} />
     <div className="explore-pulse" aria-label="The Pulse: track discovery">
-      <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle="Based on your listening" feed={feeds.discoverTracks} onPlay={playTrack} />
-      <TrackPanel id="explore-popular-songs" title="Songs Popular Externally" subtitle="Deezer charts" feed={feeds.popularTracks} onPlay={playTrack} />
+      <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle="Based on your listening" feed={feeds.discoverTracks} onPlay={playTrack} menuSongId={playlistMenuSongId} onToggleMenu={togglePlaylistMenu} renderMenu={renderTrackMenu} />
+      <TrackPanel id="explore-popular-songs" title="Songs Popular Externally" subtitle="Deezer charts" feed={feeds.popularTracks} onPlay={playTrack} menuSongId={playlistMenuSongId} onToggleMenu={togglePlaylistMenu} renderMenu={renderTrackMenu} />
     </div>
     <ArtistShelf id="explore-discover-artists" title="Discover Artists" subtitle="New voices for your library" feed={feeds.discoverArtists} />
     <AlbumShelf id="explore-discover-albums" title="Discover Albums" subtitle="A fresh shelf to explore" feed={feeds.discoverAlbums} onPlay={playAlbum} />

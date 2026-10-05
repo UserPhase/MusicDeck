@@ -1,16 +1,21 @@
 import { memo } from "react";
 import AvailabilityHint from "./AvailabilityHint";
+import AlbumDeleteButton from "./AlbumDeleteButton";
+import { useServerDeletion } from "../context/ServerDeletionContext";
 
 function AlbumCard({
+  id,
   title,
   artist,
   cover,
   availability,
   onClick,
 }) {
+  const deletion = useServerDeletion();
+  if (id && deletion?.deletedAlbums.has(String(id))) return null;
 
   return (
-
+    <div className="album-card-shell">
     <div
       className="album"
       onClick={onClick}
@@ -18,6 +23,8 @@ function AlbumCard({
       tabIndex={0}
       aria-label={`Play ${title}`}
       onKeyDown={(event) => {
+
+        if (event.target !== event.currentTarget) return;
 
         if (
           event.key === "Enter" ||
@@ -70,6 +77,8 @@ function AlbumCard({
         <AvailabilityHint availability={availability} />
       </div>
 
+    </div>
+    <AlbumDeleteButton album={{ id, title, availability }} />
     </div>
 
   );

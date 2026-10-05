@@ -22,6 +22,9 @@ import SourceIndicator from "../components/SourceIndicator";
 import InLibraryBadge from "../components/InLibraryBadge";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
+import AlbumDeleteButton from "../components/AlbumDeleteButton";
+import { useServerDeletion } from "../context/ServerDeletionContext";
+import { toArtistRouteIdFromApiId } from "../utils/idResolver";
 import {
   EmptyState,
   ErrorState,
@@ -38,6 +41,7 @@ import {
 } from "../context/PlayerContext";
 
 function Search() {
+  const deletion = useServerDeletion();
 
   const [
     searchParams,
@@ -524,7 +528,7 @@ function Search() {
 
                     <Link
                       key={artist.id}
-                      to={`/artist/${artist.id}`}
+                      to={`/artist/${encodeURIComponent(toArtistRouteIdFromApiId(artist.id))}`}
                       className="search-result"
                     >
 
@@ -574,10 +578,10 @@ function Search() {
               <div className="album-grid">
 
                 {results.album.map(
-                  (album) => (
+                  (album) => deletion?.deletedAlbums.has(String(album.id)) ? null : (
 
+                    <div key={album.id} className="album-card-shell">
                     <Link
-                      key={album.id}
                       to={`/album/${album.id}`}
                       className="see-all"
                     >
@@ -616,6 +620,8 @@ function Search() {
                       </div>
 
                     </Link>
+                    <AlbumDeleteButton album={album} />
+                    </div>
 
                   )
                 )}

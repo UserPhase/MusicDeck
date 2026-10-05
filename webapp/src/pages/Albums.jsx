@@ -11,18 +11,30 @@ import {
   getAlbums,
   getCoverUrl,
 } from "../api/musicdeck";
+import AlbumDeleteButton from "../components/AlbumDeleteButton";
+import { useServerDeletion } from "../context/ServerDeletionContext";
 
 
 function Albums() {
+  const deletion = useServerDeletion();
 
-  const [albums, setAlbums] =
+  const [allAlbums, setAlbums] =
     useState([]);
+  const albums = allAlbums.filter((album) => !deletion?.deletedAlbums.has(String(album.id)));
 
   const [loading, setLoading] =
     useState(true);
 
   const [error, setError] =
     useState(null);
+
+  useEffect(() => {
+    const handleDeleted = (event) => {
+      if (event.detail?.albumId) setAlbums((current) => current.filter((album) => album.id !== event.detail.albumId));
+    };
+    window.addEventListener("musicdeck:server-deleted", handleDeleted);
+    return () => window.removeEventListener("musicdeck:server-deleted", handleDeleted);
+  }, []);
 
 
   /*
@@ -179,8 +191,8 @@ function Albums() {
         {albums.map(
           (album) => (
 
+          <div key={album.id} className="album-card-shell">
           <Link
-            key={album.id}
             to={`/album/${album.id}`}
             className="album"
           >
@@ -227,6 +239,8 @@ function Albums() {
             </div>
 
           </Link>
+          <AlbumDeleteButton album={album} />
+          </div>
 
         ))}
 

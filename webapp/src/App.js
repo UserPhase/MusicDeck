@@ -12,10 +12,14 @@ import {
   useState,
   useCallback,
 } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { artistOverviewQueryClient } from "./api/artistOverviewQuery";
 
 import Topbar from "./components/Topbar";
 import AdminTopBar from "./components/admin/AdminTopBar";
 import Sidebar from "./components/Sidebar";
+import { ImportProvider } from "./context/ImportContext";
+import { ServerDeletionProvider } from "./context/ServerDeletionContext";
 import QueueSidebar from "./components/QueueSidebar";
 import NowPlayingSidebar from "./components/NowPlayingSidebar";
 import CommandPalette from "./components/CommandPalette";
@@ -39,6 +43,7 @@ import LibraryHealth from "./pages/LibraryHealth";
 import Album from "./pages/Album";
 import Playlist from "./pages/Playlist";
 import Artist from "./pages/Artist";
+import ArtistExternalAlbum from "./pages/ArtistExternalAlbum";
 
 import Liked from "./pages/Liked.jsx";
 import Login from "./pages/Login.jsx";
@@ -243,6 +248,7 @@ function AuthenticatedApp() {
                       <Route path="health" element={<LibraryHealth />} />
                     </Route>
                     <Route path="/album/:id" element={<Album />} />
+                    <Route path="/artist/:id/album/:albumId" element={<ArtistExternalAlbum />} />
                     <Route path="/artist/:id" element={<Artist />} />
                     <Route path="/playlist/:id" element={<Playlist />} />
                     <Route path="/liked" element={<Liked />} />
@@ -297,19 +303,21 @@ function AppContent() {
     );
   }
 
-  return <AuthenticatedApp />;
+  return <ImportProvider><ServerDeletionProvider><AuthenticatedApp /></ServerDeletionProvider></ImportProvider>;
 }
 
 
 function App() {
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <PlayerProvider>
-          <AppContent />
-        </PlayerProvider>
-      </AuthProvider>
-    </BrowserRouter>
+    <QueryClientProvider client={artistOverviewQueryClient}>
+      <BrowserRouter>
+        <AuthProvider>
+          <PlayerProvider>
+            <AppContent />
+          </PlayerProvider>
+        </AuthProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }
 

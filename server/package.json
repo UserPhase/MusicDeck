@@ -9,7 +9,8 @@
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:init": "tsx src/scripts/init-db.ts"
+    "db:init": "tsx src/scripts/init-db.ts",
+    "library:shrink": "tsx src/scripts/shrink-library.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.2",

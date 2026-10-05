@@ -17,7 +17,6 @@ import {
   getRandomSongs,
   getUserSettings,
   getSilenceAnalysis,
-  getPlayableSources,
 } from "../api/musicdeck";
 
 import {
@@ -27,7 +26,7 @@ import {
   DEFAULT_ACCENT_COLOR,
   normalizeAccentColor,
 } from "../utils/accentColors";
-import { findItunesPreview, trustedPreviewUrl } from "../utils/previewPlayback";
+import { trustedPreviewUrl } from "../utils/previewPlayback";
 import { createQueueSnapshot, queueStorageKey, readQueueSnapshot } from "../utils/queuePersistence";
 
 
@@ -486,6 +485,31 @@ export function PlayerProvider({
   const [playbackMessage, setPlaybackMessage] = useState("");
   const progressSecond = Math.floor(currentTime);
 
+  useEffect(() => {
+    const handleServerDeletion = (event) => {
+      const ids = new Set((event.detail?.trackIds || []).map(String));
+      if (!ids.size || !queue.some((song) => ids.has(String(song.id)))) return;
+      const remaining = queue.filter((song) => !ids.has(String(song.id)));
+      if (currentSong && ids.has(String(currentSong.id))) {
+        playbackRequestRef.current += 1;
+        audioRef.current?.pause();
+        setCurrentSong(null);
+        setIsPlaying(false);
+        setCurrentTime(0);
+        setDuration(0);
+        setPlaybackContext(null);
+        setQueue(remaining);
+        setQueueIndex(-1);
+      } else {
+        const removedBefore = queue.slice(0, queueIndex + 1).filter((song) => ids.has(String(song.id))).length;
+        setQueue(remaining);
+        setQueueIndex(Math.max(-1, queueIndex - removedBefore));
+      }
+    };
+    window.addEventListener("musicdeck:server-deleted", handleServerDeletion);
+    return () => window.removeEventListener("musicdeck:server-deleted", handleServerDeletion);
+  }, [queue, queueIndex, currentSong]);
+
   function cancelRestoreResume() {
     resumeListenerCleanupRef.current?.();
     resumeListenerCleanupRef.current = null;
@@ -563,28 +587,15 @@ export function PlayerProvider({
         activeAudio.volume = saved.volume;
 
         const loadRestoredSource = async () => {
-          let source = song.playableSource || song.sourceId || null;
-          let previewUrl = !isLibraryPlayable(song) ? trustedPreviewUrl(song.previewUrl) : null;
-          if (!isLibraryPlayable(song) && !previewUrl && !source) {
-            try {
-              previewUrl = await findItunesPreview(song);
-              if (!previewUrl) {
-                const resolution = await getPlayableSources(song);
-                source = resolution?.selectedSource ||
-                  (resolution?.sources || []).find((candidate) => candidate.availability === "available") || null;
-              }
-            } catch {
-              // An unavailable external preview leaves the restored track paused.
-            }
-          }
+          const localTrack = isLibraryPlayable(song);
+          const source = localTrack ? song.playableSource || song.sourceId || null : null;
+          const previewUrl = localTrack ? null : trustedPreviewUrl(song.previewUrl);
           if (restoreRequestRef.current?.requestId !== requestId) return;
-          if (!isLibraryPlayable(song) && !previewUrl && !source) {
+          if (!localTrack && !previewUrl) {
             cancelRestoreResume();
             return;
           }
-          const restoredPreview = previewUrl
-            ? { type: "preview", quality: { durationSeconds: 30 } }
-            : source?.type === "preview" ? source : null;
+          const restoredPreview = previewUrl ? { type: "preview", quality: { durationSeconds: 30 } } : null;
           setPreviewSource(restoredPreview);
           previewSourceRef.current = restoredPreview;
           activeAudio.src = previewUrl || getStreamUrl(song.id, source, streamQualityRef.current);
@@ -1406,110 +1417,20 @@ export function PlayerProvider({
      * failing playback.
      */
 
-    let source =
-      song.playableSource ||
-      song.sourceId ||
-      null;
+    const localTrack = isLibraryPlayable(song);
+    const source = localTrack ? song.playableSource || song.sourceId || null : null;
+    const directPreviewUrl = localTrack ? null : trustedPreviewUrl(song.previewUrl);
 
-    let directPreviewUrl = null;
-
-
-    if (
-      !source &&
-      !isLibraryPlayable(song)
-    ) {
-
-      directPreviewUrl = trustedPreviewUrl(song.previewUrl);
-
-      if (!directPreviewUrl) {
-        directPreviewUrl = await findItunesPreview(song);
-
-        if (requestId !== playbackRequestRef.current) return;
-
-        if (directPreviewUrl) {
-          song = { ...song, previewUrl: directPreviewUrl };
-          setQueue((currentQueue) => currentQueue.map((queuedSong) =>
-            queuedSong?.id === song.id
-              ? { ...queuedSong, previewUrl: directPreviewUrl }
-              : queuedSong
-          ));
-        }
-      }
-
-      if (directPreviewUrl) {
-        source = {
-          id: `direct-preview:${song.id}`,
-          provider: "external",
-          type: "preview",
-          mediaType: "audio",
-          label: "30-second preview",
-          availability: "available",
-          quality: { durationSeconds: 30, lossless: false },
-        };
-      }
-
-      try {
-
-        const resolution = directPreviewUrl
-          ? null
-          : await getPlayableSources(song);
-
-        source = source ||
-          resolution?.selectedSource ||
-          (resolution?.sources || []).find(
-            (candidate) =>
-              candidate.availability ===
-              "available"
-          ) ||
-          null;
-
-      } catch (error) {
-
-        source = null;
-
-      }
-
-
-      if (
-        requestId !== playbackRequestRef.current
-      ) {
-
-        return;
-
-      }
-
-
-      if (!source) {
-
-        /*
-         * Nothing playable exists for this track: keep the existing
-         * unavailable state rather than loading a broken stream.
-         */
-
-        audioRef.current.pause();
-
-        setCurrentSong(song);
-        setIsPlaying(false);
-        setCurrentTime(0);
-        setDuration(0);
-        setPreviewSource(null);
-        previewSourceRef.current = null;
-        setPlaybackUnavailable(true);
-        setPlaybackMessage("No audio preview available for this track.");
-
-        return;
-
-      }
-
+    // External catalog entries may only use their provider-supplied preview.
+    // Do not resolve a full external source when that preview is unavailable.
+    if (!localTrack && !directPreviewUrl) {
+      setPlaybackMessage("Preview unavailable for this track");
+      return false;
     }
 
-
-    const preview =
-      source &&
-      typeof source === "object" &&
-      source.type === "preview"
-        ? source
-        : null;
+    const preview = directPreviewUrl
+      ? { type: "preview", quality: { durationSeconds: 30, lossless: false } }
+      : null;
 
     setPreviewSource(preview);
     previewSourceRef.current = preview;
@@ -1604,6 +1525,8 @@ export function PlayerProvider({
 
     }
 
+    return requestId;
+
   }
 
 
@@ -1623,11 +1546,23 @@ export function PlayerProvider({
       return;
     }
 
+    const started = await loadAndPlaySong(song);
+    if (started === false || started !== playbackRequestRef.current) return;
+
     setPlaybackContext(null);
     setQueue([song]);
     setQueueIndex(0);
+  }
 
-    await loadAndPlaySong(song);
+  function addToQueue(song) {
+    if (!song) return;
+
+    setQueue((currentQueue) => {
+      const alreadyQueued = currentQueue.some(
+        (queuedSong) => String(queuedSong?.id) === String(song.id)
+      );
+      return alreadyQueued ? currentQueue : [...currentQueue, song];
+    });
   }
 
   /*
@@ -2130,30 +2065,9 @@ export function PlayerProvider({
 
     playbackRequestRef.current += 1;
 
-    let source =
-      nextTrack.playableSource ||
-      nextTrack.sourceId ||
-      null;
-
-    if (
-      !source &&
-      !isLibraryPlayable(nextTrack)
-    ) {
-      try {
-        const resolution =
-          await getPlayableSources(nextTrack);
-
-        source =
-          resolution.selectedSource ||
-          (resolution.sources || []).find(
-            (candidate) =>
-              candidate.availability === "available"
-          ) ||
-          null;
-      } catch (error) {
-        source = null;
-      }
-    }
+    const localNextTrack = isLibraryPlayable(nextTrack);
+    const source = localNextTrack ? nextTrack.playableSource || nextTrack.sourceId || null : null;
+    const previewUrl = localNextTrack ? null : trustedPreviewUrl(nextTrack.previewUrl);
 
     if (
       transitionToken !== crossfadeTokenRef.current
@@ -2162,27 +2076,19 @@ export function PlayerProvider({
     }
 
     if (
-      !source &&
-      !isLibraryPlayable(nextTrack)
+      !localNextTrack &&
+      !previewUrl
     ) {
       isCrossfadingRef.current = false;
       return;
     }
 
-    const incomingPreview =
-      source &&
-      typeof source === "object" &&
-      source.type === "preview"
-        ? source
-        : null;
+    const incomingPreview = previewUrl
+      ? { type: "preview", quality: { durationSeconds: 30, lossless: false } }
+      : null;
 
     incomingAudio.pause();
-    incomingAudio.src =
-      getStreamUrl(
-        nextTrack.id,
-        source,
-        streamQualityRef.current
-      );
+    incomingAudio.src = previewUrl || getStreamUrl(nextTrack.id, source, streamQualityRef.current);
     incomingAudio.currentTime = 0;
     deckGainRef.current.set(
       incomingAudio,
@@ -2521,9 +2427,15 @@ export function PlayerProvider({
     }
 
 
-    setDuration(
-      activeAudio.duration
-    );
+    const audioDuration = Number.isFinite(activeAudio.duration)
+      ? activeAudio.duration
+      : 0;
+    setDuration(audioDuration);
+    setCurrentSong((song) => song ? {
+      ...song,
+      metadataDuration: song.metadataDuration ?? song.duration ?? song.metadata?.durationSeconds ?? null,
+      audioDuration,
+    } : song);
 
     const restoredPosition = pendingRestoreSeekRef.current;
     if (restoredPosition !== null) {
@@ -2887,6 +2799,8 @@ export function PlayerProvider({
         accentColor,
 
         playSong,
+
+        addToQueue,
 
         playSongFromSource,
 

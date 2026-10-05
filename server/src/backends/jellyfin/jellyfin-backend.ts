@@ -165,6 +165,29 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     return item ? mapJellyfinTrack(item) : null;
   }
 
+  async getTrackFilePath(trackId: string): Promise<string | null> {
+    const result = await this.request<{ Items?: Array<{ Path?: unknown }> }>("Items", {
+      Ids: trackId,
+      IncludeItemTypes: "Audio",
+      Fields: "Path",
+    });
+    const filePath = result.Items?.[0]?.Path;
+    return typeof filePath === "string" ? filePath : null;
+  }
+
+  async requestLibraryRescan(): Promise<void> {
+    const response = await this.fetchImpl(this.buildUrl("Library/Refresh"), {
+      method: "POST",
+      headers: this.authHeaders(),
+    });
+    if (!response.ok) throw new Error(`Jellyfin library refresh failed (${response.status})`);
+  }
+
+  async scanLibrary(): Promise<{ scanning: boolean }> {
+    await this.requestLibraryRescan();
+    return { scanning: true };
+  }
+
   async getLyrics(trackId: string): Promise<string | null> {
     try {
       const result = await this.request<any>(`Audio/${encodeURIComponent(trackId)}/Lyrics`);
@@ -206,7 +229,7 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     }
   }
 
-  async search(query: string, types: string[] = ["artists", "albums", "tracks"]): Promise<SearchResult> {
+  async search(query: string, types: string[] = ["artists", "albums", "tracks"], pagination?: { offset: number; limit: number }): Promise<SearchResult> {
     const empty: SearchResult = { artists: [], albums: [], tracks: [] };
 
     if (!query.trim()) {
@@ -228,7 +251,8 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
       searchTerm: query.trim(),
       IncludeItemTypes: includeTypes.join(","),
       Recursive: true,
-      Limit: 100,
+      Limit: pagination ? Math.max(1, Math.min(500, pagination.limit)) : 100,
+      ...(pagination ? { StartIndex: Math.max(0, pagination.offset) } : {}),
     }, (item) => item);
 
     for (const item of items) {

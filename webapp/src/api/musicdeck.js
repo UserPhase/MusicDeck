@@ -551,6 +551,20 @@ export async function getArtistOverview(artistId, { scope } = {}) {
   };
 }
 
+export async function getArtistDiscography(artistId) {
+  const data = await request(`/api/artists/${encodeURIComponent(artistId)}/discography`);
+  return {
+    missingAlbums: data.missingAlbums || [],
+    missingTracks: data.missingTracks || [],
+    providers: data.providers || {},
+  };
+}
+
+export async function getArtistTopTracks(artistId) {
+  const data = await request(`/api/artists/${encodeURIComponent(artistId)}/top-tracks`);
+  return data.tracks || [];
+}
+
 export async function getArtistPortrait(artistId, options = {}) {
   const params = new URLSearchParams();
   if (options.skipNative) params.set("skipNative", "1");

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import path from "node:path";
 import type { MusicBackend, SearchResult, StreamResult } from "../music-backend.js";
 import type { Album, Artist, Playlist, Track } from "../../types.js";
 import { mapAlbum, mapArtist, mapPlaylist, mapTrack } from "./mappers.js";
@@ -210,6 +211,15 @@ export class NavidromeBackend implements MusicBackend {
     return result.song ? mapTrack(result.song) : null;
   }
 
+  async getTrackFilePath(trackId: string): Promise<string | null> {
+    // Navidrome's default Subsonic path is synthesized from tags and may not
+    // name a file on disk. Keep file management separate from playback so its
+    // real-path setting can be configured independently.
+    const result = await this.request("getSong", { id: trackId, c: "MusicDeck File Management" });
+    const filePath = result.song?.path;
+    return typeof filePath === "string" && path.isAbsolute(filePath) ? filePath : null;
+  }
+
   async scrobbleTrack(trackId: string, playedAt = Date.now()): Promise<void> {
     await this.request("scrobble", { id: trackId, time: playedAt, submission: true });
   }
@@ -278,7 +288,7 @@ export class NavidromeBackend implements MusicBackend {
     }
   }
 
-  async search(query: string, types: string[] = ["artists", "albums", "tracks"]): Promise<SearchResult> {
+  async search(query: string, types: string[] = ["artists", "albums", "tracks"], pagination?: { offset: number; limit: number }): Promise<SearchResult> {
     if (!query.trim()) {
       return { artists: [], albums: [], tracks: [] };
     }
@@ -290,8 +300,8 @@ export class NavidromeBackend implements MusicBackend {
       artistOffset: 0,
       albumCount: wants.has("albums") ? 20 : 0,
       albumOffset: 0,
-      songCount: wants.has("tracks") || wants.has("songs") ? 50 : 0,
-      songOffset: 0,
+      songCount: wants.has("tracks") || wants.has("songs") ? Math.max(1, Math.min(500, pagination?.limit || 50)) : 0,
+      songOffset: Math.max(0, pagination?.offset || 0),
     });
 
     return {
@@ -421,9 +431,13 @@ export class NavidromeBackend implements MusicBackend {
     };
   }
 
+  async requestLibraryRescan(): Promise<void> {
+    await this.request("startScan");
+  }
+
   async scanLibrary(): Promise<{ count?: number; scanning?: boolean }> {
     try {
-      await this.request("startScan");
+      await this.requestLibraryRescan();
     } catch {
       return { scanning: false };
     }

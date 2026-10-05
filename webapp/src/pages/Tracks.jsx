@@ -15,6 +15,7 @@ import {
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
+import { useServerDeletion } from "../context/ServerDeletionContext";
 import {
   EmptyState,
   ErrorState,
@@ -27,6 +28,7 @@ import {
 } from "../api/playlists";
 
 function Tracks() {
+  const deletion = useServerDeletion();
 
   const {
     playContext,
@@ -43,8 +45,18 @@ function Tracks() {
   }
 
 
-  const [songs, setSongs] =
+  const [allSongs, setSongs] =
     useState([]);
+  const songs = allSongs.filter((song) => !deletion?.deletedTracks.has(String(song.id)));
+
+  useEffect(() => {
+    const handleDeleted = (event) => {
+      const ids = new Set(event.detail?.trackIds || []);
+      if (ids.size) setSongs((current) => current.filter((song) => !ids.has(song.id)));
+    };
+    window.addEventListener("musicdeck:server-deleted", handleDeleted);
+    return () => window.removeEventListener("musicdeck:server-deleted", handleDeleted);
+  }, []);
 
   const [loadingSongs, setLoadingSongs] =
     useState(true);

@@ -546,6 +546,17 @@ test("album queues honor their start index and support next and previous", async
   });
 });
 
+test("server deletion removes queued tracks and stops a deleted current song", async () => {
+  renderPlayer();
+  fireEvent.click(screen.getByText("album"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+  act(() => window.dispatchEvent(new CustomEvent("musicdeck:server-deleted", { detail: { trackIds: ["song-3"] } })));
+  expect(screen.getByTestId("queue")).not.toHaveTextContent("song-3");
+  act(() => window.dispatchEvent(new CustomEvent("musicdeck:server-deleted", { detail: { trackIds: ["song-2"] } })));
+  expect(screen.getByTestId("current-song")).toHaveTextContent("none");
+  expect(screen.getByTestId("queue")).not.toHaveTextContent("song-2");
+});
+
 
 test("duplicate ended events advance the queue only once", async () => {
   const { container } = renderPlayer();

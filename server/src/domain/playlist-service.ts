@@ -284,12 +284,28 @@ export class PlaylistService {
     return rows.map((row) => this.withOwner(row));
   }
 
-  async create(name: string, user: SessionUser, description?: string): Promise<Playlist & { ownerUserId: string | null }> {
+  async create(name: string, user: SessionUser, description?: string, importId?: string): Promise<Playlist & { ownerUserId: string | null }> {
+    if (importId) {
+      const existing = this.getRow(importId);
+      if (existing) {
+        if (existing.owner_user_id !== user.id) throw new Error("Imported playlist belongs to another user");
+        return this.withOwner(existing);
+      }
+    }
     const now = new Date().toISOString();
-    const id = createId("mdpl");
+    const id = importId || createId("mdpl");
     const connectionId = getPrimaryConnectionId(this.db);
 
     let providerPlaylistId: string | null = null;
+    // Durable imports create their authoritative local record first. Provider
+    // playlist creation cannot be made atomic with SQLite and has no idempotency key.
+    if (importId) {
+      this.db.prepare(`
+        INSERT INTO playlists (id, owner_user_id, name, description, source_connection_id, source_playlist_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+      `).run(id, user.id, name, description?.trim() || null, connectionId, now, now);
+      return this.withOwner(this.getRow(id)!, []);
+    }
     try {
       const providerPlaylist = await this.backend.createPlaylist(name);
       providerPlaylistId = providerPlaylist?.id || null;
@@ -450,6 +466,21 @@ export class PlaylistService {
     }
 
     return { added: true };
+  }
+
+  /** Link a track returned by the primary catalog provider to a MusicDeck playlist. */
+  hasProviderTrack(playlistId: string, providerTrackId: string): boolean {
+    const connectionId = getPrimaryConnectionId(this.db);
+    return Boolean(connectionId && this.db.prepare(
+      "SELECT id FROM playlist_items WHERE playlist_id = ? AND connection_id = ? AND provider_track_id = ?"
+    ).get(playlistId, connectionId, providerTrackId));
+  }
+
+  async addProviderTrack(playlistId: string, providerTrackId: string): Promise<{ added: boolean }> {
+    const connectionId = getPrimaryConnectionId(this.db);
+    if (!connectionId || !this.getRow(playlistId)) return { added: false };
+    const libraryTrackId = this.library.ensureId("track", { connectionId, providerItemId: providerTrackId });
+    return this.addTrack(playlistId, libraryTrackId);
   }
 
   async removeItem(playlistId: string, trackId: string): Promise<boolean> {

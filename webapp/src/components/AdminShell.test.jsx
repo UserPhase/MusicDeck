@@ -6,6 +6,7 @@ import { PlayerProvider, usePlayer } from "../context/PlayerContext";
 import AdminSidebar from "./admin/AdminSidebar";
 import RequireAdmin from "./admin/RequireAdmin";
 import Sidebar from "./Sidebar";
+import { ImportProvider } from "../context/ImportContext";
 import Player from "./Player";
 
 
@@ -79,7 +80,7 @@ function renderApp({ route = "/", user = ADMIN_USER } = {}) {
   return render(
     <MemoryRouter initialEntries={[route]}>
       <PlayerProvider>
-        <Harness />
+        <ImportProvider><Harness /></ImportProvider>
       </PlayerProvider>
     </MemoryRouter>
   );
@@ -212,7 +213,7 @@ describe("Player persistence across shells", () => {
     render(
       <MemoryRouter initialEntries={["/"]}>
         <PlayerProvider>
-          <NavigableHarness />
+          <ImportProvider><NavigableHarness /></ImportProvider>
         </PlayerProvider>
       </MemoryRouter>
     );

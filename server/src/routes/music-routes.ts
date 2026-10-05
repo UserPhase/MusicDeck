@@ -29,6 +29,7 @@ import { ItunesArtistCatalog, itunesReleaseKey, sameItunesRecording } from "../d
 import { ArtistImageResolver, isNativeArtistPicture } from "../domain/artist-image.js";
 import { MusicBrainzAvatarWorker } from "../domain/musicbrainz-avatar-worker.js";
 import { LyricsService, parseLrcLines, type LyricsTrack } from "../domain/lyrics-service.js";
+import { discographyTracksMatch, mergeDiscography, normalizeDiscographyText, type DiscographyAlbum, type DiscographyTrack } from "../services/discovery/discographyMerger.js";
 import {
   findMatchingExternalAlbum,
   findMatchingExternalArtist,
@@ -607,9 +608,17 @@ export async function registerMusicRoutes(
     const { artistId } = request.params as { artistId: string };
     const { scope } = request.query as { scope?: string };
     const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
+    const keylessExternalArtist = /^external_(deezer|itunes)_artist_/.test(artistId);
     if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) {
-      if (!externalAllowed) return sendError(reply, 403, "External catalog is not available for this user");
-      const artist = await externalCatalog.getArtist(artistId);
+      // Deezer and iTunes detail metadata is keyless. Users who can see a
+      // public chart should be able to open its artist page without needing
+      // the optional external-search feature flag.
+      if (!externalAllowed && !keylessExternalArtist) {
+        return sendError(reply, 403, "External catalog is not available for this user");
+      }
+      const artist = artistId.startsWith("external_itunes_artist_")
+        ? await itunesArtistCatalog.getArtist(artistId)
+        : await externalCatalog.getArtist(artistId);
       return artist ? {
         artist,
         albums: artist.albums,
@@ -671,6 +680,158 @@ export async function registerMusicRoutes(
       localAlbumCount: localAlbums.length,
       localSongCount: artist.songCount ?? localAlbums.reduce((total, album) => total + album.songCount, 0),
       externalEnrichmentAvailable: scope === "local" && externalAllowed,
+    };
+  });
+
+  /**
+   * Slow, optional artist enrichment. The Artist page requests this only
+   * after its local overview has rendered, so a provider timeout never delays
+   * the library view.
+   */
+  app.get("/api/artists/:artistId/discography", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (user.role !== "admin" && !user.externalSearchEnabled) {
+      return sendError(reply, 403, "External catalog is not available for this user");
+    }
+
+    const { artistId } = request.params as { artistId: string };
+    if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) {
+      return sendError(reply, 400, "Complete discography requires a local artist");
+    }
+
+    const { artist, localAlbums } = await localArtistSnapshot(artistId);
+    if (!artist) return sendError(reply, 404, "Artist not found");
+    const localTracks = await catalog.getArtistTracks(artistId);
+
+    const [itunesResult, deezerArtistsResult] = await Promise.allSettled([
+      itunesArtistCatalog.resolve(artist, localAlbums, localTracks),
+      externalCatalog.deezerProvider.searchArtists(artist.name, 8),
+    ]);
+    const deezerArtist = deezerArtistsResult.status === "fulfilled"
+      ? deezerArtistsResult.value.find((candidate) => normalizeDiscographyText(candidate.title) === normalizeDiscographyText(artist.name))
+      : null;
+    const deezerDetail = deezerArtist
+      ? await externalCatalog.deezerProvider.getArtist(deezerArtist.id).catch(() => null)
+      : null;
+    const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : null;
+
+    const local = {
+      albums: localAlbums.map((album): DiscographyAlbum => ({
+        id: album.id, title: album.name, artist: album.artistName, year: album.year,
+        artworkId: album.artworkId, source: "local",
+      })),
+      tracks: localTracks.map((track): DiscographyTrack => ({
+        id: track.id, title: track.title, artist: track.artistName, album: track.albumName,
+        durationSeconds: track.durationSeconds, artworkId: track.artworkId, source: "local",
+      })),
+    };
+    const external = {
+      albums: [
+        ...(itunes?.albums || []).map((album): DiscographyAlbum => ({
+          id: album.id, title: album.title, artist: artist.name, year: album.year,
+          artworkId: album.artworkId, source: "external", provider: "itunes",
+        })),
+        ...(deezerDetail?.albums || []).map((album): DiscographyAlbum => ({
+          id: album.id, title: album.title, artist: artist.name, year: album.year,
+          artworkId: album.artworkId, source: "external", provider: "deezer",
+        })),
+      ],
+      tracks: [
+        ...(itunes?.tracks || []).map((track): DiscographyTrack => ({
+          id: track.id, title: track.title, artist: track.artist, album: track.album,
+          durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
+          artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
+          source: "external", provider: "itunes", metadata: track.metadata,
+        })),
+        ...(deezerDetail?.tracks || []).map((track): DiscographyTrack => ({
+          id: track.id, title: track.title, artist: track.artist, album: track.album,
+          durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
+          artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
+          source: "external", provider: "deezer", metadata: track.metadata,
+        })),
+      ],
+    };
+    const merged = mergeDiscography(local, external);
+    reply.header("Cache-Control", "private, max-age=300");
+    return {
+      missingAlbums: merged.missingAlbums.map((album) => ({
+        ...album, name: album.title, coverArt: album.artworkId,
+        source: { kind: "external", count: 0, externalAvailable: true },
+        discographySource: "external",
+      })),
+      missingTracks: merged.missingTracks.map((track) => ({
+        ...track, coverArt: track.artworkId,
+        source: { kind: "external", count: 0, externalAvailable: true },
+        discographySource: "external",
+      })),
+      providers: { itunes: Boolean(itunes), deezer: Boolean(deezerDetail) },
+    };
+  });
+
+  app.get("/api/artists/:artistId/top-tracks", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (user.role !== "admin" && !user.externalSearchEnabled) {
+      return sendError(reply, 403, "External catalog is not available for this user");
+    }
+    const { artistId } = request.params as { artistId: string };
+    const { artist, localAlbums } = await localArtistSnapshot(artistId);
+    if (!artist) return sendError(reply, 404, "Artist not found");
+    const localTracks = await catalog.getArtistTracks(artistId);
+    const [itunesResult, deezerArtistsResult] = await Promise.allSettled([
+      itunesArtistCatalog.resolve(artist, localAlbums, localTracks),
+      externalCatalog.deezerProvider.searchArtists(artist.name, 8),
+    ]);
+    const deezerArtist = deezerArtistsResult.status === "fulfilled"
+      ? deezerArtistsResult.value.find((candidate) => normalizeDiscographyText(candidate.title) === normalizeDiscographyText(artist.name))
+      : null;
+    const deezer = deezerArtist
+      ? await externalCatalog.deezerProvider.getArtist(deezerArtist.id).catch(() => null)
+      : null;
+    const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : null;
+    const candidates: DiscographyTrack[] = [
+      ...(deezer?.tracks || []).map((track): DiscographyTrack => ({
+        id: track.id, title: track.title, artist: track.artist, album: track.album,
+        durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
+        artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
+        source: "external", provider: "deezer", metadata: track.metadata,
+      })),
+      ...(itunes?.tracks || []).map((track): DiscographyTrack => ({
+        id: track.id, title: track.title, artist: track.artist, album: track.album,
+        durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
+        artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
+        source: "external", provider: "itunes", metadata: track.metadata,
+      })),
+    ];
+    const knownLocal = localTracks.map((track): DiscographyTrack => ({
+      id: track.id, title: track.title, artist: track.artistName, album: track.albumName,
+      durationSeconds: track.durationSeconds, artworkId: track.artworkId, source: "local",
+    }));
+    const top: Array<DiscographyTrack & { localId?: string }> = [];
+    for (const candidate of candidates) {
+      if (top.some((item) => discographyTracksMatch(candidate, item))) continue;
+      const local = knownLocal.find((item) => discographyTracksMatch(candidate, item));
+      top.push(local ? { ...local, localId: local.id } : candidate);
+      if (top.length === 10) break;
+    }
+    // Keyless providers may be unavailable. Keep a useful local fallback.
+    for (const local of knownLocal) {
+      if (top.length === 10) break;
+      if (!top.some((item) => discographyTracksMatch(local, item))) top.push({ ...local, localId: local.id });
+    }
+    reply.header("Cache-Control", "private, max-age=300");
+    return {
+      tracks: top.map((track) => ({
+        ...track,
+        coverArt: track.artworkId,
+        duration: track.durationSeconds,
+        isDownloaded: track.source === "local",
+        discographySource: track.source,
+        source: track.source === "local"
+          ? { kind: "library", count: 1 }
+          : { kind: "external", count: 0, externalAvailable: true },
+      })),
     };
   });
 
@@ -742,7 +903,9 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External catalog is not available for this user");
       }
 
-      const artist = await externalCatalog.getArtist(artistId);
+      const artist = artistId.startsWith("external_itunes_artist_")
+        ? await itunesArtistCatalog.getArtist(artistId)
+        : await externalCatalog.getArtist(artistId);
       return artist ? { artist } : sendError(reply, 404, "Artist not found");
     }
 
@@ -760,7 +923,9 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External catalog is not available for this user");
       }
 
-      const artist = await externalCatalog.getArtist(artistId);
+      const artist = artistId.startsWith("external_itunes_artist_")
+        ? await itunesArtistCatalog.getArtist(artistId)
+        : await externalCatalog.getArtist(artistId);
       return artist ? { albums: artist.albums } : sendError(reply, 404, "Artist not found");
     }
 
@@ -782,7 +947,9 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External catalog is not available for this user");
       }
 
-      const artist = await externalCatalog.getArtist(artistId);
+      const artist = artistId.startsWith("external_itunes_artist_")
+        ? await itunesArtistCatalog.getArtist(artistId)
+        : await externalCatalog.getArtist(artistId);
       return artist ? { tracks: artist.tracks } : sendError(reply, 404, "Artist not found");
     }
 

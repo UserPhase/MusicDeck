@@ -1,4 +1,17 @@
-.track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) minmax(3.75rem, 1fr) 5rem 3.125rem; --track-grid-gap: 1rem; width: 100%; margin-inline: auto; }
+.track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) minmax(3.75rem, 1fr) 5rem 4.5rem; --track-grid-gap: 1rem; width: 100%; margin-inline: auto; }
+.track-list--compact { --track-grid-columns: 2.25rem minmax(0, 1fr) 2.5rem 4.25rem; --track-grid-gap: .5rem; min-width: 0; }
+.track-list--compact .track { min-width: 0; min-height: 3.4rem; padding: .35rem .5rem; border: 1px solid transparent; border-radius: .5rem; }
+.track-list--compact .track-album, .track-list--compact .track-server-status { display: none; }
+.track-list--compact .track:hover, .track-list--compact .track:focus-within { border-color: rgb(255 255 255 / 8%); background: rgb(255 255 255 / 7%); }
+.track-list--compact .track-title { font-size: .8125rem; font-weight: 700; }
+.track-list--compact .track-artist, .track-list--compact .track-duration { font-size: .6875rem; }
+.track-list--compact .track:focus-within .track-play { opacity: 1; pointer-events: auto; transform: scale(1); }
+.track-list--compact .track:focus-within .track-number-text, .track-list--compact .track:focus-within .track-equalizer { opacity: 0; }
+.track-list--compact .track:focus-within .track-menu, .track-list--compact .track:focus-within .track-row-import .track-download-btn { opacity: 1; }
+.track-with-artwork .track-cover-art { width: 2.25rem; height: 2.25rem; border-radius: .35rem; transition: filter 150ms ease; }
+.track-with-artwork .track-cover-art .explore-artwork-fallback { font-size: .875rem; }
+.track-with-artwork:hover .track-cover-art, .track-with-artwork:focus-within .track-cover-art, .track-with-artwork.is-current-track .track-cover-art { filter: brightness(.55); }
+.track-with-artwork.is-current-track .track-play { opacity: 1; pointer-events: auto; transform: scale(1); }
 .track-list-header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: var(--track-grid-columns); gap: var(--track-grid-gap); align-items: center; min-height: 2.375rem; margin-bottom: .25rem; padding: 0 1rem .5rem; border-bottom: 1px solid var(--layout-divider); background: color-mix(in srgb, var(--bg-chrome) 96%, transparent); color: #a1a1aa; font-size: .75rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
 .track-list-header > :first-child { text-align: center; }
 .track-list-header > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -45,15 +58,17 @@
 .track-server-status { display: flex; width: 100%; height: 32px; align-items: center; justify-content: center; color: var(--text-muted); }
 .track-server-placeholder { display: inline-block; width: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
 .track-duration { min-width: 0; overflow: hidden; color: #d4d4d8; font-size: 12px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
-.track-row-actions { position: relative; display: flex; width: 100%; height: 40px; align-items: center; justify-content: center; text-align: center; }
+.track-row-actions { position: relative; display: flex; width: 100%; height: 40px; align-items: center; justify-content: center; gap: 2px; text-align: center; }
 .track-menu, .track-like { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border: none; border-radius: 6px; background: transparent; color: var(--text-muted); font-size: 18px; line-height: 1; opacity: 0; cursor: pointer; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease; }
 .track-row-actions .track-menu { width: 32px; height: 32px; }
 .track-offline-spinner { width: 14px; height: 14px; border: 2px solid color-mix(in srgb, var(--accent) 28%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: track-download-spin 0.8s linear infinite; }
 .track:hover .track-menu, .track-row-actions:focus-within .track-menu, .track-row-actions:has(.playlist-menu) .track-menu { opacity: 1; }
+.track-menu[aria-expanded="true"] { opacity: 1; }
 .track-menu:hover, .track-like:hover { background: var(--card-hover); color: var(--text); transform: scale(1.06); }
 .track-like.liked { color: var(--accent); }
 .track-menu:focus-visible, .track-like:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
 .playlist-menu { position: absolute; right: 0; top: calc(100% + 8px); z-index: 1000; min-width: 190px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 25px rgba(0, 0, 0, 0.35); }
+.track-context-menu-portal { position: fixed; z-index: 1200; width: min(240px, calc(100vw - 24px)); max-height: min(70vh, 480px); overflow-y: auto; overscroll-behavior: contain; }
 .playlist-menu-title { padding: 8px 10px; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
 .playlist-menu-item { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: none; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
 .playlist-menu-item:hover { background: var(--card-hover); }
@@ -93,6 +108,9 @@
 .track:hover .track-download-btn.already-downloaded { opacity: 0.85; }
 .track-server-status .track-download-container { width: 32px; height: 32px; }
 .track-server-status .track-download-btn { opacity: 0.78; }
+.track-row-actions .track-row-import { width: 30px; height: 32px; }
+.track-row-actions .track-row-import .track-download-btn { opacity: 0; }
+.track:hover .track-row-import .track-download-btn, .track-row-actions:focus-within .track-row-import .track-download-btn { opacity: 1; }
 .track-download-spinner { animation: track-download-spin 1s linear infinite; }
 :root[data-layout-density="compact"] .track { min-height: 2.625rem; padding: 0 1rem; }
 :root[data-layout-density="compact"] .track-album-page { grid-template-columns: var(--track-grid-columns); }
@@ -112,14 +130,27 @@
 :root[data-layout-density="compact"] .track-row-actions .track-menu { width: 28px; }
 :root[data-layout-density="compact"] .track-download-container { width: 32px; height: 32px; }
 
+.home-continue .home-continue-grid { --track-grid-columns: 3rem minmax(0, 1fr) 2.5rem 4.25rem; --track-grid-gap: .5rem; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+.home-continue .home-continue-grid .track { min-height: 4.25rem; padding: .5rem; border-radius: .5rem; }
+.home-continue .home-continue-grid .track-cover-art { width: 48px; height: 48px; border-radius: .375rem; }
+.home-continue .home-continue-grid .track-cover-art .explore-artwork-fallback { font-size: 1.125rem; }
+.home-continue .home-continue-grid .track-title { font-size: .875rem; }
+.home-continue .home-continue-grid .track-artist { margin-top: .25rem; font-size: .75rem; }
+.home-continue .home-continue-grid .track-duration { font-size: .6875rem; }
+.home-continue .home-continue-grid .track-play { width: 1.75rem; height: 1.75rem; font-size: .75rem; }
+
+@container (max-width: 40rem) {
+  .home-continue .home-continue-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 64rem) {
-  .track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) 5rem 3.125rem; --track-grid-gap: .875rem; }
+  .track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) 5rem 4.5rem; --track-grid-gap: .875rem; }
   .track-list-header > :nth-child(4),
   .track > :nth-child(4) { display: none; }
 }
 
 @media (max-width: 48rem) {
-  .track-list { --track-grid-columns: 3.125rem minmax(0, 1fr) 5rem 3.125rem; --track-grid-gap: .75rem; }
+  .track-list { --track-grid-columns: 3.125rem minmax(0, 1fr) 5rem 4.5rem; --track-grid-gap: .75rem; }
   .track-list-header > :nth-child(3),
   .track > :nth-child(3) { display: none; }
 }

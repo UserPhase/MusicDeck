@@ -4,11 +4,13 @@ import { MemoryRouter } from "react-router-dom";
 import Topbar from "./Topbar";
 import { useAuth } from "../context/AuthContext";
 import { searchNavidrome, getAcquisitions } from "../api/musicdeck";
+import { useImport } from "../context/ImportContext";
 
 
 jest.mock("../context/AuthContext", () => ({
   useAuth: jest.fn(),
 }));
+jest.mock("../context/ImportContext", () => ({ useImport: jest.fn() }));
 
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: () => ({
@@ -26,6 +28,7 @@ jest.mock("../api/musicdeck", () => ({
 
 
 function renderTopbar(user) {
+  useImport.mockReturnValue({ job: null, isMinimized: false, openProgress: jest.fn() });
   useAuth.mockReturnValue({
     session: user,
     signOut: jest.fn(),
@@ -37,6 +40,16 @@ function renderTopbar(user) {
     </MemoryRouter>
   );
 }
+
+test("shows a minimized playlist import in the header and reopens it", () => {
+  const openProgress = jest.fn();
+  useAuth.mockReturnValue({ session: { username: "sam", displayName: "Sam", role: "user" }, signOut: jest.fn() });
+  useImport.mockReturnValue({ job: { id: "job-1", status: "running" }, isMinimized: true, openProgress });
+  render(<MemoryRouter><Topbar /></MemoryRouter>);
+  fireEvent.click(screen.getByRole("button", { name: "Show playlist import progress" }));
+  expect(openProgress).toHaveBeenCalledTimes(1);
+  expect(screen.getByText("Importing 1 Playlist...")).toBeInTheDocument();
+});
 
 
 test("opens and closes the account menu from the profile button", () => {

@@ -16,6 +16,8 @@ import {
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
+import AlbumDeleteButton from "../components/AlbumDeleteButton";
+import { useServerDeletion } from "../context/ServerDeletionContext";
 
 import {
   getPlaylists,
@@ -27,6 +29,7 @@ import {
 } from "../context/PlayerContext";
 
 function Album() {
+  const deletion = useServerDeletion();
 
   const { id } = useParams();
 
@@ -39,6 +42,15 @@ function Album() {
 
   const [error, setError] =
     useState(null);
+
+  useEffect(() => {
+    const handleDeleted = (event) => {
+      const ids = new Set(event.detail?.trackIds || []);
+      if (ids.size) setAlbum((current) => current ? { ...current, song: (current.song || []).filter((song) => !ids.has(song.id)) } : current);
+    };
+    window.addEventListener("musicdeck:server-deleted", handleDeleted);
+    return () => window.removeEventListener("musicdeck:server-deleted", handleDeleted);
+  }, []);
 
   const {
     playContext,
@@ -338,7 +350,7 @@ function Album() {
 
 
   const songs =
-    album.song || [];
+    (album.song || []).filter((song) => !deletion?.deletedTracks.has(String(song.id)));
 
 
   /*
@@ -551,13 +563,7 @@ function Album() {
 
             {/* MORE */}
 
-            <button
-              type="button"
-              className="detail-secondary-action album-action"
-              aria-label="More options"
-            >
-              ⋯
-            </button>
+            <AlbumDeleteButton album={album} />
 
       </div>
 

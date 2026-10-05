@@ -1,4 +1,4 @@
-import { isValidElement, memo, useEffect, useState } from "react";
+import { isValidElement, memo, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { usePlayer } from "../context/PlayerContext";
@@ -11,6 +11,9 @@ import InLibraryBadge from "./InLibraryBadge";
 import TrackContextMenu from "./TrackContextMenu";
 import TrackDownloadButton from "./TrackDownloadButton";
 import TrackPlaybackIndicator from "./TrackPlaybackIndicator";
+import { DiscoveryArtwork } from "./DiscoveryCards";
+import { useServerDeletion } from "../context/ServerDeletionContext";
+import { toArtistRouteIdFromApiId } from "../utils/idResolver";
 
 
 function TrackRow({
@@ -18,6 +21,7 @@ function TrackRow({
   index,
   onPlay,
   showAlbum = true,
+  showArtwork = false,
   showSourceIndicator = false,
   dimWhenUnavailable = false,
   isDownloaded,
@@ -29,14 +33,17 @@ function TrackRow({
   onToggleMenu,
   menu,
   actionsRef,
+  onSpotdlDownload,
   className = "",
 }) {
+  const deletion = useServerDeletion();
   const {
     currentSong,
     downloadQuality = "320kbps",
     isPlaying,
     togglePlay,
   } = usePlayer();
+  const menuTriggerRef = useRef(null);
 
   const [offlineStatus, setOfflineStatus] = useState("not-downloaded");
 
@@ -55,6 +62,10 @@ function TrackRow({
   const isServerSynced = resolvedDownloaded ||
     Boolean(song.availability?.libraryAvailable) ||
     song.source?.kind === "library";
+  const isExternalTrack = !isServerSynced && Boolean(
+    song.external || song.sample || song.source?.kind === "external" ||
+    ["external", "deezer", "itunes"].includes(String(song.provider || "").toLowerCase())
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -127,6 +138,7 @@ function TrackRow({
 
   const rowClassName = [
     "track",
+    showArtwork && "track-with-artwork",
     !showAlbum && "track-album-page",
     dimWhenUnavailable && !resolvedDownloaded && "track-not-downloaded",
     isCurrentTrack && "is-current-track",
@@ -134,6 +146,8 @@ function TrackRow({
     className,
   ].filter(Boolean).join(" ");
   const supplementalMenuContent = isValidElement(menu) ? menu.props.children : menu;
+
+  if (deletion?.deletedTracks.has(String(song.id))) return null;
 
   return (
     <div
@@ -145,11 +159,11 @@ function TrackRow({
       onKeyDown={handleRowKeyDown}
     >
       <div className="track-number" role="cell">
-        <TrackPlaybackIndicator
+        {showArtwork ? <DiscoveryArtwork item={song} className="track-cover-art" /> : <TrackPlaybackIndicator
           index={index}
           isCurrentTrack={isCurrentTrack}
           isPlaying={isPlaying}
-        />
+        />}
 
         <button
           type="button"
@@ -173,7 +187,7 @@ function TrackRow({
         </div>
 
         {resolvedArtistId ? (
-          <Link to={`/artist/${resolvedArtistId}`} className="track-artist">
+          <Link to={`/artist/${encodeURIComponent(toArtistRouteIdFromApiId(resolvedArtistId))}`} className="track-artist">
             {song.artist || "Unknown artist"}
           </Link>
         ) : (
@@ -198,6 +212,8 @@ function TrackRow({
       <div className="track-server-status" role="cell">
         {isServerSynced ? (
           <span className="track-server-placeholder" aria-hidden="true">{"\u2063"}</span>
+        ) : isExternalTrack ? (
+          <span className="track-server-placeholder" aria-hidden="true">{"\u2063"}</span>
         ) : (
           <TrackDownloadButton song={song} completedPlaceholder />
         )}
@@ -214,13 +230,25 @@ function TrackRow({
         onClick={(event) => event.stopPropagation()}
         onMouseDown={(event) => event.stopPropagation()}
       >
+        {isExternalTrack && (
+          <TrackDownloadButton
+            song={song}
+            className="track-row-import"
+            completedPlaceholder
+          />
+        )}
+
         <button
           type="button"
           className="track-menu"
+          ref={menuTriggerRef}
           aria-label={`More options for ${song.title || "track"}`}
           aria-haspopup="menu"
           aria-expanded={Boolean(menu)}
-          onClick={(event) => onToggleMenu?.(song, event)}
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggleMenu?.(song, event);
+          }}
         >
           ⋯
         </button>
@@ -232,6 +260,9 @@ function TrackRow({
             isServerSynced={isServerSynced}
             offlineStatus={offlineStatus}
             onOfflineDownload={handleOfflineDownload}
+            onSpotdlDownload={onSpotdlDownload}
+            triggerRef={menuTriggerRef}
+            onRequestClose={() => onToggleMenu?.(song)}
           >
             {supplementalMenuContent}
           </TrackContextMenu>

@@ -20,6 +20,7 @@ import type { AcquisitionService } from "./domain/acquisition.js";
 import type { SilenceAnalysisService } from "./domain/silence-analysis.js";
 import { classifyPluginError, httpStatusForPluginError } from "./plugins/plugin-errors.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
+import { registerAdminMediaRoutes } from "./routes/admin-media-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerMusicRoutes } from "./routes/music-routes.js";
 import { registerPlaylistRoutes } from "./routes/playlist-routes.js";
@@ -108,6 +109,7 @@ export async function buildServer(options: {
   });
 
   await registerAdminRoutes(app, options.db, options.config, options.searchProviders, options.sourceProviders, options.externalCatalog, options.plugins, options.acquisition);
+  await registerAdminMediaRoutes(app, options.db, options.config.musicRoot, options.backend, options.catalog);
   await registerAuthRoutes(app, options.db, options.config);
   await registerUserRoutes(app, options.db);
   await registerSettingsRoutes(app, options.db);
