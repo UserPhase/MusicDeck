@@ -120,7 +120,8 @@ function AuthenticatedApp() {
     }
   });
   const isSidebarOpen = activeSidebar !== "none";
-  const isDetailPage = /^\/(?:album|artist|playlist)\/[^/]+/.test(location.pathname);
+  const isDetailPage = location.pathname === "/liked" ||
+    /^\/(?:album|artist|playlist)\/[^/]+/.test(location.pathname);
   const isSongPage = isDetailPage || [
     "/library/tracks",
     "/liked",
@@ -129,6 +130,7 @@ function AuthenticatedApp() {
   const isWideContentPage = isSongPage || ["/", "/explore"].includes(location.pathname) ||
     /^\/library\/(?:playlists|albums|artists)$/.test(location.pathname);
   const isHomePage = location.pathname === "/";
+  const hasFullBleedPageHero = location.pathname === "/explore" || location.pathname === "/search";
 
   const toggleTheme = useCallback(() => {
     setTheme((currentTheme) => currentTheme === "dark" ? "light" : "dark");
@@ -235,7 +237,7 @@ function AuthenticatedApp() {
                     Now Playing
                   </button>
                 )}
-                <div className={`main-content${isDetailPage ? " main-content--detail" : ""}${isHomePage ? " main-content--home" : ""}${isWideContentPage ? " main-content--wide" : ""}`}>
+                <div className={`main-content${isDetailPage ? " main-content--detail" : ""}${isHomePage ? " main-content--home" : ""}${isWideContentPage ? " main-content--wide" : ""}${hasFullBleedPageHero ? " main-content--full-bleed-hero" : ""}`}>
                   <Routes>
                     <Route path="/" element={<Home />} />
                     <Route path="/login" element={<Navigate to="/" replace />} />

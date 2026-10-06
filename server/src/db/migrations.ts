@@ -499,6 +499,22 @@ const migrations = [
       CREATE INDEX import_jobs_status_idx ON import_jobs(status, created_at);
     `,
   },
+  {
+    id: 22,
+    name: "imported-album-artwork",
+    sql: `
+      CREATE TABLE imported_album_artwork (
+        id TEXT PRIMARY KEY,
+        artist_name TEXT NOT NULL,
+        album_name TEXT NOT NULL,
+        spotify_album_id TEXT,
+        cover_url TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (artist_name, album_name)
+      );
+      CREATE INDEX imported_album_artwork_spotify_idx ON imported_album_artwork(spotify_album_id);
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

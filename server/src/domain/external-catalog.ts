@@ -482,8 +482,8 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       artist: artistName,
       album: item.album?.title || albumName || null,
       artwork: this.artwork(item.album?.cover_xl || item.album?.cover_big || item.album?.cover_medium || albumArtwork),
-      previewUrl: typeof item.preview === "string" && /^https:\/\/(?:[^/]+\.)?dzcdn\.net\//i.test(item.preview)
-        ? item.preview : null,
+      previewUrl: [item.previewUrl, item.preview_url, item.preview, item.audio_preview_url]
+        .find((value) => typeof value === "string" && /^https:\/\/(?:[^/]+\.)?dzcdn\.net\//i.test(value)) || null,
       provider: "external",
       source: { kind: "external", count: 0 },
       availability: null,
@@ -495,6 +495,7 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
         deezerTrackId: item.id,
         deezerTrackUrl: item.link || null,
       },
+      ...(typeof item.isrc === "string" ? { identityHints: { isrc: item.isrc } } : {}),
     };
   }
 
@@ -565,6 +566,16 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     });
     return (payload.data || [])
       .map((item) => this.artist(item))
+      .filter((item): item is UnifiedSearchResult => Boolean(item));
+  }
+
+  async searchTracks(query: string, limit = 10): Promise<UnifiedSearchResult[]> {
+    const payload = await this.request<{ data?: any[] }>("/search", {
+      q: query,
+      limit: String(Math.min(Math.max(limit, 1), 25)),
+    });
+    return (payload.data || [])
+      .map((item) => this.track(item))
       .filter((item): item is UnifiedSearchResult => Boolean(item));
   }
 

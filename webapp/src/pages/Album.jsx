@@ -10,8 +10,8 @@ import {
 
 import {
   getAlbum,
-  getCoverUrl,
 } from "../api/musicdeck";
+import { HeroArtwork } from "../components/Layout/FullHero";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
@@ -398,26 +398,7 @@ function Album() {
 
         {/* COVER */}
 
-        <div className="album-page-cover">
-
-          {album.coverArt && (
-
-            <img
-              width="230"
-              height="230"
-              src={
-                getCoverUrl(
-                  album.coverArt
-                )
-              }
-              alt={
-                `${album.name} cover`
-              }
-            />
-
-          )}
-
-        </div>
+        <HeroArtwork entity={album} className="album-page-cover" />
 
 
         {/* INFO */}

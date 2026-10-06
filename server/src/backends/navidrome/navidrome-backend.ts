@@ -3,6 +3,7 @@ import path from "node:path";
 import type { MusicBackend, SearchResult, StreamResult } from "../music-backend.js";
 import type { Album, Artist, Playlist, Track } from "../../types.js";
 import { mapAlbum, mapArtist, mapPlaylist, mapTrack } from "./mappers.js";
+import { NavidromeArtwork } from "../../services/media/navidromeArtwork.js";
 
 export type NavidromeConfig = {
   url: string;
@@ -28,6 +29,7 @@ export class NavidromeBackend implements MusicBackend {
   private readonly username: string;
   private readonly password: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly artwork = new NavidromeArtwork();
   private readonly artistDetails = new Map<string, { expiresAt: number; value: Promise<ArtistDetailResponse> }>();
 
   constructor(config: NavidromeConfig, fetchImpl: typeof fetch = fetch) {
@@ -422,13 +424,10 @@ export class NavidromeBackend implements MusicBackend {
   async fetchArtwork(artworkId: string, size?: number): Promise<StreamResult> {
     // Subsonic's `size` asks the server for a square thumbnail, which keeps
     // grid/sidebar artwork small without any local image processing.
-    const response = await this.fetchImpl(this.buildUrl("getCoverArt", { id: artworkId, size }));
-
-    return {
-      body: response.body,
-      status: response.status,
-      headers: response.headers,
-    };
+    const fetchCover = (id: string) => this.fetchImpl(
+      this.buildUrl("getCoverArt", { id, size }), { signal: AbortSignal.timeout(5_000) }
+    );
+    return this.artwork.read(artworkId, size, () => fetchCover(artworkId), () => fetchCover("al-0"));
   }
 
   async requestLibraryRescan(): Promise<void> {

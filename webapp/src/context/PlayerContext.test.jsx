@@ -103,6 +103,7 @@ function PlayerHarness() {
     playbackUnavailable,
     currentSong,
     isPlaying,
+    playbackMessage,
     currentTime,
     volume,
     togglePlay,
@@ -232,6 +233,7 @@ function PlayerHarness() {
       <div data-testid="is-playing">
         {String(isPlaying)}
       </div>
+      <div data-testid="playback-message">{playbackMessage}</div>
       <div data-testid="current-time">{currentTime}</div>
       <div data-testid="volume">{volume}</div>
       <div data-testid="crossfade-duration">
@@ -506,6 +508,38 @@ test("playing the active track toggles playback without rebuilding its queue", a
     "song-1,song-2,song-3"
   );
   expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+});
+
+test("reports play rejection and media errors for the current track", async () => {
+  const { container } = renderPlayer();
+  HTMLMediaElement.prototype.play.mockRejectedValueOnce(new Error("network unavailable"));
+  fireEvent.click(screen.getByText("direct"));
+
+  await waitFor(() => {
+    expect(screen.getByTestId("unavailable")).toHaveTextContent("true");
+    expect(screen.getByTestId("playback-message")).toHaveTextContent("network unavailable");
+  });
+
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "error", { configurable: true, value: { code: 2 } });
+  fireEvent.error(audio);
+  expect(screen.getByTestId("playback-message")).toHaveTextContent("network error");
+});
+
+test("ignores a late play rejection from a superseded track request", async () => {
+  renderPlayer();
+  let rejectPrevious;
+  HTMLMediaElement.prototype.play
+    .mockImplementationOnce(() => new Promise((_, reject) => { rejectPrevious = reject; }))
+    .mockResolvedValueOnce();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  fireEvent.click(screen.getByText("replay-gain-song"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("replay-gain-song"));
+
+  await act(async () => rejectPrevious(new Error("stale failure")));
+  expect(screen.getByTestId("unavailable")).toHaveTextContent("false");
+  expect(screen.getByTestId("playback-message")).toHaveTextContent("");
 });
 
 
@@ -1054,4 +1088,3 @@ test("preview playback stops at the preview endpoint", async () => {
   expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
   expect(recordListeningEvent).not.toHaveBeenCalled();
 });
-

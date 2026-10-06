@@ -21,6 +21,7 @@ import { DownloaderAdapterRegistry } from "./domain/downloader-adapter.js";
 import { SpotDLDownloaderAdapter } from "./domain/spotdl-downloader-adapter.js";
 import { AudioTaggerService } from "./services/media/audioTaggerService.js";
 import { SqliteImportJobRepository } from "./infrastructure/persistence/sqliteImportJobRepository.js";
+import { SqliteImportedArtworkRepository } from "./infrastructure/persistence/sqliteImportedArtworkRepository.js";
 import { getUserById } from "./users/users.js";
 import { PluginRegistry } from "./plugins/plugin-registry.js";
 import {
@@ -97,7 +98,8 @@ async function start() {
   const spotifyPlaylistImport = new SpotifyPlaylistImportService(
     backend, playlists, spotdlAdapter, config.musicRoot, undefined, config.spotifyImportSubdir,
     new AudioTaggerService({ getTools: () => spotdlAdapter.getMediaToolPaths() }),
-    new SqliteImportJobRepository(db)
+    new SqliteImportJobRepository(db),
+    new SqliteImportedArtworkRepository(db)
   );
   spotifyPlaylistImport.resumeInterrupted((userId) => getUserById(db, userId));
   for (const manifest of plugins.loadInstalledCustomPlugins()) {

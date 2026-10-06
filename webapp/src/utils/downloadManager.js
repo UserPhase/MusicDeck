@@ -63,14 +63,30 @@ async function readOfflineTrack(trackId) {
     return readFallbackMetadata()[String(trackId)] || null;
   }
 
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(OFFLINE_STORE_NAME, "readonly");
-    const request = transaction.objectStore(OFFLINE_STORE_NAME).get(String(trackId));
+  let failed = false;
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(OFFLINE_STORE_NAME, "readonly");
+      const request = transaction.objectStore(OFFLINE_STORE_NAME).get(String(trackId));
+      let result = null;
+      const fail = () => reject(transaction.error || request.error || new Error("Could not read offline track"));
 
-    request.onsuccess = () => resolve(request.result || null);
-    request.onerror = () => reject(request.error || new Error("Could not read offline track"));
-    transaction.oncomplete = () => database.close();
-  });
+      request.onsuccess = () => { result = request.result || null; };
+      request.onerror = fail;
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = fail;
+      transaction.onabort = fail;
+    });
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      database.close();
+    } catch (error) {
+      if (!failed) throw error;
+    }
+  }
 }
 
 async function saveOfflineTrack(record) {
@@ -88,15 +104,25 @@ async function saveOfflineTrack(record) {
     return;
   }
 
-  await new Promise((resolve, reject) => {
-    const transaction = database.transaction(OFFLINE_STORE_NAME, "readwrite");
-    transaction.objectStore(OFFLINE_STORE_NAME).put(record);
-    transaction.oncomplete = resolve;
-    transaction.onerror = () => reject(transaction.error || new Error("Could not save offline track"));
-    transaction.onabort = () => reject(transaction.error || new Error("Offline download was cancelled"));
-  });
-
-  database.close();
+  let failed = false;
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(OFFLINE_STORE_NAME, "readwrite");
+      transaction.objectStore(OFFLINE_STORE_NAME).put(record);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("Could not save offline track"));
+      transaction.onabort = () => reject(transaction.error || new Error("Offline download was cancelled"));
+    });
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      database.close();
+    } catch (error) {
+      if (!failed) throw error;
+    }
+  }
 }
 
 export async function isDownloadedToDevice(trackId) {

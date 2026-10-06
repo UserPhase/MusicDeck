@@ -44,38 +44,19 @@ export function sanitizeBiographyExtract(value) {
   return sentenceEnd >= 480 ? limit.slice(0, sentenceEnd + 1) : `${limit.slice(0, limit.lastIndexOf(" "))}…`;
 }
 
-function wikipediaUrl(title) {
-  return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/\s+/g, "_"))}`;
-}
-
-function candidatesFor(artistName) {
-  return [artistName, `${artistName} (musician)`, `${artistName} (band)`, `${artistName} (singer)`];
-}
-
 async function lookup(artistName, fetchImpl) {
-  for (const title of candidatesFor(artistName)) {
-    let response;
-    try {
-      response = await fetchImpl(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/\s+/g, "_"))}`, {
-        headers: { Accept: "application/json" }, credentials: "omit",
-      });
-    } catch {
-      return null; // Offline/CORS: no noisy retries through the other titles.
-    }
-    if (response.status === 404) continue;
-    if (!response.ok) return null;
-    let data;
-    try { data = await response.json(); } catch { return null; }
-    if (data?.type === "disambiguation") continue;
-    const text = sanitizeBiographyExtract(data?.extract);
-    if (!text || !MUSIC_CONTEXT.test(`${data?.description || ""} ${text}`)) continue;
-    const pageTitle = typeof data.title === "string" && data.title.trim() ? data.title.trim() : title;
-    return { text, url: wikipediaUrl(pageTitle), source: "wikipedia" };
-  }
-  return null;
+  const response = await fetchImpl(`/api/metadata/artist-biography?${new URLSearchParams({ artist: artistName })}`, {
+    headers: { Accept: "application/json" }, credentials: "include",
+  });
+  if (!response.ok) throw new Error(`Artist biography lookup failed (${response.status})`);
+  const data = await response.json();
+  if (!data.biography) return null;
+  const text = sanitizeBiographyExtract(data.biography.text);
+  if (!text || !MUSIC_CONTEXT.test(text)) return null;
+  return { text, url: data.biography.url, source: "wikipedia" };
 }
 
-/** Keyless, client-side fallback; positive results survive repeat page loads. */
+/** Same-origin, keyless fallback; positive results survive repeat page loads. */
 export function getWikipediaBiography(artistId, artistName, fetchImpl = fetch) {
   const name = String(artistName || "").trim();
   if (!name || !artistId) return Promise.resolve(null);
@@ -86,7 +67,7 @@ export function getWikipediaBiography(artistId, artistName, fetchImpl = fetch) {
     const request = lookup(name, fetchImpl).then((biography) => {
       if (biography) saveCached(artistId, name, biography);
       return biography;
-    }).catch(() => null).finally(() => pending.delete(key));
+    }).finally(() => pending.delete(key));
     pending.set(key, request);
   }
   return pending.get(key);

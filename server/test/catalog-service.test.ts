@@ -453,6 +453,24 @@ describe("CatalogService nested ID normalization", () => {
 });
 
 describe("CatalogService artwork identity", () => {
+  test("album detail artwork uses the same stable proxy identity as its list entry", async () => {
+    const item: Album = {
+      ...album("album-1", "Demos"),
+      artworkId: "provider-cover",
+      artworkUrl: "/api/artwork/provider-cover",
+    };
+    const backend = createFakeBackend({
+      listAlbums: vi.fn(async () => [item]),
+      getAlbum: vi.fn(async () => item),
+    });
+    const service = makeService(backend);
+    const listing = await service.listAlbums();
+    const detail = await service.getAlbum(listing.items[0].id);
+    expect(detail?.artworkId).toMatch(/^mdart_/);
+    expect(detail?.artworkId).toBe(listing.items[0].artworkId);
+    expect(detail?.artworkUrl).toBe(listing.items[0].artworkUrl);
+  });
+
   function albumWithArt(id: string, artId: string | null): Album {
     return {
       id, providerId: id, name: `Album ${id}`, artistId: null, artistName: "A",

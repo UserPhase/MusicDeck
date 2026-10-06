@@ -54,7 +54,10 @@ function toAlbum(album, songs) {
     releaseDate: album.releaseDate || null,
     genre: album.genre || null,
     label: album.label || null,
-    coverArt: album.artwork?.id || album.artworkId || null,
+    coverArt: album.artwork?.id || album.artworkId || album.coverArt || null,
+    coverUrl: album.artwork?.url || album.artworkUrl || album.coverUrl || null,
+    unavailableArtworkIds: album.unavailableArtworkIds || [],
+    artworkResolutionFailed: Boolean(album.artworkResolutionFailed),
     songCount: isExternal ? (album.tracks || []).length : album.songCount,
     // Catalog-aware completeness: total known tracks vs. locally downloaded
     // tracks. Falls back to songCount when the server hasn't merged catalog
@@ -93,7 +96,8 @@ function toPlaylist(playlist) {
   return {
     id: playlist.id,
     name: playlist.name,
-    comment: playlist.description,
+    description: playlist.description ?? null,
+    comment: playlist.description ?? null,
     coverArt: playlist.artworkId,
     coverMode: playlist.artworkMode || null,
     songCount: playlist.songCount,
@@ -326,6 +330,9 @@ export function getCoverUrl(coverArt, size) {
   if (typeof coverArt === "object") return coverArt.url || null;
 
   const id = String(coverArt);
+  if (/^https?:\/\//i.test(id) || (id.startsWith("/") && !id.startsWith("//"))) {
+    return id;
+  }
 
   if (id.startsWith("extart_")) {
     return `/api/artwork/external/${encodeURIComponent(id)}`;
@@ -676,6 +683,15 @@ export async function getPlaylist(playlistId) {
   return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
+export async function patchPlaylist(playlistId, updates) {
+  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+
+  return data.playlist ? toPlaylist(data.playlist) : null;
+}
+
 export async function createPlaylist(name, description = "") {
   const data = await request("/api/playlists", {
     method: "POST",
@@ -772,6 +788,14 @@ export async function getExternalCharts() {
   return request("/api/discovery/external");
 }
 
+export async function hydrateExternalPreviews(tracks) {
+  const data = await request("/api/discovery/external/previews", {
+    method: "POST",
+    body: JSON.stringify({ tracks }),
+  });
+  return data.tracks || [];
+}
+
 export async function getRecentlyPlayed() {
   const data = await request("/api/recently-played");
   return (data.tracks || []).map(toSong);
@@ -845,5 +869,3 @@ export async function scanAdminAcquisitions() {
     method: "POST",
   });
 }
-
-

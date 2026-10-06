@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -19,6 +20,7 @@ import {
 import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
 import SourceIndicator from "../components/SourceIndicator";
+import LightHero from "../components/Layout/LightHero";
 import InLibraryBadge from "../components/InLibraryBadge";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
@@ -39,6 +41,14 @@ import {
 import {
   usePlayer,
 } from "../context/PlayerContext";
+
+function SearchHero({ title }) {
+  return (
+    <div className="page-hero-gradient">
+      <LightHero className="search-page-hero" title={title} />
+    </div>
+  );
+}
 
 function Search() {
   const deletion = useServerDeletion();
@@ -77,6 +87,7 @@ function Search() {
   ] = useState(null);
 
   const [sourceMode, setSourceMode] = useState("hybrid");
+  const hasChosenSourceMode = useRef(false);
 
 
   const {
@@ -146,7 +157,7 @@ function Search() {
         const stored = settings.find((setting) => setting.key === "catalog.sourceMode");
         const value = stored ? JSON.parse(stored.value) : "hybrid";
 
-        if (!cancelled && ["library", "hybrid", "external"].includes(value)) {
+        if (!cancelled && !hasChosenSourceMode.current && ["library", "hybrid", "external"].includes(value)) {
           setSourceMode(value);
         }
       })
@@ -355,6 +366,9 @@ function Search() {
   }, [query, sourceMode]);
 
   function chooseSourceMode(mode) {
+    if (mode === sourceMode) return;
+
+    hasChosenSourceMode.current = true;
     setSourceMode(mode);
     updateUserSettings({ "catalog.sourceMode": mode }).catch(() => {});
   }
@@ -370,13 +384,7 @@ function Search() {
 
       <div className="search-page">
 
-        <div className="section-header">
-
-          <h1>
-            Search
-          </h1>
-
-        </div>
+        <SearchHero title="Search" />
 
 
         <EmptyState>
@@ -400,13 +408,7 @@ function Search() {
 
       <div className="search-page">
 
-        <div className="section-header">
-
-          <h1>
-            Search
-          </h1>
-
-        </div>
+        <SearchHero title="Search" />
 
 
         <LoadingState>
@@ -429,6 +431,8 @@ function Search() {
     return (
 
       <div className="search-page">
+
+        <SearchHero title="Search" />
 
         <ErrorState>
           {error}
@@ -455,20 +459,10 @@ function Search() {
 
       {/* HEADER */}
 
-      <div className="section-header">
-
-        <h1>
-          Search results
-        </h1>
-
-      </div>
+      <SearchHero title="Search results" />
 
 
-      <p className="search-query">
-        Results for "{query}"
-      </p>
-
-      <div className="search-mode" role="group" aria-label="Catalog mode">
+      <div className="search-mode" role="group" aria-label="Search source">
         {["library", "hybrid", "external"].map((mode) => (
           <button
             key={mode}

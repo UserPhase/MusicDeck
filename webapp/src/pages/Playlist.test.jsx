@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 import Playlist from "./Playlist";
 
 import {
   getPlaylist,
+  updatePlaylist,
   setPlaylistArtwork,
   clearPlaylistArtwork,
 } from "../api/playlists";
@@ -18,6 +20,7 @@ import { usePlayer } from "../context/PlayerContext";
 
 jest.mock("../api/playlists", () => ({
   getPlaylist: jest.fn(),
+  updatePlaylist: jest.fn(),
   removeSongFromPlaylist: jest.fn(),
   deletePlaylist: jest.fn(),
   setPlaylistArtwork: jest.fn(),
@@ -53,6 +56,7 @@ const customPlaylist = {
 
 const playContext = jest.fn();
 const togglePlay = jest.fn();
+const addToQueue = jest.fn();
 
 
 function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
@@ -66,6 +70,7 @@ function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
     playSong: jest.fn(),
     playContext,
     playQueue: jest.fn(),
+    addToQueue,
     playSongFromSource: jest.fn(),
     currentSong: null,
     isPlaying: false,
@@ -75,12 +80,18 @@ function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
 
   getPlaylist.mockResolvedValue(playlist);
 
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+
   return render(
-    <MemoryRouter initialEntries={["/playlist/mdpl_1"]}>
-      <Routes>
-        <Route path="/playlist/:id" element={<Playlist />} />
-      </Routes>
-    </MemoryRouter>
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/playlist/mdpl_1"]}>
+        <Routes>
+          <Route path="/playlist/:id" element={<Playlist />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -121,6 +132,68 @@ test("clicking the active playlist track toggles playback without rebuilding its
 
   expect(togglePlay).toHaveBeenCalledTimes(1);
   expect(playContext).not.toHaveBeenCalled();
+});
+
+test("adds every playlist track to the end of the queue from the options menu", async () => {
+  const playlist = {
+    ...collagePlaylist,
+    entry: [
+      { id: "track-1", title: "First", artist: "Artist" },
+      { id: "track-2", title: "Second", artist: "Artist" },
+    ],
+  };
+  renderPlaylist(playlist);
+
+  fireEvent.click(await screen.findByRole("button", { name: "More options" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Add 2 tracks to queue" }));
+
+  expect(addToQueue).toHaveBeenNthCalledWith(1, playlist.entry[0], 0, playlist.entry);
+  expect(addToQueue).toHaveBeenNthCalledWith(2, playlist.entry[1], 1, playlist.entry);
+  expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  expect(playContext).not.toHaveBeenCalled();
+});
+
+test("closes the edit details dialog with Escape", async () => {
+  renderPlaylist();
+  fireEvent.click(await screen.findByRole("button", { name: "More options" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Edit details/ }));
+  expect(await screen.findByRole("dialog", { name: "Edit details" })).toBeInTheDocument();
+
+  fireEvent.keyDown(document, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "Edit details" })).not.toBeInTheDocument();
+});
+
+test("renders the playlist description in the hero and saves edited details", async () => {
+  const playlist = {
+    ...collagePlaylist,
+    description: "Spotify playlist notes\n\nImported from Spotify: https://open.spotify.com/playlist/abc",
+  };
+  renderPlaylist(playlist);
+
+  expect(await screen.findByText(/Spotify playlist notes/)).toHaveTextContent("Imported from Spotify");
+  fireEvent.click(screen.getByRole("button", { name: "More options" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Edit details/ }));
+
+  const name = await screen.findByRole("textbox", { name: "Name" });
+  const description = screen.getByRole("textbox", { name: "Description" });
+  expect(name).toHaveValue(playlist.name);
+  expect(description).toHaveValue(playlist.description);
+
+  fireEvent.change(name, { target: { value: "Updated playlist" } });
+  fireEvent.change(description, { target: { value: "Updated description" } });
+  updatePlaylist.mockResolvedValue({
+    ...playlist,
+    name: "Updated playlist",
+    description: "Updated description",
+  });
+  fireEvent.keyDown(document, { key: "Enter", ctrlKey: true });
+
+  await waitFor(() => expect(updatePlaylist).toHaveBeenCalledWith("mdpl_1", {
+    name: "Updated playlist",
+    description: "Updated description",
+  }));
+  expect(await screen.findByRole("heading", { name: "Updated playlist" })).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
 

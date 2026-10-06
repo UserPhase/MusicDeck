@@ -1,10 +1,13 @@
-import { useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate } from "react-router-dom";
 
 import PlaylistCover from "../components/PlaylistCover";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
+import PlaylistDetailsDialog from "../components/PlaylistDetailsDialog";
+import FloatingPanel from "../components/ui/FloatingPanel";
 
 import {
   getPlaylist,
@@ -12,6 +15,7 @@ import {
   deletePlaylist,
   setPlaylistArtwork,
   clearPlaylistArtwork,
+  updatePlaylist,
 } from "../api/playlists";
 
 import { usePlayer } from "../context/PlayerContext";
@@ -37,7 +41,10 @@ function Playlist() {
 
 
   const menuRef = useRef(null);
+  const optionsTriggerRef = useRef(null);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [editDetailsOpen, setEditDetailsOpen] = useState(false);
 
   const [
   showMenu,
@@ -62,11 +69,29 @@ function Playlist() {
   const {
     playContext,
     playQueue,
+    addToQueue,
     playSongFromSource,
     downloadQuality,
     isShuffleEnabled,
     toggleShuffle,
   } = usePlayer();
+
+  const updatePlaylistMutation = useMutation({
+    mutationFn: (updates) => updatePlaylist(id, updates),
+    onSuccess: (updatedPlaylist) => {
+      if (updatedPlaylist) setPlaylist((current) => current
+        ? { ...current, ...updatedPlaylist, entry: current.entry, songCount: current.songCount }
+        : current);
+      setEditDetailsOpen(false);
+      queryClient.invalidateQueries({ queryKey: ["playlists"] });
+      queryClient.invalidateQueries({ queryKey: ["playlist", id] });
+      window.dispatchEvent(new Event("playlistsChanged"));
+    },
+  });
+
+  const closeEditDetails = useCallback(() => {
+    if (!updatePlaylistMutation.isPending) setEditDetailsOpen(false);
+  }, [updatePlaylistMutation.isPending]);
 
   function handleTrackPlayback(song, index) {
     playContext(
@@ -488,10 +513,10 @@ async function handleRemoveSong(
           </h1>
 
 
-          {playlist.comment && (
+          {playlist.description && (
 
             <p className="playlist-description">
-              {playlist.comment}
+              {playlist.description}
             </p>
 
           )}
@@ -588,7 +613,10 @@ async function handleRemoveSong(
 
   <button
     className="detail-secondary-action playlist-action"
+    ref={optionsTriggerRef}
     aria-label="More options"
+    aria-haspopup="menu"
+    aria-expanded={showMenu}
     onClick={(event) => {
       event.stopPropagation();
 
@@ -603,10 +631,41 @@ async function handleRemoveSong(
 
   {showMenu && (
 
-    <div className="playlist-options-menu">
+    <FloatingPanel anchorRef={optionsTriggerRef} onClose={() => setShowMenu(false)} className="playlist-options-menu" role="menu">
 
       <button
+        type="button"
+        className="playlist-menu-item"
+        role="menuitem"
+        disabled={songs.length === 0}
+        aria-label={`Add ${songs.length} ${songs.length === 1 ? "track" : "tracks"} to queue`}
+        onClick={() => {
+          songs.forEach(addToQueue);
+          setShowMenu(false);
+        }}
+      >
+        <span aria-hidden="true">＋</span>
+        Add to queue
+      </button>
+
+      <button
+        type="button"
+        className="playlist-menu-item"
+        role="menuitem"
+        onClick={() => {
+          setShowMenu(false);
+          updatePlaylistMutation.reset();
+          setEditDetailsOpen(true);
+        }}
+      >
+        <span aria-hidden="true">✎</span>
+        Edit details
+      </button>
+
+      <button
+        type="button"
         className="playlist-delete"
+        role="menuitem"
         disabled={deleting}
         onClick={async (event) => {
 
@@ -665,7 +724,7 @@ async function handleRemoveSong(
           : "Delete playlist"}
       </button>
 
-    </div>
+    </FloatingPanel>
 
   )}
 
@@ -732,6 +791,15 @@ async function handleRemoveSong(
         )}
 
       </div>
+      {editDetailsOpen && (
+        <PlaylistDetailsDialog
+          playlist={playlist}
+          busy={updatePlaylistMutation.isPending}
+          error={updatePlaylistMutation.error?.message || ""}
+          onClose={closeEditDetails}
+          onSave={(updates) => updatePlaylistMutation.mutate(updates)}
+        />
+      )}
 
     </div>
 

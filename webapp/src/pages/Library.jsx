@@ -6,7 +6,6 @@ function Library() {
 
       <header className="library-header">
         <h1>Library</h1>
-
         <nav className="library-actions" aria-label="Library categories">
 
         <NavLink

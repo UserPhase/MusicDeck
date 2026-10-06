@@ -68,11 +68,10 @@
   .home-skeleton-grid--albums, .home-skeleton-grid--artists { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 .search-page { max-width: var(--content-wide); margin: 0 auto; }
-.search-query { margin: -8px 0 28px; color: var(--text-secondary); font-size: var(--font-md); }
-.search-mode { display: inline-flex; gap: var(--space-1); margin: -14px 0 24px; padding: var(--space-1); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); }
-.search-mode-option { min-height: var(--control-sm); padding: 0 var(--space-3); border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); font-size: var(--font-sm); cursor: pointer; }
-.search-mode-option:hover { color: var(--text); }
-.search-mode-option.active { background: var(--nav-active); color: var(--text); }
+.search-mode { display: inline-flex; align-items: center; gap: .25rem; margin: 0 0 1.75rem; padding: .25rem; border: 1px solid var(--border); border-radius: .75rem; background: color-mix(in srgb, var(--card) 88%, transparent); }
+.search-mode-option { min-height: 2.25rem; padding: 0 .875rem; border: none; border-radius: .5rem; background: transparent; color: var(--text-secondary); font-size: var(--font-sm); font-weight: 600; cursor: pointer; transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast); }
+.search-mode-option:hover { background: var(--card-hover); color: var(--text); }
+.search-mode-option.active { background: var(--nav-active); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / 24%); }
 .search-mode-option:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
 .search-groups { display: flex; flex-direction: column; }
 .search-group-songs { order: 1; }
@@ -92,6 +91,15 @@
 .search-album-title .in-library-badge { flex: none; }
 .playlist-card { display: block; padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .playlist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
+.library-section .playlist-card {
+  background: transparent;
+  border-color: transparent;
+}
+.library-section .playlist-card:hover,
+.library-section .playlist-card:focus-visible {
+  background: var(--card-hover);
+  border-color: var(--border-hover);
+}
 .playlist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); display: flex; align-items: center; justify-content: center; }
 .playlist-cover img { width: 100%; height: 100%; object-fit: cover; }
 .playlist-cover-icon { color: var(--text-secondary); font-size: 52px; line-height: 1; }
@@ -102,6 +110,15 @@
 .playlist-meta { color: var(--text-secondary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .playlist-empty { color: var(--text-secondary); padding: 20px 0; }
 .album { padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
+.library-section .album {
+  background: transparent;
+  border-color: transparent;
+}
+.library-section .album:focus-visible,
+.library-section .playlist-card:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
 .album-card-shell { position: relative; min-width: 0; }
 .album-card-shell > .album { display: block; height: 100%; }
 .album-admin-actions { position: absolute; z-index: 5; top: 20px; right: 20px; }
@@ -111,7 +128,7 @@
 .album-actions .album-admin-actions { position: relative; top: auto; right: auto; }
 .playlist-menu-item.server-delete-menu-item { color: #fca5a5; }
 .playlist-menu-item.server-delete-menu-item:hover { background: rgb(220 38 38 / 14%); color: #fecaca; }
-.album:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
+.album:hover, .album:focus-visible { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
 .album-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 6px; background: var(--placeholder-surface); }
 .album-cover img { width: 100%; height: 100%; object-fit: cover; }
 .album-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -119,31 +136,37 @@
 .album-artist:hover { color: var(--text); }
 .album-not-downloaded { display: block; color: var(--text-muted); font-size: 12px; }
 .availability-hint { display: inline-block; margin-left: 8px; color: var(--text-secondary); font-size: 11px; letter-spacing: 0.2px; opacity: 0.85; }
-.source-indicator { display: inline-block; margin-left: var(--space-2); color: var(--text-secondary); font-size: var(--font-xs); opacity: 0.85; }
+.source-indicator { display: inline-block; margin-left: var(--space-2); padding: 2px 7px; border: 1px solid rgb(168 85 247 / 28%); border-radius: 999px; background: rgb(88 28 135 / 22%); color: var(--accent-hover); font-size: 10px; font-weight: 700; line-height: 1.25; opacity: 0.9; vertical-align: middle; }
 .recommendation-reason { margin: -4px 12px 8px 76px; color: var(--text-secondary); font-size: var(--font-xs); }
 .play-overlay { position: absolute; right: 10px; bottom: 10px; width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 16px; opacity: 0; transform: translateY(5px); transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease; }
 .album:hover .play-overlay { opacity: 1; transform: translateY(0); }
 .play-overlay:hover { background: var(--accent-hover); }
 .artist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 20px; }
-.artist { display: block; padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
-.artist:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.artist-cover { position: relative; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); }
+.artist { display: block; padding: 12px; background: transparent; border: 1px solid transparent; border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
+.artist:hover, .artist:focus-visible { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
+.artist-cover { position: relative; aspect-ratio: 1; margin: 0 auto 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); transform: scale(1); transition: transform 0.2s ease; }
+.artist:hover .artist-cover, .artist:focus-visible .artist-cover,
+.artist:hover .artist-name, .artist:focus-visible .artist-name { transform: scale(1.05); }
 .artist-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .artist-cover-placeholder { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 40px; }
-.artist-name { color: var(--text); font-size: 14px; font-weight: 650; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.artist-name { display: block; color: var(--text); font-size: 14px; font-weight: 650; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transform: scale(1); transition: transform 0.2s ease; }
+.home-continue { margin-bottom: 3.5rem; }
 .recent-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .artist-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
-.artist-card { padding: 12px; background: var(--card); border: 1px solid transparent; border-radius: 9px; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
-.artist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
-.artist-card-cover { width: 100%; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); }
+.artist-card { padding: 12px; background: transparent; border: 1px solid transparent; border-radius: 9px; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
+.artist-card:hover, .artist-card:focus-visible { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
+.artist-card-cover { width: 100%; aspect-ratio: 1; margin-bottom: 12px; overflow: hidden; border-radius: 50%; background: var(--placeholder-surface); transform: scale(1); transition: transform 0.2s ease; }
+.artist-card:hover .artist-card-cover, .artist-card:focus-visible .artist-card-cover,
+.artist-card:hover .artist-card-name, .artist-card:focus-visible .artist-card-name { transform: scale(1.05); }
 .artist-card-cover img { width: 100%; height: 100%; object-fit: cover; }
-.artist-card-name { color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.artist-card-name { display: block; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transform: scale(1); transition: transform 0.2s ease; }
 .artist-card-meta { margin-top: 5px; color: var(--text-secondary); font-size: 12px; }
 
 @media (max-width: 700px) {
 	.home-greeting { min-height: auto; margin-bottom: 28px; }
 	.home-greeting h1 { font-size: 28px; }
 	.home-section { margin-bottom: 2.5rem; }
+	.home-continue { margin-bottom: 3rem; }
 	.home-continue-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 	.home-discovery-split { grid-template-columns: 1fr; gap: 2.5rem; }
 	.home-skeleton-grid--albums { grid-template-columns: repeat(3, minmax(0, 1fr)); }

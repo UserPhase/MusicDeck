@@ -1,6 +1,7 @@
 import {
   getPlaylists as fetchPlaylists,
   getPlaylist as fetchPlaylist,
+  patchPlaylist as requestUpdatePlaylist,
   createPlaylist as requestCreatePlaylist,
   addSongToPlaylist as requestAddSongToPlaylist,
   removeSongFromPlaylist as requestRemoveSongFromPlaylist,
@@ -25,6 +26,10 @@ export async function getPlaylists() {
 
 export async function getPlaylist(playlistId) {
   return fetchPlaylist(playlistId);
+}
+
+export async function updatePlaylist(playlistId, updates) {
+  return requestUpdatePlaylist(playlistId, updates);
 }
 
 
@@ -107,4 +112,3 @@ export async function setPlaylistArtwork(playlistId, image) {
 export async function clearPlaylistArtwork(playlistId) {
   return requestClearPlaylistArtwork(playlistId);
 }
-

@@ -51,6 +51,20 @@ test("keeps a substantial server biography without requesting Wikipedia", async 
   expect(screen.queryByRole("link", { name: "Source: Wikipedia" })).not.toBeInTheDocument();
 });
 
+test("does not display a delayed biography from the previously playing artist", async () => {
+  let resolveOld;
+  getTrackArtistBiography.mockImplementation((id) => id === "old-song"
+    ? new Promise((resolve) => { resolveOld = resolve; })
+    : Promise.resolve("The new artist is a singer with a substantial locally stored biography."));
+  usePlayer.mockReturnValue({ currentSong: { id: "old-song", artist: "Old artist" }, queue: [] });
+  const { rerender } = render(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
+  usePlayer.mockReturnValue({ currentSong: { id: "new-song", artist: "New artist" }, queue: [] });
+  rerender(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
+  expect(await screen.findByText("The new artist is a singer with a substantial locally stored biography.")).toBeInTheDocument();
+  resolveOld("The previous artist is a musician whose biography should not replace the current artist.");
+  await waitFor(() => expect(screen.queryByText(/The previous artist/)).not.toBeInTheDocument());
+});
+
 test("keeps the next queue preview visible and hands off to the queue sidebar", async () => {
   const onOpenQueue = jest.fn();
   usePlayer.mockReturnValue({

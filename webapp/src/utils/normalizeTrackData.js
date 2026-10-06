@@ -200,10 +200,12 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     ),
     coverUrl: first(
       track.coverUrl,
+      track.artworkUrl,
       deezerAlbum?.cover_xl,
       deezerAlbum?.cover_medium,
       deezerAlbum?.cover,
       wrapper.coverUrl,
+      wrapper.artworkUrl,
       artwork?.url
     ),
     artwork,

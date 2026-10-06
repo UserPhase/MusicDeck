@@ -65,7 +65,10 @@ export function mapTrack(song: any): Track {
 
 export function mapAlbum(album: any): Album {
   const albumId = String(album.id);
-  const artId = id(album.coverArt);
+  const childCover = Array.isArray(album.song)
+    ? album.song.find((song: { coverArt?: unknown } | null) => song?.coverArt)?.coverArt
+    : null;
+  const artId = id(album.coverArt || childCover);
 
   return {
     id: albumId,

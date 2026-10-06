@@ -1,7 +1,7 @@
 /*
  * Provider-neutral source context for normalized catalog/search results.
- * Library items rely on AvailabilityHint; external items need a small textual
- * distinction because they are discoverable but not yet playable in MusicDeck.
+ * A compact label keeps external availability visible without extending the
+ * track title line.
  */
 function SourceIndicator({ source }) {
   if (source?.kind !== "external" && !source?.externalAvailable) {
@@ -14,7 +14,7 @@ function SourceIndicator({ source }) {
       aria-label="Available externally"
       title="Available externally"
     >
-      Available externally
+      External
     </span>
   );
 }

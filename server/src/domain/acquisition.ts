@@ -1491,6 +1491,7 @@ export class AcquisitionService {
       });
       this.emitEvent("library.imported", {
         jobId,
+        userId: job.userId,
         files: importedFiles,
         count: importedFiles.length,
       });

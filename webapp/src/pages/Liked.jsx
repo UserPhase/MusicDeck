@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -9,6 +10,8 @@ import {
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
+import CollectionDownloadButton from "../components/CollectionDownloadButton";
+import FloatingPanel from "../components/ui/FloatingPanel";
 
 import {
   getPlaylists,
@@ -43,15 +46,23 @@ function Liked() {
     playContext,
     playQueue,
     playSongFromSource,
+    addToQueue,
+    downloadQuality,
+    isShuffleEnabled,
+    toggleShuffle,
   } = usePlayer();
+  const optionsTriggerRef = useRef(null);
+  const [showMenu, setShowMenu] = useState(false);
+
+  const playbackContext = {
+    type: "collection",
+    id: "liked-songs",
+    name: "Liked Songs",
+    coverArt: null,
+  };
 
   function handleTrackPlayback(song, index) {
-    playContext(songs, index, {
-      type: "collection",
-      id: "liked-songs",
-      name: "Liked Songs",
-      coverArt: null,
-    });
+    playContext(songs, index, playbackContext);
   }
 
 
@@ -176,7 +187,8 @@ function Liked() {
 
     playQueue(
       songs,
-      0
+      0,
+      playbackContext
     );
 
   }
@@ -328,21 +340,21 @@ function Liked() {
 
   return (
 
-    <div className="liked-page">
+    <div className="liked-page detail-hero-gradient">
 
 
       {/* HEADER */}
 
-      <div className="liked-header">
+      <div className="playlist-header">
 
-        <div className="liked-icon">
+        <div className="playlist-page-cover liked-cover">
           ♥
         </div>
 
 
-        <div>
+        <div className="playlist-page-info">
 
-          <div className="liked-label">
+          <div className="playlist-type">
             PLAYLIST
           </div>
 
@@ -352,7 +364,7 @@ function Liked() {
           </h1>
 
 
-          <div className="liked-meta">
+          <div className="playlist-meta">
 
             {songs.length}{" "}
 
@@ -369,10 +381,10 @@ function Liked() {
 
       {/* ACTIONS */}
 
-      <div className="liked-actions">
+      <div className="detail-action-row playlist-actions">
 
         <button
-          className="liked-play"
+          className="playlist-play"
           onClick={
             playLikedSongs
           }
@@ -389,13 +401,59 @@ function Liked() {
 
         </button>
 
-
         <button
-          className="liked-action"
-          aria-label="More options"
+          type="button"
+          className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}
+          aria-label="Toggle shuffle"
+          aria-pressed={Boolean(isShuffleEnabled)}
+          onClick={toggleShuffle}
         >
-          ⋯
+          ⇄
         </button>
+
+        <CollectionDownloadButton
+          tracks={songs}
+          quality={downloadQuality}
+          label="liked songs"
+        />
+
+        <div className="playlist-options">
+          <button
+            type="button"
+            className="detail-secondary-action playlist-action"
+            ref={optionsTriggerRef}
+            aria-label="More options"
+            aria-haspopup="menu"
+            aria-expanded={showMenu}
+            onClick={() => setShowMenu((current) => !current)}
+          >
+            ⋯
+          </button>
+
+          {showMenu && (
+            <FloatingPanel
+              anchorRef={optionsTriggerRef}
+              onClose={() => setShowMenu(false)}
+              className="playlist-options-menu"
+              role="menu"
+            >
+              <button
+                type="button"
+                className="playlist-menu-item"
+                role="menuitem"
+                disabled={songs.length === 0}
+                aria-label={`Add ${songs.length} ${songs.length === 1 ? "track" : "tracks"} to queue`}
+                onClick={() => {
+                  songs.forEach(addToQueue);
+                  setShowMenu(false);
+                }}
+              >
+                <span aria-hidden="true">＋</span>
+                Add to queue
+              </button>
+            </FloatingPanel>
+          )}
+        </div>
 
       </div>
 

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { largestSpotifyArtwork } from "../utils/spotifyArtworkUrl.js";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -850,7 +851,7 @@ function readPlaylistMetadata(filePath: string): Pick<DownloadResult, "playlistT
       const albumArtists = Array.isArray(nestedAlbum.artists) ? nestedAlbum.artists : [];
       const albumArtist = typeof song.album_artist === "string" ? song.album_artist
         : albumArtists[0] && typeof albumArtists[0] === "object" && typeof albumArtists[0].name === "string" ? albumArtists[0].name : undefined;
-      const artwork = [song.cover_url, song.album_cover_url, nestedAlbum.cover_url, nestedAlbum.image_url, image?.url]
+      const artwork = [largestSpotifyArtwork(nestedAlbum.images), song.cover_url, song.album_cover_url, nestedAlbum.cover_url, nestedAlbum.image_url, image?.url]
         .find((value): value is string => typeof value === "string" && /^https:\/\//.test(value));
       return {
         position: Number.isSafeInteger(position) && position > 0 ? position : index + 1,
@@ -865,7 +866,8 @@ function readPlaylistMetadata(filePath: string): Pick<DownloadResult, "playlistT
         ...(albumArtist ? { albumArtist } : {}),
         ...(date !== undefined ? { year: String(date) } : {}),
         ...(artwork ? { artworkUrl: artwork } : {}),
-        ...(typeof song.album_id === "string" ? { albumId: song.album_id } : {}),
+        ...(typeof song.album_id === "string" ? { albumId: song.album_id }
+          : typeof nestedAlbum.id === "string" ? { albumId: nestedAlbum.id } : {}),
         ...(typeof song.track_number === "number" ? { trackNumber: song.track_number } : {}),
         ...(typeof song.tracks_count === "number" ? { tracksCount: song.tracks_count } : {}),
         ...(typeof song.disc_number === "number" ? { discNumber: song.disc_number } : {}),

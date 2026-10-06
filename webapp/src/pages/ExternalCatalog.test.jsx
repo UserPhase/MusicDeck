@@ -16,6 +16,7 @@ import {
   getTrackArtistBiography,
   getCoverUrl,
   getExternalCharts,
+  hydrateExternalPreviews,
   getExplore,
   getRecommendations,
   searchNavidrome,
@@ -36,6 +37,7 @@ jest.mock("../api/musicdeck", () => ({
   getTrackArtistBiography: jest.fn(async () => null),
   getCoverUrl: jest.fn((id) => (id ? typeof id === "object" ? id.url : `/artwork/${id}` : null)),
   getExternalCharts: jest.fn(),
+  hydrateExternalPreviews: jest.fn(),
   getExplore: jest.fn(),
   getRecommendations: jest.fn(async () => ({ sections: [], degraded: false })),
   searchNavidrome: jest.fn(),
@@ -92,6 +94,7 @@ beforeEach(() => {
     };
   });
   getExternalCharts.mockResolvedValue(chartData);
+  hydrateExternalPreviews.mockResolvedValue([]);
   getRecommendations.mockResolvedValue({ sections: [], degraded: false });
   usePlayer.mockReturnValue({
     playSong,
@@ -584,6 +587,30 @@ test("renders personalized Explore songs alongside Deezer charts", async () => {
   expect(screen.getByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
   expect(screen.getByText("3:29")).toBeInTheDocument();
   expect(getExternalCharts).toHaveBeenCalledTimes(1);
+});
+
+test("hydrates missing Explore chart previews after rendering the initial rows", async () => {
+  let finishHydration;
+  const tracks = [chartData.tracks[0]];
+  getExternalCharts.mockResolvedValue({ ...chartData, tracks });
+  hydrateExternalPreviews.mockImplementation(() => new Promise((resolve) => { finishHydration = resolve; }));
+
+  render(<MemoryRouter><Explore /></MemoryRouter>);
+
+  expect(await screen.findByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Download Chart Song with spotDL" })).toBeInTheDocument();
+  expect(hydrateExternalPreviews).toHaveBeenCalledWith([expect.objectContaining({
+    id: tracks[0].id,
+    title: "Chart Song",
+    artist: "Chart Artist",
+  })]);
+  await act(async () => {
+    finishHydration([{ id: tracks[0].id, previewUrl: "https://cdns-preview-a.dzcdn.net/hydrated-song.mp3" }]);
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Play Chart Song" }));
+  await waitFor(() => expect(playSong).toHaveBeenCalledWith(expect.objectContaining({
+    previewUrl: "https://cdns-preview-a.dzcdn.net/hydrated-song.mp3",
+  })));
 });
 
 test("renders Explore discovery using neutral results", async () => {

@@ -1,6 +1,7 @@
 import {
   addSongToPlaylist,
   removeSongFromPlaylist,
+  updatePlaylist,
   startSpotifyPlaylistImport,
   getSpotifyPlaylistImport,
 } from "./playlists";
@@ -15,6 +16,7 @@ jest.mock("./musicdeck", () => ({
   getPlaylists: jest.fn(),
   getPlaylist: jest.fn(),
   createPlaylist: jest.fn(),
+  patchPlaylist: jest.fn(),
   addSongToPlaylist: jest.fn(),
   removeSongFromPlaylist: jest.fn(),
   deletePlaylist: jest.fn(),
@@ -124,6 +126,21 @@ test("removing a song passes through the intended playlist and index only", asyn
   );
 });
 
+test("updates playlist name and description through the MusicDeck API", async () => {
+  const patchPlaylist = jest.requireMock("./musicdeck").patchPlaylist;
+  const updated = { id: "playlist-1", name: "New name", description: "New description" };
+  patchPlaylist.mockResolvedValue(updated);
+
+  await expect(updatePlaylist("playlist-1", {
+    name: "New name",
+    description: "New description",
+  })).resolves.toEqual(updated);
+  expect(patchPlaylist).toHaveBeenCalledWith("playlist-1", {
+    name: "New name",
+    description: "New description",
+  });
+});
+
 test("starts and polls a Spotify playlist import with session credentials", async () => {
   global.fetch = jest.fn()
     .mockResolvedValueOnce({ ok: true, json: async () => ({ job: { id: "job-1", status: "queued" } }) })
@@ -136,4 +153,3 @@ test("starts and polls a Spotify playlist import with session credentials", asyn
   await expect(getSpotifyPlaylistImport("job-1")).resolves.toMatchObject({ playlistId: "mdpl_1" });
   expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1", { credentials: "include" });
 });
-

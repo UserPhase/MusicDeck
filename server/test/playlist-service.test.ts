@@ -125,6 +125,21 @@ describe("MusicDeck-owned playlists", () => {
     expect(update.json().playlist).toMatchObject({ name: "Renamed", description: "New description" });
   });
 
+  test("rejects empty playlist updates and overlong details", async () => {
+    await setup();
+    const { cookie, playlistId } = await createPlaylistViaApi();
+    const requestUpdate = (payload: unknown) => current!.app.inject({
+      method: "PATCH",
+      url: `/api/playlists/${playlistId}`,
+      headers: { cookie },
+      payload,
+    });
+
+    expect((await requestUpdate({})).statusCode).toBe(400);
+    expect((await requestUpdate({ name: "x".repeat(201) })).statusCode).toBe(400);
+    expect((await requestUpdate({ description: "x".repeat(1001) })).statusCode).toBe(400);
+  });
+
   test("deletes a playlist and returns 404 afterward", async () => {
     await setup();
     const { cookie, playlistId } = await createPlaylistViaApi();

@@ -11,7 +11,6 @@ import {
   getAlbums,
   getCoverUrl,
 } from "../api/musicdeck";
-import AlbumDeleteButton from "../components/AlbumDeleteButton";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 
 
@@ -239,7 +238,6 @@ function Albums() {
             </div>
 
           </Link>
-          <AlbumDeleteButton album={album} />
           </div>
 
         ))}

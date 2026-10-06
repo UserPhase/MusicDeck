@@ -5,9 +5,11 @@ import { getCachedWikipediaBiography, getWikipediaBiography } from "../services/
 export function useArtistBiography({ artistId, artistName, trackId, enabled = true }) {
   const [biography, setBiography] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     let active = true;
+    setError(null);
     const cached = enabled ? getCachedWikipediaBiography(artistId || artistName, artistName) : null;
     setBiography(cached);
     if (!enabled || !artistName) {
@@ -35,9 +37,14 @@ export function useArtistBiography({ artistId, artistName, trackId, enabled = tr
         setLoading(false);
       }
     };
-    void resolve().catch(() => { if (active) setLoading(false); });
+    void resolve().catch((failure) => {
+      if (active) {
+        setError(failure.message || "Could not load the artist biography.");
+        setLoading(false);
+      }
+    });
     return () => { active = false; };
   }, [artistId, artistName, trackId, enabled]);
 
-  return { biography, loading };
+  return { biography, loading, error };
 }

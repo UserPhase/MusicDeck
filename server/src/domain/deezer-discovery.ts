@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizeExternalTrack } from "../services/discovery/externalTrackNormalizer.js";
 
 const artwork = z.string().url().nullable().optional();
 const artist = z.object({
@@ -23,9 +24,14 @@ const track = z.object({
   title: z.string(),
   link: z.string().url().optional(),
   duration: z.number().int().nonnegative(),
+  preview: z.string().nullable().optional(),
+  preview_url: z.string().nullable().optional(),
+  previewUrl: z.string().nullable().optional(),
+  audio_preview_url: z.string().nullable().optional(),
+  isrc: z.string().nullable().optional(),
   artist: artist.nullable().optional(),
   album: album.nullable().optional(),
-});
+}).passthrough();
 const chart = z.object({
   tracks: z.object({ data: z.array(track) }),
   albums: z.object({ data: z.array(album) }),
@@ -53,9 +59,12 @@ export type ExternalTrack = ExternalBase & {
   title: string;
   artist: string;
   album: string | null;
+  coverUrl: string | null;
+  previewUrl: string | null;
+  isrc: string | null;
   duration: number;
   durationLabel: string;
-  metadata: { durationSeconds: number; artistId?: string | null; albumId?: string | null };
+  metadata: { durationSeconds: number; artistId?: string | null; albumId?: string | null; isrc?: string | null };
 };
 export type ExternalCharts = { artists: ExternalArtist[]; albums: ExternalAlbum[]; tracks: ExternalTrack[] };
 
@@ -91,20 +100,33 @@ export function normalizeDeezerChart(input: unknown): ExternalCharts {
       title: item.title,
       artist: item.artist?.name || "Unknown artist",
     })),
-    tracks: data.tracks.data.map((item): ExternalTrack => ({
-      ...base(item.id, "track", item.link, coverArt(item.album?.cover_xl, item.album?.cover_big, item.album?.cover_medium)),
-      type: "track",
-      title: item.title,
-      artist: item.artist?.name || "Unknown artist",
-      album: item.album?.title || null,
-      duration: item.duration,
-      durationLabel: `${Math.floor(item.duration / 60)}:${String(item.duration % 60).padStart(2, "0")}`,
-      metadata: {
-        durationSeconds: item.duration,
-        artistId: item.artist?.id != null ? `external_deezer_artist_${item.artist.id}` : null,
-        albumId: item.album?.id != null ? `external_deezer_album_${item.album.id}` : null,
-      },
-    })),
+    tracks: data.tracks.data.map((item): ExternalTrack => {
+      const image = coverArt(item.album?.cover_xl, item.album?.cover_big, item.album?.cover_medium);
+      const normalized = normalizeExternalTrack({
+        ...item,
+        id: `external_deezer_track_${item.id}`,
+        artist: item.artist?.name,
+        album: item.album?.title,
+        coverArt: image,
+      });
+      if (!normalized) throw new Error("Deezer returned an invalid chart track");
+      return {
+        ...base(item.id, "track", item.link, image),
+        ...normalized,
+        id: `external_deezer_track_${item.id}`,
+        source: { kind: "external", count: 0 },
+        coverArt: image,
+        type: "track",
+        duration: item.duration,
+        durationLabel: `${Math.floor(item.duration / 60)}:${String(item.duration % 60).padStart(2, "0")}`,
+        metadata: {
+          durationSeconds: item.duration,
+          artistId: item.artist?.id != null ? `external_deezer_artist_${item.artist.id}` : null,
+          albumId: item.album?.id != null ? `external_deezer_album_${item.album.id}` : null,
+          ...(normalized.isrc ? { isrc: normalized.isrc } : {}),
+        },
+      };
+    }),
   };
 }
 

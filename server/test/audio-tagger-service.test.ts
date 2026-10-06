@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -42,7 +43,24 @@ describe("AudioTaggerService", () => {
     expect(isInvalidArtist("2hollis")).toBe(false);
   });
   test.each(["artist", "albumArtist", "title", "album", "year", "isrc", "hasArtwork"] as const)("repairs missing %s", (key) => {
-    expect(needsMetadataRepair({ ...good, [key]: key === "hasArtwork" ? false : null }, expected)).toBe(true);
+    const canonical = key === "hasArtwork" ? { ...expected, artworkUrl: "https://i.scdn.co/image/cover" } : expected;
+    expect(needsMetadataRepair({ ...good, [key]: key === "hasArtwork" ? false : null }, canonical)).toBe(true);
+  });
+  test("does not require canonical year or artwork when the sources omit them", () => {
+    expect(needsMetadataRepair({ ...good, year: null, hasArtwork: false }, { ...expected, year: null })).toBe(false);
+  });
+  test("does not download artwork or rewrite tags when optional canonical metadata is absent", async () => {
+    const directory = temporary(); const file = path.join(directory, "track.mp3"); fs.writeFileSync(file, "original");
+    const run = vi.fn(() => ({ promise: Promise.resolve({ exitCode: 0, stderr: "", stdout: probe({ ...good, year: null, hasArtwork: false }) }) }));
+    const fetchImpl = vi.fn();
+    const service = new AudioTaggerService({ ffprobePath: "ffprobe", fetchImpl: fetchImpl as typeof fetch,
+      processRunner: { run } as unknown as ProcessRunner });
+
+    await expect(service.verifyAndTag(file, { ...expected, year: null }))
+      .resolves.toMatchObject({ repaired: false, inspection: { year: null, hasArtwork: false } });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(file, "utf8")).toBe("original");
   });
   test("validates canonical values and every featured artist", () => {
     expect(needsMetadataRepair(good, expected)).toBe(false);
@@ -86,10 +104,10 @@ describe("AudioTaggerService", () => {
     const run = vi.fn((command: string) => {
       if (command === "missing-ffprobe") return { promise: Promise.reject(Object.assign(new Error("spawn ffprobe ENOENT"), { code: "ENOENT" })) };
       expect(command).toBe("spotdl-python");
-      return { promise: Promise.resolve({ exitCode: 0, stdout: JSON.stringify(good), stderr: "" }) };
+      return { promise: Promise.resolve({ exitCode: 0, stdout: JSON.stringify({ ...good, artworkHashes: [] }), stderr: "" }) };
     });
     const service = new AudioTaggerService({ ffprobePath: "missing-ffprobe", pythonPath: "spotdl-python", processRunner: { run } as unknown as ProcessRunner });
-    await expect(service.inspect("track.mp3")).resolves.toEqual(good); expect(run).toHaveBeenCalledTimes(2);
+    await expect(service.inspect("track.mp3")).resolves.toMatchObject(good); expect(run).toHaveBeenCalledTimes(2);
   });
   test("does not hide corrupt audio reported by ffprobe", async () => {
     const run = vi.fn(() => ({ promise: Promise.resolve({ exitCode: 1, stdout: "", stderr: "Invalid audio" }) }));
@@ -123,6 +141,7 @@ if f.endswith('.mp3'):
     t.add(TCON(encoding=3, text=['Alternative'])); t.add(TXXX(encoding=3, desc='REPLAYGAIN_TRACK_GAIN', text=['-7.25 dB']))
     t.add(TXXX(encoding=3, desc='MusicDeck private frame', text=['must survive']))
     t.add(APIC(encoding=3, type=3, mime='image/png', desc='Original cover', data=data)); t.save(f)
+    t.add(APIC(encoding=3, type=4, mime='image/png', desc='Back cover', data=data)); t.save(f)
 else:
     a = File(f)
     if a.tags is None: a.add_tags()
@@ -134,6 +153,7 @@ else:
         a.tags['artist'] = ['Unknown Artist']; a.tags['tracknumber'] = ['7/12']; a.tags['discnumber'] = ['2/2']
         a.tags['genre'] = ['Alternative']; a.tags['REPLAYGAIN_TRACK_GAIN'] = ['-7.25 dB']; a.tags['PRIVATE'] = ['must survive']
         p = Picture(); p.type=3; p.mime='image/png'; p.data=data; a.add_picture(p)
+        p = Picture(); p.type=4; p.mime='image/png'; p.data=data; a.add_picture(p)
     a.save()
 `;
 const secondaryTags = String.raw`
@@ -147,7 +167,7 @@ if f.endswith('.mp3'):
 else:
     a=File(f); keys=['trkn','disk','\xa9gen','----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN','----:com.apple.iTunes:PRIVATE','covr'] if f.endswith('.m4a') else ['tracknumber','discnumber','genre','replaygain_track_gain','PRIVATE']
     result={k:repr(a.tags[k]) for k in keys}
-    result['cover']=[hashlib.sha256(p.data).hexdigest() for p in getattr(a,'pictures',[])]
+    result['cover']=[hashlib.sha256(bytes(p)).hexdigest() for p in a.tags.get('covr',[])] if f.endswith('.m4a') else [hashlib.sha256(p.data).hexdigest() for p in getattr(a,'pictures',[])]
 print(json.dumps(result,sort_keys=True))
 `;
 describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integration", () => {
@@ -165,6 +185,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     }
     const runner = new DefaultProcessRunner(); let scanned = false;
     const tagger = new AudioTaggerService({ ffprobePath: path.join(root, "missing-ffprobe.exe"), pythonPath: python,
+      fetchImpl: vi.fn(async () => new Response(fs.readFileSync(cover), { headers: { "content-type": "image/png" } })) as typeof fetch,
       processRunner: { run: (command, args, options) => runner.run(command, args, { ...options, env: { PYTHONPATH: environment.PYTHONPATH || "" } }) } });
     const backend = { search: vi.fn(async (query: string) => ({ artists: [], albums: [], tracks: scanned ? sources.filter((source) => source.title === query).map((source) => ({
       id: `local-${source.position}`, title: source.title, artistName: source.artist, albumName: source.album, durationSeconds: source.duration, identityHints: { isrc: source.isrc },
@@ -187,12 +208,13 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=purple:s=32x32", "-frames:v", "1", "-y", cover]);
     execute(python, ["-c", fixture, audio, cover]);
     const before = execute(python, ["-c", secondaryTags, audio]); const runner = new DefaultProcessRunner();
-    const service = new AudioTaggerService({ ffprobePath: path.join(directory, "uninstalled-ffprobe.exe"), pythonPath: python,
+    const fetchImpl = vi.fn(async () => new Response(fs.readFileSync(cover), { headers: { "content-type": "image/png" } }));
+    const service = new AudioTaggerService({ ffprobePath: path.join(directory, "uninstalled-ffprobe.exe"), pythonPath: python, fetchImpl: fetchImpl as typeof fetch,
       processRunner: { run: (command, args, options) => runner.run(command, args, { ...options, env: { PYTHONPATH: environment.PYTHONPATH || "" } }) } });
     expect((await service.inspect(audio)).hasArtwork).toBe(true);
-    await expect(service.verifyAndTag(audio, expected)).resolves.toMatchObject({ repaired: true, inspection: good });
+    await expect(service.verifyAndTag(audio, { ...expected, artworkUrl: "https://i.scdn.co/image/cover" })).resolves.toMatchObject({ repaired: true, inspection: good });
     expect(execute(python, ["-c", secondaryTags, audio])).toBe(before);
-    await expect(service.verifyAndTag(audio, expected)).resolves.toMatchObject({ repaired: false });
+    await expect(service.verifyAndTag(audio, { ...expected, artworkUrl: "https://i.scdn.co/image/cover" })).resolves.toMatchObject({ repaired: false });
   });
   test("repairs spotDL-style ID3v2.3 files without losing their release year", async () => {
     const directory = temporary(); const audio = path.join(directory, "track.mp3"); const cover = path.join(directory, "cover.png");
@@ -217,6 +239,26 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect((await service.verifyAndTag(audio, expected)).repaired).toBe(false);
   });
+  test.each(["mp3", "flac", "m4a"])("replaces a stale front cover in %s without dropping other tags", async (extension) => {
+    const directory = temporary(); const audio = path.join(directory, "track." + extension);
+    const oldCover = path.join(directory, "old.png"); const newCover = path.join(directory, "new.png");
+    execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
+    execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=purple:s=32x32", "-frames:v", "1", "-y", oldCover]);
+    execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=lime:s=32x32", "-frames:v", "1", "-y", newCover]);
+    execute(python, ["-c", fixture, audio, oldCover]);
+    const expectedHash = createHash("sha256").update(fs.readFileSync(newCover)).digest("hex");
+    const fetchImpl = vi.fn(async () => new Response(fs.readFileSync(newCover), { headers: { "content-type": "image/png" } }));
+    const runner = new DefaultProcessRunner();
+    const service = new AudioTaggerService({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, pythonPath: python, fetchImpl: fetchImpl as typeof fetch,
+      processRunner: { run: (command, args, options) => runner.run(command, args, { ...options, env: { PYTHONPATH: environment.PYTHONPATH || "" } }) } });
+
+    await expect(service.verifyAndTag(audio, { ...expected, artworkUrl: "https://i.scdn.co/image/new" }))
+      .resolves.toMatchObject({ repaired: true, inspection: { artworkHashes: expect.arrayContaining([expectedHash]) } });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const written = JSON.parse(execute(python, ["-c", secondaryTags, audio]));
+    expect(written.cover).toContain(expectedHash);
+    expect(written.cover).toContain(createHash("sha256").update(fs.readFileSync(oldCover)).digest("hex"));
+  });
   test.each(["mp3", "flac", "m4a"])("preserves %s audio, artwork, track/disc numbers, genre, ReplayGain and custom tags", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension); const cover = path.join(directory, "cover.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
@@ -224,12 +266,12 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     execute(python, ["-c", fixture, audio, cover]);
     const before = execute(python, ["-c", secondaryTags, audio]);
     const hash = () => execute(ffmpeg, ["-v", "error", "-i", audio, "-map", "0:a:0", "-f", "hash", "-hash", "sha256", "-"]);
-    const beforeAudio = hash(); const fetchImpl = vi.fn(); const runner = new DefaultProcessRunner();
+    const beforeAudio = hash(); const fetchImpl = vi.fn(async () => new Response(fs.readFileSync(cover), { headers: { "content-type": "image/png" } })); const runner = new DefaultProcessRunner();
     const service = new AudioTaggerService({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, pythonPath: python, fetchImpl,
       processRunner: { run: (command, args, options) => runner.run(command, args, { ...options, env: { PYTHONPATH: environment.PYTHONPATH || "" } }) } });
     await expect(service.verifyAndTag(audio, { ...expected, artworkUrl: "https://i.scdn.co/image/unused" })).resolves.toMatchObject({ repaired: true });
     expect(execute(python, ["-c", secondaryTags, audio])).toBe(before); expect(hash()).toBe(beforeAudio);
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fetchImpl).toHaveBeenCalledOnce();
     await expect(service.verifyAndTag(audio, expected)).resolves.toMatchObject({ repaired: false });
   });
 });

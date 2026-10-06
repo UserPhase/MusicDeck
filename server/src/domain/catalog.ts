@@ -393,7 +393,7 @@ export class CatalogService {
     const album = await this.primary().getAlbum(providerId);
     if (!album) return null;
     const connectionId = this.library.getPrimarySource(albumId)!.connectionId;
-    return this.withStableAlbumArtistId(this.withStableId(album, "album", connectionId), connectionId);
+    return this.stamp(album, "album", connectionId);
   }
 
   async getAlbumTracks(albumId: string): Promise<Track[]> {

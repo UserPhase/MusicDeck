@@ -61,6 +61,7 @@ describe("Spotify playlist import", () => {
     } as unknown as DownloaderAdapter;
     const playlists = {
       adoptProviderPlaylist: vi.fn(async () => ({ id: "mdpl_1", name: "Road Trip", tracks: [{}] })),
+      update: vi.fn(async () => ({ id: "mdpl_1", name: "Road Trip" })),
     } as unknown as PlaylistService;
     const spotifyFetch = vi.fn(async () => new Response(JSON.stringify({ title: "Road Trip" }), { status: 200 }));
     const service = new SpotifyPlaylistImportService(backend, playlists, downloader, root, spotifyFetch as typeof fetch);
@@ -72,6 +73,9 @@ describe("Spotify playlist import", () => {
     expect(job).toMatchObject({ status: "completed", playlistId: "mdpl_1", playlistName: "Road Trip" });
     expect(backend.scanLibrary).toHaveBeenCalledOnce();
     expect(playlists.adoptProviderPlaylist).toHaveBeenCalledWith("nav-2", user, "Road Trip");
+    expect(playlists.update).toHaveBeenCalledWith("mdpl_1", {
+      description: "Imported from Spotify: https://open.spotify.com/playlist/abc123",
+    });
     expect(downloader.download).toHaveBeenCalledWith(expect.objectContaining({
       query: "https://open.spotify.com/playlist/abc123",
       playlistM3uName: expect.stringMatching(/^musicdeck-spimp_.*\.m3u8$/),
@@ -206,7 +210,11 @@ describe("Spotify playlist import", () => {
     expect(linked).toEqual(["nav-old", "nav-new"]);
     expect(downloader.download).toHaveBeenCalledTimes(1);
     expect(backend.scanLibrary).toHaveBeenCalledTimes(1);
-    expect(playlists.create).toHaveBeenCalledWith("Mixed Songs", user, "The original Spotify description");
+    expect(playlists.create).toHaveBeenCalledWith(
+      "Mixed Songs",
+      user,
+      "The original Spotify description\n\nImported from Spotify: https://open.spotify.com/playlist/abc123"
+    );
     expect(playlists.setCustomArtwork).toHaveBeenCalledWith("mdpl_mixed", Buffer.from([1, 2, 3]), "image/jpeg");
   });
 
@@ -330,6 +338,7 @@ describe("Spotify playlist import", () => {
     } as unknown as DownloaderAdapter;
     const playlists = {
       adoptProviderPlaylist: vi.fn(async () => ({ id: "mdpl_15", name: "Full Playlist", tracks: Array.from({ length: 15 }, () => ({})) })),
+      update: vi.fn(async () => null),
     } as unknown as PlaylistService;
     const service = new SpotifyPlaylistImportService(backend, playlists, downloader, root, vi.fn(async () => new Response("{}")) as typeof fetch);
 
@@ -372,7 +381,10 @@ describe("Spotify playlist import", () => {
         ] };
       }),
     } as unknown as DownloaderAdapter;
-    const playlists = { adoptProviderPlaylist: vi.fn(async () => ({ id: "mdpl_partial", name: "Partial", tracks: [{}] })) } as unknown as PlaylistService;
+    const playlists = {
+      adoptProviderPlaylist: vi.fn(async () => ({ id: "mdpl_partial", name: "Partial", tracks: [{}] })),
+      update: vi.fn(async () => null),
+    } as unknown as PlaylistService;
     const service = new SpotifyPlaylistImportService(backend, playlists, downloader, root, vi.fn(async () => new Response("{}")) as typeof fetch);
 
     const started = service.start("https://open.spotify.com/playlist/abc123", user);

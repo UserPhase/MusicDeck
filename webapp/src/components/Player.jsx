@@ -6,9 +6,9 @@ import {
 } from "../context/PlayerContext";
 
 import {
-  getCoverUrl,
   createAcquisition,
 } from "../api/musicdeck";
+import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
 
 import AudioBadge from "./AudioBadge";
 
@@ -79,6 +79,7 @@ function Player({
     streamQuality,
 
   } = usePlayer();
+  const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
 
   useEffect(() => {
     setImportState("idle");
@@ -143,23 +144,18 @@ function Player({
 
           <div className="now-cover">
 
-            <img
+            {coverUrl ? <img
               width="56"
               height="56"
-              src={
-                currentSong.coverArt
-                  ? getCoverUrl(
-                      currentSong.coverArt
-                    )
-                  : undefined
-              }
+              src={coverUrl}
+              onError={onCoverError}
 
               alt={
                 currentSong.title ||
                 "Album cover"
               }
 
-            />
+            /> : <span aria-hidden="true">♫</span>}
 
           </div>
 

@@ -24,10 +24,12 @@ import {
 } from "../context/AuthContext";
 
 import DownloadsMenu from "./DownloadsMenu";
+import FloatingPanel from "./ui/FloatingPanel";
 import { useImport } from "../context/ImportContext";
 
 
 function Topbar() {
+  const profileTriggerRef = useRef(null);
   const { job: importJob, isMinimized, openProgress } = useImport();
 
   const navigate = useNavigate();
@@ -426,7 +428,8 @@ function Topbar() {
 
           {showDropdown && (
 
-            <div className="search-dropdown">
+            <FloatingPanel className="search-dropdown" anchorRef={searchRef} matchWidth role={null}
+              onClose={() => setShowDropdown(false)}>
 
 
               {/* SEARCHING */}
@@ -594,7 +597,7 @@ function Topbar() {
 
               )}
 
-            </div>
+            </FloatingPanel>
 
           )}
 
@@ -625,6 +628,7 @@ function Topbar() {
             <button
               type="button"
               className="profile-button"
+              ref={profileTriggerRef}
               aria-haspopup="menu"
               aria-expanded={showAccountMenu}
               onClick={() =>
@@ -647,7 +651,9 @@ function Topbar() {
 
             {showAccountMenu && (
 
-              <div
+              <FloatingPanel
+                anchorRef={profileTriggerRef}
+                onClose={() => setShowAccountMenu(false)}
                 className="account-menu"
                 role="menu"
               >
@@ -698,7 +704,7 @@ function Topbar() {
                   Log out
                 </button>
 
-              </div>
+              </FloatingPanel>
 
             )}
 

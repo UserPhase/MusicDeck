@@ -40,7 +40,10 @@
 .progress-container { display: flex; align-items: center; gap: 9px; width: 100%; }
 .time { width: 30px; flex-shrink: 0; color: var(--text-muted); font-size: 10px; }
 .time:last-child { text-align: right; }
-.progress { height: 4px; flex: 1; min-width: 0; overflow: hidden; background: var(--border-hover); border-radius: 10px; cursor: pointer; }
+.progress { height: 4px; flex: 1; min-width: 0; accent-color: var(--accent); background: var(--border-hover); border-radius: 10px; cursor: pointer; }
+.progress::-webkit-slider-thumb { accent-color: var(--accent); background: var(--accent); }
+.progress::-moz-range-progress { background-color: var(--accent); }
+.player-volume { accent-color: var(--accent); }
 .progress-bar { width: 0%; height: 100%; background: var(--accent); border-radius: inherit; }
 .player-queue { position: relative; display: flex; align-items: center; }
 .player-queue-button { border: none; padding: 8px 0; background: transparent; color: var(--text-secondary); font-size: 13px; white-space: nowrap; cursor: pointer; transition: color 0.15s ease; }

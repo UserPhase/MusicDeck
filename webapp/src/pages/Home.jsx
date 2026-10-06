@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DiscoveryArtistCard, DiscoveryAlbumCard } from "../components/DiscoveryCards";
+import LightHero from "../components/Layout/LightHero";
 import TrackRow from "../components/TrackRow";
 import { getAlbum, getAlbums, getArtists, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
@@ -151,12 +152,11 @@ function Home() {
 
   return (
     <div className="home-page home-hero-gradient">
-      <section className="home-greeting" aria-labelledby="home-greeting-title">
-        <div>
-          <p className="home-kicker">MusicDeck</p>
-          <h1 id="home-greeting-title">Welcome back, {displayName(session)}</h1>
-        </div>
-      </section>
+      <LightHero
+        className="home-greeting"
+        eyebrow="MusicDeck"
+        title={`Welcome back, ${displayName(session)}`}
+      />
 
       {actionMessage && <p className="home-action-message" role="status">{actionMessage}</p>}
 

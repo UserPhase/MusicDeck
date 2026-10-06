@@ -172,7 +172,7 @@ function Artists() {
           <Link
             key={artist.id}
             to={`/artist/${artist.id}`}
-            className="artist"
+            className="artist group"
           >
 
 

@@ -13,6 +13,9 @@ import { AudioTaggerService, type CanonicalAudioMetadata } from "../services/med
 import { safeMusicPath, flushFile, flushDirectory } from "../services/media/safeMusicPath.js";
 import { cleanupTemporaryDirectory } from "../services/media/temporaryDirectory.js";
 import type { SqliteImportJobRepository, StoredImportJob } from "../infrastructure/persistence/sqliteImportJobRepository.js";
+import type { SqliteImportedArtworkRepository } from "../infrastructure/persistence/sqliteImportedArtworkRepository.js";
+import { saveAlbumArtworkToFolder } from "../utils/mediaFileSystem.js";
+import { isSpotifyArtworkUrl } from "../utils/spotifyArtworkUrl.js";
 
 export type ImportEntryStatus = "PENDING" | "DOWNLOADED" | "READY" | "COMPLETED"
   | "FAILED_METADATA_MISSING" | "FAILED_DOWNLOAD" | "FAILED_TAGGING" | "FAILED_INDEXING" | "FAILED_LINKING";
@@ -20,6 +23,7 @@ export type ImportEntry = {
   position: number; source: SpotifyTrackMetadata; status: ImportEntryStatus;
   error?: string; filePath?: string; providerTrackId?: string; duplicateOf?: number; requiresScan?: boolean;
   cleanupWarnings?: string[];
+  artworkWarnings?: string[];
   downloadAttempts?: Array<{ status: DownloadResult["status"]; error?: string; errorCode?: DownloadErrorCode; diagnostics?: DownloadDiagnostics }>;
 };
 export type SpotifyImportJob = {
@@ -41,7 +45,17 @@ export type SpotifyImportJob = {
   failedCount?: number;
   manifest?: ImportEntry[];
   cleanupWarnings?: string[];
+  artworkWarnings?: string[];
 };
+
+function spotifyPlaylistDescription(description: string | null | undefined, playlistUrl: string): string {
+  const attribution = `Imported from Spotify: ${playlistUrl}`;
+  const original = description?.trim();
+  if (!original) return attribution;
+  const separator = "\n\n";
+  const availableOriginalLength = Math.max(0, 1000 - separator.length - attribution.length);
+  return `${original.slice(0, availableOriginalLength).trimEnd()}${separator}${attribution}`;
+}
 
 type SpotifyTrackMetadata = NonNullable<DownloadResult["playlistTracks"]>[number];
 
@@ -68,7 +82,9 @@ export class SpotifyPlaylistImportService {
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly importSubdir = "Spotify Imports",
     private readonly audioTagger?: AudioTaggerService,
-    private readonly repository?: SqliteImportJobRepository
+    private readonly repository?: SqliteImportJobRepository,
+    private readonly importedArtwork?: SqliteImportedArtworkRepository,
+    private readonly reportArtworkWarning: (message: string, error: unknown) => void = console.warn,
   ) {}
   private readonly records = new Map<string, StoredImportJob>();
   private checkpoint(job: SpotifyImportJob): void {
@@ -127,6 +143,37 @@ export class SpotifyPlaylistImportService {
     return { title: source.title, artists, album: source.album || file?.album || "",
       albumArtist: source.albumArtist && !/unknown/i.test(source.albumArtist) ? source.albumArtist : artists[0], year: source.year,
       isrc: source.isrc, artworkUrl: source.artworkUrl };
+  }
+  private async ingestAlbumArtwork(
+    source: SpotifyTrackMetadata, filePath: string | undefined,
+    owner: { artworkWarnings?: string[] }, attempted: Set<string>,
+  ): Promise<boolean> {
+    if (!source.artworkUrl || !source.album) return false;
+    const warning = (message: string, error: unknown) => {
+      this.reportArtworkWarning(message, error);
+      owner.artworkWarnings = [...(owner.artworkWarnings || []).slice(-19),
+        `${message}: ${error instanceof Error ? error.message : String(error)}`];
+    };
+    if (!isSpotifyArtworkUrl(source.artworkUrl)) {
+      warning("Skipped unsupported album artwork source", new Error("Expected a Spotify image CDN URL"));
+      return false;
+    }
+    const artist = this.canonical(source).albumArtist || source.artist;
+    try { this.importedArtwork?.save(artist, source.album, source.artworkUrl, source.albumId); }
+    catch (error) { warning("Could not cache imported album artwork", error); }
+    if (!filePath) return false;
+    const directory = path.dirname(filePath);
+    const key = `${directory}\n${source.artworkUrl}`;
+    if (attempted.has(key)) return false;
+    attempted.add(key);
+    try {
+      safeMusicPath(this.musicRoot, filePath);
+      if (!fs.statSync(filePath).isFile()) throw new Error("Imported audio is not a regular file");
+      return await saveAlbumArtworkToFolder(directory, source.artworkUrl, this.musicRoot, this.fetchImpl);
+    } catch (error) {
+      warning("Could not publish imported album folder artwork", error);
+      return false;
+    }
   }
   private async cleanup(directory: string, owner: { cleanupWarnings?: string[] }): Promise<void> {
     const warning = await cleanupTemporaryDirectory(directory);
@@ -294,7 +341,7 @@ export class SpotifyPlaylistImportService {
         this.checkpoint(job);
         const [details, provider] = await Promise.all([detailsPromise, providerPromise]);
         job.playlistName = provider?.title || details.title || `Spotify Playlist ${spotify.id.slice(0, 8)}`;
-        job.playlistDescription = provider?.description?.trim() || `Imported from Spotify: ${spotify.url}`;
+        job.playlistDescription = spotifyPlaylistDescription(provider?.description, spotify.url);
         job.playlistArtworkUrl = provider?.artworkUrl || details.artworkUrl;
         this.checkpoint(job);
       }
@@ -303,7 +350,7 @@ export class SpotifyPlaylistImportService {
         if (!job.playlistName) {
           const [details, provider] = await Promise.all([this.spotifyDetails(spotify.url), this.downloader.fetchPlaylistDetails?.(spotify.id)]);
           job.playlistName = provider?.title || details.title || `Spotify Playlist ${spotify.id.slice(0, 8)}`;
-          job.playlistDescription = provider?.description?.trim() || `Imported from Spotify: ${spotify.url}`;
+          job.playlistDescription = spotifyPlaylistDescription(provider?.description, spotify.url);
           job.playlistArtworkUrl = provider?.artworkUrl || details.artworkUrl;
           this.checkpoint(job);
         }
@@ -353,6 +400,7 @@ export class SpotifyPlaylistImportService {
         if (track) {
           try {
             const existing = await this.backend.getTrackFilePath?.(String(track.id));
+            if (existing) entry.filePath = safeMusicPath(root, path.resolve(root, existing));
             if (this.audioTagger && existing) {
               const repair = await this.audioTagger.verifyAndTag(safeMusicPath(root, path.resolve(root, existing)), this.canonical(source), root);
               if (repair?.repaired) { needsScan = true; entry.requiresScan = true; }
@@ -424,6 +472,14 @@ export class SpotifyPlaylistImportService {
         finally { await this.cleanup(staging, entry); this.checkpoint(job); }
       }
       // Download all tracks before indexing; one stalled scan cannot stop the next download.
+      const artworkDirectories = new Set<string>();
+      for (const entry of entries) {
+        const filePath = ["DOWNLOADED", "READY", "COMPLETED"].includes(entry.status) ? entry.filePath : undefined;
+        if (await this.ingestAlbumArtwork(entry.source, filePath, entry, artworkDirectories)) {
+          needsScan = true; entry.requiresScan = true;
+        }
+        this.checkpoint(job);
+      }
       if (needsScan) {
         job.stage = "scanning"; this.checkpoint(job);
         const pending = entries.filter((entry) => entry.status === "DOWNLOADED");
@@ -487,6 +543,7 @@ export class SpotifyPlaylistImportService {
 
     const previousIds = new Set((await this.backend.listPlaylists()).map((playlist) => playlist.id));
     const titlePromise = this.spotifyDetails(spotify.url);
+    const providerDetailsPromise = this.downloader.fetchPlaylistDetails?.(spotify.id);
     const root = path.resolve(this.musicRoot);
     const outputDir = path.resolve(root, this.importSubdir, job.id);
     const relativeOutput = path.relative(root, outputDir);
@@ -599,6 +656,10 @@ export class SpotifyPlaylistImportService {
     }
     fs.writeFileSync(m3uPath, `${m3uLines.join("\n")}\n`, "utf8");
 
+    const artworkDirectories = new Set<string>();
+    for (const track of sourceTracks) {
+      await this.ingestAlbumArtwork(track, filesByPosition.get(track.position)?.path, job, artworkDirectories);
+    }
     job.stage = "scanning";
     await this.backend.scanLibrary();
 
@@ -625,8 +686,12 @@ export class SpotifyPlaylistImportService {
       throw new Error(`Navidrome found the playlist but imported 0 of ${available.length} downloaded tracks. Check M3U paths and library scanning.`);
     }
 
-    const details = await titlePromise;
-    const playlist = await this.playlists.adoptProviderPlaylist(importedId, user, details.title || `Spotify Playlist ${spotify.id.slice(0, 8)}`);
+    const [details, providerDetails] = await Promise.all([titlePromise, providerDetailsPromise]);
+    const playlistName = providerDetails?.title || details.title || `Spotify Playlist ${spotify.id.slice(0, 8)}`;
+    const playlist = await this.playlists.adoptProviderPlaylist(importedId, user, playlistName);
+    await this.playlists.update(playlist.id, {
+      description: spotifyPlaylistDescription(providerDetails?.description, spotify.url),
+    });
     await this.importArtwork(playlist.id, details.artworkUrl);
     job.playlistId = playlist.id;
     job.playlistName = playlist.name;

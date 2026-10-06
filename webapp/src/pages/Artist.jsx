@@ -16,6 +16,7 @@ import {
   createAcquisition,
 } from "../api/musicdeck";
 import ArtistAvatar from "../components/ArtistAvatar";
+import FullHero from "../components/Layout/FullHero";
 import ArtistBiography from "../components/ArtistBiography";
 import InLibraryBadge from "../components/InLibraryBadge";
 import { useArtistBiography } from "../hooks/useArtistBiography";
@@ -25,7 +26,6 @@ import { useUniversalArtist } from "../hooks/useUniversalArtist";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
-import AlbumDeleteButton from "../components/AlbumDeleteButton";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 
 import {
@@ -60,7 +60,6 @@ const ArtistAlbumCard = memo(function ArtistAlbumCard({ album, artistRouteId }) 
         <div className="album-artist album-not-downloaded">Not downloaded</div>
       )}
     </Link>
-    {!external && <AlbumDeleteButton album={album} />}
     </div>
   );
 }, (previous, next) => ["id", "name", "coverArt", "year", "inLibrary"].every(
@@ -70,13 +69,13 @@ const ArtistAlbumCard = memo(function ArtistAlbumCard({ album, artistRouteId }) 
 function ArtistBiographySection({ artist, songs }) {
   const localTrackId = songs.find((song) => song.id && song.source?.kind !== "external"
     && !String(song.id).startsWith("external_"))?.id;
-  const { biography, loading } = useArtistBiography({
+  const { biography, loading, error } = useArtistBiography({
     artistId: artist.id, artistName: artist.name, trackId: localTrackId,
   });
   return (
     <section className="artist-about" aria-labelledby="artist-about-title">
       <div className="artist-section-header"><h2 id="artist-about-title">About {artist.name}</h2></div>
-      <ArtistBiography biography={biography} loading={loading} />
+      <ArtistBiography biography={biography} loading={loading} emptyText={error || "Biography not available."} />
     </section>
   );
 }
@@ -464,71 +463,31 @@ function Artist() {
 
       {/* ARTIST HEADER */}
 
-      <div className="artist-header">
-
-
-        {/* IMAGE */}
-
-        <ArtistAvatar key={id} artist={artist} className="artist-page-cover" enableMusicBrainzFallback />
-
-
-        {/* INFO */}
-
-        <div className="artist-page-info">
-
-          <div className="artist-type">
-            {universalArtist.isExternal ? "EXTERNAL ARTIST" : "ARTIST"}
-          </div>
-
-
-          <h1>
-            {artist.name}
-          </h1>
-
-
+      <FullHero
+        className="artist-header"
+        artwork={<ArtistAvatar key={id} artist={artist} className="artist-page-cover" enableMusicBrainzFallback />}
+        eyebrow={universalArtist.isExternal ? "EXTERNAL ARTIST" : "ARTIST"}
+        title={artist.name}
+        metadata={
           <div className="artist-meta">
-
-            {albumCount}{" "}
-
-            {albumCount === 1
-              ? "album"
-              : "albums"}
-
+            {albumCount} {albumCount === 1 ? "album" : "albums"}
             {" · "}
-
-            {songCount}{" "}
-
-            {songCount === 1
-              ? "song"
-              : "songs"}
-
+            {songCount} {songCount === 1 ? "song" : "songs"}
             {artist.source?.kind !== "external" && " in library"}
-
           </div>
-
-
-        </div>
-
-      </div>
-
-      <div className="detail-action-row artist-actions">
-
+        }
+        actions={
+          <>
             <button
               className="artist-play"
               onClick={universalArtist.isExternal ? importArtistDiscography : playArtist}
-              disabled={
-                universalArtist.isExternal ? isImportingArtist : songs.length === 0
-              }
+              disabled={universalArtist.isExternal ? isImportingArtist : songs.length === 0}
             >
-
               {universalArtist.isExternal ? "☁" : "▶"}
-
               <span>
                 {universalArtist.isExternal ? (isImportingArtist ? "Adding…" : "Import Discography") : "Play"}
               </span>
-
             </button>
-
             <button
               type="button"
               className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}
@@ -538,8 +497,9 @@ function Artist() {
             >
               ⇄
             </button>
-
-      </div>
+          </>
+        }
+      />
 
 
       <ArtistBiographySection artist={artist} songs={songs} />

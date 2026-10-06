@@ -7,6 +7,7 @@ import { externalDiscoveryService } from "../services/externalDiscovery";
 import { extractArtworkColor } from "../utils/extractArtworkColor";
 import { toUnifiedTrack } from "../types/track";
 import { DiscoveryArtistCard, DiscoveryAlbumCard, DiscoveryArtwork as Artwork } from "../components/DiscoveryCards";
+import LightHero from "../components/Layout/LightHero";
 import TrackRow from "../components/TrackRow";
 import useTrackPlaylistMenu from "../hooks/useTrackPlaylistMenu";
 
@@ -37,8 +38,8 @@ function recommendedEntities(tracks, catalog, type) {
   }).slice(0, SHELF_SIZE);
 }
 
-function Header({ id, title, subtitle }) {
-  return <div className="explore-section-heading"><div><h2 id={id}>{title}</h2>{subtitle && <p>{subtitle}</p>}</div></div>;
+function Header({ id, title, subtitle, featured = false }) {
+  return <div className={`explore-section-heading${featured ? " explore-section-heading--featured" : ""}`}><div><h2 id={id}>{title}</h2>{subtitle && <p>{subtitle}</p>}</div></div>;
 }
 
 function Skeleton({ shape, count }) {
@@ -133,7 +134,28 @@ function Explore() {
     load("featured", externalDiscoveryService.getFeatured);
     load("popularArtists", externalDiscoveryService.getPopularArtists);
     load("popularAlbums", externalDiscoveryService.getPopularAlbums);
-    load("popularTracks", externalDiscoveryService.getPopularTracks);
+    load("popularTracks", async () => {
+      const tracks = await externalDiscoveryService.getPopularTracks();
+      if (active) {
+        setFeeds((previous) => ({
+          ...previous,
+          popularTracks: { items: tracks, loading: false, error: null },
+        }));
+      }
+      externalDiscoveryService.hydrateMissingPreviews(tracks)
+        .then((hydrated) => {
+          if (active) {
+            setFeeds((previous) => ({
+              ...previous,
+              popularTracks: { ...previous.popularTracks, items: hydrated },
+            }));
+          }
+        })
+        .catch((error) => {
+          console.warn("Could not resolve previews for external chart tracks:", error);
+        });
+      return tracks;
+    });
     const localDiscovery = getExplore();
     const recommendations = getRecommendations(["discover", "similar-artists"], 14);
     const recommendedTracks = recommendations.then((data) => (data.sections || []).flatMap((section) => section.items || []));
@@ -206,15 +228,18 @@ function Explore() {
   }
 
   return <div className="explore-page">
-    <header className="explore-page-heading">
-      <p className="explore-eyebrow">MusicDeck / Explore</p>
-      <h1>Find your next favorite</h1>
-      <p>Fresh directions from your library, alongside Deezer's current charts.</p>
-    </header>
+    <div className="page-hero-gradient">
+      <LightHero
+        className="explore-page-heading"
+        eyebrow="MusicDeck / Explore"
+        title="Find your next favorite"
+        subtitle="Fresh directions from your library, alongside Deezer's current charts."
+      />
+    </div>
     {actionMessage && <p className="explore-action-message" role="status">{actionMessage}</p>}
 
     <section className="explore-section" aria-labelledby="explore-featured-title">
-      <Header id="explore-featured-title" title="Trending Now / Featured" subtitle="Current chart picks from Deezer" />
+      <Header id="explore-featured-title" title="Trending Now / Featured" subtitle="Current chart picks from Deezer" featured />
       <FeedBody feed={feeds.featured} shape="hero" count={3} empty="Featured albums are unavailable.">
         <div className="explore-featured-grid" style={{ "--feature-rgb": heroColor || "104 62 148" }}>
           {feeds.featured.items.slice(0, 3).map((album, index) => <article className={`explore-featured-card${index === 0 ? " explore-featured-card--lead" : ""}`} key={album.id}>

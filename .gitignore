@@ -38,9 +38,6 @@ yarn-error.log*
 Thumbs.db
 *.code-workspace
 
-# === Reference-only project (reverb integration reference, not part of this app) ===
-reverb/
-
 # === Misc local scratch files (not needed in the repo) ===
 music_copy.txt
 Android App/

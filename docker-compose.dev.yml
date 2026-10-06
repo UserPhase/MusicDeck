@@ -18,11 +18,9 @@ services:
       musicdeck-server:
         condition: service_healthy
     ports:
-      # This is the ONLY port LAN clients need. Everything else (API,
-      # artwork, streaming, downloads, admin) is reverse-proxied through
-      # this single origin by nginx — clients never talk to port 4534,
-      # 4533, or 8096 directly.
-      - "${MUSICDECK_WEB_PORT:-8080}:80"
+      # Development serves plain HTTP with insecure cookies, so keep it
+      # reachable only from this machine by default.
+      - "127.0.0.1:${MUSICDECK_WEB_PORT:-8080}:80"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
@@ -42,16 +40,16 @@ services:
       # address, not a host-exposed port.
       MUSICDECK_HOST: 0.0.0.0
       MUSICDECK_PORT: 4534
-      # Must be the URL LAN clients actually use to reach MusicDeck, e.g.
-      # http://192.168.1.50:8080 — never leave this defaulted to localhost
-      # in a real deployment.
-      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:?Set MUSICDECK_PUBLIC_URL in .env to http://SERVER_IP:MUSICDECK_WEB_PORT}
+      # This development stack is loopback-only and uses HTTP.
+      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:?Set MUSICDECK_PUBLIC_URL in .env to http://localhost:8080}
       # Defaults to MUSICDECK_PUBLIC_URL — only set MUSICDECK_CORS_ORIGIN
       # separately if browsers reach MusicDeck through a different origin
       # than the one MusicDeck itself reports (uncommon).
       MUSICDECK_CORS_ORIGIN: ${MUSICDECK_CORS_ORIGIN:-${MUSICDECK_PUBLIC_URL}}
       MUSICDECK_DB_PATH: /app/data/musicdeck.sqlite
       MUSICDECK_SESSION_SECRET: ${MUSICDECK_SESSION_SECRET:?Set MUSICDECK_SESSION_SECRET in .env}
+      # This HTTP-only development stack may use insecure cookies only on a
+      # trusted local machine. Never expose it directly to an untrusted LAN.
       MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-false}
       MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
       MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:?Set MUSICDECK_ADMIN_PASSWORD in .env}

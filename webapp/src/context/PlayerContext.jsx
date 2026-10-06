@@ -94,6 +94,7 @@ export function PlayerProvider({
   } = useAuth();
   const playbackRequestRef =
     useRef(0);
+  const audioRequestIdsRef = useRef(new WeakMap());
   const listeningSessionRef = useRef(null);
   const pendingRestoreSeekRef = useRef(null);
   const restoreRequestRef = useRef(null);
@@ -599,6 +600,7 @@ export function PlayerProvider({
           setPreviewSource(restoredPreview);
           previewSourceRef.current = restoredPreview;
           activeAudio.src = previewUrl || getStreamUrl(song.id, source, streamQualityRef.current);
+          audioRequestIdsRef.current.set(activeAudio, { requestId, src: activeAudio.src });
         };
         loadRestoredSource().catch(() => {
           if (restoreRequestRef.current?.requestId === requestId) cancelRestoreResume();
@@ -899,6 +901,33 @@ export function PlayerProvider({
       : primaryAudioRef.current;
   }
 
+  function reportPlaybackFailure(audio, requestId, error) {
+    if (!audio || audio !== audioRef.current || requestId !== playbackRequestRef.current) return;
+    const source = audioRequestIdsRef.current.get(audio);
+    if (source?.requestId !== requestId || (audio.currentSrc && source.src !== audio.currentSrc)) return;
+    const message = error?.name === "NotAllowedError"
+      ? "Playback was blocked by the browser. Press play to try again."
+      : (typeof error?.message === "string" && error.message) ||
+        "Could not play this track. Check the connection and try again.";
+    setIsPlaying(false);
+    setPlaybackUnavailable(true);
+    setPlaybackMessage(message);
+  }
+
+  function handleMediaError(event) {
+    const audio = event.currentTarget;
+    const source = audioRequestIdsRef.current.get(audio);
+    if (audio !== audioRef.current || !source || source.requestId !== playbackRequestRef.current) return;
+    const code = audio.error?.code;
+    const message = code === 2
+      ? "A network error prevented this track from loading."
+      : code === 3
+        ? "This track could not be decoded."
+        : code === 4
+          ? "This audio source is unavailable."
+          : "Playback failed. Try again or choose another source.";
+    reportPlaybackFailure(audio, source.requestId, { message });
+  }
 
   function cancelCrossfade() {
     crossfadeTokenRef.current += 1;
@@ -1396,6 +1425,7 @@ export function PlayerProvider({
 
     }
 
+    const activeAudio = audioRef.current;
     cancelRestoreResume();
 
     cancelCrossfade();
@@ -1425,6 +1455,8 @@ export function PlayerProvider({
     // Do not resolve a full external source when that preview is unavailable.
     if (!localTrack && !directPreviewUrl) {
       setPlaybackMessage("Preview unavailable for this track");
+      setPlaybackUnavailable(true);
+      setIsPlaying(false);
       return false;
     }
 
@@ -1446,18 +1478,19 @@ export function PlayerProvider({
       );
 
 
-    audioRef.current.pause();
+    activeAudio.pause();
 
     deckGainRef.current.set(
-      audioRef.current,
+      activeAudio,
       replayGainMultiplierForSong(song)
     );
 
     pendingRestoreSeekRef.current = resumeAtSeconds > 0 ? resumeAtSeconds : null;
-    audioRef.current.src =
+    activeAudio.src =
       streamUrl;
+    audioRequestIdsRef.current.set(activeAudio, { requestId, src: activeAudio.src });
 
-    applyDeckVolume(audioRef.current);
+    applyDeckVolume(activeAudio);
 
 
     setCurrentSong(song);
@@ -1504,7 +1537,7 @@ export function PlayerProvider({
 
     try {
 
-      await audioRef.current.play();
+      await activeAudio.play();
 
       if (
         requestId === playbackRequestRef.current
@@ -1517,11 +1550,7 @@ export function PlayerProvider({
 
     } catch (error) {
 
-      if (
-        requestId === playbackRequestRef.current
-      ) {
-        setIsPlaying(false);
-      }
+      reportPlaybackFailure(activeAudio, requestId, error);
 
     }
 
@@ -2310,8 +2339,10 @@ export function PlayerProvider({
         return;
       }
 
-      audioRef.current.play().catch(() => {
-        setIsPlaying(false);
+      const activeAudio = audioRef.current;
+      const source = audioRequestIdsRef.current.get(activeAudio);
+      activeAudio.play().catch((error) => {
+        reportPlaybackFailure(activeAudio, source?.requestId, error);
       });
 
     }
@@ -2885,8 +2916,8 @@ export function PlayerProvider({
         onError={(event) => {
           if (event.currentTarget === audioRef.current) {
             if (restoreRequestRef.current) cancelRestoreResume();
-            setIsPlaying(false);
             setDuration(0);
+            handleMediaError(event);
           }
         }}
 
@@ -2928,8 +2959,8 @@ export function PlayerProvider({
         onError={(event) => {
           if (event.currentTarget === audioRef.current) {
             if (restoreRequestRef.current) cancelRestoreResume();
-            setIsPlaying(false);
             setDuration(0);
+            handleMediaError(event);
           }
         }}
 

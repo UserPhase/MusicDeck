@@ -10,6 +10,8 @@ import './styles/player.css';
 import './styles/tracks.css';
 import './styles/topbar.css';
 import './styles/admin.css';
+import './styles/hero.css';
+import './styles/glassmorphic.css';
 import App from './App';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));

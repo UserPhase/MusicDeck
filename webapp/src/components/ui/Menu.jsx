@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
+import FloatingPanel from "./FloatingPanel";
 
 import IconButton from "./IconButton";
 
@@ -14,7 +15,6 @@ function Menu({
   onOpenChange,
 }) {
   const [open, setOpen] = useState(false);
-  const containerRef = useRef(null);
   const toggleRef = useRef(null);
 
   function updateOpen(next) {
@@ -24,35 +24,6 @@ function Menu({
       return value;
     });
   }
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    function onKeyDown(event) {
-      if (event.key === "Escape") {
-        setOpen(false);
-        onOpenChange?.(false);
-        toggleRef.current?.focus();
-      }
-    }
-
-    function onPointerDown(event) {
-      if (containerRef.current && !containerRef.current.contains(event.target)) {
-        setOpen(false);
-        onOpenChange?.(false);
-      }
-    }
-
-    document.addEventListener("keydown", onKeyDown);
-    document.addEventListener("mousedown", onPointerDown);
-
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      document.removeEventListener("mousedown", onPointerDown);
-    };
-  }, [open, onOpenChange]);
 
   const toggleProps = {
     ref: toggleRef,
@@ -69,7 +40,6 @@ function Menu({
   return (
     <div
       className={`ui-menu ${className}`.trim()}
-      ref={containerRef}
       onClick={(event) => event.stopPropagation()}
     >
       {renderToggle ? (
@@ -84,7 +54,9 @@ function Menu({
       )}
 
       {open && (
-        <div
+        <FloatingPanel
+          anchorRef={toggleRef}
+          onClose={() => updateOpen(false)}
           className={`ui-menu-popover ${menuClassName}`.trim()}
           role="menu"
           aria-label={title || label}
@@ -92,7 +64,7 @@ function Menu({
         >
           {title && <div className="ui-menu-title">{title}</div>}
           {typeof children === "function" ? children({ close: () => updateOpen(false) }) : children}
-        </div>
+        </FloatingPanel>
       )}
     </div>
   );

@@ -1,10 +1,11 @@
 # MusicDeck Self-Hosting Guide
 
-This guide runs MusicDeck as a small self-hosted LAN stack:
+This guide runs MusicDeck as a self-hosted stack behind HTTPS:
 
 ```text
-Browser (any LAN device)
-  -> http://SERVER_IP:MUSICDECK_WEB_PORT
+Browser
+  -> https://music.example.com
+  -> TLS reverse proxy
   -> MusicDeck Web container (nginx)
      -> /api proxy  -> MusicDeck Server container
      -> /ws proxy   -> MusicDeck Server container (reserved; no WebSockets in use yet)
@@ -64,7 +65,7 @@ explanations):
 
 ```text
 MUSIC_BACKEND=navidrome
-MUSICDECK_PUBLIC_URL=http://SERVER_IP:8080
+MUSICDECK_PUBLIC_URL=https://music.example.com
 MUSICDECK_SESSION_SECRET=replace-with-a-long-random-secret
 MUSICDECK_ADMIN_USERNAME=admin
 MUSICDECK_ADMIN_PASSWORD=change-this-admin-password
@@ -80,8 +81,8 @@ NAVIDROME_PASSWORD=change-this-navidrome-password
 JELLYFIN_API_KEY=your-jellyfin-api-key
 ```
 
-Replace `SERVER_IP` with your Docker host's actual LAN IP address (e.g.
-`192.168.1.50`) or a resolvable hostname. `docker compose up` intentionally
+Set `MUSICDECK_PUBLIC_URL` to the HTTPS origin exposed by your TLS reverse
+proxy. `docker compose up` intentionally
 fails fast with a clear error if `MUSICDECK_PUBLIC_URL`,
 `MUSICDECK_SESSION_SECRET`, `MUSICDECK_ADMIN_PASSWORD`, or `MUSIC_ROOT` are
 missing — there is no silent `localhost` fallback in production.
@@ -128,10 +129,10 @@ docker compose pull
 docker compose up -d
 ```
 
-Open MusicDeck (the only URL LAN clients need):
+Open MusicDeck through the HTTPS reverse proxy:
 
 ```text
-http://SERVER_IP:8080
+https://music.example.com
 ```
 
 If you selected `MUSIC_BACKEND=navidrome`, open Navidrome directly for its
@@ -155,25 +156,21 @@ http://SERVER_IP:8096
 Create an API key under **Dashboard → API Keys**, set `JELLYFIN_API_KEY` in
 `.env`, then `docker compose up -d` again.
 
-## LAN Access (other devices on your network)
+## HTTPS access
 
-The Docker Compose stack already binds `musicdeck-server` to `0.0.0.0`
-internally and publishes only `musicdeck-web` on
-`${MUSICDECK_WEB_PORT:-8080}` on all host interfaces — no extra container
-configuration is required for LAN access itself. To reach MusicDeck from a
-phone, tablet, or another computer on the same network:
+Production cookies are secure by default. Do not expose MusicDeck's HTTP
+container port directly to browsers. The production Compose file binds it to
+host loopback (`127.0.0.1:${MUSICDECK_WEB_PORT:-8080}`) so a TLS-terminating
+reverse proxy on the same host can reach it without publishing cleartext
+access to the LAN. If the TLS proxy runs in another container or host, set
+`MUSICDECK_WEB_BIND` to an address reachable by that proxy and restrict the
+port with firewall rules or a private container network.
 
-1. Find the host machine's LAN IP address (e.g. `192.168.1.50`).
-2. Set `MUSICDECK_PUBLIC_URL` in `.env` to that address, for example:
-   ```text
-   MUSICDECK_PUBLIC_URL=http://192.168.1.50:8080
-   ```
-   This must match the exact origin browsers on other devices will use,
-   including port — there is no `localhost` default. `MUSICDECK_CORS_ORIGIN`
-   defaults to this value automatically.
-3. Start/restart the stack (`docker compose up -d`) so the server picks up
-   the new environment values.
-4. Browse to `http://192.168.1.50:8080` from any device on the same network.
+Configure the reverse proxy to terminate TLS, forward the original
+`X-Forwarded-Proto: https` header to MusicDeck Web, and send HSTS to clients.
+`webapp/nginx.conf` forwards the HTTPS scheme to MusicDeck Server and also
+sets HSTS on responses. `MUSICDECK_PUBLIC_URL` must be the exact HTTPS origin
+that browsers use; `MUSICDECK_CORS_ORIGIN` defaults to it.
 
 Because the React client only ever calls same-origin relative `/api/...`
 paths (proxied by nginx), there is no separate frontend build step or extra
@@ -184,19 +181,20 @@ still proxies a reserved `/ws/` path with correct `Upgrade`/`Connection`
 header forwarding so a future real-time feature works through the same
 single origin without any client-side reconfiguration.
 
-If you plan to expose MusicDeck beyond your LAN (e.g. over the public
-internet), put it behind a reverse proxy with HTTPS — see "HTTPS / Reverse
-Proxy" below — and set `MUSICDECK_SECURE_COOKIES=true`.
+The development Compose stack is intended for local development only and
+defaults secure cookies off for its HTTP URL. Never expose it to an untrusted
+network.
 
 ## Services
 
 ### musicdeck-web
 
-Serves the prebuilt React app with nginx. This is the only container LAN
-clients connect to.
+Serves the prebuilt React app with nginx. Production access should pass
+through the TLS-terminating reverse proxy.
 
 - Image: `ghcr.io/userphase/musicdeck-web`
-- Public port: `${MUSICDECK_WEB_PORT:-8080}` — **required**
+- Host binding: `127.0.0.1:${MUSICDECK_WEB_PORT:-8080}` by default; use
+  `MUSICDECK_WEB_BIND` only for a secured proxy on another host/container
 - Proxies `/api/*` and `/ws/*` to `musicdeck-server:4534`
 - Serves the React client without running the React development server
 
@@ -275,6 +273,15 @@ MusicDeck Server and the selected backend mount the same host folder
 pipeline (e.g. the spotDL downloader) lands in the exact folder the backend
 scans. MusicDeck Server mounts it read-write (to save downloaded files); the
 backend mounts it read-only (it only needs to scan/serve).
+Spotify playlist imports write `cover.jpg` and `folder.jpg` alongside each
+album's downloaded audio before triggering the library rescan. MusicDeck must
+have write access to those album directories, and Navidrome/Jellyfin must have
+read and directory-traversal access. Artwork files are created with mode 0644;
+existing covers are never overwritten. Folder-art failures appear as import
+warnings and do not prevent importing the audio. Spotify cover metadata is
+also retained in MusicDeck's SQLite data volume for missing-cover API fallback.
+Imports completed before this feature need to be re-imported to populate
+folder art and the new cache; existing audio is reused rather than replaced.
 
 If your host music folder or the backend's data folders need to change, edit
 the corresponding variable in `.env` and restart the stack —
@@ -299,6 +306,8 @@ Backend selection:
 MusicDeck:
 
 - `MUSICDECK_WEB_PORT`
+- `MUSICDECK_WEB_BIND` — production web port bind address; defaults to
+  `127.0.0.1` so a same-host TLS proxy can reach it without LAN exposure
 - `MUSICDECK_PUBLIC_URL` — required, no `localhost` default in production
 - `MUSICDECK_CORS_ORIGIN` — optional, defaults to `MUSICDECK_PUBLIC_URL`
 - `MUSICDECK_SESSION_SECRET` — required
@@ -389,8 +398,8 @@ GET /api/admin/health
 In Compose, the browser talks to `musicdeck-web` only:
 
 ```text
-http://SERVER_IP:8080/
-http://SERVER_IP:8080/api/*
+https://music.example.com/
+https://music.example.com/api/*
 ```
 
 nginx proxies `/api/*` (and reserved `/ws/*`) to the server internally. This avoids requiring users to configure browser CORS for normal production deployments.
@@ -399,17 +408,23 @@ Local development is different: React's development server uses the `proxy` sett
 
 ## HTTPS / Reverse Proxy
 
-For real production use, put MusicDeck behind a reverse proxy such as Caddy, Nginx, Traefik, or your hosting provider's proxy.
+Production requires a reverse proxy such as Caddy, Nginx, Traefik, or your
+hosting provider's proxy. The production Compose file sets
+`MUSICDECK_SECURE_COOKIES=true` by default and binds the web port to host
+loopback so browsers cannot use the cleartext container endpoint directly.
 
 Recommended external shape:
 
 ```text
-https://musicdeck.example.com
-  -> musicdeck-web:80
+https://musicdeck.example.com (TLS termination + HSTS)
+  -> http://127.0.0.1:8080 (musicdeck-web)
   -> /api proxy to musicdeck-server:4534
 ```
 
-Use HTTPS so cookies can be marked secure and credentials are protected in transit.
+Set `MUSICDECK_PUBLIC_URL=https://musicdeck.example.com` and configure the TLS
+proxy to forward `X-Forwarded-Proto: https`. Keep the web container's port
+private and use a valid certificate; secure cookies do not protect
+credentials sent over a publicly reachable HTTP endpoint.
 
 ## Backup Basics
 

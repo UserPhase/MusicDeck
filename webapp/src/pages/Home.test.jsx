@@ -70,6 +70,19 @@ test("renders the artist shelves and discovery sections with a personalized gree
   ].forEach((heading) => expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument());
 });
 
+test("uses same-origin fallback covers for missing recent album and listening artwork", async () => {
+  renderHome({
+    albums: [{ id: "album-missing", name: "Discovery", artist: "Daft Punk", coverArt: null }],
+    recentlyPlayed: [{ ...song, coverArt: null, album: "Discovery" }],
+  });
+  await waitForHome();
+  const albums = screen.getByRole("heading", { name: "Recently Added Albums" }).closest("section");
+  const listening = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
+  const expected = "/api/metadata/album-artwork?artist=Daft+Punk&album=Discovery";
+  expect(albums.querySelector("img")).toHaveAttribute("src", expected);
+  expect(listening.querySelector("img")).toHaveAttribute("src", expected);
+});
+
 test("opens artists using the same linked portrait card as Explore", async () => {
   renderHome();
   await waitForHome();

@@ -1,4 +1,5 @@
 import {
+  getAlbum,
   getAlbums,
   getArtist,
   getArtistOverview,
@@ -95,6 +96,36 @@ test("album responses are adapted to existing UI shapes", async () => {
       coverArt: "art-1",
     }),
   ]);
+});
+
+test("preserves URL-only album artwork when the media server has no cover ID", async () => {
+  global.fetch.mockResolvedValue({
+    ok: true, status: 200,
+    json: async () => ({ albums: [{
+      id: "album-url", name: "Album", artistName: "Artist", artworkId: null,
+      artworkUrl: "https://images.example.test/cover.jpg",
+    }] }),
+  });
+
+  expect(await getAlbums()).toEqual([expect.objectContaining({
+    id: "album-url", coverArt: null, coverUrl: "https://images.example.test/cover.jpg",
+  })]);
+});
+
+test("album detail preserves root references and child-track artwork URLs", async () => {
+  global.fetch.mockImplementation(async (url) => ({
+    ok: true, status: 200,
+    json: async () => url.endsWith("/tracks") ? { tracks: [
+      { id: "babydoll", title: "Babydoll", artwork: { id: "mdart_track", url: "/api/artwork/mdart_track" } },
+    ] } : { album: {
+      id: "demos", name: "Demos", artistName: "Dominic Fike",
+      coverArt: "al-root", coverUrl: "https://images.example.test/root.jpg",
+    } },
+  }));
+  expect(await getAlbum("demos")).toEqual(expect.objectContaining({
+    coverArt: "al-root", coverUrl: "https://images.example.test/root.jpg",
+    song: [expect.objectContaining({ coverArt: "mdart_track", coverUrl: "/api/artwork/mdart_track" })],
+  }));
 });
 
 test("artist albums resolve cover art the same way whether the server returns a legacy artworkId or a merged catalog artwork object", async () => {

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import FloatingPanel from "../ui/FloatingPanel";
 import { Link } from "react-router-dom";
 
 import { useAuth } from "../../context/AuthContext";
@@ -7,6 +8,7 @@ import { useAuth } from "../../context/AuthContext";
 function AdminTopBar() {
   const { session, signOut } = useAuth();
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef(null);
 
   return (
     <header className="admin-topbar">
@@ -18,6 +20,7 @@ function AdminTopBar() {
         <button
           type="button"
           className="admin-profile-button"
+          ref={triggerRef}
           aria-haspopup="menu"
           aria-expanded={open}
           onClick={() => setOpen((current) => !current)}
@@ -32,7 +35,7 @@ function AdminTopBar() {
         </button>
 
         {open && (
-          <div className="admin-profile-menu" role="menu">
+          <FloatingPanel anchorRef={triggerRef} onClose={() => setOpen(false)} className="admin-profile-menu" role="menu">
             <Link to="/profile" role="menuitem" onClick={() => setOpen(false)}>
               Profile
             </Link>
@@ -42,7 +45,7 @@ function AdminTopBar() {
             <button type="button" role="menuitem" onClick={signOut}>
               Log out
             </button>
-          </div>
+          </FloatingPanel>
         )}
       </div>
     </header>

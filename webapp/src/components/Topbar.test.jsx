@@ -64,6 +64,8 @@ test("opens and closes the account menu from the profile button", () => {
   expect(screen.getByRole("menuitem", { name: /profile/i })).toBeInTheDocument();
   expect(screen.getByRole("menuitem", { name: /settings/i })).toBeInTheDocument();
   expect(screen.queryByRole("menuitem", { name: /admin dashboard/i })).not.toBeInTheDocument();
+  expect(screen.getByRole("menu").parentElement).toBe(document.body);
+  expect(screen.getByRole("menu")).toHaveClass("glass-dropdown", "account-menu");
 
   fireEvent.keyDown(document, { key: "Escape" });
 
@@ -100,6 +102,9 @@ test("uses a real button for a live-search play result", async () => {
   });
 
   expect(await screen.findByRole("button", { name: "Digital Love" })).toBeInTheDocument();
+  const suggestionPanel = screen.getByRole("button", { name: "Digital Love" }).closest(".search-dropdown");
+  expect(suggestionPanel.parentElement).toBe(document.body);
+  expect(suggestionPanel).toHaveClass("glass-dropdown");
   jest.useRealTimers();
 });
 

@@ -1,7 +1,6 @@
-import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import { getCoverUrl } from "../api/musicdeck";
+import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { toArtistRouteIdFromApiId } from "../utils/idResolver";
 import ArtistAvatar from "./ArtistAvatar";
@@ -19,10 +18,9 @@ function itemLink(item, type) {
 }
 
 export function DiscoveryArtwork({ item, className = "" }) {
-  const [failedImage, setFailedImage] = useState(null);
-  const image = getCoverUrl(item?.coverArt, 360) || item?.coverUrl;
+  const { url: image, onError } = useAlbumArtwork(item);
   return <span className={`explore-artwork ${className}`}>
-    {image && failedImage !== image ? <img src={image} alt="" onError={() => setFailedImage(image)} />
+    {image ? <img src={image} alt="" loading="lazy" onError={onError} />
       : <span className="explore-artwork-fallback" aria-hidden="true">{nameOf(item).slice(0, 1).toUpperCase()}</span>}
   </span>;
 }

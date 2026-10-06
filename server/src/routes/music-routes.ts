@@ -29,6 +29,9 @@ import { ItunesArtistCatalog, itunesReleaseKey, sameItunesRecording } from "../d
 import { ArtistImageResolver, isNativeArtistPicture } from "../domain/artist-image.js";
 import { MusicBrainzAvatarWorker } from "../domain/musicbrainz-avatar-worker.js";
 import { LyricsService, parseLrcLines, type LyricsTrack } from "../domain/lyrics-service.js";
+import { MediaMetadataFallback } from "../domain/media-metadata-fallback.js";
+import { AlbumArtworkService } from "../services/media/albumService.js";
+import { SqliteImportedArtworkRepository } from "../infrastructure/persistence/sqliteImportedArtworkRepository.js";
 import { discographyTracksMatch, mergeDiscography, normalizeDiscographyText, type DiscographyAlbum, type DiscographyTrack } from "../services/discovery/discographyMerger.js";
 import {
   findMatchingExternalAlbum,
@@ -59,6 +62,8 @@ import { addRecentlyPlayed, listRecentlyPlayed } from "../domain/recently-played
 import { listFavoriteTracks, setTrackFavorite } from "../domain/favorites.js";
 import { listUserSettings } from "../domain/settings.js";
 import { sendError } from "../utils/http.js";
+import { SseEventWriter } from "../utils/sse.js";
+import { hydrateMissingPreviews, normalizeExternalTrack } from "../services/discovery/externalTrackNormalizer.js";
 
 const trackIdPattern = /^[^/]+$/;
 const lyricsQuerySchema = z.object({
@@ -75,6 +80,17 @@ const libraryMatchesSchema = z.object({
     artist: z.string().max(300),
     isrc: z.string().max(32).nullable().optional(),
   })).max(100),
+});
+const externalPreviewHydrationSchema = z.object({
+  tracks: z.array(z.object({
+    id: z.string().min(1).max(200),
+    title: z.string().min(1).max(300),
+    artist: z.string().min(1).max(300),
+    album: z.string().max(300).nullable().optional(),
+    coverUrl: z.string().max(2048).nullable().optional(),
+    previewUrl: z.string().max(2048).nullable().optional(),
+    isrc: z.string().max(32).nullable().optional(),
+  })).max(20),
 });
 
 function parseTypes(value: unknown) {
@@ -132,6 +148,18 @@ export async function registerMusicRoutes(
   const artistImages = new ArtistImageResolver(externalCatalog.fetchImpl);
   const musicBrainzAvatars = new MusicBrainzAvatarWorker(db, externalCatalog.fetchImpl);
   const lyricsService = new LyricsService(externalCatalog.fetchImpl);
+  const mediaMetadata = new MediaMetadataFallback(externalCatalog.fetchImpl);
+  const albumArtwork = new AlbumArtworkService(async (id) => {
+    const result = id.startsWith("mdart_")
+      ? await sourceResolver.fetchArtwork(id)
+      : await backend.fetchArtwork(id);
+    await result.body?.cancel();
+    if (result.status === 404) return false;
+    if (result.status !== 200) throw new Error(`Album artwork validation returned ${result.status}`);
+    return /^image\//i.test(result.headers.get("content-type") || "");
+  }, (artist, album) => mediaMetadata.getAlbumCover(artist, album),
+  (error) => app.log.warn({ err: error }, "Album artwork resolution failed"),
+  new SqliteImportedArtworkRepository(db));
   const metadata = new CompositeMetadataService(
     new SubsonicAdapter(catalog),
     [
@@ -174,6 +202,30 @@ export async function registerMusicRoutes(
     } catch {
       return sendError(reply, 502, "External charts are temporarily unavailable", "EXTERNAL_DISCOVERY_UNAVAILABLE");
     }
+  });
+
+  app.post("/api/discovery/external/previews", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+
+    const parsed = externalPreviewHydrationSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, "Invalid external preview lookup request", "VALIDATION_ERROR");
+    }
+
+    const tracks = parsed.data.tracks.flatMap((track) => {
+      const normalized = normalizeExternalTrack(track);
+      return normalized ? [normalized] : [];
+    });
+    const hydrated = await hydrateMissingPreviews(
+      tracks,
+      (query) => externalCatalog.deezerProvider.searchTracks(query, 10),
+      5
+    );
+    reply.header("Cache-Control", "private, max-age=300");
+    return {
+      tracks: hydrated.map(({ id, previewUrl }) => ({ id, previewUrl })),
+    };
   });
 
   app.get("/api/library/random-albums", async (request, reply) => {
@@ -546,7 +598,7 @@ export async function registerMusicRoutes(
       const { tracks, localCount } = await resolveExternalAlbumTracks(album);
       return {
         album: {
-          ...album,
+          ...await albumArtwork.resolve(album, tracks),
           tracks,
           trackCount: tracks.length,
           localTrackCount: localCount,
@@ -560,7 +612,7 @@ export async function registerMusicRoutes(
     }
 
     const { tracks, localCount } = await resolveAlbumCatalogTracks(user, albumId, album);
-    return { album: { ...album, trackCount: tracks.length, localTrackCount: localCount } };
+    return { album: { ...await albumArtwork.resolve(album, tracks), trackCount: tracks.length, localTrackCount: localCount } };
   });
 
   app.get("/api/albums/:albumId/tracks", async (request, reply) => {
@@ -1021,6 +1073,67 @@ export async function registerMusicRoutes(
     };
   });
 
+  const artistMetadataQuery = z.object({ artist: z.string().trim().min(1).max(300) });
+  const albumMetadataQuery = artistMetadataQuery.extend({ album: z.string().trim().min(1).max(300) });
+  let activeArtworkFallbacks = 0;
+
+  app.get("/api/metadata/artist-biography", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const parsed = artistMetadataQuery.safeParse(request.query);
+    if (!parsed.success) return sendError(reply, 400, "Invalid artist metadata request");
+    try {
+      const biography = await mediaMetadata.getBiography(parsed.data.artist);
+      reply.header("Cache-Control", "private, max-age=300");
+      return { biography };
+    } catch (error) {
+      request.log.warn({ err: error }, "Artist biography lookup failed");
+      return sendError(reply, 502, "Could not load the artist biography");
+    }
+  });
+
+  app.get("/api/metadata/album-artwork", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const parsed = albumMetadataQuery.safeParse(request.query);
+    if (!parsed.success) return sendError(reply, 400, "Invalid album metadata request");
+    if (activeArtworkFallbacks >= 20) return sendError(reply, 503, "Artwork lookup capacity exceeded");
+    activeArtworkFallbacks++;
+    try {
+      const url = await mediaMetadata.getAlbumCover(parsed.data.artist, parsed.data.album);
+      if (!url) return sendError(reply, 404, "No matching album artwork found");
+      const response = await mediaMetadata.fetchCover(url);
+      const contentType = response.headers.get("content-type")?.split(";")[0].trim() || "";
+      if (!response.ok || !response.body || !/^image\/(?:jpeg|png|webp|gif)$/i.test(contentType)) {
+        await response.body?.cancel();
+        return sendError(reply, 502, "Album artwork unavailable");
+      }
+      // Bound the upstream payload even when the CDN omits Content-Length.
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > 2 * 1024 * 1024) {
+            await reader.cancel();
+            return sendError(reply, 502, "Album artwork exceeds the size limit");
+          }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      reply.header("Content-Type", contentType);
+      reply.header("Cache-Control", "private, max-age=86400");
+      reply.header("X-Content-Type-Options", "nosniff");
+      return reply.send(Buffer.concat(chunks, bytes));
+    } catch (error) {
+      request.log.warn({ err: error }, "Album artwork lookup failed");
+      return sendError(reply, 502, "Could not load album artwork");
+    } finally { activeArtworkFallbacks--; }
+  });
+
   app.get("/api/tracks/:trackId/artist-biography", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -1414,15 +1527,17 @@ export async function registerMusicRoutes(
       // Respect provider cache headers when present; otherwise give the
       // browser a private cache so revisiting the page does not reload covers.
       reply.header("cache-control", "private, max-age=3600");
-      if (isMusicDeckArtwork) {
-        return await sendProxyResponse(reply, await sourceResolver.fetchArtwork(artworkId, thumbnailSize));
-      }
-      return await sendProxyResponse(
-        reply,
-        thumbnailSize === undefined
+      const result = isMusicDeckArtwork
+        ? await sourceResolver.fetchArtwork(artworkId, thumbnailSize)
+        : thumbnailSize === undefined
           ? await backend.fetchArtwork(artworkId)
-          : await backend.fetchArtwork(artworkId, thumbnailSize)
-      );
+          : await backend.fetchArtwork(artworkId, thumbnailSize);
+      if (result.status === 404) {
+        await result.body?.cancel();
+        reply.header("cache-control", "private, no-store");
+        return sendError(reply, 404, "Artwork not found");
+      }
+      return await sendProxyResponse(reply, result);
     } catch (error) {
       if (error instanceof SourceUnavailableError) {
         return sendError(reply, 502, "Artwork unavailable");
@@ -1482,23 +1597,25 @@ export async function registerMusicRoutes(
       return sendError(reply, 503, "Acquisition service is not available");
     }
 
+    reply.hijack();
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache");
     reply.raw.setHeader("Connection", "keep-alive");
     reply.raw.flushHeaders?.();
-
-    reply.raw.write(`event: connected\ndata: ${JSON.stringify({ connected: true })}\n\n`);
+    const eventWriter = new SseEventWriter(reply.raw);
+    eventWriter.push("connected", { connected: true });
 
     const unsubscribe = acquisition.subscribe((event, payload) => {
-      if (user.role !== "admin" && payload.userId && payload.userId !== user.id) {
+      if (user.role !== "admin" && payload.userId !== user.id) {
         return;
       }
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+      eventWriter.push(event, payload);
     });
 
     request.raw.on("close", () => {
       unsubscribe();
     });
+    reply.raw.on("close", unsubscribe);
   });
 
   app.get("/api/acquisitions", async (request, reply) => {

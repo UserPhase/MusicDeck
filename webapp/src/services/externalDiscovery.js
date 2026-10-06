@@ -1,4 +1,4 @@
-import { getExternalCharts } from "../api/musicdeck";
+import { getExternalCharts, hydrateExternalPreviews } from "../api/musicdeck";
 
 // Share one in-flight request across Explore's four chart shelves. The server
 // caches the result, while a later visit can request a fresh chart.
@@ -18,6 +18,23 @@ export function createExternalDiscoveryService(loadCharts = getExternalCharts) {
     getPopularArtists: async () => (await charts()).artists,
     getPopularAlbums: async () => (await charts()).albums,
     getPopularTracks: async () => (await charts()).tracks,
+    hydrateMissingPreviews: async (tracks) => {
+      const missing = tracks.filter((track) => !track.previewUrl);
+      if (!missing.length) return tracks;
+      const resolved = await hydrateExternalPreviews(missing.map((track) => ({
+        id: track.id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album || null,
+        coverUrl: track.coverUrl || null,
+        previewUrl: track.previewUrl || null,
+        isrc: track.isrc || track.metadata?.isrc || null,
+      })));
+      const previewById = new Map(resolved.map((track) => [track.id, track.previewUrl]));
+      return tracks.map((track) => previewById.get(track.id)
+        ? { ...track, previewUrl: previewById.get(track.id) }
+        : track);
+    },
     getMoods: async () => [
       { name: "Late night", tone: "#4c278a", symbol: "☾" },
       { name: "Focus", tone: "#176e74", symbol: "◈" },

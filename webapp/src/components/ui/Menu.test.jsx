@@ -28,6 +28,8 @@ test("menu opens, selects, and returns focus on Escape", () => {
 
   expect(toggle).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByRole("menu", { name: "Actions" })).toBeInTheDocument();
+  expect(screen.getByRole("menu", { name: "Actions" }).parentElement).toBe(document.body);
+  expect(screen.getByRole("menu", { name: "Actions" })).toHaveClass("glass-dropdown");
 
   fireEvent.click(screen.getByRole("menuitem", { name: "Play" }));
   expect(onSelect).toHaveBeenCalledTimes(1);

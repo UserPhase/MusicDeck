@@ -30,6 +30,15 @@ export interface ProcessRunner {
   run(command: string, args: string[], options?: ProcessOptions): ProcessHandle;
 }
 
+const MAX_CAPTURE_BYTES_PER_STREAM = 512 * 1024;
+const MAX_PARTIAL_LINE_BYTES = 64 * 1024;
+
+function appendBounded(current: Buffer, chunk: Buffer, limit: number): Buffer {
+  if (chunk.length >= limit) return chunk.subarray(chunk.length - limit);
+  const combined = Buffer.concat([current, chunk]);
+  return combined.length > limit ? combined.subarray(combined.length - limit) : combined;
+}
+
 /**
  * DefaultProcessRunner executes external binaries safely using argument arrays.
  * It strictly avoids shell string concatenation and supports cancellation, timeouts,
@@ -38,10 +47,10 @@ export interface ProcessRunner {
 export class DefaultProcessRunner implements ProcessRunner {
   run(command: string, args: string[], options: ProcessOptions = {}): ProcessHandle {
     let child: ChildProcess | undefined;
-    let stdoutData = "";
-    let stderrData = "";
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
+    let stdoutData: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderrData: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stdoutBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderrBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let timeoutTimer: NodeJS.Timeout | undefined;
     let isTerminated = false;
 
@@ -89,14 +98,13 @@ export class DefaultProcessRunner implements ProcessRunner {
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutData = appendBounded(stdoutData, chunk, MAX_CAPTURE_BYTES_PER_STREAM);
         const text = chunk.toString("utf8");
-        stdoutData += text;
         options.onStdoutChunk?.(text);
 
         if (options.onStdoutLine) {
-          stdoutBuffer += text;
-          const lines = stdoutBuffer.split(/\r?\n|\r/);
-          stdoutBuffer = lines.pop() || "";
+          const lines = Buffer.concat([stdoutBuffer, chunk]).toString("utf8").split(/\r?\n|\r/);
+          stdoutBuffer = Buffer.from(lines.pop() || "").subarray(-MAX_PARTIAL_LINE_BYTES);
           for (const line of lines) {
             if (line.trim()) {
               options.onStdoutLine(line);
@@ -106,14 +114,13 @@ export class DefaultProcessRunner implements ProcessRunner {
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
+        stderrData = appendBounded(stderrData, chunk, MAX_CAPTURE_BYTES_PER_STREAM);
         const text = chunk.toString("utf8");
-        stderrData += text;
         options.onStderrChunk?.(text);
 
         if (options.onStderrLine) {
-          stderrBuffer += text;
-          const lines = stderrBuffer.split(/\r?\n|\r/);
-          stderrBuffer = lines.pop() || "";
+          const lines = Buffer.concat([stderrBuffer, chunk]).toString("utf8").split(/\r?\n|\r/);
+          stderrBuffer = Buffer.from(lines.pop() || "").subarray(-MAX_PARTIAL_LINE_BYTES);
           for (const line of lines) {
             if (line.trim()) {
               options.onStderrLine(line);
@@ -138,17 +145,17 @@ export class DefaultProcessRunner implements ProcessRunner {
           return reject(new Error("Process was cancelled"));
         }
 
-        if (options.onStdoutLine && stdoutBuffer.trim()) {
-          options.onStdoutLine(stdoutBuffer.trim());
+        if (options.onStdoutLine && stdoutBuffer.toString("utf8").trim()) {
+          options.onStdoutLine(stdoutBuffer.toString("utf8").trim());
         }
-        if (options.onStderrLine && stderrBuffer.trim()) {
-          options.onStderrLine(stderrBuffer.trim());
+        if (options.onStderrLine && stderrBuffer.toString("utf8").trim()) {
+          options.onStderrLine(stderrBuffer.toString("utf8").trim());
         }
 
         resolve({
           exitCode,
-          stdout: stdoutData,
-          stderr: stderrData,
+          stdout: stdoutData.toString("utf8"),
+          stderr: stderrData.toString("utf8"),
           signal: signal || null,
         });
       });

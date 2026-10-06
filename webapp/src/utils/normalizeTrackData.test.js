@@ -19,6 +19,13 @@ test("normalizes a library track and derives its downloaded state", () => {
     isDownloaded: true,
     origin: "library",
   });
+
+});
+
+test("preserves URL-only track artwork, including nested playlist tracks", () => {
+  expect(normalizeTrackData({
+    id: "entry", track: { id: "song", artworkUrl: "https://images.example.test/song.jpg" },
+  })).toMatchObject({ id: "song", coverArt: null, coverUrl: "https://images.example.test/song.jpg" });
 });
 
 test("preserves ReplayGain metadata for the playback engine", () => {

@@ -20,6 +20,19 @@ Core idea:
 Users should be able to enjoy their music without needing to understand
 which backend, provider, or integration supplied it.
 
+When local album covers are absent or fail to load, album shelves, recent
+listening rows, and the player can display a matching iTunes/Deezer cover.
+Album heroes first try every available child-track cover before external
+lookups or the artwork placeholder, including when the root cover fails to load.
+Known default-cover IDs and Navidrome's HTTP 200 default-cover image are rejected
+before the hero renders, rather than waiting for a browser image error.
+New Spotify playlist imports also save album folder artwork for the media
+server's rescan and retain Spotify album-cover URLs locally as a display fallback.
+Existing folder covers are preserved; unavailable artwork does not fail a song import.
+Artist stories prefer media-server biographies and fall back to attributed
+Wikipedia summaries through MusicDeck. These fallbacks enrich the display
+without changing library identities, audio, or embedded metadata.
+
 ---
 
 ## 2. Product Goals
@@ -292,6 +305,11 @@ Native customization may include:
 - custom CSS
 
 Advanced customization should be optional.
+Dropdowns and context menus use a shared dark glass surface (88% opacity,
+16px backdrop blur, a subtle light border, and a deep shadow). Floating menus
+render above page chrome, outside scrollable panels, with visible keyboard
+focus, readable hover states, and distinct destructive actions. Browsers
+without backdrop-filter support use an opaque dark surface.
 
 ---
 

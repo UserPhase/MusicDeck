@@ -6,10 +6,10 @@ import {
 } from "react";
 
 import {
-  getCoverUrl,
   getTrackLyrics,
 } from "../api/musicdeck";
 import { useArtistBiography } from "../hooks/useArtistBiography";
+import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
 
 import {
   usePlayer,
@@ -28,12 +28,13 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   const [lyrics, setLyrics] = useState(null);
   const [isLoadingLyrics, setIsLoadingLyrics] = useState(false);
   const { currentSong, currentTime = 0, duration = 0, queue = [], queueIndex = -1 } = usePlayer();
+  const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 512);
   const nextTrack = queue[queueIndex + 1] || null;
   const trackId = currentSong?.id;
   const songTitle = currentSong?.title;
   const songArtist = currentSong?.artist;
   const artistId = currentSong?.artistId || currentSong?.metadata?.artistId || songArtist;
-  const { biography, loading: isLoadingBiography } = useArtistBiography({
+  const { biography, loading: isLoadingBiography, error: biographyError } = useArtistBiography({
     artistId, artistName: songArtist, trackId, enabled: isOpen && Boolean(trackId),
   });
   const songAlbum = currentSong?.album;
@@ -89,7 +90,7 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
           <>
             <section className="right-sidebar-song-info" aria-labelledby="now-playing-title">
               <div className="right-sidebar-now-cover">
-                {currentSong.coverArt ? <img src={getCoverUrl(currentSong.coverArt, 512)} alt="" width="512" height="512" /> : <span aria-hidden="true">♫</span>}
+                {coverUrl ? <img src={coverUrl} onError={onCoverError} alt="" width="512" height="512" /> : <span aria-hidden="true">♫</span>}
               </div>
               <div className="right-sidebar-song-kicker">Playing now</div>
               <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>
@@ -124,7 +125,7 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
             <section className="right-sidebar-metadata-section" aria-labelledby="now-playing-artist-title">
               <div className="right-sidebar-section-heading"><h3 id="now-playing-artist-title">About the artist</h3><span aria-hidden="true">✦</span></div>
               <ArtistBiography biography={biography} loading={isLoadingBiography}
-                emptyText="No artist biography is available yet." />
+                emptyText={biographyError || "No artist biography is available yet."} />
             </section>
           </>
         )}

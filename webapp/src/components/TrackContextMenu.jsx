@@ -141,7 +141,7 @@ function TrackContextMenu({
   return createPortal(
     <div
       ref={menuRef}
-      className="playlist-menu track-context-menu track-context-menu-portal"
+      className="glass-dropdown playlist-menu track-context-menu track-context-menu-portal"
       role="menu"
       aria-label={`Actions for ${song.title || "track"}`}
       style={position}

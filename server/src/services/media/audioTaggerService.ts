@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { cleanupTemporaryDirectory } from "./temporaryDirectory.js";
 import path from "node:path";
 import { DefaultProcessRunner, type ProcessRunner } from "../../domain/process-runner.js";
@@ -12,6 +13,7 @@ export type CanonicalAudioMetadata = {
 export type AudioTagInspection = {
   artist: string | null; albumArtist: string | null; title: string | null;
   album: string | null; year: string | null; isrc: string | null; hasArtwork: boolean;
+  artworkHashes?: string[];
 };
 export type MediaToolPaths = { ffmpegPath: string; ffprobePath?: string; pythonPath?: string };
 export type AudioTaggerOptions = Partial<MediaToolPaths> & {
@@ -26,23 +28,26 @@ export function isInvalidArtist(value: string | null | undefined): boolean {
   return !value?.trim() || /unknown/i.test(value) || /^various\s+artists?$/i.test(value.trim());
 }
 function matches(actual: string | null, expected: string | null): boolean {
-  return Boolean(actual?.trim()) && (!expected || normalized(actual!) === normalized(expected));
+  return !expected || (Boolean(actual?.trim()) && normalized(actual!) === normalized(expected));
 }
 export function needsMetadataRepair(tags: AudioTagInspection, expected: CanonicalAudioMetadata): boolean {
   const artists = expected.artists.map((artist) => artist.trim()).filter(Boolean);
   const actualArtists = (tags.artist || "").split(/\s*;\s*|\s+\/\s+/).filter(Boolean).map(normalized);
+  const expectedYear = year(expected.year);
   return isInvalidArtist(tags.artist)
     || artists.some((artist) => !actualArtists.includes(normalized(artist)))
     || !matches(tags.title, clean(expected.title)) || !matches(tags.album, clean(expected.album))
     || !matches(tags.albumArtist, clean(expected.albumArtist) || artists[0] || null)
     || /unknown/i.test(tags.albumArtist || "")
-    || !matches(year(tags.year), year(expected.year))
-    || (Boolean(expected.isrc) && !matches(tags.isrc, clean(expected.isrc))) || !tags.hasArtwork;
+    || (expectedYear !== null && !matches(year(tags.year), expectedYear))
+    || (Boolean(clean(expected.isrc)) && !matches(tags.isrc, clean(expected.isrc)))
+    || (Boolean(clean(expected.artworkUrl)) && !tags.hasArtwork);
 }
 
 /** spotDL installs Mutagen already; inspection must not require a separate ffprobe install. */
 export const NATIVE_TAG_INSPECT = String.raw`
 import sys, json
+import hashlib
 from mutagen import File
 from mutagen.id3 import ID3
 filename = sys.argv[1]
@@ -61,7 +66,17 @@ def value(*keys):
         if result: return result
     return None
 pictures = bool(getattr(audio, 'pictures', None)) or bool(tags.get('covr')) or bool(tags.get('metadata_block_picture'))
-if isinstance(tags, ID3): pictures = bool(tags.getall('APIC'))
+artwork = []
+if isinstance(tags, ID3):
+    image_data = [frame.data for frame in tags.getall('APIC')]
+elif getattr(audio, 'pictures', None):
+    image_data = [picture.data for picture in audio.pictures]
+elif tags.get('covr'):
+    image_data = [bytes(image) for image in tags.get('covr')]
+else:
+    image_data = []
+artwork = [hashlib.sha256(data).hexdigest() for data in image_data if data]
+pictures = bool(artwork)
 print(json.dumps({
     'artist': value('TPE1', '\xa9ART', 'artist'),
     'albumArtist': value('TPE2', 'aART', 'albumartist', 'album_artist'),
@@ -69,7 +84,8 @@ print(json.dumps({
     'album': value('TALB', '\xa9alb', 'album'),
     'year': value('TDRC', 'TYER', '\xa9day', 'date', 'year'),
     'isrc': value('TSRC', '----:com.apple.iTunes:ISRC', '----:spotdl:ISRC', 'isrc'),
-    'hasArtwork': pictures
+    'hasArtwork': pictures,
+    'artworkHashes': artwork
 }))
 `;
 
@@ -93,12 +109,14 @@ if ext == 'mp3':
     edited = {'TIT2', 'TPE1', 'TPE2', 'TALB'}
     if m.get('year'): edited.add('TDRC'); edited.add('TYER')
     if m.get('isrc'): edited.add('TSRC')
+    if cover: edited.add('APIC')
     def snapshot(t):
         result = {k: (v.pprint(), hashlib.sha256(v.data).hexdigest() if hasattr(v, 'data') else None)
                   for k,v in t.items() if k.split(':')[0] not in edited}
         result['__unknown_frames__'] = [hashlib.sha256(v).hexdigest() for v in t.unknown_frames]
         return result
     before = snapshot(tags)
+    preserved_pictures = [hashlib.sha256(frame.data).hexdigest() for frame in tags.getall('APIC') if frame.type != 3]
     for name, cls, value in [('TIT2', TIT2, m['title']), ('TPE1', TPE1, m['artists']),
                              ('TPE2', TPE2, m['albumArtist']), ('TALB', TALB, m['album']),
                              ('TDRC', TDRC, m.get('year')), ('TSRC', TSRC, m.get('isrc'))]:
@@ -106,12 +124,18 @@ if ext == 'mp3':
             tags.delall(name)
             if name == 'TDRC': tags.delall('TYER')
             tags.add(cls(encoding=3, text=[value]))
-    added_cover = bool(cover and not tags.getall('APIC'))
-    if added_cover:
+    added_cover = bool(cover and m.get('replaceArtwork'))
+    if cover and m.get('replaceArtwork'):
+        for frame in tags.getall('APIC'):
+            if frame.type == 3: tags.delall(frame.HashKey)
+    if cover and (m.get('replaceArtwork') or not tags.getall('APIC')):
         with open(cover, 'rb') as f: data = f.read()
         tags.add(APIC(encoding=3, mime=m['coverMime'], type=3, desc='Cover', data=data))
     tags.save(filename, v2_version=version, v23_sep='; ')
     after = snapshot(ID3(filename, translate=False))
+    after_tags = ID3(filename, translate=False)
+    if any(value not in [hashlib.sha256(frame.data).hexdigest() for frame in after_tags.getall('APIC')] for value in preserved_pictures):
+        raise RuntimeError('A non-front ID3 picture changed during repair')
     if added_cover: after = {k:v for k,v in after.items() if not k.startswith('APIC:')}
     if before != after: raise RuntimeError('An unrelated ID3 frame changed during repair')
 else:
@@ -123,27 +147,38 @@ else:
              'year':'\xa9day', 'isrc':'----:com.apple.iTunes:ISRC'} if mp4 else {
              'title':'title', 'artists':'artist', 'albumArtist':'albumartist', 'album':'album', 'year':'date', 'isrc':'isrc'}
     edited = {names[k].lower() for k,v in m.items() if k in names and v}
+    if cover: edited.update(('covr', 'metadata_block_picture'))
     def snapshot(a): return {k:copy.deepcopy(v) for k,v in a.tags.items() if k.lower() not in edited}
     before = snapshot(audio)
     pictures = [p.write() for p in getattr(audio, 'pictures', [])]
+    preserved_pictures = [p.write() for p in getattr(audio, 'pictures', []) if p.type != 3] if m.get('replaceArtwork') else pictures
     for key, tag in names.items():
         if m.get(key):
             value = m[key].encode('utf-8') if mp4 and key == 'isrc' else m[key]
             audio.tags[tag] = [value]
-    added_cover = False
     if cover:
         with open(cover, 'rb') as f: data = f.read()
-        if mp4 and not audio.tags.get('covr'):
-            audio.tags['covr'] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_PNG if m['coverMime'] == 'image/png' else MP4Cover.FORMAT_JPEG)]
-            added_cover = True
-        elif ext == 'flac' and not audio.pictures:
-            p = Picture(); p.data = data; p.type = 3; p.mime = m['coverMime']; audio.add_picture(p)
+        if mp4:
+            existing = list(audio.tags.get('covr') or [])
+            expected_hash = hashlib.sha256(data).hexdigest()
+            if m.get('replaceArtwork') or expected_hash not in [hashlib.sha256(bytes(image)).hexdigest() for image in existing]:
+                image = MP4Cover(data, imageformat=MP4Cover.FORMAT_PNG if m['coverMime'] == 'image/png' else MP4Cover.FORMAT_JPEG)
+                audio.tags['covr'] = [image] + [old for old in existing if hashlib.sha256(bytes(old)).hexdigest() != expected_hash]
+        elif ext == 'flac':
+            existing = list(audio.pictures)
+            expected_hash = hashlib.sha256(data).hexdigest()
+            if m.get('replaceArtwork'):
+                audio.clear_pictures()
+                for picture in existing:
+                    if picture.type != 3: audio.add_picture(picture)
+            if m.get('replaceArtwork') or expected_hash not in [hashlib.sha256(picture.data).hexdigest() for picture in existing]:
+                p = Picture(); p.data = data; p.type = 3; p.mime = m['coverMime']; audio.add_picture(p)
     audio.save()
     reread = File(filename)
     after = snapshot(reread)
-    if added_cover: after.pop('covr', None)
     if before != after: raise RuntimeError('An unrelated metadata field changed during repair')
-    if pictures and pictures != [p.write() for p in getattr(reread, 'pictures', [])]:
+    reread_pictures = [p.write() for p in getattr(reread, 'pictures', [])]
+    if any(picture not in reread_pictures for picture in preserved_pictures):
         raise RuntimeError('Embedded artwork changed during repair')
 `;
 
@@ -188,6 +223,9 @@ export class AudioTaggerService {
     if (result.exitCode !== 0) throw new Error(`Could not inspect audio with spotDL's Python (${python}): ${result.stderr.trim() || "Mutagen failed"}`);
     const inspection = JSON.parse(result.stdout) as AudioTagInspection;
     if (typeof inspection.hasArtwork !== "boolean") throw new Error("Native audio metadata inspector returned invalid data");
+    if (!Array.isArray(inspection.artworkHashes) || inspection.artworkHashes.some((hash) => typeof hash !== "string")) {
+      throw new Error("Native audio metadata inspector returned invalid artwork hashes");
+    }
     return inspection;
   }
   async verifyAndTag(filePath: string, metadata: CanonicalAudioMetadata, rootDirectory?: string): Promise<{ repaired: boolean; inspection: AudioTagInspection }> {
@@ -195,23 +233,44 @@ export class AudioTaggerService {
     const physical = fs.realpathSync(filePath);
     if (rootDirectory) safeMusicPath(fs.realpathSync(rootDirectory), physical);
     const inspection = await this.inspect(physical);
-    if (!needsMetadataRepair(inspection, metadata)) return { repaired: false, inspection };
     const artists = metadata.artists.map((artist) => artist.trim()).filter(Boolean);
     if (!artists.length || !metadata.title.trim() || !metadata.album.trim()) throw new Error("Canonical track metadata is incomplete");
     const directory = fs.mkdtempSync(path.join(path.dirname(physical), ".musicdeck-tag-"));
     const temporary = path.join(directory, path.basename(physical));
     try {
+      const artworkUrl = clean(metadata.artworkUrl);
+      let coverMime: string | null = null;
+      let canonicalArtworkHash: string | null = null;
+      let artworkNeedsRepair = false;
+      let artworkInspection: AudioTagInspection | null = null;
+      if (artworkUrl) {
+        artworkInspection = await this.inspectNative(physical);
+        const coverPath = path.join(directory, "cover");
+        coverMime = await this.downloadArtwork(artworkUrl, coverPath);
+        canonicalArtworkHash = createHash("sha256").update(fs.readFileSync(coverPath)).digest("hex");
+        artworkNeedsRepair = !artworkInspection.artworkHashes?.includes(canonicalArtworkHash);
+      }
+      if (!needsMetadataRepair(inspection, metadata) && !artworkNeedsRepair) {
+        return { repaired: false, inspection: artworkInspection || inspection };
+      }
+
       fs.copyFileSync(physical, temporary, fs.constants.COPYFILE_EXCL);
       const coverPath = path.join(directory, "cover");
-      const coverMime = !inspection.hasArtwork && metadata.artworkUrl ? await this.downloadArtwork(metadata.artworkUrl, coverPath) : null;
       const payload = { title: metadata.title.trim(), artists: [...new Set(artists)].join("; "),
         album: metadata.album.trim(), albumArtist: clean(metadata.albumArtist) || artists[0],
-        year: year(metadata.year), isrc: clean(metadata.isrc), coverMime };
+        year: year(metadata.year), isrc: clean(metadata.isrc), coverMime, replaceArtwork: artworkNeedsRepair };
       const result = await this.runner.run(this.tools().python, ["-c", NATIVE_TAG_MERGE, temporary,
         JSON.stringify(payload), coverMime ? coverPath : ""], { timeoutMs: 120_000 }).promise;
       if (result.exitCode !== 0) throw new Error(`Could not merge audio metadata: ${result.stderr.trim() || "Mutagen failed"}`);
-      const verified = await this.inspect(temporary);
+      let verified = await this.inspect(temporary);
       if (needsMetadataRepair(verified, metadata)) throw new Error("Repaired audio failed post-write metadata verification");
+      if (canonicalArtworkHash) {
+        const verifiedArtwork = await this.inspectNative(temporary);
+        if (!verifiedArtwork.artworkHashes?.includes(canonicalArtworkHash)) {
+          throw new Error("Repaired audio failed canonical artwork verification");
+        }
+        verified = { ...verified, hasArtwork: true, artworkHashes: verifiedArtwork.artworkHashes };
+      }
       flushFile(temporary); fs.chmodSync(temporary, fs.statSync(physical).mode);
       if (rootDirectory) safeMusicPath(fs.realpathSync(rootDirectory), physical);
       fs.renameSync(temporary, physical);

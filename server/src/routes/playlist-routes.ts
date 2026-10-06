@@ -9,14 +9,14 @@ import { parseImageDataUrl, MAX_ARTWORK_REQUEST_BYTES } from "../domain/playlist
 import { sendError } from "../utils/http.js";
 
 const createPlaylistSchema = z.object({
-  name: z.string().min(1),
+  name: z.string().trim().min(1).max(200),
   description: z.string().max(1000).optional(),
 });
 
 const updatePlaylistSchema = z.object({
-  name: z.string().min(1).optional(),
-  description: z.string().nullable().optional(),
-});
+  name: z.string().trim().min(1).max(200).optional(),
+  description: z.string().trim().max(1000).nullable().optional(),
+}).refine((updates) => updates.name !== undefined || updates.description !== undefined);
 
 const addTrackSchema = z.object({
   trackId: z.string().min(1),
