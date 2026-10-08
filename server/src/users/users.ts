@@ -2,6 +2,7 @@ import type { Db } from "../db/database.js";
 import type { Role, User } from "../types.js";
 import { hashPassword } from "../auth/passwords.js";
 import { createId } from "../utils/ids.js";
+import { avatarUrlFor } from "./avatars.js";
 
 export function toPublicUser(row: any): User {
   return {
@@ -10,25 +11,53 @@ export function toPublicUser(row: any): User {
     displayName: row.display_name,
     role: row.role,
     avatarRef: row.avatar_ref || null,
+    avatarUrl: avatarUrlFor(row.id, row.avatar_updated_at),
     disabled: Boolean(row.disabled),
+    isMasterAdmin: Boolean(row.is_master),
     externalSearchEnabled: row.external_search_enabled === undefined ? true : Boolean(row.external_search_enabled),
     externalPlaybackEnabled: Boolean(row.external_playback_enabled),
+    lastLoginAt: row.last_login_at || null,
+    lastPlaybackAt: row.last_playback_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
+
+const USER_WITH_ACTIVITY_SELECT = `
+  SELECT users.*,
+    (SELECT MAX(played_at) FROM recently_played WHERE recently_played.user_id = users.id) AS last_playback_at
+  FROM users
+`;
 
 export function getUserByUsername(db: Db, username: string) {
   return db.prepare("SELECT * FROM users WHERE username = ?").get(username);
 }
 
 export function getUserById(db: Db, userId: string) {
-  const row = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+  const row = db.prepare(`${USER_WITH_ACTIVITY_SELECT} WHERE users.id = ?`).get(userId);
   return row ? toPublicUser(row) : null;
 }
 
 export function listUsers(db: Db) {
-  return db.prepare("SELECT * FROM users ORDER BY username ASC").all().map(toPublicUser);
+  return db.prepare(`${USER_WITH_ACTIVITY_SELECT} ORDER BY users.username ASC`).all().map(toPublicUser);
+}
+
+/**
+ * Guarantees exactly one protected master administrator exists once any admin
+ * does: the oldest admin is promoted only when no user carries the flag yet.
+ */
+export function ensureMasterAdmin(db: Db) {
+  db.prepare(`
+    UPDATE users SET is_master = 1
+    WHERE id = (SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC, id ASC LIMIT 1)
+      AND NOT EXISTS (SELECT 1 FROM users WHERE is_master = 1)
+  `).run();
+}
+
+export function recordLogin(db: Db, userId: string) {
+  const loggedInAt = new Date().toISOString();
+  db.prepare("UPDATE users SET last_login_at = ? WHERE id = ?").run(loggedInAt, userId);
+  return loggedInAt;
 }
 
 export async function createUser(
@@ -58,6 +87,7 @@ export async function createUser(
     now
   );
 
+  ensureMasterAdmin(db);
   return getUserById(db, id);
 }
 
@@ -100,6 +130,7 @@ export async function updateUser(
     userId
   );
 
+  ensureMasterAdmin(db);
   return getUserById(db, userId);
 }
 

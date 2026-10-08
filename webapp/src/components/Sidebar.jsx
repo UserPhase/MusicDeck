@@ -20,7 +20,7 @@ export function isSpotifyPlaylistUrl(value) {
   }
 }
 
-function Sidebar() {
+function Sidebar({ id }) {
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -238,7 +238,7 @@ function Sidebar() {
 
   return (
 
-    <aside className="sidebar" aria-label="Main navigation">
+    <aside id={id} className="sidebar" aria-label="Main navigation">
       <section className="nav-section" aria-labelledby="library-navigation">
         <h2 className="nav-title" id="library-navigation">Your Library</h2>
 

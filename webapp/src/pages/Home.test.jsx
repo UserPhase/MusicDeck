@@ -83,6 +83,19 @@ test("uses same-origin fallback covers for missing recent album and listening ar
   expect(listening.querySelector("img")).toHaveAttribute("src", expected);
 });
 
+test("keeps song discovery in two ordered sections within the split layout", async () => {
+  renderHome();
+  await waitForHome();
+
+  const discovery = screen.getByRole("region", { name: "Track discovery" });
+  expect(discovery).toHaveClass("home-discovery-split");
+  const sections = Array.from(discovery.children);
+  expect(sections).toHaveLength(2);
+  expect(sections[0]).toHaveAttribute("aria-labelledby", "recent-tracks-title");
+  expect(sections[1]).toHaveAttribute("aria-labelledby", "discover-tracks-title");
+  sections.forEach((section) => expect(section).toHaveClass("home-track-panel"));
+});
+
 test("opens artists using the same linked portrait card as Explore", async () => {
   renderHome();
   await waitForHome();

@@ -24,6 +24,7 @@ import {
   getStreamUrl,
   getUserSettings,
   getSilenceAnalysis,
+  analyzeSilence,
   getPlayableSources,
   recordListeningEvent,
 } from "../api/musicdeck";
@@ -37,6 +38,7 @@ jest.mock("../api/musicdeck", () => ({
   getStreamUrl: jest.fn(),
   getUserSettings: jest.fn(),
   getSilenceAnalysis: jest.fn(),
+  analyzeSilence: jest.fn(),
   getPlayableSources: jest.fn(),
   recordListeningEvent: jest.fn(),
   starSong: jest.fn(),
@@ -265,7 +267,11 @@ function PlayerHarness() {
 }
 
 
-function renderPlayer({ recentHistory = [] } = {}) {
+function renderPlayer({
+  recentHistory = [],
+  userSettings = [],
+  silenceAnalysis = null,
+} = {}) {
   getCurrentSession.mockResolvedValue({
     authenticated: true,
     user: {
@@ -279,8 +285,13 @@ function renderPlayer({ recentHistory = [] } = {}) {
   getRandomSongs.mockResolvedValue([]);
   getRecentlyPlayed.mockResolvedValue(recentHistory);
   getStarred.mockResolvedValue([]);
-  getUserSettings.mockResolvedValue([]);
-  getSilenceAnalysis.mockResolvedValue(null);
+  getUserSettings.mockResolvedValue(userSettings);
+  getSilenceAnalysis.mockResolvedValue(silenceAnalysis);
+  analyzeSilence.mockResolvedValue({
+    status: "completed",
+    leadingSilenceSeconds: 1.25,
+    trailingSilenceSeconds: 0.75,
+  });
   getPlayableSources.mockResolvedValue({ sources: [], selectedSource: null });
   recordListeningEvent.mockResolvedValue(undefined);
   getStreamUrl.mockImplementation(
@@ -487,6 +498,47 @@ test("direct playback creates a single-song queue and replaces an old queue", as
     );
     expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
   });
+});
+
+test("automatically analyzes an unscanned library track when silence trimming is enabled", async () => {
+  renderPlayer({
+    userSettings: [
+      { key: "playback.silenceTrim.enabled", value: "true" },
+      { key: "playback.silenceTrim.thresholdDb", value: "-28" },
+      { key: "playback.silenceTrim.minSilenceSeconds", value: "0.8" },
+    ],
+  });
+
+  await waitFor(() => expect(getUserSettings).toHaveBeenCalled());
+  await act(async () => { await Promise.resolve(); });
+  fireEvent.click(screen.getByRole("button", { name: "direct" }));
+
+  await waitFor(() => {
+    expect(analyzeSilence).toHaveBeenCalledWith("song-1", {
+      thresholdDb: -28,
+      minSilenceSeconds: 0.8,
+    });
+  });
+});
+
+test("uses saved silence analysis without rescanning an analyzed track", async () => {
+  renderPlayer({
+    userSettings: [
+      { key: "playback.silenceTrim.enabled", value: "true" },
+    ],
+    silenceAnalysis: {
+      status: "completed",
+      leadingSilenceSeconds: 1,
+      trailingSilenceSeconds: 0.5,
+    },
+  });
+
+  await waitFor(() => expect(getUserSettings).toHaveBeenCalled());
+  await act(async () => { await Promise.resolve(); });
+  fireEvent.click(screen.getByRole("button", { name: "direct" }));
+
+  await waitFor(() => expect(getSilenceAnalysis).toHaveBeenCalledWith("song-1"));
+  expect(analyzeSilence).not.toHaveBeenCalled();
 });
 
 test("playing the active track toggles playback without rebuilding its queue", async () => {

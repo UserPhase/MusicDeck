@@ -50,8 +50,8 @@
 .home-continue-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; }
 .home-page :is(a, button):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .home-action-message { margin-bottom: 1.5rem; padding: .75rem 1rem; border: 1px solid rgb(168 85 247 / 25%); border-radius: .5rem; background: rgb(168 85 247 / 8%); color: var(--text); font-size: .8125rem; }
-.home-discovery-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2rem; }
-.home-track-panel { min-width: 0; }
+.home-discovery-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 2rem; }
+.home-track-panel { min-width: 0; width: 100%; }
 .home-track-list { display: grid; gap: .375rem; }
 .home-deep-cuts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .375rem 2rem; }
 .home-skeleton-grid { display: grid; gap: .75rem; }
@@ -59,7 +59,7 @@
 .home-skeleton-grid--artists { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .home-skeleton-grid--tracks { grid-template-columns: 1fr; }
 .home-skeleton-grid--deep-cuts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.home-skeleton { display: block; min-height: 3.25rem; border-radius: .625rem; background: linear-gradient(100deg, rgb(255 255 255 / 4%) 35%, rgb(255 255 255 / 8%) 50%, rgb(255 255 255 / 4%) 65%); background-size: 200% 100%; animation: home-skeleton-pulse 1.25s ease-in-out infinite; }
+.home-skeleton { display: block; min-height: 3.25rem; border-radius: .625rem; background: linear-gradient(100deg, rgb(var(--tint-rgb) / 4%) 35%, rgb(var(--tint-rgb) / 8%) 50%, rgb(var(--tint-rgb) / 4%) 65%); background-size: 200% 100%; animation: home-skeleton-pulse 1.25s ease-in-out infinite; }
 .home-skeleton-grid--albums .home-skeleton { aspect-ratio: 1 / 1.32; }
 .home-skeleton-grid--artists .home-skeleton { aspect-ratio: 1; border-radius: 50%; }
 .home-skeleton-grid--deep-cuts .home-skeleton { min-height: 3.4rem; }
@@ -89,7 +89,7 @@
 .search-album-title { display: flex; align-items: center; min-width: 0; }
 .search-album-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-album-title .in-library-badge { flex: none; }
-.playlist-card { display: block; padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
+.playlist-card { display: block; padding: 12px; background: var(--card-solid); border: 1px solid rgb(var(--tint-rgb) / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .playlist-card:hover { background: var(--card-hover); border-color: var(--border-hover); transform: translateY(-2px); }
 .library-section .playlist-card {
   background: transparent;
@@ -109,7 +109,7 @@
 .playlist-title { margin-bottom: 5px; color: var(--text); font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .playlist-meta { color: var(--text-secondary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .playlist-empty { color: var(--text-secondary); padding: 20px 0; }
-.album { padding: 12px; background: rgb(24 24 27 / 80%); border: 1px solid rgb(255 255 255 / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
+.album { padding: 12px; background: var(--card-solid); border: 1px solid rgb(var(--tint-rgb) / 4%); border-radius: 9px; cursor: pointer; text-decoration: none; transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease; }
 .library-section .album {
   background: transparent;
   border-color: transparent;
@@ -122,7 +122,7 @@
 .album-card-shell { position: relative; min-width: 0; }
 .album-card-shell > .album { display: block; height: 100%; }
 .album-admin-actions { position: absolute; z-index: 5; top: 20px; right: 20px; }
-.album-admin-menu-toggle { width: 32px; height: 32px; border: 1px solid rgb(255 255 255 / 20%); border-radius: 50%; background: rgb(18 14 26 / 84%); color: var(--text); font-size: 20px; line-height: 1; cursor: pointer; }
+.album-admin-menu-toggle { width: 32px; height: 32px; border: 1px solid rgb(var(--tint-rgb) / 20%); border-radius: 50%; background: rgb(18 14 26 / 84%); color: var(--text); font-size: 20px; line-height: 1; cursor: pointer; }
 .album-admin-menu-toggle:hover { background: var(--card-hover); }
 .album-admin-menu { position: absolute; top: calc(100% + 6px); right: 0; width: max-content; min-width: 190px; }
 .album-actions .album-admin-actions { position: relative; top: auto; right: auto; }
@@ -168,7 +168,7 @@
 	.home-section { margin-bottom: 2.5rem; }
 	.home-continue { margin-bottom: 3rem; }
 	.home-continue-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-	.home-discovery-split { grid-template-columns: 1fr; gap: 2.5rem; }
+	.home-discovery-split { grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
 	.home-skeleton-grid--albums { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 	.home-skeleton-grid--artists { grid-auto-columns: minmax(6.5rem, 28vw); grid-auto-flow: column; grid-template-columns: none; overflow-x: auto; padding: 0 .125rem .75rem; scroll-snap-type: x mandatory; scrollbar-width: none; }
 	.home-skeleton-grid--artists::-webkit-scrollbar { display: none; }

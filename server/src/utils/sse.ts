@@ -25,9 +25,9 @@ export class SseEventWriter {
     response.on("error", this.close);
   }
 
-  push(event: string, payload: Record<string, unknown>): void {
+  push(event: string, payload: Record<string, unknown>, id?: string): void {
     if (this.closed) return;
-    const frame = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+    const frame = `${id ? `id: ${id}\n` : ""}event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
     if (!this.blocked) {
       if (this.response.write(frame)) return;
       this.blocked = true;

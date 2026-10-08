@@ -14,17 +14,25 @@ import {
 } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { artistOverviewQueryClient } from "./api/artistOverviewQuery";
+import {
+  getUserSettings,
+  USER_SETTINGS_CHANGED_EVENT,
+} from "./api/musicdeck";
+import { normalizeTheme, THEME_SETTING_KEY } from "./utils/theme";
+import {
+  LAYOUT_PRESET_SETTING_KEY,
+  LAYOUT_PRESET_STORAGE_KEY,
+  normalizeLayoutPreset,
+  readStoredLayoutPreset,
+} from "./utils/layoutPreset";
 
-import Topbar from "./components/Topbar";
 import AdminTopBar from "./components/admin/AdminTopBar";
-import Sidebar from "./components/Sidebar";
 import { ImportProvider } from "./context/ImportContext";
 import { ServerDeletionProvider } from "./context/ServerDeletionContext";
-import QueueSidebar from "./components/QueueSidebar";
-import NowPlayingSidebar from "./components/NowPlayingSidebar";
 import CommandPalette from "./components/CommandPalette";
 import AmbientBackground from "./components/AmbientBackground";
 import Player from "./components/Player";
+import AppLayout from "./components/Layout/AppLayout";
 import AdminSidebar from "./components/admin/AdminSidebar";
 import RequireAdmin from "./components/admin/RequireAdmin";
 import CustomCssStyle, {
@@ -81,6 +89,7 @@ import {
   useAuth,
 } from "./context/AuthContext";
 
+import { BrandingProvider } from "./context/BrandingContext";
 import useGlobalHotkeys from "./hooks/useGlobalHotkeys";
 
 function AdminLayout() {
@@ -98,10 +107,8 @@ function AdminLayout() {
 function AuthenticatedApp() {
   const location = useLocation();
   const {
-    currentSong,
     activeSidebar,
     setActiveSidebar,
-    autoOpenSidebar,
     togglePlay,
     nextSong,
     previousSong,
@@ -109,7 +116,6 @@ function AuthenticatedApp() {
     volume,
     changeVolume,
   } = usePlayer();
-  const previousTrackIdRef = useRef(null);
   const lastAudibleVolumeRef = useRef(0.7);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
@@ -119,21 +125,50 @@ function AuthenticatedApp() {
       return "dark";
     }
   });
-  const isSidebarOpen = activeSidebar !== "none";
-  const isDetailPage = location.pathname === "/liked" ||
-    /^\/(?:album|artist|playlist)\/[^/]+/.test(location.pathname);
-  const isSongPage = isDetailPage || [
-    "/library/tracks",
-    "/liked",
-    "/search",
-  ].includes(location.pathname);
-  const isWideContentPage = isSongPage || ["/", "/explore"].includes(location.pathname) ||
-    /^\/library\/(?:playlists|albums|artists)$/.test(location.pathname);
-  const isHomePage = location.pathname === "/";
-  const hasFullBleedPageHero = location.pathname === "/explore" || location.pathname === "/search";
+  const [layoutPreset, setLayoutPreset] = useState(readStoredLayoutPreset);
+  const isAdminRoute = location.pathname.startsWith("/admin");
 
-  const toggleTheme = useCallback(() => {
-    setTheme((currentTheme) => currentTheme === "dark" ? "light" : "dark");
+  useEffect(() => {
+    let cancelled = false;
+    const applyTheme = (value) => {
+      const nextTheme = normalizeTheme(value);
+      if (nextTheme) setTheme(nextTheme);
+    };
+    const applyLayoutPreset = (value) => {
+      const nextPreset = normalizeLayoutPreset(value);
+      if (nextPreset) setLayoutPreset(nextPreset);
+    };
+    const readSetting = (settings, key) => {
+      const row = Array.isArray(settings) ? settings.find((setting) => setting.key === key) : null;
+      if (!row) return null;
+      try {
+        return JSON.parse(row.value);
+      } catch {
+        return row.value;
+      }
+    };
+
+    Promise.resolve()
+      .then(() => getUserSettings())
+      .then((settings) => {
+        if (cancelled) return;
+        applyTheme(readSetting(settings, THEME_SETTING_KEY));
+        applyLayoutPreset(readSetting(settings, LAYOUT_PRESET_SETTING_KEY));
+      })
+      .catch(() => {
+        // Fall back to the locally stored theme and layout preset.
+      });
+
+    function handleUserSettingsChanged(event) {
+      applyTheme(event.detail?.[THEME_SETTING_KEY]);
+      applyLayoutPreset(event.detail?.[LAYOUT_PRESET_SETTING_KEY]);
+    }
+
+    window.addEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+    };
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -146,13 +181,41 @@ function AuthenticatedApp() {
   }, [changeVolume, volume]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
+    const root = document.documentElement;
+    const previousTheme = root.dataset.theme;
+    let transitionTimer = null;
+    // Cross-fade only on an actual switch, never on the first paint.
+    if (previousTheme && previousTheme !== theme) {
+      root.classList.add("theme-transitioning");
+      transitionTimer = window.setTimeout(() => root.classList.remove("theme-transitioning"), 350);
+    }
+    root.dataset.theme = theme;
     try {
       localStorage.setItem("musicdeckTheme", theme);
     } catch {
       // Theme persistence is optional when storage is unavailable.
     }
+    return () => {
+      if (transitionTimer !== null) {
+        window.clearTimeout(transitionTimer);
+        root.classList.remove("theme-transitioning");
+      }
+    };
   }, [theme]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.layoutPreset = layoutPreset;
+    try {
+      localStorage.setItem(LAYOUT_PRESET_STORAGE_KEY, layoutPreset);
+    } catch {
+      // Preset persistence is optional when storage is unavailable.
+    }
+  }, [layoutPreset]);
+
+  useEffect(() => () => {
+    delete document.documentElement.dataset.layoutPreset;
+  }, []);
 
   useGlobalHotkeys({
     enabled: !isCommandPaletteOpen,
@@ -164,33 +227,10 @@ function AuthenticatedApp() {
     onOpenPalette: () => setIsCommandPaletteOpen(true),
   });
 
-  useEffect(() => {
-    const nextTrackId = currentSong?.id == null
-      ? null
-      : String(currentSong.id);
-    const previousTrackId = previousTrackIdRef.current;
-    const isNewTrack = Boolean(nextTrackId) && nextTrackId !== previousTrackId;
-
-    if (
-      isNewTrack &&
-      autoOpenSidebar &&
-      activeSidebar !== "now-playing"
-    ) {
-      setActiveSidebar("now-playing");
-    }
-
-    previousTrackIdRef.current = nextTrackId;
-  }, [
-    currentSong?.id,
-    autoOpenSidebar,
-    activeSidebar,
-    setActiveSidebar,
-  ]);
-
   return (
     <>
-      {!location.pathname.startsWith("/admin") && <AmbientBackground />}
-      {location.pathname.startsWith("/admin") ? <AdminTopBar /> : <Topbar />}
+      {!isAdminRoute && <AmbientBackground />}
+      {isAdminRoute && <AdminTopBar />}
       <CustomCssStyle />
       <CustomCssResetButton />
       <Routes>
@@ -215,74 +255,42 @@ function AuthenticatedApp() {
         <Route
           path="*"
           element={
-            <>
-              <Sidebar />
-              <main
-                className={
-                  `main${
-                    isSidebarOpen
-                      ? " sidebar-open"
-                      : ""
-                  }`
-                }
-              >
-                {activeSidebar === "none" && (
-                  <button
-                    className="main-now-playing-toggle"
-                    type="button"
-                    onClick={() => setActiveSidebar("now-playing")}
-                    aria-label="Open Now Playing sidebar"
-                  >
-                    <span aria-hidden="true">♫</span>
-                    Now Playing
-                  </button>
-                )}
-                <div className={`main-content${isDetailPage ? " main-content--detail" : ""}${isHomePage ? " main-content--home" : ""}${isWideContentPage ? " main-content--wide" : ""}${hasFullBleedPageHero ? " main-content--full-bleed-hero" : ""}`}>
-                  <Routes>
-                    <Route path="/" element={<Home />} />
-                    <Route path="/login" element={<Navigate to="/" replace />} />
-                    <Route path="/library" element={<Library />}>
-                      <Route index element={<Navigate to="playlists" replace />} />
-                      <Route path="tracks" element={<Tracks />} />
-                      <Route path="albums" element={<Albums />} />
-                      <Route path="artists" element={<Artists />} />
-                      <Route path="playlists" element={<Playlists />} />
-                      <Route path="health" element={<LibraryHealth />} />
-                    </Route>
-                    <Route path="/album/:id" element={<Album />} />
-                    <Route path="/artist/:id/album/:albumId" element={<ArtistExternalAlbum />} />
-                    <Route path="/artist/:id" element={<Artist />} />
-                    <Route path="/playlist/:id" element={<Playlist />} />
-                    <Route path="/liked" element={<Liked />} />
-                    <Route path="/search" element={<Search />} />
-                    <Route path="/explore" element={<Explore />} />
-                    <Route path="/profile" element={<Profile />} />
-                    <Route path="/settings" element={<Settings />} />
-                    <Route path="*" element={<Navigate to="/" replace />} />
-                  </Routes>
-                </div>
-              </main>
-              <QueueSidebar
-                isOpen={activeSidebar === "queue"}
-                onClose={() => setActiveSidebar("none")}
-              />
-              <NowPlayingSidebar
-                isOpen={activeSidebar === "now-playing"}
-                onClose={() => setActiveSidebar("none")}
-                onOpenQueue={() => setActiveSidebar("queue")}
-              />
-            </>
+            <AppLayout preset={layoutPreset}>
+              <Routes>
+                <Route path="/" element={<Home />} />
+                <Route path="/login" element={<Navigate to="/" replace />} />
+                <Route path="/library" element={<Library />}>
+                  <Route index element={<Navigate to="playlists" replace />} />
+                  <Route path="tracks" element={<Tracks />} />
+                  <Route path="albums" element={<Albums />} />
+                  <Route path="artists" element={<Artists />} />
+                  <Route path="playlists" element={<Playlists />} />
+                  <Route path="health" element={<LibraryHealth />} />
+                </Route>
+                <Route path="/album/:id" element={<Album />} />
+                <Route path="/artist/:id/album/:albumId" element={<ArtistExternalAlbum />} />
+                <Route path="/artist/:id" element={<Artist />} />
+                <Route path="/playlist/:id" element={<Playlist />} />
+                <Route path="/liked" element={<Liked />} />
+                <Route path="/search" element={<Search />} />
+                <Route path="/explore" element={<Explore />} />
+                <Route path="/profile" element={<Profile />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </AppLayout>
           }
         />
       </Routes>
-      <Player
-        isQueueSidebarOpen={activeSidebar === "queue"}
-        onToggleQueueSidebar={() => setActiveSidebar((current) => current === "queue" ? "none" : "queue")}
-      />
+      {isAdminRoute && (
+        <Player
+          isQueueSidebarOpen={activeSidebar === "queue"}
+          onToggleQueueSidebar={() => setActiveSidebar((current) => current === "queue" ? "none" : "queue")}
+        />
+      )}
       <CommandPalette
         isOpen={isCommandPaletteOpen}
         onClose={() => setIsCommandPaletteOpen(false)}
-        onToggleTheme={toggleTheme}
       />
     </>
   );
@@ -313,11 +321,13 @@ function App() {
   return (
     <QueryClientProvider client={artistOverviewQueryClient}>
       <BrowserRouter>
-        <AuthProvider>
-          <PlayerProvider>
-            <AppContent />
-          </PlayerProvider>
-        </AuthProvider>
+        <BrandingProvider>
+          <AuthProvider>
+            <PlayerProvider>
+              <AppContent />
+            </PlayerProvider>
+          </AuthProvider>
+        </BrandingProvider>
       </BrowserRouter>
     </QueryClientProvider>
   );

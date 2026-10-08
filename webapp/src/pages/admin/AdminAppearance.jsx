@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 
 import {
   getUserSettings,
+  updateAppConfig,
   updateUserSettings,
 } from "../../api/musicdeck";
 import {
@@ -10,6 +11,14 @@ import {
   CUSTOM_CSS_SETTING_KEY,
   sanitizeCustomCss,
 } from "../../components/admin/CustomCssStyle";
+import {
+  DEFAULT_APP_NAME,
+  splitBrandName,
+  useBranding,
+} from "../../context/BrandingContext";
+
+// Mirrors the server-side limit in config-routes.ts.
+const APP_NAME_MAX_LENGTH = 40;
 
 
 function AdminAppearanceHome() {
@@ -17,44 +26,18 @@ function AdminAppearanceHome() {
     <section className="admin-section">
       <h2>Appearance</h2>
       <p className="account-meta">
-        Customize how MusicDeck looks. Choose a section above.
+        Customize how the app looks for everyone. Themes and layout styles are
+        personal preferences in each user&apos;s Settings.
       </p>
       <div className="admin-link-grid">
-        <NavLink to="/admin/appearance/themes" className="admin-link-card">
-          <strong>Themes</strong>
-          <span>Accent color and base theme.</span>
+        <NavLink to="/admin/appearance/branding" className="admin-link-card">
+          <strong>Branding</strong>
+          <span>Application name shown in the header, sidebar and browser title.</span>
         </NavLink>
         <NavLink to="/admin/appearance/custom-css" className="admin-link-card">
           <strong>Custom CSS</strong>
           <span>Write your own CSS overrides with preview and reset.</span>
         </NavLink>
-        <NavLink to="/admin/appearance/branding" className="admin-link-card">
-          <strong>Branding</strong>
-          <span>Application name shown in the top bar.</span>
-        </NavLink>
-        <NavLink to="/admin/appearance/layout" className="admin-link-card">
-          <strong>Layout</strong>
-          <span>Density and sidebar preferences.</span>
-        </NavLink>
-      </div>
-    </section>
-  );
-}
-
-
-function AdminAppearanceThemes() {
-  return (
-    <section className="admin-section">
-      <h2>Themes</h2>
-      <p className="account-meta">
-        The default MusicDeck dark theme is always applied. Use Custom CSS to
-        override accent colors and surfaces.
-      </p>
-      <div className="admin-grid">
-        <div className="admin-card">
-          <span>Active theme</span>
-          <strong>MusicDeck Dark</strong>
-        </div>
       </div>
     </section>
   );
@@ -62,26 +45,104 @@ function AdminAppearanceThemes() {
 
 
 function AdminAppearanceBranding() {
+  const { appName, setAppName } = useBranding();
+  const [draft, setDraft] = useState(appName);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [message, setMessage] = useState("");
+  const draftTouchedRef = useRef(false);
+
+  // Follow the loaded name until the admin starts typing.
+  useEffect(() => {
+    if (!draftTouchedRef.current) setDraft(appName);
+  }, [appName]);
+
+  const trimmed = draft.trim();
+  const isValid = trimmed.length > 0 && trimmed.length <= APP_NAME_MAX_LENGTH;
+  const isDirty = trimmed !== appName;
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    if (!isValid || !isDirty) return;
+
+    try {
+      setSaving(true);
+      setError(null);
+      setMessage("");
+      const config = await updateAppConfig({ appName: trimmed });
+      setAppName(config?.appName || trimmed);
+      setDraft(config?.appName || trimmed);
+      draftTouchedRef.current = false;
+      setMessage("Application name saved.");
+    } catch (err) {
+      setError(err.message || "Could not save the application name.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleReset() {
+    draftTouchedRef.current = true;
+    setDraft(DEFAULT_APP_NAME);
+    setMessage("");
+  }
+
   return (
     <section className="admin-section">
       <h2>Branding</h2>
-      <p className="account-meta">
-        The application is branded as MusicDeck. A future release will allow
-        overriding the display name here.
-      </p>
-    </section>
-  );
-}
 
+      {error && <div className="error" role="alert">{error}</div>}
+      {message && <div className="success" role="status">{message}</div>}
 
-function AdminAppearanceLayout() {
-  return (
-    <section className="admin-section">
-      <h2>Layout</h2>
-      <p className="account-meta">
-        The standard MusicDeck layout (sidebar + content + global player) is
-        always used. The admin area switches to its own sidebar automatically.
-      </p>
+      <form className="admin-form admin-branding-form" onSubmit={handleSubmit}>
+        <label htmlFor="admin-app-name">
+          Application Name
+          <input
+            id="admin-app-name"
+            type="text"
+            value={draft}
+            maxLength={APP_NAME_MAX_LENGTH}
+            autoComplete="off"
+            aria-describedby="admin-app-name-help"
+            aria-invalid={!isValid}
+            onChange={(event) => {
+              draftTouchedRef.current = true;
+              setDraft(event.target.value);
+              setMessage("");
+            }}
+          />
+        </label>
+        <p id="admin-app-name-help" className="account-meta">
+          This name will appear in the sidebar logo, header, and browser window title.
+        </p>
+
+        <div className="admin-brand-preview" aria-hidden="true">
+          <span className="admin-brand-preview-label">Preview</span>
+          <span className="logo admin-brand-preview-mark">
+            {splitBrandName(trimmed || DEFAULT_APP_NAME).map((part, index) => (
+              index === 0 ? part : part && <span key="accent">{part}</span>
+            ))}
+          </span>
+        </div>
+
+        <div className="admin-actions">
+          <button
+            type="submit"
+            className="account-primary"
+            disabled={saving || !isValid || !isDirty}
+          >
+            {saving ? "Saving..." : "Save"}
+          </button>
+          <button
+            type="button"
+            className="account-action"
+            disabled={saving || draft === DEFAULT_APP_NAME}
+            onClick={handleReset}
+          >
+            Use default name
+          </button>
+        </div>
+      </form>
     </section>
   );
 }
@@ -279,26 +340,19 @@ function AdminAppearance() {
         <NavLink to="/admin/appearance" end className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
           Overview
         </NavLink>
-        <NavLink to="/admin/appearance/themes" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
-          Themes
-        </NavLink>
-        <NavLink to="/admin/appearance/custom-css" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
-          Custom CSS
-        </NavLink>
         <NavLink to="/admin/appearance/branding" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
           Branding
         </NavLink>
-        <NavLink to="/admin/appearance/layout" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
-          Layout
+        <NavLink to="/admin/appearance/custom-css" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
+          Custom CSS
         </NavLink>
       </nav>
 
       <Routes>
         <Route index element={<AdminAppearanceHome />} />
-        <Route path="themes" element={<AdminAppearanceThemes />} />
-        <Route path="custom-css" element={<AdminCustomCss />} />
         <Route path="branding" element={<AdminAppearanceBranding />} />
-        <Route path="layout" element={<AdminAppearanceLayout />} />
+        <Route path="custom-css" element={<AdminCustomCss />} />
+        <Route path="*" element={<Navigate to="/admin/appearance" replace />} />
       </Routes>
     </div>
   );

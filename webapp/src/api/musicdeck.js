@@ -172,6 +172,24 @@ export async function updateCurrentUser(profile) {
   return data.user;
 }
 
+/* Upload the signed-in user's avatar as a base64 image data URL. */
+export async function uploadCurrentUserAvatar(image) {
+  const data = await request("/api/users/profile/avatar", {
+    method: "POST",
+    body: JSON.stringify({ image }),
+  });
+
+  return data.user;
+}
+
+export async function removeCurrentUserAvatar() {
+  const data = await request("/api/users/profile/avatar", {
+    method: "DELETE",
+  });
+
+  return data.user;
+}
+
 export async function getUserSettings() {
   const data = await request("/api/settings/user");
   return data.settings || [];
@@ -186,8 +204,53 @@ export async function updateUserSettings(settings) {
   return data.settings || [];
 }
 
+// Fired after the signed-in user's own preferences change outside Settings
+// (e.g. an admin editing their own account) so live app state can re-apply them.
+export const USER_SETTINGS_CHANGED_EVENT = "musicdeck:user-settings-changed";
+
+export async function getPublicConfig() {
+  return request("/api/public/config");
+}
+
+export async function updateAppConfig(config) {
+  return request("/api/admin/config", {
+    method: "PATCH",
+    body: JSON.stringify(config),
+  });
+}
+
+export async function getAdminUserSettings(userId) {
+  const data = await request(`/api/admin/users/${encodeURIComponent(userId)}/settings`);
+  return data.settings || [];
+}
+
+export async function updateAdminUserSettings(userId, settings) {
+  const data = await request(`/api/admin/users/${encodeURIComponent(userId)}/settings`, {
+    method: "PATCH",
+    body: JSON.stringify({ settings }),
+  });
+
+  return data.settings || [];
+}
+
 export async function getAdminHealth() {
   return request("/api/admin/health");
+}
+
+export async function getAdminLogs({ level, limit = 1000 } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (level) params.set("level", level);
+  return request(`/api/admin/logs?${params}`);
+}
+
+export async function clearAdminLogs() {
+  return request("/api/admin/logs", { method: "DELETE" });
+}
+
+export function adminLogsStreamUrl(afterSeq) {
+  return Number.isInteger(afterSeq) && afterSeq > 0
+    ? `/api/admin/logs/stream?after=${afterSeq}`
+    : "/api/admin/logs/stream";
 }
 
 export async function getAdminBackendConnections() {
@@ -288,6 +351,15 @@ export async function updateServerSettings(settings) {
   });
 
   return data.settings || [];
+}
+
+export async function getAdminLibraryScanStatus() {
+  return request("/api/admin/library/scan/status");
+}
+
+/** Queues a library scan; resolves immediately with `{ started, alreadyRunning, status }`. */
+export async function triggerAdminLibraryScan() {
+  return request("/api/admin/library/scan", { method: "POST" });
 }
 
 export async function getUsers() {

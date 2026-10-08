@@ -36,7 +36,7 @@ function ImportStatusButton() {
 }
 
 
-function renderSidebar(playlists) {
+function renderSidebar(playlists, initialPath = "/") {
   getCoverUrl.mockImplementation((id, size) =>
     id ? `/api/artwork/${id}${size ? `?size=${size}` : ""}` : null
   );
@@ -48,7 +48,7 @@ function renderSidebar(playlists) {
   }
 
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[initialPath]}>
       <ImportProvider>
         <Sidebar />
         <ImportStatusButton />
@@ -90,6 +90,24 @@ test("sidebar playlist entries render the resolved playlist artwork", async () =
     "src",
     "/api/artwork/mdplart_sig2_mdpl_2?size=64"
   );
+});
+
+test("sidebar navigation exposes section labels and synchronized active item icons", async () => {
+  const { container } = renderSidebar([
+    { id: "mdpl_1", name: "Evening Drive", coverArt: null, coverMode: null },
+  ], "/library/playlists");
+
+  expect(await screen.findByText("Evening Drive")).toBeInTheDocument();
+  const sidebar = screen.getByRole("complementary", { name: "Main navigation" });
+  expect(screen.getByRole("heading", { name: "Your Library" })).toHaveClass("nav-title");
+  expect(screen.getByRole("heading", { name: "Playlists" })).toHaveClass("nav-title");
+
+  const library = screen.getByRole("link", { name: /Library/ });
+  expect(library).toHaveClass("nav-item", "active");
+  expect(library).toHaveAttribute("aria-current", "page");
+  expect(library.querySelector(".nav-icon")).toHaveClass("nav-icon");
+  expect(container.querySelector(".playlist-nav-item")).toHaveClass("nav-item", "playlist-nav-item");
+  expect(sidebar).toBeInTheDocument();
 });
 
 

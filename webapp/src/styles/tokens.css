@@ -15,6 +15,12 @@
   /* Page lighting uses the same cool violet as playback, never a competing burgundy. */
   --ambient-glow: #A855F7;
   --nav-background: rgb(16 16 20 / 85%); --nav-hover: rgb(255 255 255 / 5%); --nav-active: rgb(39 39 42 / 60%);
+  --nav-section-text: #9ca3af;
+  --nav-item-text: #9ca3af;
+  --nav-hover-text: var(--text);
+  --nav-active-text: var(--accent-text);
+  --nav-active-fill: color-mix(in srgb, var(--accent) 10%, transparent);
+  --nav-active-shadow: none;
   --control-surface: rgb(9 9 11 / 82%); --placeholder-surface: rgb(24 24 27 / 85%);
   --danger: #ef6b73; --danger-text: #ff9aa0; --danger-text-strong: #ffd4d7;
   --status-failed: #e06565; --entity-artist: #8ed8bd; --entity-playlist: #e8b76a;
@@ -29,18 +35,122 @@
   --content-max: 1100px; --content-wide: 1200px;
   --focus-ring: 2px solid var(--accent);
   --transition-fast: 0.15s ease; --transition-base: 0.2s ease;
+
+  /*
+   * Theme-adaptive surfaces. Dark values reproduce the original hand-tuned
+   * colors exactly; :root[data-theme="light"] below remaps them.
+   * --tint-rgb is the ink used for translucent hovers, borders and fills.
+   */
+  --tint-rgb: 255 255 255;
+  --accent-text: var(--accent);
+  --text-soft: #d4d4d8;
+  --panel-chrome: rgb(12 12 14 / 90%);
+  --panel-shadow: 0 25px 50px rgb(0 0 0 / 80%);
+  --player-bg: #09090b;
+  --card-solid: rgb(24 24 27 / 80%);
+  --card-raised: rgb(24 24 27 / 86%);
+  --sheet-bg: rgb(9 9 11 / 90%);
+  --dialog-rgb: 24 18 36;
+  --danger-dialog-bg: #181224;
+  --input-bg: rgb(9 9 11 / 80%);
+  --toast-bg: rgb(24 24 27 / 96%);
+  --press-base: rgb(12 12 16 / 70%);
+  --secondary-button-bg: #27272a;
+  --secondary-button-hover: #3f3f46;
+  --secondary-button-text: #e4e4e7;
+  --queue-tab-bg: #18181b;
+  --queue-tab-text: #a1a1aa;
+  --queue-tab-hover-bg: #27272a;
+  --queue-tab-hover-text: #f5f7fa;
+  --avatar-fallback-bg: #1a1721;
+  --artwork-fallback-base: rgb(26 26 31);
+  --ambient-blob: #000000;
+  --hero-wash: linear-gradient(135deg, rgb(39 28 54 / 58%), rgb(18 18 21 / 15%));
+
+  /* Desktop panel depth: canvas < left sidebar < right panel < main content. */
+  --sidebar-surface: var(--panel-chrome);
+  --aside-surface: var(--panel-chrome);
+  --main-surface: var(--bg-chrome);
+  --panel-border: rgb(var(--tint-rgb) / 10%);
+
+  --glass-menu-bg: rgba(20, 20, 24, 0.88);
+  --glass-menu-solid: rgb(20, 20, 24);
+  --glass-menu-border: rgba(255, 255, 255, 0.1);
+  --glass-menu-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  --glass-menu-text: #fff;
+  --glass-menu-text-secondary: #d4d4dd;
+  --glass-menu-text-muted: #b9b9c4;
+  --glass-menu-hover: rgba(255, 255, 255, 0.1);
+  --glass-menu-focus: #c4b5fd;
+  --glass-menu-danger: #fca5a5;
+  --glass-menu-danger-hover: #fecaca;
+  --glass-menu-danger-bg: rgba(239, 68, 68, 0.14);
 }
 
 :root[data-theme="light"] {
-  --bg-app: #f4f7fb;
+  --bg-app: #e9ecf1;
   --bg-panel: rgba(255, 255, 255, 0.88);
   --bg-chrome: rgba(255, 255, 255, 0.94);
   --bg-card: rgba(249, 251, 254, 0.82);
   --border-glass: rgba(18, 24, 39, 0.12);
   --black: var(--bg-app); --background: #edf2f8;
   --surface: var(--bg-panel); --card: var(--bg-card); --card-hover: #e8eef7;
-  --text: #121827; --text-secondary: #536073; --text-muted: #768196; --text-subtle: #8b96a8;
+  /* Each step is >= 4.5:1 on every light surface, down to the #f3f4f6 sidebar and its hover fills. */
+  --text: #111827; --text-secondary: #4b5563; --text-muted: #5f6775; --text-subtle: #636b78;
   --border: var(--border-glass); --border-hover: #cbd6e5;
-  --nav-background: #f8faff; --nav-hover: #eef3fa; --nav-active: #e2eaff;
+  --layout-divider: rgb(226 232 240 / 80%);
+  --nav-background: #f8faff; --nav-hover: rgb(15 23 42 / 6%); --nav-active: #e2eaff;
+  --nav-section-text: #636b78;
+  --nav-item-text: #374151;
+  --nav-hover-text: #111827;
+  --nav-active-text: #6d28d9;
+  --nav-active-fill: rgb(237 233 254 / 82%);
+  --nav-active-shadow: 0 1px 2px rgb(76 29 149 / 10%), inset 0 0 0 1px rgb(124 58 237 / 10%);
   --control-surface: rgb(255 255 255 / 82%); --placeholder-surface: #eef3fa;
+
+  /* Cool off-white canvas, white elevated chrome, near-black ink. */
+  --tint-rgb: 15 23 42;
+  /* Darkened accent for text/icons so any chosen accent stays ≥ 4.5:1 on the light canvas. */
+  --accent-text: color-mix(in srgb, var(--accent) 70%, #000);
+  --text-soft: #374151;
+  --panel-chrome: rgb(255 255 255 / 92%);
+  --panel-shadow: 0 18px 40px rgb(15 23 42 / 8%), 0 1px 2px rgb(15 23 42 / 6%);
+  --player-bg: #ffffff;
+  --card-solid: rgb(255 255 255 / 90%);
+  --card-raised: #ffffff;
+  --sheet-bg: rgb(255 255 255 / 94%);
+  --dialog-rgb: 255 255 255;
+  --danger-dialog-bg: #ffffff;
+  --input-bg: #f7f7f9;
+  --toast-bg: rgb(255 255 255 / 97%);
+  --press-base: rgb(255 255 255 / 80%);
+  --secondary-button-bg: #e5e7eb;
+  --secondary-button-hover: #d1d5db;
+  --secondary-button-text: #111827;
+  --queue-tab-bg: #f3f4f6;
+  --queue-tab-text: #4b5563;
+  --queue-tab-hover-bg: #e5e7eb;
+  --queue-tab-hover-text: #111827;
+  --avatar-fallback-bg: #e9e4f3;
+  --artwork-fallback-base: #e7e3ef;
+  --ambient-blob: transparent;
+  --hero-wash: linear-gradient(135deg, rgb(168 85 247 / 10%), rgb(255 255 255 / 0%));
+  --sidebar-surface: #f3f4f6;
+  --aside-surface: #f8f9fa;
+  --main-surface: #ffffff;
+  --panel-border: rgb(226 232 240 / 80%);
+
+  --glass-menu-bg: rgb(255 255 255 / 80%);
+  --glass-menu-solid: #ffffff;
+  --glass-menu-border: rgb(229 231 235 / 50%);
+  --glass-menu-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+  --glass-menu-text: #111827;
+  --glass-menu-text-secondary: #374151;
+  --glass-menu-text-muted: #6b7280;
+  --glass-menu-hover: rgb(0 0 0 / 5%);
+  --glass-menu-focus: #7e22ce;
+  --glass-menu-danger: #b91c1c;
+  --glass-menu-danger-hover: #991b1b;
+  --glass-menu-danger-bg: rgb(239 68 68 / 10%);
+  color-scheme: light;
 }

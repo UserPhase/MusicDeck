@@ -17,7 +17,7 @@ jest.mock("../api/musicdeck", () => ({
 function renderPalette(props = {}) {
   return render(
     <MemoryRouter>
-      <CommandPalette isOpen onClose={jest.fn()} onToggleTheme={jest.fn()} {...props} />
+      <CommandPalette isOpen onClose={jest.fn()} {...props} />
     </MemoryRouter>
   );
 }
@@ -33,6 +33,7 @@ describe("CommandPalette", () => {
     renderPalette();
     const input = screen.getByRole("textbox", { name: "Command palette search" });
     expect(input).toHaveFocus();
+    expect(screen.queryByRole("option", { name: /theme/i })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("option", { name: /Open Queue/i }));
     expect(mockSetActiveSidebar).toHaveBeenCalledWith("queue");

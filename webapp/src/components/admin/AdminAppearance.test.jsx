@@ -6,11 +6,14 @@ import {
   CUSTOM_CSS_SETTING_KEY,
   sanitizeCustomCss,
 } from "./CustomCssStyle";
-import { getUserSettings, updateUserSettings } from "../../api/musicdeck";
+import { getPublicConfig, getUserSettings, updateAppConfig, updateUserSettings } from "../../api/musicdeck";
+import { BrandingProvider } from "../../context/BrandingContext";
 
 
 jest.mock("../../api/musicdeck", () => ({
+  getPublicConfig: jest.fn(),
   getUserSettings: jest.fn(),
+  updateAppConfig: jest.fn(),
   updateUserSettings: jest.fn(),
 }));
 
@@ -21,17 +24,21 @@ jest.mock("../../context/AuthContext", () => ({
 
 function renderAppearance(route = "/admin/appearance/custom-css") {
   return render(
-    <MemoryRouter initialEntries={[route]}>
-      <Routes>
-        <Route path="/admin/appearance/*" element={<AdminAppearance />} />
-      </Routes>
-    </MemoryRouter>
+    <BrandingProvider>
+      <MemoryRouter initialEntries={[route]}>
+        <Routes>
+          <Route path="/admin/appearance/*" element={<AdminAppearance />} />
+        </Routes>
+      </MemoryRouter>
+    </BrandingProvider>
   );
 }
 
 
 beforeEach(() => {
   jest.clearAllMocks();
+  localStorage.clear();
+  getPublicConfig.mockResolvedValue({ appName: "MusicDeck" });
   getUserSettings.mockResolvedValue([]);
   updateUserSettings.mockResolvedValue([]);
 });
@@ -114,5 +121,62 @@ describe("Appearance custom CSS page", () => {
         [CUSTOM_CSS_SETTING_KEY]: "",
       })
     );
+  });
+});
+
+
+describe("Appearance navigation and branding", () => {
+  test("only offers the Overview, Branding and Custom CSS sections", async () => {
+    renderAppearance("/admin/appearance");
+
+    const nav = screen.getByRole("navigation", { name: /appearance sections/i });
+    const tabs = Array.from(nav.querySelectorAll("a")).map((link) => link.textContent);
+    expect(tabs).toEqual(["Overview", "Branding", "Custom CSS"]);
+    expect(screen.queryByRole("link", { name: /^themes$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /^layout$/i })).not.toBeInTheDocument();
+  });
+
+  test("retired section URLs fall back to the overview", async () => {
+    renderAppearance("/admin/appearance/themes");
+
+    expect(await screen.findByRole("heading", { name: /^appearance$/i, level: 2 })).toBeInTheDocument();
+  });
+
+  test("saves the application name and applies it immediately", async () => {
+    updateAppConfig.mockResolvedValue({ appName: "Basement FM" });
+    renderAppearance("/admin/appearance/branding");
+
+    const input = await screen.findByRole("textbox", { name: /application name/i });
+    await waitFor(() => expect(input).toHaveValue("MusicDeck"));
+    expect(
+      screen.getByText("This name will appear in the sidebar logo, header, and browser window title.")
+    ).toBeInTheDocument();
+
+    const save = screen.getByRole("button", { name: /^save$/i });
+    expect(save).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "  Basement FM " } });
+    fireEvent.click(save);
+
+    await waitFor(() => expect(updateAppConfig).toHaveBeenCalledWith({ appName: "Basement FM" }));
+    expect(await screen.findByText(/application name saved/i)).toBeInTheDocument();
+    expect(document.title).toBe("Basement FM");
+    expect(input).toHaveValue("Basement FM");
+  });
+
+  test("blocks empty names and reports save errors", async () => {
+    updateAppConfig.mockRejectedValue(new Error("Application name must be 1-40 characters"));
+    renderAppearance("/admin/appearance/branding");
+
+    const input = await screen.findByRole("textbox", { name: /application name/i });
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+
+    fireEvent.change(input, { target: { value: "Deck" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/1-40 characters/);
+    expect(document.title).toBe("MusicDeck");
   });
 });

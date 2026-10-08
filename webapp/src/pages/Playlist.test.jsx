@@ -220,13 +220,15 @@ beforeAll(() => {
 });
 
 
-test("a collage playlist offers an upload action and no remove action", async () => {
+test("a collage playlist offers the choose-photo overlay and no remove action", async () => {
   renderPlaylist();
 
   expect(await screen.findByText("Evening Drive")).toBeInTheDocument();
 
-  expect(screen.getByText("Upload cover")).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /remove custom cover/i })).toBeNull();
+  expect(screen.getByRole("button", { name: /choose photo for evening drive/i })).toBeInTheDocument();
+  expect(screen.queryByText("Upload cover")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /more options/i }));
+  expect(screen.queryByRole("menuitem", { name: /remove custom cover/i })).toBeNull();
 
   // The page renders the same resolved artwork reference as everywhere else.
   expect(screen.getByAltText("Evening Drive cover")).toHaveAttribute(
@@ -236,12 +238,25 @@ test("a collage playlist offers an upload action and no remove action", async ()
 });
 
 
-test("uploading custom artwork swaps the cover and reveals the remove action", async () => {
+test("clicking the cover opens the hidden file picker", async () => {
+  renderPlaylist();
+
+  expect(await screen.findByText("Evening Drive")).toBeInTheDocument();
+
+  const clickSpy = jest.spyOn(coverInput(), "click");
+  fireEvent.click(screen.getByRole("button", { name: /choose photo/i }));
+  expect(clickSpy).toHaveBeenCalled();
+});
+
+
+test("uploading custom artwork swaps the cover, syncs the sidebar, and reveals the remove action", async () => {
   renderPlaylist();
 
   expect(await screen.findByText("Evening Drive")).toBeInTheDocument();
 
   setPlaylistArtwork.mockResolvedValue(customPlaylist);
+  const changed = jest.fn();
+  window.addEventListener("playlistsChanged", changed);
 
   fireEvent.change(coverInput(), { target: { files: [imageFile()] } });
 
@@ -252,7 +267,6 @@ test("uploading custom artwork swaps the cover and reveals the remove action", a
     );
   });
 
-  // Custom artwork overrides the collage, and the action becomes "Change".
   await waitFor(() => {
     expect(screen.getByAltText("Evening Drive cover")).toHaveAttribute(
       "src",
@@ -260,22 +274,25 @@ test("uploading custom artwork swaps the cover and reveals the remove action", a
     );
   });
 
-  expect(screen.getByText("Change cover")).toBeInTheDocument();
+  expect(changed).toHaveBeenCalled();
+  window.removeEventListener("playlistsChanged", changed);
+
+  fireEvent.click(screen.getByRole("button", { name: /more options/i }));
   expect(
-    screen.getByRole("button", { name: /remove custom cover/i })
+    screen.getByRole("menuitem", { name: /remove custom cover/i })
   ).toBeInTheDocument();
 });
 
 
-test("removing custom artwork immediately falls back to the automatic collage", async () => {
+test("removing custom artwork from the options menu falls back to the automatic collage", async () => {
   renderPlaylist(customPlaylist);
 
   expect(await screen.findByText("Evening Drive")).toBeInTheDocument();
-  expect(screen.getByText("Change cover")).toBeInTheDocument();
 
   clearPlaylistArtwork.mockResolvedValue(collagePlaylist);
 
-  fireEvent.click(screen.getByRole("button", { name: /remove custom cover/i }));
+  fireEvent.click(screen.getByRole("button", { name: /more options/i }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /remove custom cover/i }));
 
   await waitFor(() => {
     expect(clearPlaylistArtwork).toHaveBeenCalledWith("mdpl_1");
@@ -289,8 +306,8 @@ test("removing custom artwork immediately falls back to the automatic collage", 
     );
   });
 
-  expect(screen.getByText("Upload cover")).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /remove custom cover/i })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /more options/i }));
+  expect(screen.queryByRole("menuitem", { name: /remove custom cover/i })).toBeNull();
 });
 
 

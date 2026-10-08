@@ -73,6 +73,14 @@ test("opens and closes the account menu from the profile button", () => {
 });
 
 
+test("keeps theme controls out of the profile menu", () => {
+  renderTopbar({ username: "sam", displayName: "Sam", role: "user" });
+  fireEvent.click(screen.getByRole("button", { name: /sam/i }));
+  expect(screen.getAllByRole("menuitem").map((item) => item.textContent.trim()))
+    .toEqual(["Profile", "Settings", "Log out"]);
+});
+
+
 test("shows Admin Dashboard only for admin users", () => {
   renderTopbar({
     username: "admin",

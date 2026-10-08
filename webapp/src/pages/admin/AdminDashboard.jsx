@@ -83,11 +83,11 @@ function AdminDashboard() {
           <div className="admin-card">
             <span>Library</span>
             <strong>
-              {statistics?.totalTracks ?? statistics?.tracks ?? "—"}
+              {statistics?.collection?.tracks ?? "—"}
             </strong>
             <small>
-              {statistics?.totalAlbums != null
-                ? `${statistics.totalAlbums} albums`
+              {statistics?.collection?.albums != null
+                ? `${statistics.collection.albums} albums`
                 : "tracks indexed"}
             </small>
           </div>

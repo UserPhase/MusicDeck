@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 
 import {
@@ -5,11 +6,16 @@ import {
   getAdminAcquisitions,
   getAdminBackendConnections,
   getAdminHealth,
+  getAdminLibraryScanStatus,
   getDownloaderDiagnostics,
   getServerSettings,
   scanAdminAcquisitions,
+  triggerAdminLibraryScan,
   updateServerSettings,
 } from "../../api/musicdeck";
+import ScanSchedulePicker from "../../components/admin/ScanSchedulePicker";
+import { DEFAULT_SCHEDULE, configToCron, parseCronSchedule } from "../../utils/cronUtils";
+import AdminLogs from "./AdminLogs";
 import { useAdminData } from "./useAdminData";
 
 
@@ -39,40 +45,195 @@ function getSetting(settings, key, fallback) {
 }
 
 
+function ServerSettingsForm({ settings, saving, run, onSaved, scanStatus }) {
+  const storedSchedule = String(getSetting(settings, "library.scanSchedule", "") ?? "");
+  const parsedSchedule = useMemo(() => parseCronSchedule(storedSchedule), [storedSchedule]);
+  const [schedule, setSchedule] = useState(parsedSchedule.config);
+  const [scheduleTouched, setScheduleTouched] = useState(false);
+  const [maxConcurrency, setMaxConcurrency] = useState(
+    Number(getSetting(settings, "jobs.maxConcurrency", 1)) || 1
+  );
+
+  // Re-sync when the stored value changes (e.g. after a save normalizes it).
+  useEffect(() => {
+    setSchedule(parsedSchedule.config);
+    setScheduleTouched(false);
+  }, [parsedSchedule]);
+
+  const showLegacy = parsedSchedule.status === "unsupported" && !scheduleTouched;
+
+  function handleScheduleChange(next) {
+    setSchedule(next);
+    setScheduleTouched(true);
+  }
+
+  async function handleSave(event) {
+    event.preventDefault();
+    const payload = { "jobs.maxConcurrency": Math.min(8, Math.max(1, Number(maxConcurrency) || 1)) };
+    // An untouched legacy expression is preserved rather than overwritten by the suggested default.
+    if (parsedSchedule.status !== "unsupported" || scheduleTouched) {
+      payload["library.scanSchedule"] = configToCron(schedule);
+    }
+
+    const updated = await run(() => updateServerSettings(payload), {
+      successMessage: "Server settings saved.",
+      errorMessage: "Could not save server settings.",
+    });
+    if (updated) onSaved(updated);
+  }
+
+  return (
+    <form className="admin-form" onSubmit={handleSave}>
+      <ScanSchedulePicker
+        value={schedule}
+        onChange={handleScheduleChange}
+        legacyExpression={showLegacy ? parsedSchedule.raw : null}
+        onReset={() => handleScheduleChange({ ...DEFAULT_SCHEDULE })}
+        timezone={scanStatus?.timezone}
+        disabled={saving}
+      />
+      <label>
+        <span>Job concurrency</span>
+        <input
+          name="maxConcurrency"
+          type="number"
+          min="1"
+          max="8"
+          value={maxConcurrency}
+          onChange={(event) => setMaxConcurrency(event.target.value)}
+        />
+      </label>
+      {settings.length === 0 && (
+        <div className="library-empty">No server settings saved yet.</div>
+      )}
+      <button type="submit" className="account-primary" disabled={saving}>
+        Save server settings
+      </button>
+    </form>
+  );
+}
+
+const SCAN_POLL_MS = 2000;
+const RUN_LABELS = {
+  succeeded: "Completed",
+  partial: "Partially failed",
+  failed: "Failed",
+  skipped: "Skipped",
+  running: "Running",
+};
+
+function formatDateTime(iso) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime())
+    ? null
+    : date.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function LibraryScanControl({ status, onStatus }) {
+  const [requesting, setRequesting] = useState(false);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState("");
+  const running = Boolean(status?.running);
+
+  // Poll only while a scan is in flight; stops as soon as it finishes or the page unmounts.
+  useEffect(() => {
+    if (!running) return undefined;
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      try {
+        const next = await getAdminLibraryScanStatus();
+        if (!cancelled) onStatus(next);
+      } catch {
+        // Transient poll failures are retried on the next tick.
+      }
+    }, SCAN_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [running, onStatus]);
+
+  async function handleScan() {
+    setRequesting(true);
+    setError(null);
+    setNotice("");
+    try {
+      const result = await triggerAdminLibraryScan();
+      if (result?.status) onStatus(result.status);
+      setNotice(result?.alreadyRunning ? "A scan is already running." : "Library scan started.");
+    } catch (err) {
+      setError(err.message || "Could not start a library scan.");
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  const busy = requesting || running;
+  const lastRun = status?.lastRun;
+  const nextRun = formatDateTime(status?.nextRunAt);
+
+  return (
+    <div className="scan-now">
+      <div className="scan-now__info">
+        <strong>Manual scan</strong>
+        <dl>
+          <div>
+            <dt>Next scheduled</dt>
+            <dd>{nextRun || "Not scheduled"}</dd>
+          </div>
+          <div>
+            <dt>Last scan</dt>
+            <dd>
+              {running
+                ? `Running since ${formatDateTime(status.currentRun?.startedAt) || "now"}`
+                : lastRun
+                  ? (
+                    <>
+                      <span className={`scan-now__state is-${lastRun.status}`}>{RUN_LABELS[lastRun.status] || lastRun.status}</span>
+                      {" "}{formatDateTime(lastRun.finishedAt || lastRun.startedAt)} · {lastRun.trigger}
+                    </>
+                  )
+                  : "Never"}
+            </dd>
+          </div>
+        </dl>
+        {lastRun?.message && !running && <p className="scan-now__detail">{lastRun.message}</p>}
+        {status && !status.valid && status.error && <p className="scan-now__detail is-error">{status.error}</p>}
+        {error && <p className="scan-now__detail is-error" role="alert">{error}</p>}
+        {notice && !error && <p className="scan-now__detail" role="status">{notice}</p>}
+      </div>
+      <button type="button" className="account-primary scan-now__button" onClick={handleScan} disabled={busy} aria-busy={busy}>
+        {busy && <span className="scan-now__spinner" aria-hidden="true" />}
+        {running ? "Scanning…" : requesting ? "Queuing…" : "Scan library now"}
+      </button>
+    </div>
+  );
+}
+
 function AdminServerGeneral() {
   const { data, setData, loading, saving, error, message, run } = useAdminData({
     health: getAdminHealth,
     settings: getServerSettings,
+    scanStatus: getAdminLibraryScanStatus,
   });
+  const setScanStatus = useCallback(
+    (scanStatus) => setData((current) => ({ ...current, scanStatus })),
+    [setData]
+  );
 
   if (loading) {
     return <div className="loading">Loading server settings...</div>;
   }
 
   const settings = data.settings || [];
-  const scanSchedule = String(
-    getSetting(settings, "library.scanSchedule", "")
-  );
-  const maxConcurrency = Number(getSetting(settings, "jobs.maxConcurrency", 1));
 
-  async function handleSave(event) {
-    event.preventDefault();
-
-    const form = new FormData(event.target);
-    const updated = await run(
-      () =>
-        updateServerSettings({
-          "library.scanSchedule": String(form.get("scanSchedule") || ""),
-          "jobs.maxConcurrency": Number(form.get("maxConcurrency") || 1),
-        }),
-      {
-        successMessage: "Server settings saved.",
-        errorMessage: "Could not save server settings.",
-      }
-    );
-
-    if (updated) {
-      setData((current) => ({ ...current, settings: updated }));
+  async function handleSaved(updated) {
+    setData((current) => ({ ...current, settings: updated }));
+    try {
+      setScanStatus(await getAdminLibraryScanStatus());
+    } catch {
+      // The next poll or page load will pick up the new schedule.
     }
   }
 
@@ -101,32 +262,14 @@ function AdminServerGeneral() {
 
       <section className="admin-section">
         <h2>Server settings</h2>
-        <form className="admin-form" onSubmit={handleSave}>
-          <label>
-            <span>Library scan schedule</span>
-            <input
-              name="scanSchedule"
-              defaultValue={scanSchedule}
-              placeholder="Not scheduled"
-            />
-          </label>
-          <label>
-            <span>Job concurrency</span>
-            <input
-              name="maxConcurrency"
-              type="number"
-              min="1"
-              max="8"
-              defaultValue={maxConcurrency}
-            />
-          </label>
-          {settings.length === 0 && (
-            <div className="library-empty">No server settings saved yet.</div>
-          )}
-          <button type="submit" className="account-primary" disabled={saving}>
-            Save server settings
-          </button>
-        </form>
+        <ServerSettingsForm
+          settings={settings}
+          saving={saving}
+          run={run}
+          onSaved={handleSaved}
+          scanStatus={data.scanStatus}
+        />
+        <LibraryScanControl status={data.scanStatus} onStatus={setScanStatus} />
       </section>
     </>
   );
@@ -253,15 +396,7 @@ function AdminServerTasks() {
 
 
 function AdminServerLogs() {
-  return (
-    <section className="admin-section">
-      <h2>Logs</h2>
-      <p className="account-meta">
-        Server logs are written to the server process output. Check your
-        Docker or terminal logs for <code>musicdeck-server</code>.
-      </p>
-    </section>
-  );
+  return <AdminLogs />;
 }
 
 

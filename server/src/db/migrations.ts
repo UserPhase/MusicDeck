@@ -515,6 +515,37 @@ const migrations = [
       CREATE INDEX imported_album_artwork_spotify_idx ON imported_album_artwork(spotify_album_id);
     `,
   },
+  {
+    id: 23,
+    name: "user-uploaded-avatars",
+    sql: `
+      ALTER TABLE users ADD COLUMN avatar_updated_at TEXT;
+
+      CREATE TABLE user_avatars (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        content_type TEXT NOT NULL,
+        data BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    id: 24,
+    name: "master-admin-and-login-activity",
+    sql: `
+      ALTER TABLE users ADD COLUMN is_master INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN last_login_at TEXT;
+
+      UPDATE users SET is_master = 1
+      WHERE id = (
+        SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC, id ASC LIMIT 1
+      );
+
+      UPDATE users SET last_login_at = (
+        SELECT MAX(created_at) FROM sessions WHERE sessions.user_id = users.id
+      );
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {
@@ -613,8 +644,8 @@ export async function seedInitialData(db: Database.Database, config: AppConfig) 
     const passwordHash = await hashPassword(config.firstAdmin.password);
     db.prepare(`
       INSERT INTO users
-        (id, username, password_hash, display_name, role, disabled, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+        (id, username, password_hash, display_name, role, disabled, is_master, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
     `).run(
       createId("user"),
       config.firstAdmin.username,

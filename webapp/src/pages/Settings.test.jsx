@@ -12,6 +12,7 @@ import {
 
 
 jest.mock("../api/musicdeck", () => ({
+  USER_SETTINGS_CHANGED_EVENT: "musicdeck:user-settings-changed",
   analyzeSilence: jest.fn(async () => ({ status: "completed" })),
   getUserSettings: jest.fn(),
   updateUserSettings: jest.fn(),
@@ -103,6 +104,97 @@ test("loads and updates user settings", async () => {
     });
   });
   expect(await screen.findByText(/settings saved/i)).toBeInTheDocument();
+});
+
+
+test("theme selector reflects the saved theme and applies changes instantly", async () => {
+  document.documentElement.dataset.theme = "dark";
+  getUserSettings.mockResolvedValue([{ key: "ui.theme", value: "\"light\"" }]);
+  updateUserSettings.mockResolvedValue([]);
+  const themeEvents = jest.fn();
+  window.addEventListener("musicdeck:user-settings-changed", themeEvents);
+
+  render(<Settings />);
+
+  const themeGroup = await screen.findByRole("radiogroup", { name: "Theme" });
+  await waitFor(() => expect(screen.getByRole("radio", { name: "Light" })).toHaveAttribute("aria-checked", "true"));
+  expect(themeGroup).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+
+  expect(themeEvents.mock.calls[0][0].detail).toEqual({ "ui.theme": "dark" });
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith({ "ui.theme": "dark" }));
+  expect(screen.getByRole("radio", { name: "Dark" })).toHaveAttribute("aria-checked", "true");
+
+  window.dispatchEvent(new CustomEvent("musicdeck:user-settings-changed", { detail: { "ui.theme": "light" } }));
+  await waitFor(() => expect(screen.getByRole("radio", { name: "Light" })).toHaveAttribute("aria-checked", "true"));
+  window.removeEventListener("musicdeck:user-settings-changed", themeEvents);
+});
+
+
+test("theme selector restores the previous theme when saving fails", async () => {
+  document.documentElement.dataset.theme = "dark";
+  getUserSettings.mockResolvedValue([]);
+  updateUserSettings.mockRejectedValue(new Error("Offline"));
+
+  render(<Settings />);
+
+  fireEvent.click(await screen.findByRole("radio", { name: "Light" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Offline");
+  expect(screen.getByRole("radio", { name: "Dark" })).toHaveAttribute("aria-checked", "true");
+});
+
+
+test("layout style selector reflects the saved preset and applies changes instantly", async () => {
+  delete document.documentElement.dataset.layoutPreset;
+  getUserSettings.mockResolvedValue([{ key: "ui.layoutPreset", value: "\"soundcloud\"" }]);
+  updateUserSettings.mockResolvedValue([]);
+  const settingsEvents = jest.fn();
+  window.addEventListener("musicdeck:user-settings-changed", settingsEvents);
+
+  render(<Settings />);
+
+  const presetGroup = await screen.findByRole("radiogroup", { name: "Layout Style" });
+  await waitFor(() => expect(screen.getByRole("radio", { name: "SoundCloud" })).toHaveAttribute("aria-checked", "true"));
+  expect(presetGroup.querySelectorAll('[role="radio"]')).toHaveLength(4);
+  expect(screen.getByRole("radio", { name: "YouTube Music" })).toHaveAccessibleDescription(/header navigation/i);
+
+  fireEvent.click(screen.getByRole("radio", { name: "Apple Music" }));
+
+  expect(settingsEvents.mock.calls[0][0].detail).toEqual({ "ui.layoutPreset": "apple" });
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith({ "ui.layoutPreset": "apple" }));
+  expect(screen.getByRole("radio", { name: "Apple Music" })).toHaveAttribute("aria-checked", "true");
+
+  fireEvent.keyDown(presetGroup, { key: "ArrowRight" });
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith({ "ui.layoutPreset": "ytmusic" }));
+  expect(screen.getByRole("radio", { name: "YouTube Music" })).toHaveFocus();
+  window.removeEventListener("musicdeck:user-settings-changed", settingsEvents);
+});
+
+
+test("layout style maps the retired Tidal preset to the Spotify / Tidal archetype", async () => {
+  delete document.documentElement.dataset.layoutPreset;
+  getUserSettings.mockResolvedValue([{ key: "ui.layoutPreset", value: "\"tidal\"" }]);
+
+  render(<Settings />);
+
+  await waitFor(() => expect(screen.getByRole("radio", { name: "Spotify / Tidal" })).toHaveAttribute("aria-checked", "true"));
+});
+
+
+test("layout style restores the previous preset when saving fails", async () => {
+  document.documentElement.dataset.layoutPreset = "spotify";
+  getUserSettings.mockResolvedValue([]);
+  updateUserSettings.mockRejectedValue(new Error("Offline"));
+
+  render(<Settings />);
+
+  fireEvent.click(await screen.findByRole("radio", { name: "YouTube Music" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Offline");
+  expect(screen.getByRole("radio", { name: "Spotify / Tidal" })).toHaveAttribute("aria-checked", "true");
+  delete document.documentElement.dataset.layoutPreset;
 });
 
 

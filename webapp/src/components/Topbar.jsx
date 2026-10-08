@@ -25,10 +25,32 @@ import {
 
 import DownloadsMenu from "./DownloadsMenu";
 import FloatingPanel from "./ui/FloatingPanel";
+import UserAvatar from "./UserAvatar";
 import { useImport } from "../context/ImportContext";
+import { BrandWordmark } from "../context/BrandingContext";
+
+// Primary destinations for header-navigation layouts (YouTube Music, SoundCloud).
+export const HEADER_NAV_ITEMS = [
+  { to: "/", label: "Home", exact: true },
+  { to: "/explore", label: "Explore" },
+  { to: "/library/playlists", label: "Library", match: "/library" },
+  { to: "/liked", label: "Liked Songs" },
+];
+
+export function isHeaderNavItemActive(item, pathname) {
+  if (item.exact) return pathname === item.to;
+  return pathname.startsWith(item.match || item.to);
+}
 
 
-function Topbar() {
+/**
+ * Shared header. Layout shells customise it through slots instead of forking
+ * the search and account logic:
+ *   leading        – control rendered before the logo (drawer toggle).
+ *   showPrimaryNav – header navigation links (top-navigation shells).
+ *   playerSlot     – transport controls rendered in the header (Apple Music).
+ */
+function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
   const profileTriggerRef = useRef(null);
   const { job: importJob, isMinimized, openProgress } = useImport();
 
@@ -103,6 +125,7 @@ function Topbar() {
     navigate("/login");
 
   }
+
 
 
   /*
@@ -350,21 +373,45 @@ function Topbar() {
 
   return (
 
-    <header className="topbar">
+    <header className={`topbar${playerSlot ? " topbar--player" : ""}${showPrimaryNav ? " topbar--topnav" : ""}`}>
 
 
       {/* LOGO */}
 
-      <Link
-        to="/"
-        className="logo"
-      >
-        Music<span>Deck</span>
-      </Link>
+      <div className="topbar-brand-group">
+        {leading}
 
-      {isAdminShell && (
-        <span className="admin-shell-badge">Admin</span>
-      )}
+        <Link
+          to="/"
+          className="logo"
+        >
+          <BrandWordmark />
+        </Link>
+
+        {isAdminShell && (
+          <span className="admin-shell-badge">Admin</span>
+        )}
+
+        {showPrimaryNav && (
+          <nav className="topbar-primary-nav" aria-label="Header navigation">
+            {HEADER_NAV_ITEMS.map((item) => {
+              const isActive = isHeaderNavItemActive(item, location.pathname);
+              return (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  className={`topbar-primary-link${isActive ? " active" : ""}`}
+                  aria-current={isActive ? "page" : undefined}
+                >
+                  {item.label}
+                </Link>
+              );
+            })}
+          </nav>
+        )}
+      </div>
+
+      {playerSlot}
 
 
       {/* CENTER */}
@@ -637,11 +684,7 @@ function Topbar() {
                 )
               }
             >
-              <span className="avatar">
-                {(user.displayName || user.username)
-                  .slice(0, 2)
-                  .toUpperCase()}
-              </span>
+              <UserAvatar user={user} />
 
               <span>
                 {user.displayName || user.username}

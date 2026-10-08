@@ -1,5 +1,7 @@
 import { Link, NavLink, useLocation } from "react-router-dom";
 
+import { useBranding } from "../../context/BrandingContext";
+
 
 const ADMIN_NAV_ITEMS = [
   { to: "/admin", label: "Dashboard", icon: "▦", end: true },
@@ -20,6 +22,7 @@ const ADMIN_NAV_ITEMS = [
  */
 function AdminSidebar() {
   const location = useLocation();
+  const { appName } = useBranding();
 
   return (
     <aside className="sidebar admin-sidebar" aria-label="Admin navigation">
@@ -49,7 +52,7 @@ function AdminSidebar() {
           }`}
         >
           <span className="nav-icon">←</span>
-          <span>Back to MusicDeck</span>
+          <span>Back to {appName}</span>
         </Link>
       </div>
     </aside>

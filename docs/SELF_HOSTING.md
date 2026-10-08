@@ -510,11 +510,25 @@ docker compose ps
 
 View logs:
 
+Admins can read the most recent 1,000 server log lines live under
+**Admin → Server → Logs**. The viewer has level filters, search, pause,
+copy and export, and secrets are redacted. The buffer is held in memory and
+resets on restart. For full history, use the container output:
+
 ```bash
 docker compose logs musicdeck-server
 docker compose logs musicdeck-web
 docker compose logs "$MUSIC_BACKEND"
 ```
+
+Library scans:
+
+Under **Admin → Server → General** you can schedule automatic library scans
+(Disabled, Daily or Weekly at a chosen time) or run one immediately with
+**Scan library now**. Changes apply without a restart. Scheduled times use the
+MusicDeck server's time zone, which is shown next to the schedule. In Docker
+this is UTC unless you set `TZ` (for example `TZ=Europe/Amsterdam`) on the
+`musicdeck-server` service.
 
 Common startup issues:
 

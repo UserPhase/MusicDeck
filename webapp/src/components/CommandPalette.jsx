@@ -8,7 +8,6 @@ const QUICK_ACTIONS = [
   { id: "explore", label: "Go to Explore", detail: "Discover something new", shortcut: "G E", path: "/explore" },
   { id: "settings", label: "Go to Settings", detail: "Tune MusicDeck", shortcut: "G S", path: "/settings" },
   { id: "queue", label: "Open Queue", detail: "See what plays next", shortcut: "Q", sidebar: "queue" },
-  { id: "theme", label: "Toggle Dark / Light Theme", detail: "Change the workspace surface", shortcut: "T", theme: true },
 ];
 
 function matchesQuery(item, query) {
@@ -16,7 +15,7 @@ function matchesQuery(item, query) {
   return text.includes(query.toLowerCase());
 }
 
-function CommandPalette({ isOpen, onClose, onToggleTheme }) {
+function CommandPalette({ isOpen, onClose }) {
   const navigate = useNavigate();
   const { playSong, setActiveSidebar } = usePlayer();
   const inputRef = useRef(null);
@@ -104,7 +103,6 @@ function CommandPalette({ isOpen, onClose, onToggleTheme }) {
     if (item.song) playSong(item.song);
     if (item.path) navigate(item.path);
     if (item.sidebar) setActiveSidebar(item.sidebar);
-    if (item.theme) onToggleTheme?.();
     onClose();
   }
 

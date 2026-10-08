@@ -4,6 +4,7 @@ import {
   analyzeSilence,
   getUserSettings,
   updateUserSettings,
+  USER_SETTINGS_CHANGED_EVENT,
 } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
 import {
@@ -18,6 +19,20 @@ import {
   MAX_SETTINGS_BACKUP_BYTES,
 } from "../utils/settingsBackup";
 import { ACCENT_COLORS, DEFAULT_ACCENT_COLOR, normalizeAccentColor } from "../utils/accentColors";
+import {
+  getActiveTheme,
+  normalizeTheme,
+  saveThemePreference,
+  THEME_OPTIONS,
+  THEME_SETTING_KEY,
+} from "../utils/theme";
+import {
+  getActiveLayoutPreset,
+  LAYOUT_PRESET_OPTIONS,
+  LAYOUT_PRESET_SETTING_KEY,
+  normalizeLayoutPreset,
+  saveLayoutPresetPreference,
+} from "../utils/layoutPreset";
 
 function parseSettingValue(value) {
   try {
@@ -65,6 +80,12 @@ function Settings() {
     globalReplayGainEnabled,
   );
   const [layoutDensity, setLayoutDensity] = useState(globalLayoutDensity);
+  const [theme, setTheme] = useState(getActiveTheme);
+  const [themeError, setThemeError] = useState(null);
+  const themeTouchedRef = useRef(false);
+  const [layoutPreset, setLayoutPreset] = useState(getActiveLayoutPreset);
+  const [layoutPresetError, setLayoutPresetError] = useState(null);
+  const layoutPresetTouchedRef = useRef(false);
   const [accentColor, setAccentColor] = useState(globalAccentColor);
   const [autoOpenSidebar, setAutoOpenSidebar] = useState(globalAutoOpenSidebar);
   const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(globalAutoplayEnabled);
@@ -220,6 +241,12 @@ function Settings() {
           setLayoutDensity(nextLayoutDensity);
           initialLayoutPreference.current.change?.(nextLayoutDensity);
 
+          const savedTheme = normalizeTheme(getSetting(settings, THEME_SETTING_KEY, null));
+          if (savedTheme && !themeTouchedRef.current) setTheme(savedTheme);
+
+          const savedLayoutPreset = normalizeLayoutPreset(getSetting(settings, LAYOUT_PRESET_SETTING_KEY, null));
+          if (savedLayoutPreset && !layoutPresetTouchedRef.current) setLayoutPreset(savedLayoutPreset);
+
           const nextAccentColor = normalizeAccentColor(getSetting(
             settings,
             "ui.accentColor",
@@ -346,6 +373,50 @@ function Settings() {
     }
   }
 
+  useEffect(() => {
+    function handleUserSettingsChanged(event) {
+      const nextTheme = normalizeTheme(event.detail?.[THEME_SETTING_KEY]);
+      if (nextTheme) setTheme(nextTheme);
+      const nextLayoutPreset = normalizeLayoutPreset(event.detail?.[LAYOUT_PRESET_SETTING_KEY]);
+      if (nextLayoutPreset) setLayoutPreset(nextLayoutPreset);
+    }
+
+    window.addEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+    return () => window.removeEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+  }, []);
+
+  async function handleThemeChange(nextTheme) {
+    if (nextTheme === theme) return;
+    themeTouchedRef.current = true;
+    setThemeError(null);
+    try {
+      await saveThemePreference(nextTheme);
+    } catch (err) {
+      setThemeError(err.message || "Could not save theme.");
+    }
+  }
+
+  async function handleLayoutPresetChange(nextPreset) {
+    if (nextPreset === layoutPreset) return;
+    layoutPresetTouchedRef.current = true;
+    setLayoutPresetError(null);
+    try {
+      await saveLayoutPresetPreference(nextPreset);
+    } catch (err) {
+      setLayoutPresetError(err.message || "Could not save layout style.");
+    }
+  }
+
+  function handleLayoutPresetKeyDown(event) {
+    const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
+    if (!step) return;
+    event.preventDefault();
+    const currentIndex = Math.max(0, LAYOUT_PRESET_OPTIONS.findIndex((option) => option.value === layoutPreset));
+    const next = LAYOUT_PRESET_OPTIONS[(currentIndex + step + LAYOUT_PRESET_OPTIONS.length) % LAYOUT_PRESET_OPTIONS.length];
+    handleLayoutPresetChange(next.value);
+    event.currentTarget.querySelector(`[data-layout-preset-option="${next.value}"]`)?.focus();
+  }
+
   function handleLayoutDensityChange(nextDensity) {
     setLayoutDensity(nextDensity);
     changeLayoutDensity?.(nextDensity);
@@ -466,8 +537,8 @@ function Settings() {
             <div className="settings-row-copy">
               <h3>Automatic Silence Trimming</h3>
               <p>
-                Skip detected silence at the beginning and end of tracks during
-                playback.
+                Automatically analyze new library tracks during playback, then
+                skip detected silence at the beginning and end.
               </p>
             </div>
             <label
@@ -601,6 +672,87 @@ function Settings() {
             <span>02</span>
             <h2 id="interface-layout-title">Interface &amp; Layout</h2>
           </div>
+
+          <article className="settings-row settings-theme-row">
+            <div className="settings-row-copy">
+              <h3>Theme</h3>
+              <p>Switch between dark and light appearance. Applies instantly and syncs to your account.</p>
+              {themeError && <p className="settings-inline-error" role="alert">{themeError}</p>}
+            </div>
+            <div
+              className="settings-density-control"
+              role="radiogroup"
+              aria-label="Theme"
+            >
+              <span
+                className={`settings-density-indicator${theme === "light" ? " is-second" : ""}`}
+                aria-hidden="true"
+              />
+              {THEME_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={theme === option.value}
+                  className={theme === option.value ? "active" : ""}
+                  onClick={() => handleThemeChange(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </article>
+
+          <article className="settings-row settings-layout-preset-row">
+            <div className="settings-row-copy">
+              <h3>Layout Style</h3>
+              <p>
+                Choose the app structure you feel at home in. Switching is instant, keeps your music playing, and syncs to your account.
+                Below 768px every style uses the same mobile layout.
+              </p>
+              {layoutPresetError && <p className="settings-inline-error" role="alert">{layoutPresetError}</p>}
+            </div>
+            <div
+              className="layout-preset-picker"
+              role="radiogroup"
+              aria-label="Layout Style"
+              onKeyDown={handleLayoutPresetKeyDown}
+            >
+              {LAYOUT_PRESET_OPTIONS.map((option) => {
+                const isSelected = layoutPreset === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
+                    aria-label={option.label}
+                    aria-describedby={`layout-preset-${option.value}-description`}
+                    tabIndex={isSelected ? 0 : -1}
+                    data-layout-preset-option={option.value}
+                    className={`layout-preset-card${isSelected ? " active" : ""}`}
+                    onClick={() => handleLayoutPresetChange(option.value)}
+                  >
+                    <span className={`layout-preset-diagram layout-preset-diagram--${option.value}`} aria-hidden="true">
+                      <span className="lpd-header" />
+                      <span className="lpd-nav" />
+                      <span className="lpd-main"><i /><i /><i /></span>
+                      <span className="lpd-aside" />
+                      <span className="lpd-player" />
+                    </span>
+                    <span className="layout-preset-card-copy">
+                      <span className="layout-preset-card-label">{option.label}</span>
+                      <span className="layout-preset-card-subtitle">{option.subtitle}</span>
+                      <span className="layout-preset-card-description" id={`layout-preset-${option.value}-description`}>
+                        {option.description}
+                      </span>
+                    </span>
+                    <span className="layout-preset-card-check" aria-hidden="true">✓</span>
+                  </button>
+                );
+              })}
+            </div>
+          </article>
 
           <article className="settings-row settings-layout-density-row">
             <div className="settings-row-copy">

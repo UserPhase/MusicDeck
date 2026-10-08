@@ -509,15 +509,17 @@ export class CatalogService {
     return resolved.provider.getArtistBiographyForTrack(resolved.providerTrackId);
   }
 
-  async scanLibrary(): Promise<void> {
-    const connections = this.connections();
-    await Promise.allSettled(
-      connections.map((entry) => {
-        if (typeof entry.provider.scanLibrary === "function") {
-          return entry.provider.scanLibrary();
-        }
-        return Promise.resolve();
-      })
-    );
+  /**
+   * Triggers a scan on every connected provider. Provider failures are
+   * collected rather than thrown so one broken connection cannot block the
+   * rest; callers that care (the scan scheduler) inspect the summary.
+   */
+  async scanLibrary(): Promise<{ attempted: number; failures: unknown[] }> {
+    const scanners = this.connections().filter((entry) => typeof entry.provider.scanLibrary === "function");
+    const results = await Promise.allSettled(scanners.map((entry) => entry.provider.scanLibrary!()));
+    return {
+      attempted: scanners.length,
+      failures: results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
+    };
   }
 }

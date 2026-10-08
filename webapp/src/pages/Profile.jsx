@@ -3,8 +3,12 @@ import { useEffect, useState } from "react";
 import {
   changePassword,
   getCurrentUser,
+  removeCurrentUserAvatar,
   updateCurrentUser,
+  uploadCurrentUserAvatar,
 } from "../api/musicdeck";
+
+import ProfileAvatarUpload from "../components/ProfileAvatarUpload";
 
 import {
   useAuth,
@@ -16,13 +20,14 @@ function Profile() {
 
   const [user, setUser] = useState(null);
   const [displayName, setDisplayName] = useState("");
-  const [avatarRef, setAvatarRef] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [loading, setLoading] = useState(true);
   const [savingProfile, setSavingProfile] = useState(false);
   const [savingPassword, setSavingPassword] = useState(false);
+  const [removingAvatar, setRemovingAvatar] = useState(false);
   const [error, setError] = useState(null);
+  const [avatarError, setAvatarError] = useState(null);
   const [profileMessage, setProfileMessage] = useState("");
   const [passwordMessage, setPasswordMessage] = useState("");
 
@@ -40,7 +45,6 @@ function Profile() {
         if (!cancelled) {
           setUser(data);
           setDisplayName(data.displayName || data.username || "");
-          setAvatarRef(data.avatarRef || "");
         }
       } catch (err) {
         if (!cancelled) {
@@ -71,7 +75,6 @@ function Profile() {
 
       const updated = await updateCurrentUser({
         displayName: displayName.trim(),
-        avatarRef: avatarRef.trim() || null,
       });
 
       setUser(updated);
@@ -81,6 +84,31 @@ function Profile() {
       setError(err.message || "Could not update profile.");
     } finally {
       setSavingProfile(false);
+    }
+  }
+
+
+  // The session user feeds the top bar avatar, so syncing it here updates
+  // every avatar in the app without a reload.
+  function applyAvatarUpdate(updated) {
+    if (!updated) return;
+    setUser(updated);
+    updateSession(updated);
+  }
+
+  async function handleAvatarUpload(image) {
+    applyAvatarUpdate(await uploadCurrentUserAvatar(image));
+  }
+
+  async function handleAvatarRemove() {
+    try {
+      setRemovingAvatar(true);
+      setAvatarError(null);
+      applyAvatarUpdate(await removeCurrentUserAvatar());
+    } catch (err) {
+      setAvatarError(err.message || "Could not remove your avatar.");
+    } finally {
+      setRemovingAvatar(false);
     }
   }
 
@@ -116,10 +144,22 @@ function Profile() {
   return (
     <div className="account-page">
       <div className="account-header">
-        <div className="account-avatar">
-          {(user?.displayName || user?.username || "MD")
-            .slice(0, 2)
-            .toUpperCase()}
+        <div className="account-avatar-column">
+          <ProfileAvatarUpload
+            user={user}
+            onUpload={handleAvatarUpload}
+            onError={setAvatarError}
+          />
+          {user?.avatarUrl && (
+            <button
+              type="button"
+              className="account-avatar-remove"
+              disabled={removingAvatar}
+              onClick={handleAvatarRemove}
+            >
+              {removingAvatar ? "Removing…" : "Remove photo"}
+            </button>
+          )}
         </div>
         <div>
           <div className="account-label">PROFILE</div>
@@ -128,14 +168,10 @@ function Profile() {
         </div>
       </div>
 
+      {avatarError && <div className="error" role="alert">{avatarError}</div>}
       {error && <div className="error">{error}</div>}
 
       <form className="account-form" onSubmit={handleProfileSubmit}>
-        <label>
-          <span>Username</span>
-          <input type="text" value={user?.username || ""} disabled />
-        </label>
-
         <label>
           <span>Display name</span>
           <input
@@ -144,21 +180,6 @@ function Profile() {
             onChange={(event) => setDisplayName(event.target.value)}
             required
           />
-        </label>
-
-        <label>
-          <span>Avatar reference</span>
-          <input
-            type="text"
-            value={avatarRef}
-            onChange={(event) => setAvatarRef(event.target.value)}
-            placeholder="Optional"
-          />
-        </label>
-
-        <label>
-          <span>Role</span>
-          <input type="text" value={user?.role || ""} disabled />
         </label>
 
         {profileMessage && <div className="success">{profileMessage}</div>}

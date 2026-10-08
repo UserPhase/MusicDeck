@@ -6,9 +6,15 @@ export type User = {
   displayName: string;
   role: Role;
   avatarRef: string | null;
+  /** Server-hosted, versioned URL of the user's uploaded avatar, if any. */
+  avatarUrl: string | null;
   disabled: boolean;
+  /** The protected bootstrap administrator; cannot be disabled, deleted, or demoted. */
+  isMasterAdmin: boolean;
   externalSearchEnabled: boolean;
   externalPlaybackEnabled: boolean;
+  lastLoginAt: string | null;
+  lastPlaybackAt: string | null;
   createdAt: string;
   updatedAt: string;
 };

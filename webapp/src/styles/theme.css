@@ -1,0 +1,98 @@
+/*
+ * Theme layer. Most colors adapt through tokens.css; this file holds the
+ * remaining light-theme exceptions (one-off tints tuned for dark surfaces)
+ * and the cross-fade used while switching themes.
+ */
+
+:root:not([data-theme="light"]) .nav-icon-playlist-placeholder { color: currentColor; }
+:root:not([data-theme="light"]) .add-playlist { color: var(--nav-item-text); }
+:root:not([data-theme="light"]) .add-playlist:hover { color: var(--nav-hover-text); }
+:root:not([data-theme="light"]) .add-playlist-icon { color: var(--nav-item-text); }
+:root:not([data-theme="light"]) .add-playlist-icon:hover { color: var(--nav-hover-text); }
+:root:not([data-theme="light"]) .nav-loading { color: var(--nav-section-text); }
+
+/* Softer physical depth on light surfaces. */
+:root[data-theme="light"] {
+  --tactile-inset: inset 0 2px 5px rgb(15 23 42 / 14%);
+  --tactile-float: 0 10px 22px rgb(15 23 42 / 14%), 0 2px 6px rgb(15 23 42 / 8%);
+  --tactile-rest: 0 4px 12px rgb(15 23 42 / 10%);
+}
+
+/* Pale purples/reds that only read on dark backgrounds. */
+:root[data-theme="light"] :is(.in-library-badge, .audio-badge-preview, .now-preview-import) { color: #6b21a8; }
+:root[data-theme="light"] .now-preview-import { background: rgb(168 85 247 / 10%); }
+:root[data-theme="light"] .now-preview-import:hover:not(:disabled) { background: rgb(168 85 247 / 18%); }
+:root[data-theme="light"] .server-delete-error { color: #b91c1c !important; }
+:root[data-theme="light"] :is(.playlist-menu-item.server-delete-menu-item, .admin-badge.is-disabled) { color: #b91c1c; }
+:root[data-theme="light"] .playlist-menu-item.server-delete-menu-item:hover { color: #991b1b; }
+:root[data-theme="light"] :is(.playlist-modal-intro, .playlist-modal-option > span:nth-last-child(2), .playlist-modal-option-arrow) { color: var(--text-secondary); }
+:root[data-theme="light"] :is(.playlist-modal-form input, .playlist-modal-form textarea)::placeholder { color: var(--text-muted); }
+:root[data-theme="light"] .album-admin-menu-toggle { background: rgb(255 255 255 / 90%); }
+:root[data-theme="light"] .admin-content::-webkit-scrollbar-thumb { background: #cbd5e1; }
+:root[data-theme="light"] .admin-content::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+:root[data-theme="light"] .admin-warning { border-color: #e7c66b; background: #fdf6e3; color: #7a5a00; }
+
+/* Right panel: the docked "Next in queue" sheet only needs a hairline lift on light. */
+:root[data-theme="light"] .now-playing-next-queue { box-shadow: 0 -8px 20px rgb(15 23 42 / 6%); }
+:root[data-theme="light"] .right-sidebar-lyrics,
+:root[data-theme="light"] .right-sidebar-lyric-line { color: var(--text-soft); }
+:root[data-theme="light"] .right-sidebar-lyric-line:is(.is-active, :hover) { color: var(--accent-text); }
+:root[data-theme="light"] .now-playing-sidebar :is(.right-sidebar-metadata-state, .right-sidebar-section-heading h3),
+:root[data-theme="light"] .now-playing-next-header h3,
+:root[data-theme="light"] .now-playing-next-track :is(.queue-sidebar-track-artist, .queue-sidebar-track-duration),
+:root[data-theme="light"] .now-playing-next-queue .queue-sidebar-empty,
+:root[data-theme="light"] .queue-sidebar :is(.queue-sidebar-track-artist, .queue-sidebar-track-duration) { color: var(--text-secondary); }
+
+:root[data-theme="light"] .explore-album:is(:hover, :focus-within) { background: rgb(241 245 249 / 80%); }
+
+/* Explore artists: no dark halo around portraits on the light canvas. */
+:root[data-theme="light"] .explore-artist-image { box-shadow: none; }
+:root[data-theme="light"] :is(.explore-artist:hover, .explore-artist:focus-visible) .explore-artist-image { box-shadow: 0 .75rem 1.5rem rgb(15 23 42 / 14%); }
+
+/*
+ * Explore featured cards: soft frosted slate panel tinted by the artwork color
+ * (--feature-rgb), instead of the near-black dark-mode gradient. The wash stays
+ * opaque under the copy column so dark text never sits on raw artwork.
+ */
+:root[data-theme="light"] .explore-featured-card {
+  border-color: rgb(226 232 240 / 80%);
+  background: linear-gradient(110deg, rgb(241 245 249 / 94%) 0%, rgb(var(--feature-rgb) / 22%) 100%);
+  box-shadow: 0 6px 16px rgb(15 23 42 / 8%), 0 1px 3px rgb(15 23 42 / 6%);
+}
+:root[data-theme="light"] .explore-featured-card::after {
+  background: linear-gradient(90deg, rgb(241 245 249 / 96%) 0%, rgb(241 245 249 / 92%) 50%, rgb(241 245 249 / 62%) 75%, transparent);
+}
+:root[data-theme="light"] .explore-featured-image { box-shadow: -1rem 0 3rem rgb(15 23 42 / 12%); }
+:root[data-theme="light"] .explore-featured-kicker { color: var(--accent-text); }
+:root[data-theme="light"] .explore-featured-copy h3 { color: var(--text); }
+:root[data-theme="light"] .explore-featured-copy p { color: var(--text-soft); }
+:root[data-theme="light"] .explore-featured-actions button:not(:first-child) {
+  border-color: rgb(15 23 42 / 16%);
+  background: rgb(255 255 255 / 72%);
+  color: var(--text);
+}
+:root[data-theme="light"] .explore-featured-actions button:not(:first-child):hover:not(:disabled) { background: #ffffff; }
+
+/*
+ * Cross-fade colors only while the theme is changing (App.js toggles the
+ * class for ~350ms). Scoping it this way keeps hover/press transitions and
+ * the tactile spring physics untouched the rest of the time.
+ */
+html.theme-transitioning,
+html.theme-transitioning *,
+html.theme-transitioning *::before,
+html.theme-transitioning *::after {
+  transition-property: background-color, border-color, color, fill, stroke, box-shadow, outline-color !important;
+  transition-duration: 0.3s !important;
+  transition-timing-function: ease !important;
+  transition-delay: 0s !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.theme-transitioning,
+  html.theme-transitioning *,
+  html.theme-transitioning *::before,
+  html.theme-transitioning *::after {
+    transition: none !important;
+  }
+}

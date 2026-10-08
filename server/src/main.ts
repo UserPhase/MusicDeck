@@ -31,9 +31,17 @@ import {
   createMusicBrainzPlugin,
   createSpotDLDownloaderPlugin,
 } from "./plugins/first-party.js";
+import { installLogCapture, registerLogSecret } from "./utils/logger.js";
+
+// Capture console output and process-level failures for the Admin log viewer
+// before anything else can log.
+installLogCapture();
 
 async function start() {
   const config = loadConfig();
+  for (const secret of [config.sessionSecret, config.navidrome.password, config.jellyfin.apiKey, config.firstAdmin.password]) {
+    registerLogSecret(secret);
+  }
   validateConfig(config);
   const db = await openDatabase(config);
   const registry = createProviderRegistry(db, config);
@@ -53,6 +61,8 @@ async function start() {
   const sourcePipeline = new SourcePipelineRegistry(db);
   const sourceProviders = new SourceProviderRegistry(db, library, registry, sourceResolver, undefined, sourcePipeline);
   const spotifyConfig = searchProviders.rawConfig("spotify");
+  const spotifySecret = (spotifyConfig?.config as Record<string, unknown> | undefined)?.clientSecret;
+  if (typeof spotifySecret === "string") registerLogSecret(spotifySecret);
   externalCatalog.configure(Boolean(spotifyConfig?.enabled), spotifyConfig?.config);
   const recommendations = new RecommendationRegistry(new RecommendationService(db, catalog));
   const libraryInsights = new LibraryInsightsService(db, catalog);

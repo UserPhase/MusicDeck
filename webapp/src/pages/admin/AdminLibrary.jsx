@@ -16,7 +16,7 @@ function AdminLibrary() {
     return <div className="loading">Loading library overview...</div>;
   }
 
-  const statistics = data.statistics;
+  const collection = data.statistics?.collection;
 
   return (
     <div className="admin-page">
@@ -39,19 +39,21 @@ function AdminLibrary() {
         <div className="admin-grid">
           <div className="admin-card">
             <span>Tracks</span>
-            <strong>{statistics?.totalTracks ?? statistics?.tracks ?? "—"}</strong>
+            <strong>{collection?.tracks ?? "—"}</strong>
           </div>
           <div className="admin-card">
             <span>Albums</span>
-            <strong>{statistics?.totalAlbums ?? statistics?.albums ?? "—"}</strong>
+            <strong>{collection?.albums ?? "—"}</strong>
           </div>
           <div className="admin-card">
             <span>Artists</span>
-            <strong>{statistics?.totalArtists ?? statistics?.artists ?? "—"}</strong>
+            <strong>{collection?.artists ?? "—"}</strong>
           </div>
           <div className="admin-card">
-            <span>Genres</span>
-            <strong>{statistics?.totalGenres ?? statistics?.genres ?? "—"}</strong>
+            <span>Total duration</span>
+            <strong>{collection?.totalDurationSeconds != null
+              ? `${Math.round(collection.totalDurationSeconds / 3600)} h`
+              : "—"}</strong>
           </div>
         </div>
       </section>

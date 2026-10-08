@@ -5,6 +5,26 @@ import {
   updateServerSettings,
 } from "../../api/musicdeck";
 
+async function loadAdminData(loaders) {
+  const entries = Object.entries(loaders);
+  const results = await Promise.allSettled(
+    entries.map(([, loader]) => Promise.resolve().then(loader))
+  );
+  const data = {};
+  const errors = [];
+  results.forEach((result, index) => {
+    const [key] = entries[index];
+    if (result.status === "fulfilled") {
+      data[key] = result.value;
+    } else {
+      console.error(`Could not load admin ${key}:`, result.reason);
+      errors.push(`${key}: ${result.reason instanceof Error
+        ? result.reason.message : "Could not load admin data."}`);
+      data[key] = null;
+    }
+  });
+  return { data, error: errors.length ? errors.join(" ") : null };
+}
 
 /*
  * Shared loader for admin sub-pages: fetches a set of API functions in
@@ -24,16 +44,9 @@ export function useAdminData(loaders, deps = []) {
     setError(null);
 
     try {
-      const entries = await Promise.all(
-        Object.entries(loaders).map(async ([key, fn]) => [
-          key,
-          await Promise.resolve()
-            .then(fn)
-            .catch(() => null),
-        ])
-      );
-
-      setData(Object.fromEntries(entries));
+      const result = await loadAdminData(loaders);
+      setData(result.data);
+      setError(result.error);
     } catch (err) {
       setError(err.message || "Could not load admin data.");
     } finally {
@@ -50,17 +63,11 @@ export function useAdminData(loaders, deps = []) {
       setError(null);
 
       try {
-        const entries = await Promise.all(
-          Object.entries(loaders).map(async ([key, fn]) => [
-            key,
-            await Promise.resolve()
-              .then(fn)
-              .catch(() => null),
-          ])
-        );
+        const result = await loadAdminData(loaders);
 
         if (!cancelled) {
-          setData(Object.fromEntries(entries));
+          setData(result.data);
+          setError(result.error);
         }
       } catch (err) {
         if (!cancelled) {

@@ -1,4 +1,4 @@
-.player { position: fixed; left: 0; right: 0; bottom: 0; height: var(--player-height); padding: 0 24px; background: #09090b; border-top: 1px solid rgb(255 255 255 / 10%); display: grid; grid-template-columns: minmax(220px, 1fr) minmax(400px, 1.5fr) minmax(220px, 1fr); align-items: center; gap: 20px; z-index: 20; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
+.player { position: fixed; left: 0; right: 0; bottom: 0; height: var(--player-height); padding: 0 24px; background: var(--player-bg); border-top: 1px solid rgb(var(--tint-rgb) / 10%); display: grid; grid-template-columns: minmax(220px, 1fr) minmax(400px, 1.5fr) minmax(220px, 1fr); align-items: center; gap: 20px; z-index: 20; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
 .player-toast { position: absolute; left: 50%; bottom: calc(100% + 10px); max-width: min(380px, calc(100vw - 32px)); padding: 9px 13px; border: 1px solid var(--border-hover); border-radius: 8px; background: color-mix(in srgb, var(--card) 94%, transparent); color: var(--text-secondary); box-shadow: 0 10px 28px rgb(0 0 0 / 34%); font-size: 12px; transform: translateX(-50%); }
 .player-right { display: flex; align-items: center; justify-content: flex-end; gap: 18px; min-width: 0; }
 .now-playing { display: flex; align-items: center; min-width: 0; }
@@ -14,7 +14,7 @@
 .audio-badge-standard { border-color: transparent; background: var(--nav-active); color: var(--text-muted); }
 .now-audio-badge { margin-left: 8px; vertical-align: middle; }
 .now-preview-import { margin-left: 8px; padding: 3px 7px; border: 1px solid rgb(168 85 247 / 55%); border-radius: 999px; background: rgb(88 28 135 / 32%); color: #e9d5ff; font-size: 10px; font-weight: 700; line-height: 1.2; white-space: nowrap; cursor: pointer; transition: background 150ms ease, border-color 150ms ease, color 150ms ease; }
-.now-preview-import:hover:not(:disabled) { border-color: #c084fc; background: rgb(126 34 206 / 44%); color: #fff; }
+.now-preview-import:hover:not(:disabled) { border-color: #c084fc; background: rgb(126 34 206 / 44%); color: var(--text); }
 .now-preview-import:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
 .now-preview-import:disabled { cursor: default; opacity: .7; }
 .now-badge { margin-left: 8px; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; vertical-align: middle; }
@@ -28,10 +28,10 @@
 .control:hover { color: var(--text); }
 .shuffle-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
 .shuffle-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.shuffle-control.active { color: var(--accent); }
+.shuffle-control.active { color: var(--accent-text); }
 .loop-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
 .loop-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.loop-control.active { color: var(--accent); }
+.loop-control.active { color: var(--accent-text); }
 .control:disabled { cursor: not-allowed; opacity: 0.45; }
 .control:disabled:hover { color: var(--text-subtle); }
 .play-button { width: 34px; height: 34px; display: grid; place-items: center; border: none; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 14px; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease; }
@@ -57,14 +57,14 @@
 .player-queue-context-info { min-width: 0; }
 .player-queue-context-label { color: var(--text-secondary); font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; }
 .player-queue-context-name { display: block; margin-top: 2px; color: var(--text); font-size: 13px; font-weight: 650; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.player-queue-context-name:hover { color: var(--accent); }
+.player-queue-context-name:hover { color: var(--accent-text); }
 .player-queue-tabs button { flex: 1; padding: 12px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); font-size: 12px; cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease; }
 .player-queue-tabs button:hover { color: var(--text); }
 .player-queue-tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
 .player-queue-list { padding: 6px; overflow-y: auto; min-height: 0; }
 .player-queue-song { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: none; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; transition: background 0.15s ease; }
 .player-queue-song:hover { background: var(--card-hover); }
-.player-queue-song.playing { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); font-weight: 650; }
+.player-queue-song.playing { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent-text); font-weight: 650; }
 .player-queue-song.playing:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 .player-queue-song.playing .player-queue-number { color: inherit; }
 .player-queue-number { width: 22px; flex-shrink: 0; color: var(--text-muted); font-size: 12px; text-align: center; }

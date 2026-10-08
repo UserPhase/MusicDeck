@@ -33,6 +33,17 @@ Artist stories prefer media-server biographies and fall back to attributed
 Wikipedia summaries through MusicDeck. These fallbacks enrich the display
 without changing library identities, audio, or embedded metadata.
 
+Home's Recently Added Songs and Discover Tracks are full-width, vertically
+stacked sections. Album shelf cards stay transparent at rest, with a neutral
+hover or keyboard-focus fill. Light-mode Now Playing lyrics use dark slate
+text and a purple active-line highlight; queue details use high-contrast
+secondary text.
+
+Profile's Remove photo button and the Queue / Recently Played segmented
+control use explicit theme-adaptive button fills and contrasting text,
+including hover and selected states, rather than browser-default button
+backgrounds. Both retain keyboard focus rings and subtle press feedback.
+
 ---
 
 ## 2. Product Goals
@@ -305,6 +316,24 @@ Native customization may include:
 - custom CSS
 
 Advanced customization should be optional.
+Each listener can pick a Layout Style in Settings → Interface & Layout:
+
+- **Spotify / Tidal** (the default): library sidebar, docked Now Playing
+  panel and a bottom player bar.
+- **Apple Music:** library sidebar with playback controls and search in the
+  header, plus full-height lyrics and queue panels.
+- **YouTube Music:** header navigation with a menu drawer, edge-to-edge
+  content and a floating player that expands.
+- **SoundCloud:** header navigation, a feed with a widget column (now
+  playing, next up, recently played, playlists) and a full-width player bar.
+
+Switching styles applies instantly and never interrupts playback. On screens
+narrower than 768px, every style uses the same mobile layout: a menu drawer,
+a mini player and bottom tabs.
+
+Admins can rename the application under Admin → Appearance → Branding. The
+new name appears in the header logo, the admin chrome and the browser tab
+title.
 Dropdowns and context menus use a shared dark glass surface (88% opacity,
 16px backdrop blur, a subtle light border, and a deep shadow). Floating menus
 render above page chrome, outside scrollable panels, with visible keyboard

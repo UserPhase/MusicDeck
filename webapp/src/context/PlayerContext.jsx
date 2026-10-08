@@ -17,6 +17,8 @@ import {
   getRandomSongs,
   getUserSettings,
   getSilenceAnalysis,
+  analyzeSilence,
+  USER_SETTINGS_CHANGED_EVENT,
 } from "../api/musicdeck";
 
 import {
@@ -449,6 +451,7 @@ export function PlayerProvider({
   ] = useState({ enabled: false, thresholdDb: -35, minSilenceSeconds: 0.5 });
 
   const trimBoundsRef = useRef(null);
+  const silenceAnalysisRequestsRef = useRef(new Map());
 
   /*
    * PLAYBACK CONTEXT
@@ -867,6 +870,31 @@ export function PlayerProvider({
       cancelled = true;
     };
   }, [isAuthenticated]);
+
+  useEffect(() => {
+    function handleUserSettingsChanged(event) {
+      const settings = event.detail || {};
+      const nextStreamQuality = settings["playback.streamQuality"];
+      const nextDownloadQuality = settings["playback.downloadQuality"];
+
+      try {
+        if (["128", "320", "original"].includes(nextStreamQuality)) {
+          streamQualityRef.current = nextStreamQuality;
+          setStreamQuality(nextStreamQuality);
+          localStorage.setItem("playerStreamQuality", nextStreamQuality);
+        }
+        if (["lossless", "320kbps", "256kbps", "192kbps", "128kbps"].includes(nextDownloadQuality)) {
+          setDownloadQuality(nextDownloadQuality);
+          localStorage.setItem("playerDownloadQuality", nextDownloadQuality);
+        }
+      } catch (error) {
+        console.error("Could not save updated playback preferences:", error);
+      }
+    }
+
+    window.addEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+    return () => window.removeEventListener(USER_SETTINGS_CHANGED_EVENT, handleUserSettingsChanged);
+  }, []);
 
 
   function requestFadeFrame(callback) {
@@ -1409,6 +1437,36 @@ export function PlayerProvider({
 
   }
 
+  function getOrAnalyzeSilence(song) {
+    const trackId = String(song.id);
+    const pendingAnalysis = silenceAnalysisRequestsRef.current.get(trackId);
+    if (pendingAnalysis) {
+      return pendingAnalysis;
+    }
+
+    const analysisRequest = (async () => {
+      const savedAnalysis = await getSilenceAnalysis(trackId);
+      if (savedAnalysis) {
+        return savedAnalysis;
+      }
+
+      return analyzeSilence(trackId, {
+        thresholdDb: silenceTrimSettings.thresholdDb,
+        minSilenceSeconds: silenceTrimSettings.minSilenceSeconds,
+      });
+    })();
+
+    silenceAnalysisRequestsRef.current.set(trackId, analysisRequest);
+    analysisRequest.finally(() => {
+      if (silenceAnalysisRequestsRef.current.get(trackId) === analysisRequest) {
+        silenceAnalysisRequestsRef.current.delete(trackId);
+      }
+    }).catch(() => {
+      // The playback caller logs and handles background analysis failures.
+    });
+    return analysisRequest;
+  }
+
 
   /*
    * PLAY SONG
@@ -1503,8 +1561,8 @@ export function PlayerProvider({
     // track until (and unless) an analysis is available.
     trimBoundsRef.current = null;
 
-    if (silenceTrimSettings.enabled && !preview) {
-      getSilenceAnalysis(song.id)
+    if (silenceTrimSettings.enabled && !preview && isLibraryPlayable(song)) {
+      getOrAnalyzeSilence(song)
         .then((analysis) => {
           if (
             requestId !== playbackRequestRef.current ||
@@ -1529,8 +1587,8 @@ export function PlayerProvider({
             audioRef.current.currentTime = trimBoundsRef.current.leading;
           }
         })
-        .catch(() => {
-          // Analysis unavailable — play the full track.
+        .catch((error) => {
+          console.warn("Could not analyze silence for track:", song.id, error);
         });
     }
 
@@ -2198,9 +2256,10 @@ export function PlayerProvider({
 
       if (
         silenceTrimSettings.enabled &&
-        !incomingPreview
+        !incomingPreview &&
+        isLibraryPlayable(nextTrack)
       ) {
-        getSilenceAnalysis(nextTrack.id)
+        getOrAnalyzeSilence(nextTrack)
           .then((analysis) => {
             if (
               audioRef.current !== incomingAudio ||
@@ -2214,9 +2273,16 @@ export function PlayerProvider({
               leading: analysis.leadingSilenceSeconds || 0,
               trailing: analysis.trailingSilenceSeconds || 0,
             };
+
+            if (
+              trimBoundsRef.current.leading > 0 &&
+              incomingAudio.currentTime < trimBoundsRef.current.leading
+            ) {
+              incomingAudio.currentTime = trimBoundsRef.current.leading;
+            }
           })
-          .catch(() => {
-            // Analysis unavailable — play the full incoming track.
+          .catch((error) => {
+            console.warn("Could not analyze silence for track:", nextTrack.id, error);
           });
       }
 

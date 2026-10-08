@@ -25,7 +25,11 @@ import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerMusicRoutes } from "./routes/music-routes.js";
 import { registerPlaylistRoutes } from "./routes/playlist-routes.js";
 import { registerSettingsRoutes } from "./routes/settings-routes.js";
+import { registerConfigRoutes } from "./routes/config-routes.js";
+import { registerAdminLogsRoutes } from "./routes/admin-logs-routes.js";
+import { createLogCaptureStream, type LogBuffer, serverLogs } from "./utils/logger.js";
 import { registerUserRoutes } from "./routes/user-routes.js";
+import { ScannerScheduler } from "./services/scannerScheduler.js";
 
 export async function buildServer(options: {
   config: AppConfig;
@@ -45,17 +49,22 @@ export async function buildServer(options: {
   acquisition?: AcquisitionService;
   silenceAnalysis?: SilenceAnalysisService;
   logger?: boolean;
+  logBuffer?: LogBuffer;
+  scanScheduler?: ScannerScheduler;
 }) {
+  const logBuffer = options.logBuffer ?? serverLogs;
   const app = Fastify({
     logger: options.logger === false ? false : {
       level: process.env.LOG_LEVEL || "info",
       redact: [
         "req.headers.cookie",
+        "req.headers.authorization",
         "request.headers.cookie",
         "password",
         "*.password",
         "sessionSecret",
       ],
+      stream: createLogCaptureStream(logBuffer),
     },
   });
 
@@ -112,7 +121,18 @@ export async function buildServer(options: {
   await registerAdminMediaRoutes(app, options.db, options.config.musicRoot, options.backend, options.catalog);
   await registerAuthRoutes(app, options.db, options.config);
   await registerUserRoutes(app, options.db);
-  await registerSettingsRoutes(app, options.db);
+  const scanScheduler = options.scanScheduler ?? new ScannerScheduler(
+    options.db,
+    () => options.catalog.scanLibrary(),
+    { logger: app.log },
+  );
+  scanScheduler.start();
+  app.addHook("onClose", async () => {
+    scanScheduler.stop();
+  });
+  await registerSettingsRoutes(app, options.db, scanScheduler);
+  await registerConfigRoutes(app, options.db);
+  await registerAdminLogsRoutes(app, options.db, logBuffer);
   await registerMusicRoutes(app, options.db, options.backend, options.catalog, options.library, options.sourceResolver, options.playlists, options.searchProviders, options.sourceProviders, options.externalCatalog, options.recommendations, options.libraryInsights, options.acquisition, options.silenceAnalysis);
   await registerPlaylistRoutes(app, options.db, options.playlists, options.spotifyPlaylistImport);
 

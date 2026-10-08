@@ -7,7 +7,7 @@ import { createSession, clearSessionCookie, deleteSession, getSessionUser, setSe
 import { requireUser } from "../auth/authorization.js";
 import { hashPassword, verifyPassword } from "../auth/passwords.js";
 import { sendError } from "../utils/http.js";
-import { getUserByUsername, toPublicUser } from "../users/users.js";
+import { getUserByUsername, recordLogin, toPublicUser } from "../users/users.js";
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -40,9 +40,10 @@ export async function registerAuthRoutes(app: FastifyInstance, db: Db, config: A
     }
 
     const session = createSession(db, row.id);
+    const lastLoginAt = recordLogin(db, row.id);
       setSessionCookie(reply, session.id, session.expiresAt, config.secureCookies);
 
-    return { user: toPublicUser(row) };
+    return { user: toPublicUser({ ...row, last_login_at: lastLoginAt }) };
   });
 
   app.post("/api/auth/logout", async (request, reply) => {

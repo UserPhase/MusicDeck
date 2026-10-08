@@ -1,19 +1,16 @@
-import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
 import {
   usePlayer,
 } from "../context/PlayerContext";
 
-import {
-  createAcquisition,
-} from "../api/musicdeck";
 import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
+import { usePreviewImport } from "../hooks/usePreviewImport";
 
 import AudioBadge from "./AudioBadge";
 
 
-function formatTime(seconds) {
+export function formatTime(seconds) {
 
   if (
     seconds === undefined ||
@@ -42,12 +39,17 @@ function formatTime(seconds) {
 }
 
 
+/**
+ * Docked player bar. `variant="drawer"` restyles it as the floating,
+ * expandable bar used by the YouTube Music layout; `actions` renders extra
+ * buttons (such as the drawer expand toggle) beside the queue button.
+ */
 function Player({
   isQueueSidebarOpen = false,
   onToggleQueueSidebar,
+  variant = "bar",
+  actions = null,
 }) {
-
-  const [importState, setImportState] = useState("idle");
 
   const {
     currentSong,
@@ -80,10 +82,7 @@ function Player({
 
   } = usePlayer();
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
-
-  useEffect(() => {
-    setImportState("idle");
-  }, [currentSong?.id]);
+  const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(currentSong);
 
 
   /*
@@ -98,34 +97,10 @@ function Player({
         )
       : 0;
 
-  async function importPreviewTrack() {
-    if (!currentSong || importState === "loading") return;
-    setImportState("loading");
-    try {
-      await createAcquisition({
-        result: {
-          id: currentSong.id,
-          type: "track",
-          title: currentSong.title || "",
-          artist: currentSong.artist || "",
-          album: currentSong.album || "",
-          provider: currentSong.provider || "external",
-          source: currentSong.source || { kind: "external", count: 0 },
-          metadata: currentSong.metadata || {},
-        },
-        trackId: currentSong.id,
-        sourceProvider: "spotdl",
-      });
-      setImportState("queued");
-    } catch {
-      setImportState("error");
-    }
-  }
-
 
   return (
 
-    <footer className="player">
+    <footer className={`player player--${variant}`}>
 
       {playbackMessage && (
         <div className="player-toast" role="status" aria-live="polite">
@@ -202,9 +177,9 @@ function Player({
                 type="button"
                 className="now-preview-import"
                 onClick={importPreviewTrack}
-                disabled={importState === "loading" || importState === "queued"}
+                disabled={isImportDisabled}
               >
-                {importState === "loading" ? "Adding…" : importState === "queued" ? "Import queued" : importState === "error" ? "Retry import" : "Import full song"}
+                {importLabel}
               </button>
             )}
 
@@ -482,7 +457,9 @@ function Player({
               !currentSong
             }
 
-            className="progress"
+            className="progress tactile-slider"
+
+            style={{ "--range-progress": `${Math.min(100, Math.max(0, Number(progress) || 0))}%` }}
 
             aria-label="Song progress"
           />
@@ -523,6 +500,7 @@ function Player({
             Queue
           </button>
 
+          {actions}
 
         </div>
 
@@ -541,7 +519,9 @@ function Player({
 
 
           <input
-            className="player-volume"
+            className="player-volume tactile-slider"
+
+            style={{ "--range-progress": `${Math.min(100, Math.max(0, (Number(volume) || 0) * 100))}%` }}
 
             type="range"
 

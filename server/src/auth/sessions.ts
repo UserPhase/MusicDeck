@@ -1,24 +1,14 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Db } from "../db/database.js";
 import type { SessionUser } from "../types.js";
+import { toPublicUser } from "../users/users.js";
 import { createId } from "../utils/ids.js";
 
 export const SESSION_COOKIE = "musicdeck_session";
 const SESSION_DAYS = 30;
 
 function toUser(row: any): SessionUser {
-  return {
-    id: row.id,
-    username: row.username,
-    displayName: row.display_name,
-    role: row.role,
-    avatarRef: row.avatar_ref || null,
-    disabled: Boolean(row.disabled),
-    externalSearchEnabled: row.external_search_enabled === undefined ? true : Boolean(row.external_search_enabled),
-    externalPlaybackEnabled: Boolean(row.external_playback_enabled),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
+  return toPublicUser(row);
 }
 
 export function createSession(db: Db, userId: string) {

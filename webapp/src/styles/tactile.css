@@ -1,0 +1,256 @@
+/*
+ * TACTILE INTERACTION LAYER
+ *
+ * Shared press physics for MusicDeck's primary controls. Controls keep their
+ * own colour/size styles; this layer only adds motion and depth using
+ * compositor-friendly properties (transform, box-shadow, opacity), so presses
+ * never trigger layout.
+ *
+ * Model: a press compresses quickly (short ease-out), and the release springs
+ * back with a slight overshoot. That asymmetry is what makes a control feel
+ * physical rather than animated.
+ *
+ * Reusable classes for new components:
+ *   .tactile-btn-primary  filled accent buttons (play, primary hero action)
+ *   .tactile-btn-icon     bare icon toggles (like, shuffle, repeat)
+ *   .tactile-pill         outlined secondary pills (save, import)
+ *   .tactile-slider       range inputs with a grab-able thumb; set
+ *                         --range-progress (0%–100%) for the filled track
+ *
+ * Existing control classes are mapped to the same tokens below so every
+ * surface shares one feel. This file is imported last on purpose: several
+ * rules tie on specificity with card hover rules and must win the cascade.
+ */
+
+:root {
+  --tactile-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --tactile-press: cubic-bezier(0.2, 0, 0, 1);
+  --tactile-release-ms: 240ms;
+  --tactile-press-ms: 70ms;
+  --tactile-glow: 0 8px 22px color-mix(in srgb, var(--accent) 32%, transparent);
+  --tactile-inset: inset 0 2px 6px rgb(0 0 0 / 35%);
+  --tactile-float: 0 10px 24px rgb(0 0 0 / 45%), 0 2px 6px rgb(0 0 0 / 30%);
+  --tactile-rest: 0 4px 12px rgb(0 0 0 / 30%);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Shared release timing                                                  */
+/* ---------------------------------------------------------------------- */
+
+.tactile-btn-primary,
+.account-avatar-remove, .queue-sidebar-segmented button,
+.play-button,
+.album-play, .playlist-play, .artist-play, .liked-play,
+.explore-featured-actions button,
+.tactile-btn-icon,
+.heart, .control, .track-like, .detail-secondary-action, .liked-action,
+.tactile-pill,
+.now-preview-import,
+.play-overlay, .explore-album-play, .track-play {
+  -webkit-tap-highlight-color: transparent;
+  transition-property: transform, box-shadow, opacity, background, background-color, border-color, color;
+  transition-duration: var(--tactile-release-ms), 180ms, 180ms, 150ms, 150ms, 150ms, 150ms;
+  transition-timing-function: var(--tactile-spring), ease-out, ease, ease, ease, ease, ease;
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Primary buttons: lift a glow on hover, sink with an inner shadow       */
+/* ---------------------------------------------------------------------- */
+
+.tactile-btn-primary:hover:not(:disabled),
+.play-button:hover:not(:disabled),
+:is(.album-play, .playlist-play, .artist-play, .liked-play):hover:not(:disabled),
+.explore-featured-actions button:first-child:hover:not(:disabled) {
+  box-shadow: var(--tactile-glow);
+}
+
+.tactile-btn-primary:active:not(:disabled),
+.play-button:active:not(:disabled),
+:is(.album-play, .playlist-play, .artist-play, .liked-play):active:not(:disabled),
+.explore-featured-actions button:first-child:active:not(:disabled) {
+  transform: scale(0.95);
+  box-shadow: var(--tactile-inset);
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Icon toggles: grow slightly on hover, compress noticeably on press     */
+/* ---------------------------------------------------------------------- */
+
+:is(.account-avatar-remove, .queue-sidebar-segmented button):active:not(:disabled) {
+  transform: scale(0.95);
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+.tactile-btn-icon:hover:not(:disabled),
+.heart:hover:not(:disabled),
+.control:hover:not(:disabled) {
+  transform: scale(1.1);
+}
+
+.tactile-btn-icon:active:not(:disabled),
+.heart:active:not(:disabled),
+.control:active:not(:disabled),
+.track-like:active:not(:disabled) {
+  transform: scale(0.8);
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+/* Larger circular actions get a gentler press so they do not look comical. */
+:is(.detail-secondary-action, .liked-action):active:not(:disabled) {
+  transform: scale(0.9);
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Pills: outlined secondary actions that tint accent while pressed       */
+/* ---------------------------------------------------------------------- */
+
+.tactile-pill {
+  border: 1px solid rgb(var(--tint-rgb) / 10%);
+}
+
+.tactile-pill:active:not(:disabled),
+.now-preview-import:active:not(:disabled),
+.explore-featured-actions button:not(:first-child):active:not(:disabled) {
+  transform: scale(0.95);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--press-base));
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Floating card play buttons: rest shadow, float on hover, sink on press */
+/* Doubled class selectors deliberately match the card-hover rules'       */
+/* specificity so the hover/press transforms are not overridden.          */
+/* ---------------------------------------------------------------------- */
+
+.play-overlay, .explore-album-play {
+  box-shadow: var(--tactile-rest);
+}
+
+.play-overlay.play-overlay:hover,
+.explore-album .explore-album-play:hover {
+  transform: translateY(-2px) scale(1.06);
+  box-shadow: var(--tactile-float);
+}
+
+.play-overlay.play-overlay:active,
+.explore-album .explore-album-play:active,
+.track-play.track-play:active:not(:disabled) {
+  transform: translateY(0) scale(0.92);
+  box-shadow: var(--tactile-inset), 0 2px 6px rgb(0 0 0 / 30%);
+  transition-duration: var(--tactile-press-ms);
+  transition-timing-function: var(--tactile-press);
+}
+
+.track-play.track-play:hover:not(:disabled) {
+  transform: scale(1.08);
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Focus: keyboard users get a distinct ring that coexists with presses.  */
+/* The card play overlay must also become visible when focused directly.  */
+/* ---------------------------------------------------------------------- */
+
+:is(.tactile-btn-primary, .tactile-btn-icon, .tactile-pill,
+  .album-play, .playlist-play, .artist-play, .liked-play,
+  .detail-secondary-action, .liked-action,
+  .explore-featured-actions button, .explore-album-play):focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
+
+.play-overlay:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Sliders: custom-drawn track so the thumb can carry hover/grab physics  */
+/* ---------------------------------------------------------------------- */
+
+.tactile-slider {
+  --range-progress: 0%;
+  height: 4px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--accent) 0 var(--range-progress), var(--border-hover) var(--range-progress) 100%);
+  cursor: pointer;
+}
+
+.tactile-slider::-moz-range-track { height: 4px; border-radius: 999px; background: var(--border-hover); }
+.tactile-slider::-moz-range-progress { height: 4px; border-radius: 999px; background: var(--accent); }
+
+.tactile-slider::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 45%);
+  cursor: grab;
+  transition: transform 150ms var(--tactile-spring), box-shadow 150ms ease-out;
+}
+
+.tactile-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 45%);
+  cursor: grab;
+  transition: transform 150ms var(--tactile-spring), box-shadow 150ms ease-out;
+}
+
+.tactile-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 2px 8px rgb(0 0 0 / 50%); }
+.tactile-slider:hover:not(:disabled)::-moz-range-thumb { transform: scale(1.25); box-shadow: 0 2px 8px rgb(0 0 0 / 50%); }
+
+/* Grabbing settles the thumb back to rest size: it feels "held", not inflated. */
+.tactile-slider:active:not(:disabled) { cursor: grabbing; }
+.tactile-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1); cursor: grabbing; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 28%, transparent), 0 1px 4px rgb(0 0 0 / 45%); }
+.tactile-slider:active:not(:disabled)::-moz-range-thumb { transform: scale(1); cursor: grabbing; box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 28%, transparent), 0 1px 4px rgb(0 0 0 / 45%); }
+
+.tactile-slider:focus-visible { outline: var(--focus-ring); outline-offset: 5px; }
+
+.tactile-slider:disabled { cursor: not-allowed; opacity: 0.5; }
+.tactile-slider:disabled::-webkit-slider-thumb { cursor: not-allowed; background: var(--text-muted); }
+.tactile-slider:disabled::-moz-range-thumb { cursor: not-allowed; background: var(--text-muted); }
+
+
+/* ---------------------------------------------------------------------- */
+/* Reduced motion: keep colour/shadow feedback, drop the movement.        */
+/* ---------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .tactile-btn-primary, .play-button, .account-avatar-remove, .queue-sidebar-segmented button,
+  .album-play, .playlist-play, .artist-play, .liked-play,
+  .explore-featured-actions button,
+  .tactile-btn-icon, .heart, .control, .track-like, .detail-secondary-action, .liked-action,
+  .tactile-pill, .now-preview-import,
+  .play-overlay, .explore-album-play, .track-play {
+    transition-duration: 1ms !important;
+  }
+
+  .tactile-slider::-webkit-slider-thumb { transition: none; }
+  .tactile-slider::-moz-range-thumb { transition: none; }
+}

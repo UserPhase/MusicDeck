@@ -42,6 +42,7 @@ function Playlist() {
 
   const menuRef = useRef(null);
   const optionsTriggerRef = useRef(null);
+  const coverInputRef = useRef(null);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [editDetailsOpen, setEditDetailsOpen] = useState(false);
@@ -256,6 +257,13 @@ useEffect(() => {
           }
         : currentPlaylist
     );
+
+    // The sidebar and library grids own separate playlist lists; the new
+    // artwork reference carries an updated signature, so a reload is enough
+    // to bust their cached thumbnails.
+    queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    queryClient.invalidateQueries({ queryKey: ["playlist", id] });
+    window.dispatchEvent(new Event("playlistsChanged"));
 
   }
 
@@ -488,15 +496,57 @@ async function handleRemoveSong(
 
         <div className="playlist-cover-column">
 
-          <div className="playlist-page-cover">
+          <button
+            type="button"
+            className="playlist-page-cover playlist-cover-editable"
+            aria-label={`Choose photo for ${playlist.name}`}
+            aria-busy={artworkBusy}
+            disabled={artworkBusy}
+            onClick={() => coverInputRef.current?.click()}
+          >
 
-          <PlaylistCover
-            playlist={playlist}
-            placeholderClassName="playlist-placeholder"
+            <PlaylistCover
+              playlist={playlist}
+              placeholderClassName="playlist-placeholder"
+            />
+
+            <span className="playlist-cover-overlay" aria-hidden="true">
+              <svg
+                className="playlist-cover-overlay-icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21.17 6.81a2.83 2.83 0 0 0-4-4L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5Z" />
+                <path d="m15 5 4 4" />
+              </svg>
+              <span>
+                {artworkBusy ? "Updating…" : "Choose photo"}
+              </span>
+            </span>
+
+          </button>
+
+          <input
+            ref={coverInputRef}
+            id="playlist-cover-upload"
+            className="playlist-cover-input"
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            tabIndex={-1}
+            aria-hidden="true"
+            disabled={artworkBusy}
+            onChange={handleCoverUpload}
           />
 
-          </div>
-
+          {artworkError && (
+            <div className="error playlist-cover-error" role="alert">
+              {artworkError}
+            </div>
+          )}
 
         </div>
 
@@ -569,46 +619,6 @@ async function handleRemoveSong(
               label="playlist"
             />
 
-            <div className="playlist-cover-actions">
-              <label
-                className="playlist-cover-action"
-                htmlFor="playlist-cover-upload"
-              >
-                {artworkBusy
-                  ? "Updating cover…"
-                  : playlist.coverMode === "custom"
-                    ? "Change cover"
-                    : "Upload cover"}
-              </label>
-
-              <input
-                id="playlist-cover-upload"
-                className="playlist-cover-input"
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif"
-                disabled={artworkBusy}
-                onChange={handleCoverUpload}
-              />
-
-              {playlist.coverMode === "custom" && (
-                <button
-                  type="button"
-                  className="playlist-cover-action"
-                  disabled={artworkBusy}
-                  onClick={handleCoverReset}
-                >
-                  Remove custom cover
-                </button>
-              )}
-
-              {artworkError && (
-                <div className="error playlist-cover-error" role="alert">
-                  {artworkError}
-                </div>
-              )}
-            </div>
-
-
 <div className="playlist-options">
 
   <button
@@ -661,6 +671,22 @@ async function handleRemoveSong(
         <span aria-hidden="true">✎</span>
         Edit details
       </button>
+
+      {playlist.coverMode === "custom" && (
+        <button
+          type="button"
+          className="playlist-menu-item"
+          role="menuitem"
+          disabled={artworkBusy}
+          onClick={() => {
+            setShowMenu(false);
+            handleCoverReset();
+          }}
+        >
+          <span aria-hidden="true">↺</span>
+          Remove custom cover
+        </button>
+      )}
 
       <button
         type="button"

@@ -3,17 +3,20 @@ import FloatingPanel from "../ui/FloatingPanel";
 import { Link } from "react-router-dom";
 
 import { useAuth } from "../../context/AuthContext";
+import { useBranding } from "../../context/BrandingContext";
+import UserAvatar from "../UserAvatar";
 
 
 function AdminTopBar() {
   const { session, signOut } = useAuth();
+  const { appName } = useBranding();
   const [open, setOpen] = useState(false);
   const triggerRef = useRef(null);
 
   return (
     <header className="admin-topbar">
       <Link to="/admin" className="admin-topbar-brand">
-        MusicDeck <span>Admin</span>
+        {appName} <span>Admin</span>
       </Link>
 
       <div className="admin-topbar-profile">
@@ -25,11 +28,7 @@ function AdminTopBar() {
           aria-expanded={open}
           onClick={() => setOpen((current) => !current)}
         >
-          <span className="admin-avatar">
-            {(session?.displayName || session?.username || "A")
-              .slice(0, 2)
-              .toUpperCase()}
-          </span>
+          <UserAvatar user={session} className="admin-avatar" fallback="A" />
           <span>Profile</span>
           <span aria-hidden="true">▾</span>
         </button>
