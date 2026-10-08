@@ -546,6 +546,35 @@ const migrations = [
       );
     `,
   },
+  {
+    id: 25,
+    name: "persistent-listening-activity",
+    sql: `
+      ALTER TABLE listening_events ADD COLUMN playback_session_id TEXT;
+      ALTER TABLE listening_events ADD COLUMN listened_seconds REAL;
+      ALTER TABLE listening_events ADD COLUMN duration_seconds REAL;
+      ALTER TABLE listening_events ADD COLUMN counted INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE listening_events ADD COLUMN finished INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE listening_events ADD COLUMN updated_at TEXT;
+      ALTER TABLE listening_events ADD COLUMN track_json TEXT;
+      ALTER TABLE listening_events ADD COLUMN artist_key TEXT;
+      ALTER TABLE listening_events ADD COLUMN album_key TEXT;
+      UPDATE listening_events SET counted = 1, finished = 1, updated_at = created_at
+        WHERE event_type = 'complete';
+      INSERT INTO listening_events (id, user_id, track_id, event_type, created_at, counted, finished, updated_at)
+        SELECT 'history_' || r.id, r.user_id, r.track_id, 'complete', r.played_at, 1, 1, r.played_at
+        FROM recently_played r
+        WHERE NOT EXISTS (
+          SELECT 1 FROM listening_events e WHERE e.user_id = r.user_id
+            AND e.track_id = r.track_id AND e.event_type = 'complete'
+            AND ABS(julianday(e.created_at) - julianday(r.played_at)) * 86400 < 5
+        );
+      CREATE UNIQUE INDEX listening_events_session_idx ON listening_events(user_id, playback_session_id)
+        WHERE playback_session_id IS NOT NULL;
+      CREATE INDEX listening_activity_history_idx ON listening_events(user_id, created_at DESC, id DESC)
+        WHERE counted = 1;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database) {

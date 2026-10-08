@@ -448,6 +448,7 @@ export class SpotifyTrackResolver {
             Authorization: `Basic ${Buffer.from(`${this.clientId}:${this.clientSecret}`).toString("base64")}`,
           },
           body: body.toString(),
+          signal: AbortSignal.timeout(10_000),
         });
         if (res.ok) {
           const data = (await res.json()) as any;
@@ -493,6 +494,7 @@ export class SpotifyTrackResolver {
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
         },
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (!res.ok) {
@@ -567,6 +569,7 @@ export class SpotifyTrackResolver {
           authorization: `Bearer ${token}`,
           accept: "application/json",
         },
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (!res.ok) {

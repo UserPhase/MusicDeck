@@ -30,7 +30,9 @@ function validItem(song) {
 export function createQueueSnapshot({ currentSong, queue, queueIndex, isShuffleEnabled, isLooping, volume, currentTime, wasPlaying = false }) {
   const queueItems = (Array.isArray(queue) ? queue : []).map(validItem).filter(Boolean).slice(0, MAX_QUEUE);
   const currentTrackId = currentSong?.id == null ? null : String(currentSong.id);
-  const selectedIndex = queueItems.findIndex((item) => item.id === currentTrackId);
+  const selectedIndex = Number.isInteger(queueIndex) && queueItems[queueIndex]?.id === currentTrackId
+    ? queueIndex
+    : queueItems.findIndex((item) => item.id === currentTrackId);
   const safeIndex = selectedIndex >= 0 ? selectedIndex : Math.max(-1, Math.min(Number(queueIndex) || 0, queueItems.length - 1));
   return {
     version: 1,
@@ -55,7 +57,9 @@ export function readQueueSnapshot(storage, userId) {
     const queueItems = parsed.queueItems.map(validItem).filter(Boolean).slice(0, MAX_QUEUE);
     const queueTrackIds = parsed.queueTrackIds.map(String).slice(0, MAX_QUEUE);
     if (queueItems.length !== queueTrackIds.length || queueItems.some((item, index) => item.id !== queueTrackIds[index])) return null;
-    const queueIndex = queueItems.findIndex((item) => item.id === parsed.currentTrackId);
+    const queueIndex = Number.isInteger(parsed.queueIndex) && queueItems[parsed.queueIndex]?.id === parsed.currentTrackId
+      ? parsed.queueIndex
+      : queueItems.findIndex((item) => item.id === parsed.currentTrackId);
     return {
       ...parsed,
       queueItems,

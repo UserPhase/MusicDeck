@@ -44,6 +44,20 @@ control use explicit theme-adaptive button fills and contrasting text,
 including hover and selected states, rather than browser-default button
 backgrounds. Both retain keyboard focus rings and subtle press feedback.
 
+The Queue tab lets listeners drag the non-interactive part of a song row
+with a mouse; desktop rows have no drag handles or right-side arrow buttons.
+Touch input uses a dedicated right-side handle with a 44-pixel touch target while the
+rest of the row remains scrollable. Hybrid devices adapt to the most recent
+pointer input rather than viewport width. Keyboard users press Arrow Up/Down
+on a focused row or handle; focus follows the song and positions are announced.
+Dragging starts after 6 pixels of movement, shows an insertion line and subtle
+row movement (disabled for reduced motion), and supports edge auto-scroll.
+Escape cancels dragging without changing the queue. The current
+track and played entries stay fixed; Recently Played remains read-only.
+The queue shows 25 upcoming tracks initially, with a Show full queue control
+for longer queues. Reordering changes playback order only, never the source
+playlist, and does not restart audio or reset progress.
+
 ---
 
 ## 2. Product Goals

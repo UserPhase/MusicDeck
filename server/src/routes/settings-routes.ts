@@ -122,6 +122,10 @@ export async function registerSettingsRoutes(app: FastifyInstance, db: Db, sched
     }
 
     const settings = { ...parsed.data.settings };
+    if (Object.prototype.hasOwnProperty.call(settings, "listening.thresholdSeconds")) {
+      const threshold = z.number().finite().min(1).max(240).safeParse(settings["listening.thresholdSeconds"]);
+      if (!threshold.success) return sendError(reply, 400, "Listening threshold must be between 1 and 240 seconds", "VALIDATION_ERROR");
+    }
     const scheduleChanged = Object.prototype.hasOwnProperty.call(settings, SCAN_SCHEDULE_SETTING_KEY);
     if (scheduleChanged) {
       const validation = validateScanSchedule(settings[SCAN_SCHEDULE_SETTING_KEY]);

@@ -46,3 +46,13 @@ test("rejects corrupt queue IDs instead of restoring a mismatched track", () => 
   }));
   expect(readQueueSnapshot(storage, "user-1")).toBeNull();
 });
+
+test("restores the active duplicate occurrence rather than the first matching song", () => {
+  const snapshot = createQueueSnapshot({
+    currentSong: { id: "a" }, queue: [{ id: "a" }, { id: "b" }, { id: "a" }, { id: "c" }],
+    queueIndex: 2, volume: 1, currentTime: 42,
+  });
+  localStorage.setItem(queueStorageKey("duplicates"), JSON.stringify(snapshot));
+  expect(snapshot.queueIndex).toBe(2);
+  expect(readQueueSnapshot(localStorage, "duplicates").queueIndex).toBe(2);
+});

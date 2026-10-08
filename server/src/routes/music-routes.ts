@@ -58,7 +58,8 @@ const sourceRequestSchema = z.object({
     metadata: z.record(z.string(), z.unknown()).optional(),
   }),
 });
-import { addRecentlyPlayed, listRecentlyPlayed } from "../domain/recently-played.js";
+import { addRecentlyPlayed } from "../domain/recently-played.js";
+import { activityRecent, playbackEventSchema, recordPlayback } from "../domain/listening-activity.js";
 import { listFavoriteTracks, setTrackFavorite } from "../domain/favorites.js";
 import { listUserSettings } from "../domain/settings.js";
 import { sendError } from "../utils/http.js";
@@ -426,6 +427,32 @@ export async function registerMusicRoutes(
   app.post("/api/listening-events", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
+
+    if (request.body && typeof request.body === "object" && "playbackSessionId" in request.body) {
+      const parsed = playbackEventSchema.safeParse(request.body);
+      if (!parsed.success) return sendError(reply, 400, "Invalid playback report", "VALIDATION_ERROR");
+      if (parsed.data.ownerUserId && parsed.data.ownerUserId !== user.id) {
+        return sendError(reply, 403, "Playback report belongs to a different signed-in user", "USER_MISMATCH");
+      }
+      let result: ReturnType<typeof recordPlayback>;
+      try {
+        result = recordPlayback(db, user.id, parsed.data);
+      } catch (error) {
+        if (error instanceof Error && (error.message.startsWith("Playback session") || error.message.startsWith("Playback start"))) {
+          return sendError(reply, 400, error.message, "VALIDATION_ERROR");
+        }
+        throw error;
+      }
+      if (result.newlyCounted || parsed.data.finished) recommendations.local.invalidateListeningTaste(user.id);
+      if (result.newlyCounted) {
+        addRecentlyPlayed(db, user.id, parsed.data.trackId, parsed.data.startedAt);
+        // Provider scrobbling is secondary; commit the local event first and
+        // never make the player wait for the upstream provider.
+        sourceResolver.scrobbleTrack(parsed.data.trackId).catch((error) =>
+          request.log.warn({ error }, "Could not scrobble qualified play"));
+      }
+      return reply.code(200).send({ ok: true, ...result });
+    }
 
     const parsed = z.object({
       trackId: z.string().min(1),
@@ -1343,7 +1370,7 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
-    return { tracks: await listRecentlyPlayed(db, catalog, user.id) };
+    return { tracks: await activityRecent(db, catalog, user.id) };
   });
 
   app.post("/api/recently-played", async (request, reply) => {
@@ -1358,6 +1385,7 @@ export async function registerMusicRoutes(
     }
 
     addRecentlyPlayed(db, user.id, trackId);
+    recommendations.local.recordListeningEvent(user.id, trackId, "complete");
     return reply.code(201).send({ ok: true });
   });
 

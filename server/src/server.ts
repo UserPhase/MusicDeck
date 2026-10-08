@@ -30,6 +30,7 @@ import { registerAdminLogsRoutes } from "./routes/admin-logs-routes.js";
 import { createLogCaptureStream, type LogBuffer, serverLogs } from "./utils/logger.js";
 import { registerUserRoutes } from "./routes/user-routes.js";
 import { ScannerScheduler } from "./services/scannerScheduler.js";
+import { registerListeningActivityRoutes } from "./routes/listening-activity-routes.js";
 
 export async function buildServer(options: {
   config: AppConfig;
@@ -133,6 +134,7 @@ export async function buildServer(options: {
   await registerSettingsRoutes(app, options.db, scanScheduler);
   await registerConfigRoutes(app, options.db);
   await registerAdminLogsRoutes(app, options.db, logBuffer);
+  await registerListeningActivityRoutes(app, options.db, options.catalog);
   await registerMusicRoutes(app, options.db, options.backend, options.catalog, options.library, options.sourceResolver, options.playlists, options.searchProviders, options.sourceProviders, options.externalCatalog, options.recommendations, options.libraryInsights, options.acquisition, options.silenceAnalysis);
   await registerPlaylistRoutes(app, options.db, options.playlists, options.spotifyPlaylistImport);
 

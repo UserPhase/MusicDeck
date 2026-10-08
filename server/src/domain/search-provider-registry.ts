@@ -253,7 +253,7 @@ class SpotifySearchProvider implements SearchProvider {
 
     let response: Response;
     try {
-      response = await this.fetchImpl(url, { headers: { Authorization: `Bearer ${token}` } });
+      response = await this.fetchImpl(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000) });
     } catch (error) {
       throw new Error(`Spotify catalog request failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -388,6 +388,7 @@ class SpotifySearchProvider implements SearchProvider {
     try {
       const response = await this.fetchImpl(new URL("https://api.spotify.com/v1/search?q=test&type=track&limit=1"), {
         headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) {
         const bodyText = await response.text().catch(() => "");

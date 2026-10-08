@@ -25,7 +25,7 @@ import MobileNavBar from "./MobileNavBar";
 function getContentClassName(pathname) {
   const isDetailPage = pathname === "/liked" || /^\/(?:album|artist|playlist)\/[^/]+/.test(pathname);
   const isSongPage = isDetailPage || ["/library/tracks", "/liked", "/search"].includes(pathname);
-  const isWideContentPage = isSongPage || ["/", "/explore"].includes(pathname) ||
+  const isWideContentPage = isSongPage || ["/", "/explore", "/listening-activity"].includes(pathname) ||
     /^\/library\/(?:playlists|albums|artists)$/.test(pathname);
   return [
     "main-content",

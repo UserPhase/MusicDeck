@@ -13,12 +13,57 @@ import {
   login,
   matchLibraryItems,
   recordRecentlyPlayed,
+  reportPlaybackSession,
+  LISTENING_ACTIVITY_CHANGED_EVENT,
   searchNavidrome,
 } from "./musicdeck";
 
 
 beforeEach(() => {
   global.fetch = jest.fn();
+});
+
+test("playback reports only refresh activity for qualification or a final duration update", async () => {
+  const changed = jest.fn();
+  window.addEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, changed);
+  const payload = { playbackSessionId: "playback-session-1", listenedSeconds: 10, finished: false };
+  global.fetch.mockResolvedValue({
+    ok: true, status: 200, json: async () => ({ counted: false, newlyCounted: false }),
+  });
+  try {
+    await reportPlaybackSession(payload);
+    expect(changed).not.toHaveBeenCalled();
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200, json: async () => ({ counted: true, newlyCounted: true }),
+    });
+    await reportPlaybackSession({ ...payload, listenedSeconds: 30 });
+    expect(changed).toHaveBeenCalledTimes(1);
+    global.fetch.mockResolvedValue({
+      ok: true, status: 200, json: async () => ({ counted: true, newlyCounted: false }),
+    });
+    await reportPlaybackSession({ ...payload, listenedSeconds: 40, finished: true });
+    expect(changed).toHaveBeenCalledTimes(2);
+    expect(global.fetch).toHaveBeenLastCalledWith("/api/listening-events", expect.objectContaining({
+      credentials: "include", keepalive: true, method: "POST", signal: expect.any(AbortSignal),
+    }));
+  } finally {
+    window.removeEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, changed);
+  }
+});
+
+test("stalled playback-report requests abort after 15 seconds without leaking timers", async () => {
+  jest.useFakeTimers();
+  global.fetch.mockImplementation((url, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener("abort", () => reject(new DOMException("Timed out", "AbortError")));
+  }));
+  try {
+    const assertion = expect(reportPlaybackSession({ finished: false })).rejects.toMatchObject({ name: "AbortError" });
+    jest.advanceTimersByTime(15_000);
+    await assertion;
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 

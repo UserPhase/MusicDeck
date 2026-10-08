@@ -661,7 +661,8 @@ export class SpotifyPlaylistImportService {
       await this.ingestAlbumArtwork(track, filesByPosition.get(track.position)?.path, job, artworkDirectories);
     }
     job.stage = "scanning";
-    await this.backend.scanLibrary();
+    // Best effort: the playlist poll below still finds the import if Navidrome scans on its own schedule.
+    await this.backend.scanLibrary().catch(() => undefined);
 
     // Navidrome's scanner can finish before M3U auto-import becomes visible.
     let importedId: string | null = null;

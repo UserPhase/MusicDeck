@@ -9,13 +9,16 @@ import AlbumDeleteButton from "../components/AlbumDeleteButton";
 jest.mock("./AuthContext", () => ({ useAuth: jest.fn() }));
 jest.mock("../api/adminMedia", () => ({ deleteServerAlbum: jest.fn(), deleteServerTrack: jest.fn() }));
 jest.mock("../components/TrackLikeButton", () => () => <button type="button">Like</button>);
+jest.mock("./PlayerContext", () => ({ usePlayer: () => ({ addToQueue: jest.fn() }) }));
 
 const song = { id: "track-1", title: "Midnight Signal" };
 
 function renderActions(role) {
   useAuth.mockReturnValue({ session: { id: "user-1", role } });
+  // The menu stays visibility:hidden until it can anchor to its trigger.
+  const triggerRef = { current: document.createElement("button") };
   return render(<MemoryRouter><ServerDeletionProvider>
-    <TrackContextMenu song={song} isServerSynced offlineStatus="not-downloaded" />
+    <TrackContextMenu song={song} isServerSynced offlineStatus="not-downloaded" triggerRef={triggerRef} />
     <AlbumDeleteButton album={{ id: "album-1", name: "Night Drive" }} />
   </ServerDeletionProvider></MemoryRouter>);
 }

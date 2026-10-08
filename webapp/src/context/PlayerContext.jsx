@@ -11,7 +11,9 @@ import {
   getStreamUrl,
   getRecentlyPlayed,
   getStarred,
-  recordListeningEvent,
+  reportPlaybackSession,
+  getListeningConfig,
+  LISTENING_ACTIVITY_CHANGED_EVENT,
   starSong,
   unstarSong,
   getRandomSongs,
@@ -30,6 +32,7 @@ import {
 } from "../utils/accentColors";
 import { trustedPreviewUrl } from "../utils/previewPlayback";
 import { createQueueSnapshot, queueStorageKey, readQueueSnapshot } from "../utils/queuePersistence";
+import { createListeningTracker } from "../utils/listeningTracker";
 
 
 const PlayerContext =
@@ -37,17 +40,22 @@ const PlayerContext =
 
 const VALID_SIDEBARS = new Set(["none", "now-playing", "queue"]);
 const MAX_RECENTLY_PLAYED = 50;
-const LISTENING_WINDOW_MS = 45 * 24 * 60 * 60 * 1000;
 
 function normalizeSidebar(value) {
   return VALID_SIDEBARS.has(value) ? value : "none";
+}
+
+function cancelFadeFrame(frameId) {
+  if (frameId === null) return;
+  if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(frameId);
+  else window.clearTimeout(frameId);
 }
 
 function normalizeRecentlyPlayed(value) {
   return Array.isArray(value)
     ? value.filter((song) => {
         const playedAt = Date.parse(song?.playedAt);
-        return Number.isFinite(playedAt) && playedAt >= Date.now() - LISTENING_WINDOW_MS;
+        return Number.isFinite(playedAt);
       }).slice(0, MAX_RECENTLY_PLAYED)
     : [];
 }
@@ -98,6 +106,26 @@ export function PlayerProvider({
     useRef(0);
   const audioRequestIdsRef = useRef(new WeakMap());
   const listeningSessionRef = useRef(null);
+  const trackingUserRef = useRef(null);
+  trackingUserRef.current = isAuthenticated ? session?.id : null;
+  useEffect(() => {
+    if (!isAuthenticated || !session?.id) return undefined;
+    const tracker = createListeningTracker({
+      userId: session.id, storage: window.sessionStorage,
+      report: reportPlaybackSession,
+    });
+    listeningSessionRef.current = tracker;
+    getListeningConfig().then((config) => tracker.setThreshold(config.thresholdSeconds))
+      .catch((error) => console.error("Could not load listening threshold; using 30 seconds:", error));
+    const flush = () => tracker.flush();
+    window.addEventListener("pagehide", flush);
+    return () => {
+      if (trackingUserRef.current !== session.id) tracker.finish();
+      tracker.suspend();
+      window.removeEventListener("pagehide", flush);
+      if (listeningSessionRef.current === tracker) listeningSessionRef.current = null;
+    };
+  }, [isAuthenticated, session?.id]);
   const pendingRestoreSeekRef = useRef(null);
   const restoreRequestRef = useRef(null);
   const resumeListenerCleanupRef = useRef(null);
@@ -227,33 +255,7 @@ export function PlayerProvider({
   const [
     recentlyPlayed,
     setRecentlyPlayed,
-  ] = useState(() => {
-
-    try {
-
-      const saved =
-        localStorage.getItem(
-          "recentlyPlayed"
-        );
-
-      if (!saved) {
-        return [];
-      }
-
-      return normalizeRecentlyPlayed(JSON.parse(saved));
-
-    } catch (error) {
-
-      console.error(
-        "Could not load recently played:",
-        error
-      );
-
-      return [];
-
-    }
-
-  });
+  ] = useState([]);
 
 
   /*
@@ -497,6 +499,7 @@ export function PlayerProvider({
       if (currentSong && ids.has(String(currentSong.id))) {
         playbackRequestRef.current += 1;
         audioRef.current?.pause();
+        listeningSessionRef.current?.finish();
         setCurrentSong(null);
         setIsPlaying(false);
         setCurrentTime(0);
@@ -514,12 +517,12 @@ export function PlayerProvider({
     return () => window.removeEventListener("musicdeck:server-deleted", handleServerDeletion);
   }, [queue, queueIndex, currentSong]);
 
-  function cancelRestoreResume() {
+  const cancelRestoreResume = useCallback(() => {
     resumeListenerCleanupRef.current?.();
     resumeListenerCleanupRef.current = null;
     restoreRequestRef.current = null;
     setRestorePending(false);
-  }
+  }, []);
 
   function attemptRestoredPlayback(activeAudio, requestId) {
     if (restoreRequestRef.current?.requestId !== requestId || audioRef.current !== activeAudio) return;
@@ -611,7 +614,7 @@ export function PlayerProvider({
       }
     }
     setHydratedQueueUserId(session.id);
-  }, [isAuthenticated, session?.id]);
+  }, [isAuthenticated, session?.id, cancelRestoreResume]);
 
   useEffect(() => {
     if (!isAuthenticated || !session?.id || hydratedQueueUserId !== session.id || restorePending) return;
@@ -651,6 +654,12 @@ export function PlayerProvider({
 
   /* Mirrors previewSource for the timeupdate handler's end-of-preview check. */
   const previewSourceRef = useRef(null);
+
+  useEffect(() => {
+    if (isPlaying && currentSong && !previewSourceRef.current && isLibraryPlayable(currentSong)) {
+      listeningSessionRef.current?.begin(currentSong, audioRef.current);
+    }
+  }, [isPlaying, currentSong]);
 
   useEffect(() => {
     if (!playbackMessage) return undefined;
@@ -909,25 +918,11 @@ export function PlayerProvider({
   }
 
 
-  function cancelFadeFrame(frameId) {
-    if (frameId === null) {
-      return;
-    }
-
-    if (typeof window.cancelAnimationFrame === "function") {
-      window.cancelAnimationFrame(frameId);
-      return;
-    }
-
-    window.clearTimeout(frameId);
-  }
-
-
-  function getInactiveAudio() {
+  const getInactiveAudio = useCallback(() => {
     return audioRef.current === primaryAudioRef.current
       ? secondaryAudioRef.current
       : primaryAudioRef.current;
-  }
+  }, []);
 
   function reportPlaybackFailure(audio, requestId, error) {
     if (!audio || audio !== audioRef.current || requestId !== playbackRequestRef.current) return;
@@ -957,7 +952,13 @@ export function PlayerProvider({
     reportPlaybackFailure(audio, source.requestId, { message });
   }
 
-  function cancelCrossfade() {
+  const applyDeckVolume = useCallback((audio, intensity = 1) => {
+    if (!audio) return;
+    audio.volume = Math.max(0, Math.min(1,
+      volumeRef.current * (deckGainRef.current.get(audio) || 1) * intensity));
+  }, []);
+
+  const cancelCrossfade = useCallback(() => {
     crossfadeTokenRef.current += 1;
     isCrossfadingRef.current = false;
     cancelFadeFrame(crossfadeFrameRef.current);
@@ -976,14 +977,14 @@ export function PlayerProvider({
     if (audioRef.current) {
       applyDeckVolume(audioRef.current);
     }
-  }
+  }, [applyDeckVolume, getInactiveAudio]);
 
 
   /*
    * LOAD LIKED SONGS
    */
 
-  function resetPlayer() {
+  const resetPlayer = useCallback(() => {
     cancelRestoreResume();
     playbackRequestRef.current += 1;
     pendingRestoreSeekRef.current = null;
@@ -996,7 +997,7 @@ export function PlayerProvider({
       queueStorageKeyRef.current = null;
     }
     setHydratedQueueUserId(null);
-    listeningSessionRef.current = null;
+    listeningSessionRef.current?.finish();
     isTransitioningRef.current = false;
 
     cancelCrossfade();
@@ -1032,7 +1033,7 @@ export function PlayerProvider({
         error
       );
     }
-  }
+  }, [cancelCrossfade, cancelRestoreResume, setActiveSidebar]);
 
   useEffect(() => {
 
@@ -1043,6 +1044,7 @@ export function PlayerProvider({
     }
 
     let cancelled = false;
+    let recentRequest = 0;
 
     async function loadLikedSongs() {
 
@@ -1075,21 +1077,14 @@ export function PlayerProvider({
     }
 
     async function loadRecentlyPlayed() {
-
+      const requestId = ++recentRequest;
       try {
 
         const songs =
           await getRecentlyPlayed();
 
-        if (!cancelled) {
-          setRecentlyPlayed((current) => {
-            const byId = new Map();
-            for (const song of [...normalizeRecentlyPlayed(current), ...normalizeRecentlyPlayed(songs)]) {
-              const key = String(song.id);
-              if (!byId.has(key) || Date.parse(song.playedAt) > Date.parse(byId.get(key).playedAt)) byId.set(key, song);
-            }
-            return [...byId.values()].sort((a, b) => Date.parse(b.playedAt) - Date.parse(a.playedAt)).slice(0, MAX_RECENTLY_PLAYED);
-          });
+        if (!cancelled && requestId === recentRequest) {
+          setRecentlyPlayed(normalizeRecentlyPlayed(songs));
         }
 
       } catch (error) {
@@ -1106,12 +1101,18 @@ export function PlayerProvider({
 
     loadLikedSongs();
     loadRecentlyPlayed();
+    window.addEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, loadRecentlyPlayed);
+    window.addEventListener("focus", loadRecentlyPlayed);
+    const refresh = window.setInterval(loadRecentlyPlayed, 60_000);
 
     return () => {
       cancelled = true;
+      window.removeEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, loadRecentlyPlayed);
+      window.removeEventListener("focus", loadRecentlyPlayed);
+      window.clearInterval(refresh);
     };
 
-  }, [isAuthenticated, authIsLoading]);
+  }, [isAuthenticated, authIsLoading, session?.id, resetPlayer]);
 
 
   /*
@@ -1165,58 +1166,6 @@ export function PlayerProvider({
   }, [volume]);
 
 
-  /*
-   * RECENTLY PLAYED
-   */
-
-  function addToRecentlyPlayed(song) {
-
-    if (!song?.id) {
-      return;
-    }
-
-
-    setRecentlyPlayed(
-      (current) => {
-
-        const withoutSong =
-          normalizeRecentlyPlayed(current).filter(
-            (recentSong) =>
-              String(recentSong.id) !==
-              String(song.id)
-          );
-
-
-        const previous = current.find((recentSong) => String(recentSong.id) === String(song.id));
-        const updated = [
-          { ...song, playedAt: new Date().toISOString(), playCount: (previous?.playCount || 0) + 1 },
-          ...withoutSong,
-        ].slice(0, MAX_RECENTLY_PLAYED);
-
-
-        try {
-
-          localStorage.setItem(
-            "recentlyPlayed",
-            JSON.stringify(updated)
-          );
-
-        } catch (error) {
-
-          console.error(
-            "Could not save recently played:",
-            error
-          );
-
-        }
-
-
-        return updated;
-
-      }
-    );
-
-  }
 
 
   /*
@@ -1500,9 +1449,8 @@ export function PlayerProvider({
 
     /*
      * Prefer the full local track. When the track is not in the library,
-     * transparently resolve a playable external source (typically a
-     * preview) through the provider-neutral source model instead of
-     * failing playback.
+     * play only its trusted provider-supplied preview URL; otherwise
+     * report the track as unavailable.
      */
 
     const localTrack = isLibraryPlayable(song);
@@ -1524,7 +1472,7 @@ export function PlayerProvider({
 
     setPreviewSource(preview);
     previewSourceRef.current = preview;
-    listeningSessionRef.current = null;
+    listeningSessionRef.current?.finish();
     setPlaybackUnavailable(false);
 
 
@@ -1602,7 +1550,7 @@ export function PlayerProvider({
       ) {
         setIsPlaying(true);
         if (!preview && isLibraryPlayable(song)) {
-          listeningSessionRef.current = { trackId: song.id, qualified: false };
+          listeningSessionRef.current?.begin(song, activeAudio);
         }
       }
 
@@ -1671,18 +1619,6 @@ export function PlayerProvider({
     });
   }
 
-  function qualifyCurrentListen(song, position, totalDuration, completed = false) {
-    const session = listeningSessionRef.current;
-    if (!session || session.qualified || String(session.trackId) !== String(song?.id)) return;
-    const durationSeconds = Number(totalDuration) || Number(song?.duration) || Number(song?.metadata?.durationSeconds) || 0;
-    const threshold = durationSeconds > 0 ? Math.min(durationSeconds / 2, 240) : 240;
-    if (!completed && position < threshold) return;
-    session.qualified = true;
-    addToRecentlyPlayed(song);
-    recordListeningEvent(String(song.id), "complete", durationSeconds > 0 ? Math.min(1, position / durationSeconds) : 1)
-      .catch((error) => console.error("Could not record listening event:", error));
-  }
-
   function toggleLike() {
     return toggleLikeSong(currentSong);
   }
@@ -1732,26 +1668,6 @@ export function PlayerProvider({
       Math.min(
         4,
         10 ** (gainDb / 20)
-      )
-    );
-  }
-
-
-  function deckGain(audio) {
-    return deckGainRef.current.get(audio) || 1;
-  }
-
-
-  function applyDeckVolume(audio, intensity = 1) {
-    if (!audio) {
-      return;
-    }
-
-    audio.volume = Math.max(
-      0,
-      Math.min(
-        1,
-        volumeRef.current * deckGain(audio) * intensity
       )
     );
   }
@@ -1945,6 +1861,38 @@ export function PlayerProvider({
 
   }
 
+  function moveQueueItem(from, to) {
+    if (
+      !Number.isInteger(from) || !Number.isInteger(to) ||
+      from <= queueIndex || to <= queueIndex ||
+      from < 0 || to < 0 || from >= queue.length || to >= queue.length ||
+      from === to
+    ) {
+      return;
+    }
+
+    // An incoming crossfade deck must not commit a now-reordered next track.
+    if (isCrossfadingRef.current) cancelCrossfade();
+    setQueue((currentQueue) => {
+      if (from >= currentQueue.length || to >= currentQueue.length) return currentQueue;
+      const reordered = [...currentQueue];
+      const [song] = reordered.splice(from, 1);
+      reordered.splice(to, 0, song);
+      return reordered;
+    });
+  }
+
+  async function refillUpcomingQueue(baseQueue, index) {
+    const updatedQueue = await refillQueue(baseQueue, index);
+    const additions = updatedQueue.slice(baseQueue.length);
+    if (!additions.length) return;
+    setQueue((currentQueue) => {
+      if (currentQueue[index] !== baseQueue[index]) return currentQueue;
+      const existingIds = new Set(currentQueue.map((song) => String(song.id)));
+      return [...currentQueue, ...additions.filter((song) => !existingIds.has(String(song.id)))];
+    });
+  }
+
 
   /*
    * NEXT SONG
@@ -1968,12 +1916,10 @@ export function PlayerProvider({
         setQueueIndex(nextIndex);
         await loadAndPlaySong(queue[nextIndex]);
 
-        const updatedQueue = await refillQueue(
+        await refillUpcomingQueue(
           queue,
           nextIndex
         );
-
-        setQueue(updatedQueue);
         return;
       }
 
@@ -2010,7 +1956,7 @@ export function PlayerProvider({
   function stopPlaybackAtQueueEnd() {
     cancelRestoreResume();
     playbackRequestRef.current += 1;
-    listeningSessionRef.current = null;
+    listeningSessionRef.current?.finish();
 
     if (audioRef.current) {
       audioRef.current.pause();
@@ -2058,9 +2004,12 @@ export function PlayerProvider({
       3
     ) {
 
+      listeningSessionRef.current?.finish();
       audioRef.current.currentTime =
         0;
-
+      if (isPlaying && !previewSourceRef.current) {
+        listeningSessionRef.current?.begin(currentSong, audioRef.current, false);
+      }
       return;
 
     }
@@ -2075,9 +2024,12 @@ export function PlayerProvider({
       queueIndex <= 0
     ) {
 
+      listeningSessionRef.current?.finish();
       audioRef.current.currentTime =
         0;
-
+      if (isPlaying && !previewSourceRef.current) {
+        listeningSessionRef.current?.begin(currentSong, audioRef.current, false);
+      }
       return;
 
     }
@@ -2211,6 +2163,7 @@ export function PlayerProvider({
       typeof performance !== "undefined"
         ? performance.now()
         : Date.now();
+    const incomingStartedAt = Date.now();
 
     const fadeDurationMs =
       Math.max(100, fadeSeconds * 1000);
@@ -2223,7 +2176,7 @@ export function PlayerProvider({
       }
 
       if (!previewSourceRef.current) {
-        qualifyCurrentListen(currentSong, outgoingAudio.currentTime || 0, outgoingAudio.duration || 0, true);
+        listeningSessionRef.current?.finish();
       }
 
       audioRef.current = incomingAudio;
@@ -2251,8 +2204,11 @@ export function PlayerProvider({
       setIsPlaying(true);
       trimBoundsRef.current = null;
 
-      listeningSessionRef.current = !incomingPreview && isLibraryPlayable(nextTrack)
-        ? { trackId: nextTrack.id, qualified: false } : null;
+      if (!incomingPreview && isLibraryPlayable(nextTrack)) {
+        const fadeListenSeconds = Math.min((Date.now() - incomingStartedAt) / 1000,
+          (incomingAudio.currentTime || 0) / (incomingAudio.playbackRate || 1));
+        listeningSessionRef.current?.begin(nextTrack, incomingAudio, false, fadeListenSeconds, incomingStartedAt);
+      }
 
       if (
         silenceTrimSettings.enabled &&
@@ -2286,14 +2242,7 @@ export function PlayerProvider({
           });
       }
 
-      refillQueue(queue, nextIndex)
-        .then((updatedQueue) => {
-          if (
-            audioRef.current === incomingAudio
-          ) {
-            setQueue(updatedQueue);
-          }
-        });
+      refillUpcomingQueue(queue, nextIndex);
     }
 
     function animateCrossfade(timestamp) {
@@ -2437,7 +2386,7 @@ export function PlayerProvider({
       activeAudio.currentTime
     );
     if (!previewSourceRef.current) {
-      qualifyCurrentListen(currentSong, activeAudio.currentTime, activeAudio.duration);
+      listeningSessionRef.current?.sample();
     }
 
     /*
@@ -2794,7 +2743,7 @@ export function PlayerProvider({
     }
 
     if (!previewSourceRef.current && audioRef.current) {
-      qualifyCurrentListen(currentSong, audioRef.current.currentTime || 0, audioRef.current.duration || 0, true);
+      listeningSessionRef.current?.finish();
     }
 
     if (isLooping) {
@@ -2811,7 +2760,7 @@ export function PlayerProvider({
         setCurrentTime(0);
         await activeAudio.play();
         setIsPlaying(true);
-        listeningSessionRef.current = { trackId: currentSong?.id, qualified: false };
+        listeningSessionRef.current?.begin(currentSong, activeAudio, false);
       } catch (error) {
         setIsPlaying(false);
       } finally {
@@ -2906,6 +2855,8 @@ export function PlayerProvider({
         playQueue,
 
         playQueueSong,
+
+        moveQueueItem,
 
         nextSong,
 

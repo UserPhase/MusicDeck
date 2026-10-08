@@ -156,6 +156,7 @@ export async function createTestServer(
   externalFetchImpl?: typeof fetch,
   pluginFetchImpl?: typeof fetch,
   spotifyImportFactory?: (backend: MusicBackend, playlists: PlaylistService, musicRoot: string) => SpotifyPlaylistImportService,
+  serverOptions: Pick<Parameters<typeof buildServer>[0], "logger" | "logBuffer"> = {},
 ) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "musicdeck-test-"));
   const config = loadConfig({
@@ -182,7 +183,7 @@ export async function createTestServer(
     provider: backend,
   }]);
   const library = new LibraryService(db);
-  const catalog = new CatalogService(registry, library);
+  const catalog = new CatalogService(registry, library, serverOptions.logBuffer);
   const sourceResolver = new SourceResolver(registry, library);
   const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
   const externalCatalog = new ExternalCatalogRegistry(externalFetchImpl, db);
@@ -254,7 +255,7 @@ export async function createTestServer(
     ffmpegPath: "ffmpeg-test-stub",
   });
   const spotifyPlaylistImport = spotifyImportFactory?.(backend, playlists, config.musicRoot);
-  const app = await buildServer({ config, db, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis, logger: false });
+  const app = await buildServer({ config, db, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis, logger: false, ...serverOptions });
 
   return { app, db, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders, sourcePipeline, externalCatalog, recommendations, libraryInsights, plugins, acquisition, acquisitionProviders, registry, directory, silenceAnalysis };
 }

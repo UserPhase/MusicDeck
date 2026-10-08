@@ -50,8 +50,9 @@ export function registerLogSecret(value: string | undefined | null): void {
 const SENSITIVE_KEY = /(pass(word|wd)?|secret|token|api[-_]?key|authorization|cookie|session|credential|salt)/i;
 
 const TEXT_PATTERNS: Array<[RegExp, string]> = [
+  [/\b(https?:\/\/)[^\s/"'<>]*@/gi, `$1${REDACTED}@`],
   // Authorization: Bearer xyz / Basic xyz
-  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/g, `$1 ${REDACTED}`],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`],
   // Header-style "cookie: a=b; c=d" or "x-emby-token=abc"
   [/\b(authorization|proxy-authorization|cookie|set-cookie|x-emby-token|x-mediabrowser-token|x-api-key)(["']?\s*[:=]\s*["']?)[^"'\r\n,}]+/gi, `$1$2${REDACTED}`],
   [/\bmusicdeck_session=[^;\s&"']+/g, `musicdeck_session=${REDACTED}`],
@@ -60,7 +61,7 @@ const TEXT_PATTERNS: Array<[RegExp, string]> = [
   // "apiKey": "value" in serialized JSON.
   [/(["'][\w-]*(?:pass(?:word|wd)?|secret|token|api[-_]?key)[\w-]*["']\s*:\s*)("[^"]*"|'[^']*'|[^\s,}\]]+)/gi, `$1"${REDACTED}"`],
   // key=value pairs in query strings, env dumps and CLI arguments.
-  [/(\b[\w-]*(?:pass(?:word|wd)?|secret|token|api[-_]?key)[\w-]*=)("[^"]*"|[^\s,&}#;"']+)/gi, `$1${REDACTED}`],
+  [/(\b[\w-]*(?:pass(?:word|wd)?|secret|token|api[-_]?key)[\w-]*\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,&}#;"']+)/gi, `$1${REDACTED}`],
 ];
 
 // eslint-disable-next-line no-control-regex

@@ -19,6 +19,8 @@ type ArtistInfoResponse = {
   artistInfo2?: { largeImageUrl?: unknown; mediumImageUrl?: unknown };
 };
 
+const NAVIDROME_REQUEST_TIMEOUT_MS = 15_000;
+
 /**
  * Navidrome provides every current capability: catalog reads, media
  * streaming/artwork, and provider-side user-data sync (favorites,
@@ -78,7 +80,10 @@ export class NavidromeBackend implements MusicBackend {
   }
 
   private async request<T = any>(endpoint: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
-    const response = await this.fetchImpl(this.buildUrl(endpoint, params), signal ? { signal } : undefined);
+    // Default bound so a hung Navidrome cannot stall API requests or scan polling forever.
+    const response = await this.fetchImpl(this.buildUrl(endpoint, params), {
+      signal: signal ?? AbortSignal.timeout(NAVIDROME_REQUEST_TIMEOUT_MS),
+    });
 
     if (!response.ok) {
       throw new Error(`Navidrome returned ${response.status}`);
@@ -435,11 +440,9 @@ export class NavidromeBackend implements MusicBackend {
   }
 
   async scanLibrary(): Promise<{ count?: number; scanning?: boolean }> {
-    try {
-      await this.requestLibraryRescan();
-    } catch {
-      return { scanning: false };
-    }
+    // A failed trigger must surface so scan schedulers can report it; callers
+    // that only want best-effort refreshes catch it themselves.
+    await this.requestLibraryRescan();
 
     // Navidrome's startScan.view only *triggers* an async background scan;
     // it does not wait for indexing to finish. Callers (e.g. acquisition

@@ -617,6 +617,42 @@ export async function recordListeningEvent(trackId, eventType, completionRatio) 
   });
 }
 
+export const LISTENING_ACTIVITY_CHANGED_EVENT = "musicdeck:listening-activity-changed";
+
+export async function reportPlaybackSession(payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const result = await request("/api/listening-events", {
+      method: "POST", keepalive: true, signal: controller.signal, body: JSON.stringify(payload),
+    });
+    if (result.newlyCounted || payload.finished) window.dispatchEvent(new Event(LISTENING_ACTIVITY_CHANGED_EVENT));
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function getListeningConfig() {
+  return request("/api/listening-activity/config");
+}
+
+export async function getListeningHistory({ period = "all", search = "", cursor, signal } = {}) {
+  const query = new URLSearchParams({ period, search, limit: "30" });
+  if (cursor) query.set("cursor", cursor);
+  const data = await request(`/api/listening-activity/history?${query}`, { signal });
+  return { ...data, items: data.items.map((item) => ({ ...item, track: normalizeTrackData(item.track) })) };
+}
+
+export function getListeningStatistics(period = "30", signal) {
+  return request(`/api/listening-activity/statistics?${new URLSearchParams({ period })}`, { signal });
+}
+
+export async function getListeningTrack(trackId) {
+  const data = await request(`/api/tracks/${encodeURIComponent(trackId)}`);
+  return toSong(data.track);
+}
+
 export async function getArtistOverview(artistId, { scope } = {}) {
   const suffix = scope === "local" ? "?scope=local" : "";
   const data = await request(`/api/artists/${encodeURIComponent(artistId)}/overview${suffix}`);

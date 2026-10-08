@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import Database from "better-sqlite3";
 
 import { CatalogService } from "../src/domain/catalog.js";
@@ -9,6 +9,7 @@ import type { CatalogProvider } from "../src/backends/catalog-provider.js";
 import type { MusicBackend } from "../src/backends/music-backend.js";
 import type { Album, Artist, Track } from "../src/types.js";
 import { createFakeBackend } from "./helpers.js";
+import { LogBuffer, registerLogSecret } from "../src/utils/logger.js";
 
 function entry(connectionId: string, provider: MusicBackend, name = "Navidrome"): RegisteredProvider {
   return { connectionId, type: "navidrome", name, enabled: true, provider };
@@ -156,6 +157,102 @@ describe("CatalogService multi-provider fan-out", () => {
     expect(result.items.map((item) => item.name)).toEqual(["From A", "From B"]);
     expect(a.listAlbums).toHaveBeenCalled();
     expect(b.listAlbums).toHaveBeenCalled();
+  });
+
+  describe("CatalogService partial-outage logging", () => {
+    const databases: Database.Database[] = [];
+    afterEach(() => {
+      for (const db of databases.splice(0)) db.close();
+    });
+
+    function setup(...providers: MusicBackend[]) {
+      const db = new Database(":memory:");
+      databases.push(db);
+      runMigrations(db);
+      const logs = new LogBuffer();
+      return { service: new CatalogService(makeRegistry(...providers), new LibraryService(db), logs), logs };
+    }
+
+    test("successful reads do not produce outage warnings", async () => {
+      const { service, logs } = setup(createFakeBackend(), createFakeBackend());
+      expect((await service.listTracks()).degraded).toBe(false);
+      expect((await service.search("song")).degraded).toBe(false);
+      expect(logs.list()).toEqual([]);
+    });
+
+    test.each([1, 2])("logs once for each of %s failed connections, not once per returned item", async (count) => {
+      const failures = Array.from({ length: count }, (_, index) => createFakeBackend({
+        listTracks: vi.fn(async () => { throw new Error(`provider ${index} unavailable`); }),
+      }));
+      const { service, logs } = setup(createFakeBackend({
+        listTracks: vi.fn(async () => [track("one", "One"), track("two", "Two")]),
+      }), ...failures);
+      const live = vi.fn();
+      const unsubscribe = logs.subscribe(live);
+      const result = await service.listTracks();
+      unsubscribe();
+      expect(result.items).toHaveLength(2);
+      expect(result.degraded).toBe(true);
+      expect(logs.list()).toHaveLength(count);
+      expect(live).toHaveBeenCalledTimes(count);
+      expect(logs.list().map((entry) => entry.meta)).toEqual(failures.map((_, index) => ({
+        connectionId: `conn-${index + 2}`, providerType: "navidrome", operation: "listTracks",
+        errorDescription: `Error: provider ${index} unavailable`,
+      })));
+      expect(logs.list().every((entry) => entry.level === "warn" && entry.source === "server")).toBe(true);
+      expect(JSON.stringify(result)).not.toContain("unavailable");
+    });
+
+    test("total failures retain their AggregateError causes without duplicate partial warnings", async () => {
+      const causes = [new Error("connection refused"), new Error("timeout")];
+      const { service, logs } = setup(...causes.map((error) => createFakeBackend({
+        listTracks: vi.fn(async () => { throw error; }),
+      })));
+      await expect(service.listTracks()).rejects.toMatchObject({
+        message: "All catalog providers are unavailable",
+        cause: expect.objectContaining({ errors: causes }),
+      });
+      expect(logs.list()).toEqual([]);
+    });
+
+    test.each(["listAlbums", "listArtists", "listTracks", "getRandomAlbums", "getRandomTracks", "search"] as const)(
+      "%s logs provider timeout failures and preserves healthy results", async (operation) => {
+        const error = new DOMException("Media-server request exceeded 15000ms", "TimeoutError");
+        const failedRead = vi.fn(async () => { throw error; });
+        const { service, logs } = setup(createFakeBackend(), createFakeBackend({ [operation]: failedRead }));
+        const result = operation === "search" ? await service.search("song") : await service[operation]();
+        expect(result.degraded).toBe(true);
+        expect(logs.list()).toMatchObject([{
+          level: "warn", meta: { connectionId: "conn-2", operation, errorDescription: expect.stringContaining("TimeoutError") },
+        }]);
+      },
+    );
+
+    test("redacts credentials, headers, cookies and private URLs before publishing warnings", async () => {
+      registerLogSecret("literal-provider-secret");
+      const error = new Error([
+        "Failed https://private-user:private-password@private-host/rest?apiKey=query-key",
+        "Authorization: Bearer header-token", "Cookie: musicdeck_session=session-secret",
+        '{"password":"json-password","apiKey":"json-key"}', "token=standalone-token",
+        "password: raw-password", "apiKey='quoted key'", "Bearer tiny",
+        "literal-provider-secret",
+      ].join("\n"));
+      const { service, logs } = setup(createFakeBackend(), createFakeBackend({
+        listTracks: vi.fn(async () => { throw error; }),
+      }));
+      const live = vi.fn();
+      const unsubscribe = logs.subscribe(live);
+      await service.listTracks();
+      unsubscribe();
+      const output = JSON.stringify([logs.list(), live.mock.calls]);
+      for (const secret of ["private-user", "private-password", "private-host", "query-key", "header-token",
+        "session-secret", "json-password", "json-key", "standalone-token", "literal-provider-secret",
+        "raw-password", "quoted key", "tiny"]) {
+        expect(output).not.toContain(secret);
+      }
+      expect(output).toContain("[REDACTED]");
+      expect(output).toContain("[provider URL]");
+    });
   });
 
   test("preserves duplicate items across providers without deduplication", async () => {

@@ -60,5 +60,6 @@
 	.search-wrapper, .search { width: 100%; max-width: none; }
 	.search input { min-width: 0; padding: 10px 14px; }
 	.profile { padding-right: 6px; }
+	.profile-button > span:last-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 	.topbar-import-status span:last-child { display: none; }
 }

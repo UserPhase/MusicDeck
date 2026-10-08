@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render as rtlRender, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 import Album from "./Album";
@@ -12,6 +13,8 @@ import {
   getArtistPortrait,
   getMusicBrainzArtistPortrait,
   getArtistOverview,
+  getArtistDiscography,
+  getArtistTopTracks,
   getArtistTracks,
   getTrackArtistBiography,
   getCoverUrl,
@@ -26,6 +29,16 @@ import {
 import { usePlayer } from "../context/PlayerContext";
 import { getWikipediaBiography } from "../services/biographyFallback";
 
+// Mirrors App.js, which provides the shared artist-overview query client.
+function render(ui, options) {
+  return rtlRender(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={artistOverviewQueryClient}>{children}</QueryClientProvider>
+    ),
+    ...options,
+  });
+}
+
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
   getAlbums: jest.fn(async () => []),
@@ -33,6 +46,8 @@ jest.mock("../api/musicdeck", () => ({
   getArtistPortrait: jest.fn(async () => null),
   getMusicBrainzArtistPortrait: jest.fn(async () => null),
   getArtistOverview: jest.fn(),
+  getArtistDiscography: jest.fn(),
+  getArtistTopTracks: jest.fn(),
   getArtistTracks: jest.fn(async () => []),
   getTrackArtistBiography: jest.fn(async () => null),
   getCoverUrl: jest.fn((id) => (id ? typeof id === "object" ? id.url : `/artwork/${id}` : null)),
@@ -94,6 +109,8 @@ beforeEach(() => {
     };
   });
   getExternalCharts.mockResolvedValue(chartData);
+  getArtistDiscography.mockResolvedValue({ missingAlbums: [], missingTracks: [] });
+  getArtistTopTracks.mockResolvedValue([]);
   hydrateExternalPreviews.mockResolvedValue([]);
   getRecommendations.mockResolvedValue({ sections: [], degraded: false });
   usePlayer.mockReturnValue({
@@ -144,7 +161,6 @@ test("renders an external album in the shared album page", async () => {
 });
 
 test("renders an external artist in the shared artist page and links albums", async () => {
-  matchLibraryItems.mockResolvedValue([{ id: "external_itunes_album_10", inLibrary: true, localAlbumId: "local-album" }]);
   getArtistTracks.mockResolvedValue([{
     id: "external_itunes_30",
     title: "External Song",
@@ -190,11 +206,9 @@ test("renders an external artist in the shared artist page and links albums", as
   expect(await screen.findByRole("heading", { name: "External Artist" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: /external album/i })).toHaveAttribute(
     "href",
-    "/album/external_itunes_album_10"
+    "/artist/external_itunes_artist_20/album/external_itunes_album_10"
   );
   expect(screen.getByText("External Song")).toBeInTheDocument();
-  expect(await screen.findByLabelText("In your library")).toBeInTheDocument();
-  expect(screen.queryByText("Not downloaded")).not.toBeInTheDocument();
 });
 
 test("shows the complete catalog tracklist for an album with only some tracks downloaded", async () => {
@@ -364,7 +378,7 @@ test("artist page album cover art resolves through the same getCoverUrl call as 
     "src",
     "/artwork/artwork-legacy-1"
   );
-  expect(getCoverUrl).toHaveBeenCalledWith("artwork-legacy-1");
+  expect(getCoverUrl).toHaveBeenCalledWith("artwork-legacy-1", 300);
 });
 
 test("artist page waits for ID-scoped tracks, uses an artist portrait, and renders only the ten most played", async () => {
@@ -487,7 +501,7 @@ test("artist page shows keyless catalog albums and popular tracks without inflat
   await waitFor(() => expect(document.querySelector(".artist-page-cover img"))
     .toHaveAttribute("src", "/api/artwork/external/portrait-token"));
   expect(screen.getByText("1 album · 1 song in library")).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: /Another Queen Album/ })).toHaveAttribute("href", "/album/external_deezer_album_42");
+  expect(screen.getByRole("link", { name: /Another Queen Album/ })).toHaveAttribute("href", "/artist/queen-id/album/external_deezer_album_42");
   expect(screen.getByText("Not downloaded")).toBeInTheDocument();
   expect(getCoverUrl).toHaveBeenCalledWith("local-cover", 300);
   expect(getCoverUrl).toHaveBeenCalledWith("external-cover", 300);
@@ -509,9 +523,8 @@ test("artist page shows local music before slower external enrichment finishes",
     localSongCount: 1,
     externalEnrichmentAvailable: true,
   };
-  getArtistOverview.mockImplementation((artistId, options) =>
-    options?.scope === "local" ? Promise.resolve(local) : enriched
-  );
+  getArtistOverview.mockResolvedValue(local);
+  getArtistDiscography.mockReturnValue(enriched);
 
   render(
     <MemoryRouter initialEntries={["/artist/queen-id"]}>
@@ -522,23 +535,21 @@ test("artist page shows local music before slower external enrichment finishes",
   expect(await screen.findByRole("heading", { name: "Queen" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: /Local Album/ })).toBeInTheDocument();
   expect(screen.getByText("1 album · 1 song in library")).toBeInTheDocument();
-  expect(screen.getByText("Finding more releases…").closest('[role="status"]')).toBeInTheDocument();
+  expect((await screen.findByText("Finding more releases…")).closest('[role="status"]')).toBeInTheDocument();
   expect(screen.queryByText("External Album")).not.toBeInTheDocument();
   expect(getArtistOverview).toHaveBeenCalledWith("queen-id", { scope: "local" });
 
   await act(async () => {
     finishEnrichment({
-      ...local,
-      artist: { ...local.artist, album: [
-        ...local.artist.album,
-        { id: "external_deezer_album_42", name: "External Album", artistId: "queen-id", source: { kind: "external", count: 0 } },
-      ] },
-      externalEnrichmentAvailable: false,
+      missingAlbums: [
+        { id: "external_deezer_album_42", name: "External Album", artistId: "queen-id", discographySource: "external", source: { kind: "external", count: 0 } },
+      ],
+      missingTracks: [],
     });
   });
 
-  expect(screen.getByRole("link", { name: /External Album/ })).toBeInTheDocument();
-  expect(screen.queryByText("Finding more releases…")).not.toBeInTheDocument();
+  expect(await screen.findByRole("link", { name: /External Album/ })).toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByText("Finding more releases…")).not.toBeInTheDocument());
   expect(screen.getByText("1 album · 1 song in library")).toBeInTheDocument();
 });
 
@@ -649,7 +660,7 @@ test("renders Explore discovery using neutral results", async () => {
   const artistSection = screen.getByRole("heading", { name: "Discover Artists" }).closest("section");
   await waitFor(() => {
     expect(albumSection?.querySelector('a[href="/album/external_itunes_album_10"]')).not.toBeNull();
-    expect(artistSection?.querySelector('a[href="/artist/external_itunes_artist_20"]')).not.toBeNull();
+    expect(artistSection?.querySelector('a[href="/artist/ext%3Aitunes%3A20"]')).not.toBeNull();
   });
 });
 
@@ -672,12 +683,11 @@ test("resolves a Deezer featured album locally before playing or saving it", asy
   await waitFor(() => expect(setMediaFavorite).toHaveBeenCalledWith("album", "catalog-chart-album", true));
 });
 
-test("shows a local availability message when a Deezer track cannot be matched", async () => {
+test("plays a Deezer chart track directly so the player can use its embedded preview", async () => {
   getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
-  searchNavidrome.mockResolvedValue({ results: { track: [] } });
   render(<MemoryRouter><Explore /></MemoryRouter>);
 
   fireEvent.click(await screen.findByRole("button", { name: "Play Chart Song" }));
-  expect(await screen.findByRole("status")).toHaveTextContent("not available in your local library");
-  expect(playSong).not.toHaveBeenCalled();
+  await waitFor(() => expect(playSong).toHaveBeenCalledWith(expect.objectContaining({ title: "Chart Song" })));
+  expect(searchNavidrome).not.toHaveBeenCalled();
 });

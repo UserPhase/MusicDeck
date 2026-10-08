@@ -2,6 +2,7 @@ import type { Album, Artist, Track } from "../types.js";
 import type { CatalogProvider } from "../backends/catalog-provider.js";
 import type { ProviderRegistry, RegisteredProvider } from "../backends/registry.js";
 import { LibraryService, type LibraryItemType } from "./library.js";
+import { redactText, serverLogs, type LogBuffer } from "../utils/logger.js";
 
 /**
  * MusicDeck-owned availability summary attached to catalog read-model items.
@@ -54,8 +55,25 @@ export type CatalogSearchResult = {
 };
 
 type SettledRead<T> =
-  | { entry: RegisteredProvider; ok: true; value: T[] }
-  | { entry: RegisteredProvider; ok: false };
+  | { entry: RegisteredProvider; ok: true; value: T }
+  | { entry: RegisteredProvider; ok: false; error: unknown };
+
+/**
+ * The public message stays generic (no provider internals reach clients), but
+ * each provider's own failure is kept as `cause` and appended to the stack so
+ * server logs show why every source failed instead of swallowing it.
+ */
+function allProvidersUnavailable(failures: Array<{ entry: RegisteredProvider; error: unknown }>): Error {
+  const causes = failures.map(({ error }) => (error instanceof Error ? error : new Error(String(error))));
+  const failure = new Error("All catalog providers are unavailable", {
+    cause: new AggregateError(causes, "Catalog provider failures"),
+  });
+  const details = failures
+    .map(({ entry }, index) => `Caused by [${entry.connectionId}]: ${causes[index].stack ?? causes[index].message}`)
+    .join("\n");
+  if (details) failure.stack = `${failure.stack}\n${details}`;
+  return failure;
+}
 
 /** Build the availability summary for one item returned by one connection. */
 function availabilityFor(connectionId: string, totalSources: number, availableSources: number): Availability {
@@ -89,7 +107,8 @@ function availabilityFor(connectionId: string, totalSources: number, availableSo
 export class CatalogService {
   constructor(
     private readonly registry: ProviderRegistry,
-    private readonly library: LibraryService
+    private readonly library: LibraryService,
+    private readonly logger: Pick<LogBuffer, "push"> = serverLogs,
   ) {}
 
   private connections(): RegisteredProvider[] {
@@ -261,19 +280,41 @@ export class CatalogService {
    * connection so failures never reject the whole batch.
    */
   private async runReads<T>(
-    read: (provider: CatalogProvider) => Promise<T[]>
+    operation: string,
+    read: (provider: CatalogProvider) => Promise<T>
   ): Promise<Array<SettledRead<T>>> {
     const connections = this.connections();
 
-    return Promise.all(
+    const results = await Promise.all(
       connections.map(async (entry): Promise<SettledRead<T>> => {
         try {
           return { entry, ok: true, value: await read(entry.provider) };
-        } catch {
-          return { entry, ok: false };
+        } catch (error) {
+          return { entry, ok: false, error };
         }
       })
     );
+    if (results.some((result) => result.ok)) {
+      for (const result of results) {
+        if (result.ok) continue;
+        const description = result.error instanceof Error
+          ? `${result.error.name}: ${result.error.message}`
+          : String(result.error);
+        this.logger.push({
+          level: "warn",
+          source: "server",
+          message: "Catalog provider read failed; returning partial results",
+          meta: {
+            connectionId: result.entry.connectionId,
+            providerType: result.entry.type,
+            operation,
+            // Provider URLs are not needed to diagnose which connection failed.
+            errorDescription: redactText(description).replace(/https?:\/\/[^\s"'<>]+/gi, "[provider URL]"),
+          },
+        });
+      }
+    }
+    return results;
   }
 
   /**
@@ -281,14 +322,14 @@ export class CatalogService {
    * throw a MusicDeck error only when every provider failed.
    */
   private aggregate<T extends { id: string; artworkId: string | null; artworkUrl: string | null }>(
-    results: Array<SettledRead<T>>,
+    results: Array<SettledRead<T[]>>,
     type: LibraryItemType
   ): CatalogListResult<T> {
     const totalSources = results.length;
     const availableSources = results.filter((result) => result.ok).length;
 
     if (availableSources === 0 && totalSources > 0) {
-      throw new Error("All catalog providers are unavailable");
+      throw allProvidersUnavailable(results.flatMap((result) => (result.ok ? [] : [result])));
     }
 
     const items: Array<Available<T>> = [];
@@ -310,43 +351,35 @@ export class CatalogService {
   }
 
   async listAlbums(limit?: number): Promise<CatalogListResult<Album>> {
-    return this.aggregate(await this.runReads((provider) => provider.listAlbums(limit)), "album");
+    return this.aggregate(await this.runReads("listAlbums", (provider) => provider.listAlbums(limit)), "album");
   }
 
   async listArtists(): Promise<CatalogListResult<Artist>> {
-    return this.aggregate(await this.runReads((provider) => provider.listArtists()), "artist");
+    return this.aggregate(await this.runReads("listArtists", (provider) => provider.listArtists()), "artist");
   }
 
   async listTracks(): Promise<CatalogListResult<Track>> {
-    return this.aggregate(await this.runReads((provider) => provider.listTracks()), "track");
+    return this.aggregate(await this.runReads("listTracks", (provider) => provider.listTracks()), "track");
   }
 
   async getRandomAlbums(limit?: number): Promise<CatalogListResult<Album>> {
-    return this.aggregate(await this.runReads((provider) => provider.getRandomAlbums(limit)), "album");
+    return this.aggregate(await this.runReads("getRandomAlbums", (provider) => provider.getRandomAlbums(limit)), "album");
   }
 
   async getRandomTracks(limit?: number): Promise<CatalogListResult<Track>> {
-    return this.aggregate(await this.runReads((provider) => provider.getRandomTracks(limit)), "track");
+    return this.aggregate(await this.runReads("getRandomTracks", (provider) => provider.getRandomTracks(limit)), "track");
   }
 
   async search(query: string, types?: string[]): Promise<CatalogSearchResult> {
     const connections = this.connections();
     const totalSources = connections.length;
 
-    const settled = await Promise.all(
-      connections.map(async (entry) => {
-        try {
-          return { entry, ok: true as const, value: await entry.provider.search(query, types) };
-        } catch {
-          return { entry, ok: false as const };
-        }
-      })
-    );
+    const settled = await this.runReads("search", (provider) => provider.search(query, types));
 
     const availableSources = settled.filter((result) => result.ok).length;
 
     if (availableSources === 0 && totalSources > 0) {
-      throw new Error("All catalog providers are unavailable");
+      throw allProvidersUnavailable(settled.flatMap((result) => (result.ok ? [] : [result])));
     }
 
     const artists: Array<Available<Artist>> = [];

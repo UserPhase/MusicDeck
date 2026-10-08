@@ -293,7 +293,7 @@ describe("NavidromeBackend", () => {
     expect(scanStatusCalls).toBeGreaterThanOrEqual(3);
   });
 
-  test("scanLibrary reports not-scanning if triggering the scan itself fails", async () => {
+  test("scanLibrary surfaces a failure to trigger the scan", async () => {
     const fetchImpl = vi.fn(async () => new Response("error", { status: 500 }));
 
     const backend = new NavidromeBackend({
@@ -302,7 +302,19 @@ describe("NavidromeBackend", () => {
       password: "navidrome-password",
     }, fetchImpl as any);
 
-    await expect(backend.scanLibrary()).resolves.toEqual({ scanning: false });
+    await expect(backend.scanLibrary()).rejects.toThrow("Navidrome returned 500");
+  });
+
+  test("requests carry a default timeout signal", async () => {
+    const fetchImpl = vi.fn(async (_url: URL, _init?: RequestInit) => jsonResponse({ "subsonic-response": { status: "ok" } }));
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test",
+      username: "navidrome-user",
+      password: "navidrome-password",
+    }, fetchImpl as any);
+
+    await backend.requestLibraryRescan();
+    expect(fetchImpl.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
   });
 
   test("requestLibraryRescan starts a scan and reports a failed request", async () => {

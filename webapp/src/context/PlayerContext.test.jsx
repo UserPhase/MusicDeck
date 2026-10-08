@@ -5,6 +5,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 
 import {
   AuthProvider,
@@ -26,7 +27,8 @@ import {
   getSilenceAnalysis,
   analyzeSilence,
   getPlayableSources,
-  recordListeningEvent,
+  reportPlaybackSession as recordListeningEvent,
+  getListeningConfig,
 } from "../api/musicdeck";
 
 
@@ -40,7 +42,9 @@ jest.mock("../api/musicdeck", () => ({
   getSilenceAnalysis: jest.fn(),
   analyzeSilence: jest.fn(),
   getPlayableSources: jest.fn(),
-  recordListeningEvent: jest.fn(),
+  reportPlaybackSession: jest.fn(),
+  getListeningConfig: jest.fn(async () => ({ thresholdSeconds: 30 })),
+  LISTENING_ACTIVITY_CHANGED_EVENT: "musicdeck:listening-activity-changed",
   starSong: jest.fn(),
   unstarSong: jest.fn(),
 }));
@@ -84,6 +88,12 @@ const previewSource = {
   quality: { codec: "MP3", lossless: false, durationSeconds: 30 },
 };
 
+function audioDecks(container) {
+  // Audio elements have no implicit ARIA role to query with Testing Library.
+  // eslint-disable-next-line testing-library/no-container, testing-library/no-node-access
+  return container.querySelectorAll("audio");
+}
+
 
 function PlayerHarness() {
   const {
@@ -91,6 +101,7 @@ function PlayerHarness() {
     playSongFromSource,
     playContext,
     playQueue,
+    moveQueueItem,
     nextSong,
     previousSong,
     toggleShuffle,
@@ -159,6 +170,14 @@ function PlayerHarness() {
       <button onClick={() => playQueue(songs, 0)}>
         album-start
       </button>
+      <button onClick={() => playQueue([songs[0], songs[1], songs[0], songs[2]], 0)}>duplicates</button>
+      <button onClick={() => moveQueueItem(1, 2)}>move-later</button>
+      <button onClick={() => moveQueueItem(2, 1)}>move-earlier</button>
+      <button onClick={() => moveQueueItem(3, 1)}>move-last-first</button>
+      <button onClick={() => moveQueueItem(3, 2)}>move-last-second</button>
+      <button onClick={() => {
+        for (const [from, to] of [[0, 1], [1, 0], [-1, 1], [1, 99], [NaN, 1], [1, 1.5], [1, 1]]) moveQueueItem(from, to);
+      }}>invalid-moves</button>
       <button onClick={() => playQueue(playlistSongs, 1)}>
         playlist
       </button>
@@ -271,6 +290,7 @@ function renderPlayer({
   recentHistory = [],
   userSettings = [],
   silenceAnalysis = null,
+  children = <PlayerHarness />,
 } = {}) {
   getCurrentSession.mockResolvedValue({
     authenticated: true,
@@ -293,7 +313,10 @@ function renderPlayer({
     trailingSilenceSeconds: 0.75,
   });
   getPlayableSources.mockResolvedValue({ sources: [], selectedSource: null });
-  recordListeningEvent.mockResolvedValue(undefined);
+  recordListeningEvent.mockImplementation(async (payload) => ({
+    counted: payload.listenedSeconds >= Math.min(30, payload.durationSeconds || Infinity),
+  }));
+  getListeningConfig.mockResolvedValue({ thresholdSeconds: 30 });
   getStreamUrl.mockImplementation(
     (songId) => `/stream/${songId}`
   );
@@ -305,7 +328,7 @@ function renderPlayer({
   return render(
     <AuthProvider>
       <PlayerProvider>
-        <PlayerHarness />
+        {children}
       </PlayerProvider>
     </AuthProvider>
   );
@@ -314,11 +337,115 @@ function renderPlayer({
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   jest.clearAllMocks();
   global.fetch = jest.fn(async () => ({
     ok: true,
     json: async () => ({ results: [] }),
   }));
+});
+
+test("moves upcoming entries both ways without touching playback, source tracks, or persistence progress", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  const [audio] = audioDecks(container);
+  audio.currentTime = 42;
+  fireEvent.timeUpdate(audio);
+  const plays = HTMLMediaElement.prototype.play.mock.calls.length;
+  const streams = getStreamUrl.mock.calls.length;
+  fireEvent.click(screen.getByText("move-later"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2");
+  expect(audio.currentTime).toBe(42);
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(plays);
+  expect(getStreamUrl).toHaveBeenCalledTimes(streams);
+  expect(songs.map((song) => song.id)).toEqual(["song-1", "song-2", "song-3"]);
+  expect(JSON.parse(localStorage.getItem(queueStorageKey("user-1")))).toMatchObject({
+    queueTrackIds: ["song-1", "song-3", "song-2"], playbackProgressSeconds: 42,
+  });
+  fireEvent.click(screen.getByText("invalid-moves"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2");
+  fireEvent.click(screen.getByText("move-earlier"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
+});
+
+test("reorders duplicate occurrences by position and Next/Previous follow the reordered sequence", async () => {
+  renderPlayer();
+  fireEvent.click(screen.getByText("duplicates"));
+  await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-1,song-3"));
+  fireEvent.click(screen.getByText("move-last-first"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2,song-1");
+  fireEvent.click(screen.getByText("next"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-3"));
+  fireEvent.click(screen.getByText("previous"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  fireEvent.click(screen.getByText("move-earlier"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3,song-1");
+});
+
+test("preserves manual ordering under shuffle and repeat-one, with manual Next still advancing", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  const random = jest.spyOn(Math, "random").mockReturnValue(0);
+  fireEvent.click(screen.getByText("shuffle"));
+  random.mockRestore();
+  fireEvent.click(screen.getByText("move-earlier"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
+  expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("true");
+  fireEvent.click(screen.getByText("loop"));
+  fireEvent.ended(audioDecks(container)[0]);
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2));
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  fireEvent.click(screen.getByText("next"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+});
+
+test("a pending autoplay refill cannot overwrite a newer queue order", async () => {
+  renderPlayer();
+  fireEvent.click(screen.getByText("duplicates"));
+  await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-1,song-3"));
+  let finishRefill;
+  getRandomSongs.mockImplementationOnce(() => new Promise((resolve) => { finishRefill = resolve; }));
+  fireEvent.click(screen.getByText("next"));
+  await waitFor(() => expect(finishRefill).toBeDefined());
+  fireEvent.click(screen.getByText("move-last-first"));
+  // The current index is now 1; only indices 2 and 3 are movable.
+  fireEvent.click(screen.getByText("move-last-second"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3,song-1");
+  await act(async () => finishRefill([{ id: "autoplay", title: "Autoplay" }]));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3,song-1,autoplay");
+});
+
+test("reordered queues survive navigation and replacement of layout consumers", async () => {
+  const view = (preset) => (
+    <MemoryRouter>
+      <Link to="/library">Navigate to library</Link>
+      <Routes>
+        <Route path="/" element={<PlayerHarness key={preset} />} />
+        <Route path="/library" element={<PlayerHarness key={`library-${preset}`} />} />
+      </Routes>
+    </MemoryRouter>
+  );
+  const { container, rerender } = renderPlayer({ children: view("spotify") });
+  fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  const [audio] = audioDecks(container);
+  audio.currentTime = 42;
+  fireEvent.timeUpdate(audio);
+  fireEvent.click(screen.getByText("move-later"));
+  const plays = HTMLMediaElement.prototype.play.mock.calls.length;
+  fireEvent.click(screen.getByRole("link", { name: "Navigate to library" }));
+  for (const preset of ["apple", "ytmusic", "soundcloud", "spotify"]) {
+    rerender(<AuthProvider><PlayerProvider>{view(preset)}</PlayerProvider></AuthProvider>);
+    expect(audioDecks(container)[0]).toBe(audio);
+    expect(audio.currentTime).toBe(42);
+    expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2");
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  }
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(plays);
 });
 
 test("rehydrates the queue and progress without starting audio until Play", async () => {
@@ -459,13 +586,13 @@ test("caps and validates recently played history received from the server", asyn
   expect(hydratedIds).not.toContain("history-50");
 });
 
-test("drops listening history older than 45 days during hydration", async () => {
+test("preserves persistent history older than 45 days during hydration", async () => {
   renderPlayer({ recentHistory: [
     { id: "old", playedAt: new Date(Date.now() - 46 * 86_400_000).toISOString() },
     { id: "current", playedAt: new Date().toISOString() },
   ] });
   await waitFor(() => expect(screen.getByTestId("recently-played")).toHaveTextContent("current"));
-  expect(screen.getByTestId("recently-played")).not.toHaveTextContent("old");
+  expect(screen.getByTestId("recently-played")).toHaveTextContent("old");
 });
 
 test("ignores malformed recently played history received from the server", async () => {
@@ -663,11 +790,11 @@ test("duplicate ended events advance the queue only once", async () => {
   });
 
   expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
-  expect(recordListeningEvent).toHaveBeenCalledTimes(1);
-  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 1);
+  expect(recordListeningEvent.mock.calls.filter(([payload]) => payload.finished && payload.trackId === "song-1")).toHaveLength(1);
+  expect(recordListeningEvent).toHaveBeenCalledWith(expect.objectContaining({ trackId: "song-1", listenedSeconds: 0, finished: true }));
 });
 
-test("scrobbles a local track once after half its duration, not on play start", async () => {
+test("records cumulative actual listening time rather than a seeked position", async () => {
   const { container } = renderPlayer();
   fireEvent.click(screen.getByText("direct"));
   await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
@@ -675,30 +802,78 @@ test("scrobbles a local track once after half its duration, not on play start", 
 
   const audio = container.querySelector("audio");
   Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
-  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 89 });
+  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 90 });
   fireEvent.timeUpdate(audio);
   expect(recordListeningEvent).not.toHaveBeenCalled();
-  audio.currentTime = 90;
+  const clock = jest.spyOn(Date, "now");
+  const start = Date.now();
+  clock.mockReturnValue(start + 30_000);
+  audio.currentTime = 120;
   fireEvent.timeUpdate(audio);
-  fireEvent.timeUpdate(audio);
-
-  expect(recordListeningEvent).toHaveBeenCalledTimes(1);
-  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 0.5);
-  expect(screen.getByTestId("recently-played")).toHaveTextContent("song-1");
+  await waitFor(() => expect(recordListeningEvent).toHaveBeenCalledWith(expect.objectContaining({ trackId: "song-1", listenedSeconds: 30, finished: false })));
+  clock.mockRestore();
+  getRecentlyPlayed.mockResolvedValue([{ ...songs[0], playedAt: new Date().toISOString() }]);
+  fireEvent(window, new Event("musicdeck:listening-activity-changed"));
+  await waitFor(() => expect(screen.getByTestId("recently-played")).toHaveTextContent("song-1"));
 });
 
-test("qualifies a long track at four minutes without waiting for halfway", async () => {
+test("a late recent-history response cannot overwrite a newer canonical refresh", async () => {
+  renderPlayer();
+  await waitFor(() => expect(getRecentlyPlayed).toHaveBeenCalledTimes(1));
+  let resolveOld;
+  getRecentlyPlayed.mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }));
+  fireEvent(window, new Event("musicdeck:listening-activity-changed"));
+  await waitFor(() => expect(getRecentlyPlayed).toHaveBeenCalledTimes(2));
+  getRecentlyPlayed.mockResolvedValueOnce([{ ...songs[1], playedAt: new Date().toISOString() }]);
+  fireEvent(window, new Event("musicdeck:listening-activity-changed"));
+  await waitFor(() => expect(screen.getByTestId("recently-played")).toHaveTextContent("song-2"));
+  await act(async () => resolveOld([{ ...songs[0], playedAt: new Date().toISOString() }]));
+  expect(screen.getByTestId("recently-played")).toHaveTextContent("song-2");
+  expect(screen.getByTestId("recently-played")).not.toHaveTextContent("song-1");
+});
+
+test("long tracks use 30 actual seconds rather than four minutes of playback position", async () => {
   const { container } = renderPlayer();
   fireEvent.click(screen.getByText("direct"));
   await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
   const audio = container.querySelector("audio");
   Object.defineProperty(audio, "duration", { configurable: true, value: 1000 });
-  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 239 });
-  fireEvent.timeUpdate(audio);
+  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 0 });
   expect(recordListeningEvent).not.toHaveBeenCalled();
-  audio.currentTime = 240;
+  const clock = jest.spyOn(Date, "now");
+  const start = Date.now();
+  clock.mockReturnValue(start + 30_000);
+  audio.currentTime = 30;
   fireEvent.timeUpdate(audio);
-  expect(recordListeningEvent).toHaveBeenCalledWith("song-1", "complete", 0.24);
+  await waitFor(() => expect(recordListeningEvent).toHaveBeenCalledWith(expect.objectContaining({ trackId: "song-1", listenedSeconds: 30, durationSeconds: 1000 })));
+  clock.mockRestore();
+});
+
+test("explicit previous-button restarts create a new listening session", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  const audio = container.querySelector("audio");
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 0 });
+  const start = Date.now();
+  const clock = jest.spyOn(Date, "now");
+  try {
+    clock.mockReturnValue(start + 30_000);
+    audio.currentTime = 30;
+    fireEvent.timeUpdate(audio);
+    await waitFor(() => expect(recordListeningEvent).toHaveBeenCalled());
+    const first = recordListeningEvent.mock.calls[0][0].playbackSessionId;
+    fireEvent.click(screen.getByText("previous"));
+    expect(audio.currentTime).toBe(0);
+    clock.mockReturnValue(start + 60_000);
+    audio.currentTime = 30;
+    fireEvent.timeUpdate(audio);
+    await waitFor(() => expect(new Set(recordListeningEvent.mock.calls.map(([payload]) => payload.playbackSessionId)).size).toBe(2));
+    expect(recordListeningEvent.mock.calls.at(-1)[0].playbackSessionId).not.toBe(first);
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 
@@ -1004,6 +1179,45 @@ test("crossfade starts the next queued track on the idle deck and hands it off",
 });
 
 
+test("reordering during crossfade keeps current progress and cancels the stale incoming track", async () => {
+  const frames = [];
+  const animation = jest.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+    frames.push(callback);
+    return frames.length;
+  });
+  const cancellation = jest.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+  const now = jest.spyOn(performance, "now").mockReturnValue(1000);
+  try {
+    const { container } = renderPlayer();
+    fireEvent.click(screen.getByText("context-first"));
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+    fireEvent.click(screen.getByText("crossfade-three"));
+    const [outgoing, incoming] = audioDecks(container);
+    Object.defineProperty(outgoing, "duration", { configurable: true, value: 100 });
+    outgoing.currentTime = 97;
+    fireEvent.timeUpdate(outgoing);
+    await waitFor(() => expect(frames.length).toBeGreaterThan(0));
+    act(() => frames.shift()(2500));
+    const plays = HTMLMediaElement.prototype.play.mock.calls.length;
+    fireEvent.click(screen.getByText("move-later"));
+    expect(outgoing.currentTime).toBe(97);
+    expect(outgoing).toHaveAttribute("src", "/stream/song-1");
+    expect(outgoing.volume).toBe(1);
+    expect(incoming).not.toHaveAttribute("src");
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(plays);
+    act(() => frames.shift()(4000));
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+    expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3,song-2");
+    fireEvent.click(screen.getByText("next"));
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-3"));
+  } finally {
+    animation.mockRestore();
+    cancellation.mockRestore();
+    now.mockRestore();
+  }
+});
+
 test("playlist queues honor their start index", async () => {
   renderPlayer();
 
@@ -1046,7 +1260,7 @@ test("a library track plays locally without resolving an external source", async
 });
 
 
-test("a track missing from the library transparently plays an external preview", async () => {
+test("a catalog track without an embedded preview never resolves a full external source", async () => {
   renderPlayer();
 
   getPlayableSources.mockResolvedValue({
@@ -1057,23 +1271,12 @@ test("a track missing from the library transparently plays an external preview",
   fireEvent.click(screen.getByText("catalog"));
 
   await waitFor(() => {
-    expect(getStreamUrl).toHaveBeenCalledWith(
-      "external_deezer_42",
-      expect.objectContaining({ id: "playable_preview", type: "preview" }),
-      "original"
-    );
+    expect(screen.getByTestId("unavailable")).toHaveTextContent("true");
   });
 
-  expect(getPlayableSources).toHaveBeenCalledWith(
-    expect.objectContaining({ id: "external_deezer_42" })
-  );
-
-  await waitFor(() => {
-    expect(screen.getByTestId("is-preview")).toHaveTextContent("true");
-  });
-
-  expect(screen.getByTestId("preview-duration")).toHaveTextContent("30");
-  expect(screen.getByTestId("unavailable")).toHaveTextContent("false");
+  expect(getPlayableSources).not.toHaveBeenCalled();
+  expect(getStreamUrl).not.toHaveBeenCalled();
+  expect(screen.getByTestId("is-preview")).toHaveTextContent("false");
 });
 
 test("an embedded external preview plays directly before source resolution", async () => {
@@ -1110,16 +1313,12 @@ test("a track with no preview falls back to the unavailable state", async () => 
 test("preview playback stops at the preview endpoint", async () => {
   const { container } = renderPlayer();
 
-  getPlayableSources.mockResolvedValue({
-    sources: [previewSource],
-    selectedSource: previewSource,
-  });
-
-  fireEvent.click(screen.getByText("catalog"));
+  fireEvent.click(screen.getByText("catalog-with-preview"));
 
   await waitFor(() => {
     expect(screen.getByTestId("is-preview")).toHaveTextContent("true");
   });
+  expect(screen.getByTestId("preview-duration")).toHaveTextContent("30");
 
   const audio = container.querySelector("audio");
 

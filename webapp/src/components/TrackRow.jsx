@@ -35,6 +35,7 @@ function TrackRow({
   actionsRef,
   onSpotdlDownload,
   className = "",
+  preserveDeleted = false,
 }) {
   const deletion = useServerDeletion();
   const {
@@ -147,7 +148,7 @@ function TrackRow({
   ].filter(Boolean).join(" ");
   const supplementalMenuContent = isValidElement(menu) ? menu.props.children : menu;
 
-  if (deletion?.deletedTracks.has(String(song.id))) return null;
+  if (!preserveDeleted && deletion?.deletedTracks.has(String(song.id))) return null;
 
   return (
     <div

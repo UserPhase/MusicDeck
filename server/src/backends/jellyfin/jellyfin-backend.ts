@@ -8,6 +8,9 @@ export type JellyfinConfig = {
   apiKey: string;
 };
 
+// Applied to JSON/control requests only; audio and artwork streams are long-lived by design.
+const JELLYFIN_REQUEST_TIMEOUT_MS = 15_000;
+
 /**
  * Jellyfin provider: catalog reads + direct audio streaming/artwork.
  *
@@ -53,8 +56,12 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     try {
       response = await this.fetchImpl(this.buildUrl(path, params), {
         headers: this.authHeaders(),
+        signal: AbortSignal.timeout(JELLYFIN_REQUEST_TIMEOUT_MS),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new Error("Jellyfin request timed out");
+      }
       throw new Error("Jellyfin connection failed");
     }
 
@@ -179,6 +186,7 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     const response = await this.fetchImpl(this.buildUrl("Library/Refresh"), {
       method: "POST",
       headers: this.authHeaders(),
+      signal: AbortSignal.timeout(JELLYFIN_REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) throw new Error(`Jellyfin library refresh failed (${response.status})`);
   }

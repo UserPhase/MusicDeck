@@ -134,6 +134,10 @@ export class RecommendationService {
 
   recordListeningEvent(userId: string, trackId: string, eventType: "play" | "skip" | "complete", completionRatio?: unknown) {
     dbInsertEvent(this.db, userId, trackId, eventType, parseRatio(completionRatio));
+    this.invalidateListeningTaste(userId);
+  }
+
+  invalidateListeningTaste(userId: string) {
     this.tasteCache.delete(userId);
     this.libraryCache.delete(userId);
   }
@@ -196,7 +200,7 @@ export class RecommendationService {
         SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completedCount,
         MAX(CASE WHEN event_type = 'complete' THEN created_at END) AS lastCompletedAt
       FROM listening_events
-      WHERE user_id = ? AND created_at >= ?
+      WHERE user_id = ? AND created_at >= ? AND event_type IN ('play', 'skip', 'complete')
       GROUP BY track_id
     `).all(userId, cutoff) as Array<{
       track_id: string; scoreDelta: number; completedCount: number; lastCompletedAt: string | null;
@@ -400,9 +404,9 @@ export class RecommendationService {
 
 function dbInsertEvent(db: Db, userId: string, trackId: string, eventType: string, completionRatio: number | null) {
   db.prepare(`
-    INSERT INTO listening_events (id, user_id, track_id, event_type, completion_ratio, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(createId("listen"), userId, trackId, eventType, completionRatio, new Date().toISOString());
+    INSERT INTO listening_events (id, user_id, track_id, event_type, completion_ratio, created_at, counted, finished)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+  `).run(createId("listen"), userId, trackId, eventType, completionRatio, new Date().toISOString(), Number(eventType === "complete"));
 }
 
 /**

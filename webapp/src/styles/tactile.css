@@ -39,7 +39,7 @@
 /* ---------------------------------------------------------------------- */
 
 .tactile-btn-primary,
-.account-avatar-remove, .queue-sidebar-segmented button,
+.account-avatar-remove, .account-secondary, .queue-sidebar-segmented button,
 .play-button,
 .album-play, .playlist-play, .artist-play, .liked-play,
 .explore-featured-actions button,
@@ -81,7 +81,7 @@
 /* Icon toggles: grow slightly on hover, compress noticeably on press     */
 /* ---------------------------------------------------------------------- */
 
-:is(.account-avatar-remove, .queue-sidebar-segmented button):active:not(:disabled) {
+:is(.account-avatar-remove, .account-secondary, .queue-sidebar-segmented button):active:not(:disabled) {
   transform: scale(0.95);
   transition-duration: var(--tactile-press-ms);
   transition-timing-function: var(--tactile-press);
@@ -242,7 +242,7 @@
 /* ---------------------------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
-  .tactile-btn-primary, .play-button, .account-avatar-remove, .queue-sidebar-segmented button,
+  .tactile-btn-primary, .play-button, .account-avatar-remove, .account-secondary, .queue-sidebar-segmented button,
   .album-play, .playlist-play, .artist-play, .liked-play,
   .explore-featured-actions button,
   .tactile-btn-icon, .heart, .control, .track-like, .detail-secondary-action, .liked-action,

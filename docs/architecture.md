@@ -162,13 +162,30 @@ playback continues while you switch. Now Playing auto-opens on a new track
 only in the shells where it docks (Spotify and Apple). Every preset keeps the
 same routes.
 
+`PlayerProvider.moveQueueItem(from, to)` moves only upcoming queue positions
+using an immutable state update. Manual, context-generated and autoplay entries
+share that same sequence, including when shuffle is enabled. A pending crossfade
+is cancelled before reordering, retaining the outgoing track's position.
+Asynchronous refills append new entries to the latest queue rather than replacing
+manual moves. Queue snapshots preserve the active index for repeated song IDs.
+Repeat remains the existing off/one toggle; this remediation does not add repeat-all.
+
+`useQueueReorder` implements Pointer Events for the shared `QueueSidebar`
+without a drag-and-drop dependency. Mouse input uses the non-interactive row;
+touch/pen input uses only the handle. Per-occurrence render keys preserve row
+identity even when one song object appears multiple times. Preview transforms
+never modify playback state; one `moveQueueItem` call commits the drop.
+Queue/index changes, closing the panel, switching tabs, Escape, pointer
+cancellation and window blur cancel the gesture and its edge-scroll frame.
+Keyboard reordering uses the same action with focus and live announcements.
+
 ### Admin server log viewer
 
 `server/src/utils/logger.ts` keeps the last 1,000 server log entries in an
 in-memory ring buffer that is also capped at about 2 MB. It evicts the oldest
 entries first and truncates oversized messages, stacks and metadata.
 
-The buffer is fed from four places:
+The buffer is fed from five places:
 
 - Fastify/pino output, through a capture stream passed as the logger `stream`.
   Lines still print to stdout.
@@ -177,6 +194,7 @@ The buffer is fed from four places:
   alive.
 - `uncaughtExceptionMonitor` and process warnings. These are recorded only, so
   an uncaught exception still crashes the process.
+- Partial catalog provider failures, pushed directly by `CatalogService`.
 
 Every entry is redacted before it is stored. Redaction removes:
 
@@ -186,6 +204,16 @@ Every entry is redacted before it is stored. Redaction removes:
   `musicdeck_session` value.
 - Subsonic `t`/`s`/`p` query parameters.
 - Credential-looking keys, in both text and nested metadata.
+- HTTP(S) URL userinfo credentials.
+
+Catalog list, random and search fan-out reads share `CatalogService.runReads`.
+The service accepts the existing log-buffer interface (the process-wide
+`serverLogs` in production). If some providers fail and at least one succeeds,
+it pushes one structured warning per failed connection and operation into the
+same redacted, bounded buffer used by admin history and live SSE. Warnings
+include connection ID, provider type, operation and a redacted error description;
+provider URLs and search text are not logged. Total failures retain the existing
+generic public error and aggregate causes, without duplicate partial warnings.
 
 Admin-only endpoints (`routes/admin-logs-routes.ts`):
 
@@ -199,6 +227,67 @@ Admin-only endpoints (`routes/admin-logs-routes.ts`):
 - `DELETE /api/admin/logs`: clears the buffer.
 
 The UI lives at Admin → Server → Logs (`webapp/src/pages/admin/AdminLogs.jsx`).
+
+### Listening activity
+
+`listening_events` is the persistent, per-user source for Listening Activity
+and the queue's Recently Played preview. Migration 25 extends the existing
+recommendation events rather than introducing another tracking system.
+Events are not pruned. Legacy completed events and unmatched recent rows are
+preserved, with unknown durations left NULL (never inferred from track length).
+
+- The global `PlayerProvider` owns one `listeningTracker` across navigation
+  and layout changes. Media progress is bounded by elapsed wall time;
+  pausing, buffering and seeking do not manufacture listening seconds.
+  External previews are excluded.
+- Each listen has a session ID and cumulative seconds. The server upserts
+  `(user_id, playback_session_id)` transactionally and takes the maximum
+  reported duration, so duplicate/out-of-order requests cannot add plays.
+  Native repeat-one wraps, explicit previous-button restarts and new plays
+  get new session IDs. Crossfade handoffs preserve incoming playback time.
+  Logout ends the session; queued reports carry an expected owner that the
+  server checks against authentication to prevent account-switch races.
+- Reports are sent every 10 seconds, at the qualification threshold, on
+  pause/finish and on page hide, using keepalive requests. A per-user,
+  per-tab sessionStorage outbox retries failed reports (up to 100 sessions,
+  logging explicitly if offline storage overflows). Refresh resumes the same
+  unfinished session. Requests time out after 15 seconds and only one report
+  per session is in flight. Closing a tab or a process crash can lose the final
+  unreported interval; server-confirmed history remains persistent.
+- The counted-listen threshold defaults to **30 seconds**, or the full track
+  duration for shorter tracks. Admins may set `listening.thresholdSeconds`
+  (a JSON number from 1 to 240) via `PATCH /api/admin/settings/server`.
+  New player sessions load this setting; changing it takes effect in the
+  server immediately. Listening time includes known short listens, whereas
+  history, play counts and rankings require a qualified listen.
+- Metadata/artwork snapshots keep history readable after a track disappears.
+  Playback resolves the current library track first and reports unavailable
+  tracks without removing their history. Missing legacy metadata is explicitly
+  excluded from distinct artist/album totals rather than guessed.
+
+Authenticated endpoints:
+
+- `POST /api/listening-events`: accepts cumulative session reports; the
+  previous recommendation-event body remains compatible.
+- `GET /api/listening-activity/config`: the counted-listen threshold.
+- `GET /api/listening-activity/history`: `period=7|30|90|year|all`, literal
+  `search`, `limit` (1-50), and an opaque keyset `cursor`. Date/ID indexes
+  make repeated listens and concurrent inserts safe at page boundaries.
+- `GET /api/listening-activity/statistics`: the same period choices, with
+  real listening seconds, qualified plays, distinct identities, top 10 songs/
+  artists/albums and daily/monthly/weekday/hourly aggregates. Trends are
+  attributed to the playback start in UTC. The calendar-year period provides
+  the basis for future annual recaps.
+- `GET /api/recently-played`: the latest 50 qualified events from the same
+  source; the queue renders 10 and links to full history. Shared provider-account
+  history is not mixed into these user-specific events.
+
+`ListeningActivity.jsx` uses the existing React Query cache, with user-scoped
+keys, 30-second freshness, abortable reads and progressive cursor pagination.
+Statistics are refreshed after qualified listens/finish, not each heartbeat.
+Recent lists also refresh on focus and every minute for other-device activity.
+The page reuses `TrackRow`, its context menu and playlist actions, and lives
+inside the unchanged layout/player shell.
 
 ### Library scan scheduler
 
@@ -218,7 +307,10 @@ that triggers `CatalogService.scanLibrary()` on every connected provider.
   overlap. A scheduled tick that hits a running scan is skipped and logged.
 - Each run is recorded as `succeeded`, `partial` (some providers failed),
   `failed`, or `skipped` (no provider supports scanning). The last run is
-  persisted in `server_settings` as `library.lastScanRun`.
+  persisted in `server_settings` as `library.lastScanRun`. A provider counts
+  as failed when its scan trigger errors or times out. For example, Navidrome
+  `startScan` returning non-2xx fails the provider instead of silently
+  succeeding.
 - Times use the server process time zone, which the status response reports.
 
 Admin-only endpoints:

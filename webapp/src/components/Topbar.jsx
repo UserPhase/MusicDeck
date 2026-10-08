@@ -35,6 +35,7 @@ export const HEADER_NAV_ITEMS = [
   { to: "/explore", label: "Explore" },
   { to: "/library/playlists", label: "Library", match: "/library" },
   { to: "/liked", label: "Liked Songs" },
+  { to: "/listening-activity", label: "Listening Activity" },
 ];
 
 export function isHeaderNavItemActive(item, pathname) {

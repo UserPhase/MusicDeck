@@ -145,6 +145,7 @@ export class SpotifyAuthClient {
           Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64")}`,
         },
         body: body.toString(),
+        signal: AbortSignal.timeout(10_000),
       });
     } catch (error) {
       throw new SpotifyAuthError(

@@ -6,6 +6,7 @@ import { usePlayer } from "../context/PlayerContext";
 const QUICK_ACTIONS = [
   { id: "library", label: "Go to Library", detail: "Your saved music", shortcut: "G L", path: "/library/tracks" },
   { id: "explore", label: "Go to Explore", detail: "Discover something new", shortcut: "G E", path: "/explore" },
+  { id: "activity", label: "Listening Activity", detail: "Your history and statistics", path: "/listening-activity" },
   { id: "settings", label: "Go to Settings", detail: "Tune MusicDeck", shortcut: "G S", path: "/settings" },
   { id: "queue", label: "Open Queue", detail: "See what plays next", shortcut: "Q", sidebar: "queue" },
 ];

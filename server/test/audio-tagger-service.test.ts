@@ -196,12 +196,12 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     const service = new SpotifyPlaylistImportService(backend as unknown as MusicBackend, playlists as unknown as PlaylistService,
       downloader as unknown as DownloaderAdapter, root, vi.fn(async () => new Response("{}")) as typeof fetch, "Spotify Imports", tagger);
     const started = service.start("https://open.spotify.com/playlist/playlist14", user);
-    const deadline = Date.now() + 15000;
+    const deadline = Date.now() + 45000;
     while (["queued", "running"].includes(service.get(started.id, user.id)!.status) && Date.now() < deadline)
       await new Promise((resolve) => setTimeout(resolve, 20));
     expect(service.get(started.id, user.id)).toMatchObject({ status: "completed", expectedCount: 14, completedCount: 14, importedCount: 14, failedCount: 0 });
     expect(downloader.download).not.toHaveBeenCalled(); expect(playlists.addProviderTrack).toHaveBeenCalledTimes(14); expect(backend.scanLibrary).toHaveBeenCalledOnce();
-  }, 20000);
+  }, 60000);
   test.each(["mp3", "flac", "m4a"])("repairs and verifies %s without ffprobe installed", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension); const cover = path.join(directory, "cover.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);

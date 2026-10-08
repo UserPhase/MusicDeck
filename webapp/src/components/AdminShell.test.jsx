@@ -220,7 +220,9 @@ describe("Player persistence across shells", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "play" }));
     expect(screen.getByTestId("probe-song")).toHaveTextContent("Keep Playing");
-    expect(screen.getByTestId("probe-queue")).toHaveTextContent("1");
+    await waitFor(() =>
+      expect(screen.getByTestId("probe-queue")).toHaveTextContent("1")
+    );
 
     // The probe state lives in PlayerProvider, mounted above the Routes, so
     // it persists regardless of which shell is active.

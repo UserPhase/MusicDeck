@@ -1,8 +1,10 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, test } from "vitest";
-import { closeTestServer, createTestServer, login } from "./helpers.js";
+import { closeTestServer, createFakeBackend, createTestServer, login } from "./helpers.js";
 import { createUser } from "../src/users/users.js";
+import { CatalogService } from "../src/domain/catalog.js";
+import { ProviderRegistry } from "../src/backends/registry.js";
 import {
   LogBuffer,
   createLogCaptureStream,
@@ -75,6 +77,9 @@ describe("LogBuffer", () => {
 });
 
 describe("redaction", () => {
+  test("masks URL userinfo credentials before capture", () => {
+    expect(redactText("Failed https://user:password123@host/path")).toBe("Failed https://[REDACTED]@host/path");
+  });
   test("masks tokens, cookies, subsonic auth and credential fields", () => {
     const output = redactText([
       "Authorization: Bearer abc.def.ghijkl",
@@ -211,9 +216,25 @@ describe("admin log routes", () => {
     expect(body).not.toContain("before-connect");
     expect(serverLogs.emitter.listenerCount("entry")).toBe(baseline + 1);
 
-    serverLogs.push({ level: "error", source: "server", message: "live-entry" });
-    await waitFor(() => body.includes("live-entry"));
+    const catalog = new CatalogService(new ProviderRegistry([
+      ...current.registry.list(),
+      {
+        connectionId: "offline-connection", type: "jellyfin", name: "Offline", enabled: true,
+        provider: createFakeBackend({
+          listTracks: async () => { throw new Error("provider timed out; token=do-not-publish"); },
+        }),
+      },
+    ]), current.library, serverLogs);
+    expect((await catalog.listTracks()).degraded).toBe(true);
+    await waitFor(() => body.includes("Catalog provider read failed"));
+    expect(body).toContain("offline-connection");
+    expect(body).toContain("listTracks");
+    expect(body).not.toContain("do-not-publish");
     expect(body).toMatch(/id: \d+\nevent: logs/);
+    const history = await app.inject({ method: "GET", url: "/api/admin/logs?level=warn", headers: { cookie } });
+    expect(history.json().entries).toContainEqual(expect.objectContaining({
+      meta: expect.objectContaining({ connectionId: "offline-connection", providerType: "jellyfin", operation: "listTracks" }),
+    }));
 
     serverLogs.clear();
     await waitFor(() => body.includes("event: cleared"));

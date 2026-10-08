@@ -31,7 +31,7 @@ import {
   createMusicBrainzPlugin,
   createSpotDLDownloaderPlugin,
 } from "./plugins/first-party.js";
-import { installLogCapture, registerLogSecret } from "./utils/logger.js";
+import { installLogCapture, registerLogSecret, serverLogs } from "./utils/logger.js";
 
 // Capture console output and process-level failures for the Admin log viewer
 // before anything else can log.
@@ -53,7 +53,7 @@ async function start() {
   const backend: MusicBackend = withLocalUserDataSync(primaryProvider);
 
   const library = new LibraryService(db);
-  const catalog = new CatalogService(registry, library);
+  const catalog = new CatalogService(registry, library, serverLogs);
   const sourceResolver = new SourceResolver(registry, library);
   const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
   const externalCatalog = new ExternalCatalogRegistry(undefined, db);

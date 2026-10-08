@@ -268,6 +268,18 @@ function Sidebar({ id }) {
           <span className="nav-icon" aria-hidden="true">♡</span>
           <span className="nav-label">Liked Songs</span>
         </Link>
+        <Link
+          to="/listening-activity"
+          className={`nav-item ${location.pathname === "/listening-activity" ? "active" : ""}`}
+          aria-current={location.pathname === "/listening-activity" ? "page" : undefined}
+        >
+          <span className="nav-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+              <circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" />
+            </svg>
+          </span>
+          <span className="nav-label">Listening Activity</span>
+        </Link>
       </section>
 
       <section className="nav-section playlists-section" aria-labelledby="playlist-navigation">

@@ -54,6 +54,7 @@ import Artist from "./pages/Artist";
 import ArtistExternalAlbum from "./pages/ArtistExternalAlbum";
 
 import Liked from "./pages/Liked.jsx";
+import ListeningActivity from "./pages/ListeningActivity";
 import Login from "./pages/Login.jsx";
 import Search from "./pages/Search";
 import Explore from "./pages/Explore";
@@ -272,6 +273,7 @@ function AuthenticatedApp() {
                 <Route path="/artist/:id" element={<Artist />} />
                 <Route path="/playlist/:id" element={<Playlist />} />
                 <Route path="/liked" element={<Liked />} />
+                <Route path="/listening-activity" element={<ListeningActivity />} />
                 <Route path="/search" element={<Search />} />
                 <Route path="/explore" element={<Explore />} />
                 <Route path="/profile" element={<Profile />} />
