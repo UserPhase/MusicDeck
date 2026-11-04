@@ -947,6 +947,10 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     const horizontalOverflow = () => tasteView.evaluate(element => element.scrollWidth - element.clientWidth);
     await expect(tasteView.getByText(longArtistCredit, { exact: true })).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
+    // The shell switches to its mobile layout through a JS media query, so wait
+    // for that re-render before measuring; otherwise a slow runner measures the
+    // desktop shell squeezed into the narrow viewport.
+    await expect(page.locator("html")).toHaveAttribute("data-layout-shell", "mobile");
     await expect(page.getByRole("switch", { name: "Private listening mode", exact: true })).toBeVisible();
     expect(await horizontalOverflow(), "Taste profile overflow at 390px").toBeLessThanOrEqual(0);
     await page.locator("main").evaluate(element => element.scrollTo(0, 0));
@@ -1197,9 +1201,6 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const cdp = await context.newCDPSession(page);
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true });
-      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 20 });
-      // DIAGNOSTIC: throttle CPU to simulate a loaded CI runner.
-      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
       await login(page, app); await openTracks(page, app, 80);
       const touch = (type: "touchStart" | "touchMove" | "touchEnd", x = 0, y = 0) => cdp.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y, id: 1 }] });
       const tap = async (target: Locator) => {
@@ -1221,23 +1222,24 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         // timer can fire late on a loaded CI runner), keeping the touch held until
         // the gesture is recognized rather than releasing after a fixed duration.
         await expect(page.getByRole("checkbox", { name: /^Select / }).first()).toBeChecked();
+        // Engaging selection mode must not reflow the list under the held finger:
+        // if it did, the release would land on whatever moved into place (on a
+        // narrow viewport, the selection controls), not on the pressed row.
+        const held = await title.boundingBox();
+        expect(held, "The held title keeps its on-screen position").toBeTruthy();
+        expect(Math.abs((held!.y + held!.height / 2) - y), "Vertical shift of the held row while entering selection mode").toBeLessThan(4);
+        expect(await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('.track[role="row"]')?.getAttribute("aria-rowindex") ?? null, [x, y])).toBe("2");
         await touch("touchEnd");
         expect(await page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(false);
-        // The click that follows touchEnd can toggle the long-pressed row back off
-        // when the click-suppression window expires on a slow CI runner, dropping
-        // selection mode. Wait until selection mode is active (a selection-mode
-        // row per visible row), then tap two rows to reach a multi-selection.
-        const selectionRows = page.locator('.track[role="row"].track-selection-mode');
-        await expect.poll(() => selectionRows.count()).toBeGreaterThanOrEqual(2);
-        const selectedRows = page.locator('.track[role="row"][aria-selected="true"]');
-        // Ensure the long-pressed row is still selected; re-tap it if the release
-        // click toggled it off.
-        if (await selectedRows.count() === 0) await tap(selectionRows.first());
-        const secondRow = selectionRows.nth(1);
-        await expect(secondRow).toBeVisible();
+        // Entering selection mode must not shift the list under the held finger, so
+        // releasing keeps the long-pressed row selected and selection mode active.
+        const rows = page.locator('.track[role="row"]');
+        await expect(rows.first()).toHaveAttribute("aria-selected", "true");
+        const secondRow = rows.nth(1);
+        await expect(secondRow).toHaveClass(/track-selection-mode/);
         await tap(secondRow);
         await expect(secondRow).toHaveAttribute("aria-selected", "true");
-        await expect.poll(() => selectedRows.count()).toBeGreaterThanOrEqual(2);
+        await expect(page.locator('.track[role="row"][aria-selected="true"]')).toHaveCount(2);
         await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
         await tap(page.getByRole("menuitem", { name: /^Play Next/ }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);

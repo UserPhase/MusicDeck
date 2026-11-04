@@ -25,7 +25,7 @@
 .track { display: grid; grid-template-columns: var(--track-grid-columns); gap: var(--track-grid-gap); align-items: center; min-height: 4rem; padding: .625rem 1rem; border: 0; border-radius: .375rem; background: transparent; transition: background 0.15s ease; }
 .track:hover { background: rgb(var(--tint-rgb) / 10%); }
 .track:focus-visible { outline: var(--focus-ring); outline-offset: -2px; background: var(--card-hover); }
-:is(.track-list, .track, .track-context-menu, .track-selection-controls, .universal-track-toolbar) :is(button, input, select, a):focus-visible,
+:is(.track-list, .track, .track-context-menu, .universal-track-toolbar) :is(button, input, select, a):focus-visible,
 :is(.track-context-menu.glass-dropdown, .universal-track-toolbar[data-track-selection-menu]) :is(button, input, select, a):focus-visible {
   outline: var(--focus-ring);
   outline-offset: 2px;

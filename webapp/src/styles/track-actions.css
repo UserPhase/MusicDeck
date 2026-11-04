@@ -1,6 +1,5 @@
-.track-selection-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-height: 56px; padding: 8px 0 12px; color: var(--text-secondary, #aaa); font-size: .78rem; }
-.track-selection-controls button, .universal-track-toolbar button { border: 1px solid var(--border, #444); border-radius: 6px; padding: 10px 14px; background: var(--card, #202020); color: var(--text, #eee); cursor: pointer; font: inherit; min-height: 44px; }
-.track-selection-controls button[aria-pressed="true"] { border-color: var(--accent, #d1ad77); color: var(--accent, #e5bd7e); }
+.universal-track-toolbar button { border: 1px solid var(--border, #444); border-radius: 6px; padding: 10px 14px; background: var(--card, #202020); color: var(--text, #eee); cursor: pointer; font: inherit; min-height: 44px; }
+.universal-track-toolbar .track-selection-hint { flex: 1 1 auto; min-width: 0; color: var(--text-secondary, #aaa); font-size: .78rem; line-height: 1.4; }
 .track-selectable { touch-action: pan-y pinch-zoom; -webkit-touch-callout: none; }
 .track-selectable .track-title-text { -webkit-user-select: none; user-select: none; }
 .track-selectable a { -webkit-touch-callout: default; -webkit-user-select: text; user-select: text; }
@@ -16,13 +15,11 @@
 .universal-track-context-menu [role="group"] button { min-height: 44px; }
 .universal-track-context-menu .track-context-menu-error, .track-action-notice { padding: 10px 14px; line-height: 1.5; font-size: .8rem; overflow-wrap: anywhere; }
 .universal-track-context-menu .track-action-notice { color: var(--text-secondary, #bbb); }
-.track-selection-controls button:focus-visible, .universal-track-toolbar button:focus-visible, .track-selection-checkbox:focus-visible { outline: 2px solid var(--accent, #d1ad77); outline-offset: 3px; }
-.universal-track-toolbar button:disabled, .track-selection-controls button:disabled { opacity: .45; cursor: default; }
+.universal-track-toolbar button:focus-visible, .track-selection-checkbox:focus-visible { outline: 2px solid var(--accent, #d1ad77); outline-offset: 3px; }
+.universal-track-toolbar button:disabled { opacity: .45; cursor: default; }
 @media (max-width: 600px) {
-  .track-selection-controls { display: grid; grid-template-columns: auto minmax(0, 1fr); justify-content: flex-start; }
-  .track-selection-controls span { max-width: 38ch; }
   .universal-track-toolbar { width: calc(100vw - 24px); max-width: none; padding: 10px; flex-wrap: wrap; box-sizing: border-box; gap: 6px; }
-  .universal-track-toolbar strong { flex: 1; }
+  .universal-track-toolbar strong, .universal-track-toolbar .track-selection-hint { flex: 1 1 100%; }
   .universal-track-toolbar button:last-of-type { width: 100%; }
   .universal-track-toolbar button { flex: 0 1 auto; }
 }
