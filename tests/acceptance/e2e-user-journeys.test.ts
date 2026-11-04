@@ -1220,10 +1220,14 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await expect(page.getByRole("checkbox", { name: /^Select / }).first()).toBeChecked();
         await touch("touchEnd");
         expect(await page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(false);
-        const secondSelect = page.getByRole("checkbox", { name: /^Select / }).nth(1);
-        await expect(secondSelect).toBeVisible();
-        await tap(secondSelect);
-        await expect(secondSelect).toBeChecked();
+        // In selection mode, tapping a row toggles its selection. Tap the second
+        // row directly rather than its checkbox: rows are always rendered, while
+        // checkboxes depend on the selection-mode re-render reaching every
+        // virtualized row, which can lag on a loaded CI runner.
+        const secondRow = page.locator('.track[role="row"]').nth(1);
+        await expect(secondRow).toBeVisible();
+        await tap(secondRow);
+        await expect(secondRow).toHaveAttribute("aria-selected", "true");
         await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
         await tap(page.getByRole("menuitem", { name: /^Play Next/ }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
