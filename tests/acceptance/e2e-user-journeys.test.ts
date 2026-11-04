@@ -1214,13 +1214,16 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         if (!bounds) throw new Error("The first mobile track title has no visible bounds");
         const x = bounds.x + bounds.width / 2, y = bounds.y + bounds.height / 2;
         await touch("touchStart", x, y);
-        // Real hold duration is part of the gesture contract, not an arbitrary readiness wait.
-        await page.waitForTimeout(550);
+        // Wait for the long-press to actually enter selection mode (the 500ms hold
+        // timer can fire late on a loaded CI runner), keeping the touch held until
+        // the gesture is recognized rather than releasing after a fixed duration.
         await expect(page.getByRole("checkbox", { name: /^Select / }).first()).toBeChecked();
         await touch("touchEnd");
         expect(await page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(false);
-        await tap(page.getByRole("checkbox", { name: /^Select / }).nth(1));
-        await expect(page.getByRole("checkbox", { name: /^Select / }).nth(1)).toBeChecked();
+        const secondSelect = page.getByRole("checkbox", { name: /^Select / }).nth(1);
+        await expect(secondSelect).toBeVisible();
+        await tap(secondSelect);
+        await expect(secondSelect).toBeChecked();
         await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
         await tap(page.getByRole("menuitem", { name: /^Play Next/ }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
