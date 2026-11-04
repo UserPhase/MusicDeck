@@ -2,9 +2,12 @@ import { test as base, expect, type Page, type TestInfo, type Locator } from "@p
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { buildAcceptanceBrowser, fixtureConfig, root, startApplication, type Application } from "./helpers/appFixture.js";
 import { catalogTracks, createWav, startMockBackend, type MockBackend, type MockTrack } from "./helpers/mockBackends.js";
-import { openDatabase } from "../../server/src/db/database.js";
+import { openDatabase, type Db } from "../../server/src/db/database.js";
+import { prepareDatabasePath } from "../../server/src/db/file-permissions.js";
+import { runMigrations, seedInitialData } from "../../server/src/db/migrations.js";
 import type { DownloaderAdapter, SpotifyImportTrackMetadata } from "../../server/src/domain/downloader-adapter.js";
 import type { SpotifyImportJob } from "../../server/src/domain/spotify-playlist-import.js";
 import type { Track } from "../../server/src/types.js";
@@ -30,39 +33,19 @@ async function removeFixture(directory: string) {
 
 /** Materialize the actual pre-39 inline-payload shape, not just an old migration number. */
 async function seedLegacyDatabase(config: ReturnType<typeof fixtureConfig>) {
-  const db = await openDatabase(config);
+  const require = createRequire(path.join(root, "server/package.json"));
+  const Database = require("better-sqlite3") as new (filename: string) => Db;
+  prepareDatabasePath(config.databasePath);
+  const db = new Database(config.databasePath);
   try {
+    db.pragma("foreign_keys = ON");
+    runMigrations(db, 38);
+    await seedInitialData(db, config);
     const user = db.prepare("SELECT id FROM users WHERE username='admin'").get() as { id: string };
     db.transaction(() => {
-      db.exec(`DROP TRIGGER smart_listening_events_insert; DROP TRIGGER smart_listening_events_update; DROP TRIGGER smart_listening_events_delete;
-        DROP TRIGGER smart_recently_played_insert; DROP TRIGGER smart_recently_played_update; DROP TRIGGER smart_recently_played_delete;
-        DROP VIEW taste_listening_events; DROP VIEW taste_recently_played;
-        DROP TRIGGER taste_feedback_insert; DROP TRIGGER taste_feedback_update; DROP TRIGGER taste_feedback_delete;
-        ALTER TABLE loudness_scan_jobs DROP COLUMN scope;
-        ALTER TABLE silence_scan_jobs DROP COLUMN scope;
-        DROP TABLE sonic_vectors; DROP TABLE queue_playlist_saves; DROP TABLE named_queues; DROP TABLE queue_sessions; DROP TABLE queue_contents;
-        DROP TABLE playlist_party_requests; DROP TABLE playlist_party_sessions; DROP TABLE playlist_share_links; DROP TABLE playlist_permissions;
-        ALTER TABLE playlist_items DROP COLUMN added_by_user_id; ALTER TABLE playlists DROP COLUMN sharing_mode; ALTER TABLE playlists DROP COLUMN sharing_revision;
-        DROP TABLE followed_artists; DROP TABLE new_release_cache; DROP TABLE followed_artist_catalog; DROP TABLE release_provider_throttle;
-        DROP TABLE taste_private_periods; DROP TABLE taste_track_exclusions; DROP TABLE taste_settings;
-        ALTER TABLE playlists DROP COLUMN exclude_from_taste;
-        ALTER TABLE listening_events DROP COLUMN taste_excluded; ALTER TABLE listening_events DROP COLUMN context_playlist_id; ALTER TABLE listening_events DROP COLUMN taste_recording_key;
-        ALTER TABLE recently_played DROP COLUMN taste_excluded; ALTER TABLE recently_played DROP COLUMN playback_session_id; ALTER TABLE recently_played DROP COLUMN taste_recording_key;
-        ALTER TABLE recommendation_feedback DROP COLUMN identity_album;
-        DROP TABLE similar_mix_previews; DROP TABLE similar_mix_vectors; DROP TABLE similar_mix_external_tracks;
-        ALTER TABLE playlist_items DROP COLUMN external_track_json;
-        ALTER TABLE smart_playlist_catalog_state DROP COLUMN mix_revision;
-        ALTER TABLE recommendation_feedback DROP COLUMN identity_title; ALTER TABLE recommendation_feedback DROP COLUMN identity_artist;
-        DROP TRIGGER playlist_trash_tombstone; DROP TRIGGER playlist_metadata_revision;
-        DROP TRIGGER playlist_insert_revision; DROP TRIGGER playlist_update_revision; DROP TRIGGER playlist_remove_revision;
-        DROP TABLE playlist_edit_commands; DROP TABLE playlist_placements; DROP TABLE playlist_organization_state;
-        DROP TABLE playlist_provider_tombstones; DROP TABLE playlist_folders;
-        DROP INDEX playlists_trash_expiry;
-        ALTER TABLE playlists DROP COLUMN deleted_at; ALTER TABLE playlists DROP COLUMN edit_revision;
-        DROP TABLE scrobble_auth_states; DROP TABLE scrobble_queue; DROP TABLE scrobble_connections;
-        DELETE FROM schema_migrations WHERE id>=39;
-        ALTER TABLE smart_playlist_tracks ADD COLUMN track_json TEXT NOT NULL DEFAULT '{}';
-        DROP TABLE smart_playlist_track_payloads; DROP TABLE smart_playlist_genres;`);
+      db.exec(`ALTER TABLE smart_playlist_tracks ADD COLUMN track_json TEXT NOT NULL DEFAULT '{}';
+        DROP TABLE smart_playlist_track_payloads;
+        DROP TABLE smart_playlist_genres;`);
       db.prepare("INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,?,?,?)").run(user.id, "acceptance.preference", '"keep-me"', "2024-01-01");
       db.prepare("INSERT INTO playlists(id,owner_user_id,name,created_at,updated_at) VALUES(?,?,?,?,?)").run("mdpl_legacy", user.id, "Legacy road trip", "2024-01-01", "2024-01-01");
       const item = db.prepare("INSERT INTO playlist_items(id,playlist_id,position,connection_id,provider_track_id,created_at) VALUES(?,?,?,?,?,?)");
@@ -1210,10 +1193,11 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await touch("touchEnd");
       };
       try {
-        const row = page.locator('.track[role="row"]').first();
-        const bounds = await row.boundingBox();
-        if (!bounds) throw new Error("The first mobile track has no visible bounds");
-        const x = bounds.x + bounds.width * 0.58, y = bounds.y + bounds.height / 2;
+        const title = page.locator('.track[role="row"] .track-title-text').first();
+        await title.scrollIntoViewIfNeeded();
+        const bounds = await title.boundingBox();
+        if (!bounds) throw new Error("The first mobile track title has no visible bounds");
+        const x = bounds.x + bounds.width / 2, y = bounds.y + bounds.height / 2;
         await touch("touchStart", x, y);
         // Real hold duration is part of the gesture contract, not an arbitrary readiness wait.
         await page.waitForTimeout(550);
@@ -1249,7 +1233,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
           requestAnimationFrame(check);
         }));
         const scrollBefore = await page.evaluate(() => ({ window: window.scrollY, containers: [...document.querySelectorAll<HTMLElement>(".app-main,.main-content,main")].map(el => el.scrollTop) }));
-        const links = page.locator('.track[role="row"] a.track-artist');
+        const links = page.locator('.track[role="row"] a.track-artist-link');
         const visibleLink = await links.evaluateAll(elements => elements.findIndex(element => {
           const bounds = element.getBoundingClientRect();
           return bounds.top > 160 && bounds.bottom < Math.min(550, innerHeight - 160);

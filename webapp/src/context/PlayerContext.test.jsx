@@ -1015,17 +1015,18 @@ test("duplicate ended events advance the queue only once", async () => {
 
 test("records cumulative actual listening time rather than a seeked position", async () => {
   const { container } = renderPlayer();
+  await playerReady();
+  const start = Date.now();
+  const clock = jest.spyOn(Date, "now").mockReturnValue(start);
   fireEvent.click(screen.getByText("direct"));
   await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
   expect(recordListeningEvent).not.toHaveBeenCalled();
 
-  const audio = container.querySelector("audio");
+  const audio = activeAudio(container);
   Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
   Object.defineProperty(audio, "currentTime", { configurable: true, writable: true, value: 90 });
-  fireEvent.timeUpdate(audio);
+  await act(async () => { fireEvent.timeUpdate(audio); });
   expect(recordListeningEvent).not.toHaveBeenCalled();
-  const clock = jest.spyOn(Date, "now");
-  const start = Date.now();
   clock.mockReturnValue(start + 30_000);
   audio.currentTime = 120;
   fireEvent.timeUpdate(audio);

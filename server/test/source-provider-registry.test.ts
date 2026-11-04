@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { SourceProvider } from "../src/domain/playable-sources.js";
 import { closeTestServer, createTestServer, login } from "./helpers.js";
@@ -374,7 +374,7 @@ describe("SourceProviderRegistry", () => {
       id: "slow-provider",
       name: "Slow Provider",
       async getSources() {
-        // Deliberately delay longer than bounded timeout (mocked short for test)
+        // Take longer than the registry's 10-second deadline.
         await new Promise((resolve) => setTimeout(resolve, 15_000));
         return [];
       },
@@ -396,10 +396,16 @@ describe("SourceProviderRegistry", () => {
       metadata: {},
     };
 
-    const start = Date.now();
-    // Resolve with timeout protection
-    const resolved = await sourceProviders.resolve(trackResult, { allowExternal: true });
-    // Should return with preview source and not hang indefinitely
-    expect(resolved.sources.some((s) => s.type === "preview")).toBe(true);
-  }, 20_000);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const onSettled = vi.fn();
+      void sourceProviders.resolve(trackResult, { allowExternal: true }).then(onSettled, onSettled);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(onSettled).toHaveBeenCalledWith(expect.objectContaining({
+        sources: expect.arrayContaining([expect.objectContaining({ type: "preview" })]),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

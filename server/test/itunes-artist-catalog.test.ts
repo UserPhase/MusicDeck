@@ -26,12 +26,18 @@ const item = (id: number, artistId: number, name: string, title: string) => ({
 });
 
 function fixture() {
-  const fetchImpl = vi.fn(async (input: URL | string) => {
-    const url = new URL(String(input));
-    const results = url.pathname === "/search" ? [
+  const song = {
+    wrapperType: "track", kind: "song", artistId: 10, artistName: "GEMS",
+    trackId: 7, trackName: "X Valentine", trackTimeMillis: 180000,
+    collectionId: 1, collectionName: "Kill the One You Love", artworkUrl100: art,
+  };
+  const responses = new Map<string, object[]>([
+    ["/search:album:", [
       item(1, 10, "GEMS", "Kill the One You Love"),
       item(9, 99, "GEMS", "GLOW With GEMS"),
-    ] : url.searchParams.get("entity") === "album" ? [
+    ]],
+    ["/search:song:", [song]],
+    ["/lookup:album:10", [
       { wrapperType: "artist", artistId: 10 },
       item(1, 10, "GEMS", "Kill the One You Love"),
       item(2, 10, "GEMS", "Medusa"),
@@ -39,14 +45,21 @@ function fixture() {
       item(4, 10, "GEMS", "medusa deluxe"),
       item(5, 10, "GLOW With GEMS", "GLOW With GEMS"),
       item(6, 99, "GEMS", "Wrong artist ID"),
-    ] : [{
-      wrapperType: "track", kind: "song", artistId: 10, artistName: "GEMS",
-      trackId: 7, trackName: "X Valentine", trackTimeMillis: 180000,
-      collectionId: 1, collectionName: "Kill the One You Love", artworkUrl100: art,
-    }];
-    return new Response(JSON.stringify({ results }), { status: 200 });
+    ]],
+    ["/lookup:song:10", [song]],
+  ]);
+  function requestKey(input: URL | string) {
+    const url = new URL(input);
+    return `${url.pathname}:${url.searchParams.get("entity") ?? ""}:${url.searchParams.get("id") ?? ""}`;
+  }
+  const fetchImpl = vi.fn(async (input: URL | string) => {
+    const results = responses.get(requestKey(input));
+    return results ? Response.json({ results }) : new Response(null, { status: 404 });
   });
-  return { fetchImpl, catalog: new ItunesArtistCatalog(fetchImpl as typeof fetch, new ExternalArtworkTokenStore()) };
+  return {
+    requests: () => fetchImpl.mock.calls.map(([input]) => requestKey(input)).sort(),
+    catalog: new ItunesArtistCatalog(fetchImpl as typeof fetch, new ExternalArtworkTokenStore()),
+  };
 }
 
 describe("ItunesArtistCatalog", () => {
@@ -57,7 +70,7 @@ describe("ItunesArtistCatalog", () => {
   });
 
   test("uses a local release anchor and iTunes artist ID to reject collisions", async () => {
-    const { catalog, fetchImpl } = fixture();
+    const { catalog, requests } = fixture();
     const [first, second] = await Promise.all([
       catalog.resolve(artist, localAlbums, localTracks),
       catalog.resolve(artist, localAlbums, localTracks),
@@ -67,14 +80,14 @@ describe("ItunesArtistCatalog", () => {
       "Kill the One You Love", "Medusa", "Medusa (Deluxe)",
     ]);
     expect(first?.tracks.map((track) => track.title)).toEqual(["X Valentine"]);
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(requests()).toEqual(["/lookup:album:10", "/lookup:song:10", "/search:album:", "/search:song:"]);
   });
 
-  test("rejects a same-name catalog without a matching local release", async () => {
-    const { catalog, fetchImpl } = fixture();
-    await expect(catalog.resolve(artist, [{ ...localAlbums[0], name: "Different release" }], localTracks))
+  test("rejects a same-name catalog without a matching local release or recording", async () => {
+    const { catalog, requests } = fixture();
+    await expect(catalog.resolve(artist, [{ ...localAlbums[0], name: "Different release" }], []))
       .resolves.toBeNull();
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(requests()).toEqual(["/search:album:", "/search:song:"]);
   });
 
   test("opens an iTunes album with upscaled artwork and only its own tracks", async () => {

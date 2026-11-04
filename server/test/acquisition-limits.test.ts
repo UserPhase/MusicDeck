@@ -189,7 +189,7 @@ describe("bounded acquisition scheduling", () => {
       (id, user_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`);
     for (const [index, status] of ["completed", "failed", "cancelled"].entries()) {
       const id = `terminal-${index}`;
-      const date = new Date(Date.now() + index).toISOString();
+      const date = new Date(Date.parse(active.createdAt) + index).toISOString();
       insert.run(id, env.user.id, status, date, date);
       env.db.prepare("INSERT INTO acquisition_job_inputs VALUES (?, ?)").run(id, "{}");
       env.db.prepare(`INSERT INTO acquisition_containers
