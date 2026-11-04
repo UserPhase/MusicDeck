@@ -1197,6 +1197,9 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const cdp = await context.newCDPSession(page);
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 20 });
+      // DIAGNOSTIC: throttle CPU to simulate a loaded CI runner.
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
       await login(page, app); await openTracks(page, app, 80);
       const touch = (type: "touchStart" | "touchMove" | "touchEnd", x = 0, y = 0) => cdp.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y, id: 1 }] });
       const tap = async (target: Locator) => {
@@ -1220,14 +1223,21 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await expect(page.getByRole("checkbox", { name: /^Select / }).first()).toBeChecked();
         await touch("touchEnd");
         expect(await page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(false);
-        // In selection mode, tapping a row toggles its selection. Tap the second
-        // row directly rather than its checkbox: rows are always rendered, while
-        // checkboxes depend on the selection-mode re-render reaching every
-        // virtualized row, which can lag on a loaded CI runner.
-        const secondRow = page.locator('.track[role="row"]').nth(1);
+        // The click that follows touchEnd can toggle the long-pressed row back off
+        // when the click-suppression window expires on a slow CI runner, dropping
+        // selection mode. Wait until selection mode is active (a selection-mode
+        // row per visible row), then tap two rows to reach a multi-selection.
+        const selectionRows = page.locator('.track[role="row"].track-selection-mode');
+        await expect.poll(() => selectionRows.count()).toBeGreaterThanOrEqual(2);
+        const selectedRows = page.locator('.track[role="row"][aria-selected="true"]');
+        // Ensure the long-pressed row is still selected; re-tap it if the release
+        // click toggled it off.
+        if (await selectedRows.count() === 0) await tap(selectionRows.first());
+        const secondRow = selectionRows.nth(1);
         await expect(secondRow).toBeVisible();
         await tap(secondRow);
         await expect(secondRow).toHaveAttribute("aria-selected", "true");
+        await expect.poll(() => selectedRows.count()).toBeGreaterThanOrEqual(2);
         await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
         await tap(page.getByRole("menuitem", { name: /^Play Next/ }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
