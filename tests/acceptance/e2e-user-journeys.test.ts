@@ -144,7 +144,14 @@ const test = base.extend<Options & { system: System }, { browserDirectory: strin
 });
 
 async function login(page: Page, app: Application) {
-  await page.goto(`${app.url}/login`);
+  const url = `${app.url}/login`;
+  try {
+    await page.goto(url, { waitUntil: "commit" });
+  } catch (error) {
+    // A newly attached Chromium startup tab can abort its first navigation.
+    if (!(error instanceof Error) || !error.message.includes("net::ERR_ABORTED") || page.url() !== "about:blank") throw error;
+    await page.goto(url, { waitUntil: "commit" });
+  }
   await page.getByPlaceholder("Username").fill("admin");
   await page.getByPlaceholder("Password").fill("acceptance-admin-password");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
@@ -705,7 +712,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     let desktop = await launchLifecycleBrowser(directory);
     const other = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
     try {
-      let page = await desktop.context.newPage(); await page.setViewportSize({ width: 1280, height: 900 }); await login(page, app);
+      let page = desktop.page; await page.setViewportSize({ width: 1280, height: 900 }); await login(page, app);
       const tracks = await allTracks(page, app);
       await page.evaluate(tracks => window.__acceptance.player.playQueue(Array.from({ length: 5000 }, (_, i) => {
         const track = tracks[i % tracks.length]; return { ...track, artist: track.artistName, album: track.albumName, duration: track.durationSeconds };
@@ -724,7 +731,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       expect(Math.max(...benchmark.runs.map(run => run.applyMs)), "Applying 10,000 decoded occurrences stays below 10 ms").toBeLessThan(10);
       expect(Math.max(...distinctBenchmark.runs.map(run => run.applyMs)), "Applying 10,000 distinct tracks stays below 10 ms").toBeLessThan(10);
       await desktop.close(); desktop = await launchLifecycleBrowser(directory);
-      page = await desktop.context.newPage(); await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(`${app.url}/library/playlists`);
+      page = desktop.page; await page.setViewportSize({ width: 1280, height: 900 }); await page.goto(`${app.url}/library/playlists`);
       await page.waitForFunction(() => window.__acceptance?.player.queue.length === 5000);
       expect(await page.evaluate(() => ({ ids: window.__acceptance.player.queue.map(track => track.id), index: window.__acceptance.player.queueIndex, position: window.__acceptance.player.currentTime }))).toEqual(expected);
       expect(await page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(false);
@@ -919,7 +926,8 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     await page.getByRole("menuitemcheckbox", { name: "Exclude from taste profile" }).click();
     await expect(page.getByRole("menuitemcheckbox", { name: "Exclude from taste profile" })).toHaveAttribute("aria-checked", "true");
     expect((await report("excluded-playlist-report", tracks[1], { playlistId, privateListening: false })).tasteExcluded).toBe(true);
-    await api(page, app, "/api/v1/taste-profile/track", "POST", { ownerId: owner, trackId: tracks[4].id, title: tracks[4].title, artist: tracks[4].artistName, excluded: true });
+    const longArtistCredit = "AcceptanceArtist".repeat(8);
+    await api(page, app, "/api/v1/taste-profile/track", "POST", { ownerId: owner, trackId: tracks[4].id, title: tracks[4].title, artist: longArtistCredit, excluded: true });
     await api(page, app, "/api/recommendations/feedback", "POST", { action: "block-artist", itemType: "artist", artist: "Distant Artist" });
     await api(page, app, "/api/recommendations/feedback", "POST", { action: "hide", itemType: "track", itemId: "external_deezer_track_hidden", title: tracks[2].title, artist: tracks[2].artistName });
     await api(page, app, "/api/recommendations/feedback", "POST", { action: "block-album", itemType: "album", itemId: "external_album_hidden", title: "Hidden Release", album: "Hidden Release", artist: "Other Artist" });
@@ -935,14 +943,22 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     expect(candidates.tracks.some(track => track.id === tracks[2].id)).toBe(false);
     await page.locator("main").evaluate(element => element.scrollTo(0, 0));
     await page.screenshot({ path: info.outputPath("taste-profile-desktop.png"), animations: "disabled" });
+    const tasteView = page.getByRole("region", { name: "Taste and feedback manager" });
+    const horizontalOverflow = () => tasteView.evaluate(element => element.scrollWidth - element.clientWidth);
+    await expect(tasteView.getByText(longArtistCredit, { exact: true })).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(page.getByRole("switch", { name: "Private listening mode", exact: true })).toBeVisible();
-    expect(await page.locator(".taste-profile-view").evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(await horizontalOverflow(), "Taste profile overflow at 390px").toBeLessThanOrEqual(0);
     await page.locator("main").evaluate(element => element.scrollTo(0, 0));
-    await page.screenshot({ path: info.outputPath("taste-profile-mobile.png"), animations: "disabled" }); await page.setViewportSize({ width: 1280, height: 900 });
+    await page.screenshot({ path: info.outputPath("taste-profile-mobile.png"), animations: "disabled" });
+    await page.setViewportSize({ width: 320, height: 844 });
+    expect(await horizontalOverflow(), "Taste profile overflow at 320px").toBeLessThanOrEqual(0);
     const historyCount = (app.db.prepare("SELECT COUNT(*) AS n FROM listening_events WHERE user_id=?").get(owner) as { n: number }).n;
     const favoritesCount = (app.db.prepare("SELECT COUNT(*) AS n FROM favorites WHERE user_id=?").get(owner) as { n: number }).n;
-    await page.getByRole("button", { name: "Reset listening influence", exact: true }).click(); await page.getByLabel("Confirm taste reset").fill("RESET");
+    await page.getByRole("button", { name: "Reset listening influence", exact: true }).click();
+    await expect(page.getByLabel("Confirm taste reset")).toBeVisible();
+    expect(await horizontalOverflow(), "Taste reset form overflow at 320px").toBeLessThanOrEqual(0);
+    await page.getByLabel("Confirm taste reset").fill("RESET");
     await page.getByRole("button", { name: "Confirm reset", exact: true }).click(); await expect(page.getByRole("status").filter({ hasText: "Past listening influence has been reset" })).toBeVisible();
     const after = await api<{ eligibleListens: number; hidden: unknown[] }>(page, app, "/api/v1/taste-profile"); expect(after.eligibleListens).toBe(0); expect(after.hidden).toHaveLength(2);
     expect((app.db.prepare("SELECT COUNT(*) AS n FROM listening_events WHERE user_id=?").get(owner) as { n: number }).n).toBe(historyCount);
@@ -1176,9 +1192,8 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
   test("Scenario 8: Mobile Gesture & Background Playback", async ({ system }, info) => {
     const { app } = system;
     const lifecycle = await launchLifecycleBrowser(system.directory);
-    const { context } = lifecycle;
+    const { context, page } = lifecycle;
     try {
-      const page = await context.newPage();
       const cdp = await context.newCDPSession(page);
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true });

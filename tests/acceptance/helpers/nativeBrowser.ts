@@ -16,13 +16,17 @@ export async function launchLifecycleBrowser(directory: string) {
   await fs.mkdir(profile, { recursive: true });
   // A closed browser leaves its old port file behind; a restart must wait for the new one.
   await fs.unlink(path.join(profile, "DevToolsActivePort")).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  // This fixture uses trusted local pages. Match Playwright's default launch
+  // on GitHub's Linux runner, where Chromium's own sandbox may not initialize.
+  const noSandbox = process.platform !== "win32" && (process.getuid?.() === 0 ||
+    (process.platform === "linux" && process.env.GITHUB_ACTIONS === "true"));
   const child = spawn(executable, ["--headless=new", "--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
     `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
     "--disable-component-update", "--disable-sync", "--autoplay-policy=no-user-gesture-required",
-    ...(process.platform !== "win32" && process.getuid?.() === 0 ? ["--no-sandbox"] : []), "about:blank"],
+    ...(noSandbox ? ["--no-sandbox"] : []), "about:blank"],
   { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
   let failure: Error | undefined, exited = false, stderr = "", browser: Browser | undefined;
-  child.stderr?.on("data", chunk => { stderr = (stderr + String(chunk)).slice(-2000); });
+  child.stderr?.on("data", chunk => { stderr = (stderr + String(chunk)).slice(-16_384); });
   child.once("error", error => { failure = error; });
   const exit = new Promise<void>(resolve => child.once("exit", () => { exited = true; resolve(); }));
   const close = async () => {
@@ -46,7 +50,10 @@ export async function launchLifecycleBrowser(directory: string) {
     const deadline = Date.now() + 20_000;
     let endpoint: string | undefined, lastPortError = "";
     while (Date.now() < deadline) {
-      if (failure || exited) throw new Error(`Lifecycle browser failed to start: ${failure?.message || stderr}`);
+      if (failure || exited) {
+        const reason = failure?.message ?? `exit ${child.signalCode ?? child.exitCode}`;
+        throw new Error(`Lifecycle browser failed to start (${reason}): ${stderr}`);
+      }
       const active = await fs.readFile(path.join(profile, "DevToolsActivePort"), "utf8").catch(error => {
         const code = (error as NodeJS.ErrnoException).code || "unknown";
         // Chromium briefly holds this file exclusively while publishing it on Windows.
@@ -63,6 +70,9 @@ export async function launchLifecycleBrowser(directory: string) {
     if (!context) throw new Error("The lifecycle browser has no default context");
     context.setDefaultTimeout(15_000);
     context.setDefaultNavigationTimeout(30_000);
-    return { browser, context, close };
+    const page = context.pages()[0];
+    if (!page) throw new Error("The lifecycle browser has no startup tab");
+    await page.waitForLoadState("load");
+    return { browser, context, page, close };
   } catch (error) { await close(); throw error; }
 }
