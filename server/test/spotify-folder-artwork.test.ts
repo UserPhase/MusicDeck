@@ -67,7 +67,7 @@ test.each([false, true])("matched imports save metadata and publish folder art b
     const warning = vi.fn();
     const service = new SpotifyPlaylistImportService(backend, playlists, downloader as unknown as DownloaderAdapter,
       root, fetchImpl, undefined, undefined, undefined, repo, warning);
-    const user = { id: "user-1" } as SessionUser;
+    const user = { id: "user-1", role: "user", externalPlaybackEnabled: true } as SessionUser;
     const started = service.start("https://open.spotify.com/playlist/abc123", user);
     let job = service.get(started.id, user.id);
     for (let attempt = 0; attempt < 200 && (job?.status === "queued" || job?.status === "running"); attempt++) {
@@ -128,9 +128,13 @@ test("legacy M3U imports also write album artwork before their scan", async () =
     } as unknown as PlaylistService;
     const fetchImpl: typeof fetch = async (input) => String(input).startsWith("https://i.scdn.co/")
       ? new Response(jpeg, { headers: { "content-type": "image/jpeg" } }) : new Response("{}");
+    const analyze = vi.fn(async (file: string) => {
+      expect(fs.existsSync(file)).toBe(true);
+      expect(scanned).toBe(false);
+    });
     const service = new SpotifyPlaylistImportService(backend, playlists, downloader as unknown as DownloaderAdapter,
-      root, fetchImpl, undefined, undefined, undefined, repo, vi.fn());
-    const user = { id: "user-1" } as SessionUser;
+      root, fetchImpl, undefined, undefined, undefined, repo, vi.fn(), analyze);
+    const user = { id: "user-1", role: "user", externalPlaybackEnabled: true } as SessionUser;
     const started = service.start("https://open.spotify.com/playlist/abc123", user);
     let job = service.get(started.id, user.id);
     for (let attempt = 0; attempt < 200 && (job?.status === "queued" || job?.status === "running"); attempt++) {
@@ -138,6 +142,7 @@ test("legacy M3U imports also write album artwork before their scan", async () =
       job = service.get(started.id, user.id);
     }
     expect(job?.status).toBe("completed");
+    expect(analyze).toHaveBeenCalledOnce();
     expect(backend.scanLibrary).toHaveBeenCalledTimes(1);
   } finally {
     db.close();

@@ -198,7 +198,7 @@
 :root[data-layout-shell="mobile"] .right-sidebar,
 :root[data-layout-shell="mobile"] .queue-sidebar { display: flex; top: 80px; left: var(--frame); right: var(--frame); bottom: calc(var(--mobile-player-height) + var(--mobile-nav-height) + 4px); width: auto; z-index: 25; animation: shell-sheet-in 260ms var(--drawer-ease) both; }
 
-.mobile-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 21; height: var(--mobile-nav-height); display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); padding-bottom: env(safe-area-inset-bottom, 0px); box-sizing: content-box; border-top: 1px solid var(--layout-divider); background: var(--player-bg); }
+.mobile-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 21; height: var(--mobile-nav-height); display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); padding-bottom: env(safe-area-inset-bottom, 0px); box-sizing: content-box; border-top: 1px solid var(--layout-divider); background: var(--player-bg); }
 .mobile-nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; color: var(--nav-item-text); font-size: 10.5px; font-weight: 600; text-decoration: none; transition: color 150ms ease; }
 .mobile-nav-icon { width: 34px; height: 24px; display: grid; place-items: center; border-radius: var(--radius-pill); font-size: 16px; line-height: 1; transition: background 150ms ease; }
 .mobile-nav-label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

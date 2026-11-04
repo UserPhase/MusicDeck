@@ -1,5 +1,32 @@
 import type { ServerResponse } from "node:http";
 
+export class SseConnectionLimiter {
+  private readonly users = new Map<string, number>();
+  private total = 0;
+
+  constructor(private readonly perUser: number, private readonly global: number) {
+    if (![perUser, global].every((limit) => Number.isSafeInteger(limit) && limit > 0)) {
+      throw new Error("SSE connection limits must be positive safe integers");
+    }
+  }
+
+  reserve(userId: string): (() => void) | null {
+    const count = this.users.get(userId) || 0;
+    if (count >= this.perUser || this.total >= this.global) return null;
+    this.users.set(userId, count + 1);
+    this.total++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.total--;
+      const remaining = (this.users.get(userId) || 1) - 1;
+      if (remaining) this.users.set(userId, remaining);
+      else this.users.delete(userId);
+    };
+  }
+}
+
 type PendingEvent = { event: string; payload: Record<string, unknown>; frame: string };
 
 const DEFAULT_MAX_PENDING = 100;
@@ -18,7 +45,8 @@ export class SseEventWriter {
   constructor(
     private readonly response: ServerResponse,
     private readonly maxPending = DEFAULT_MAX_PENDING,
-    private readonly stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS
+    private readonly stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS,
+    private readonly canSend: (event: string, payload: Record<string, unknown>) => boolean = () => true,
   ) {
     response.on("drain", this.onDrain);
     response.on("close", this.close);
@@ -26,7 +54,7 @@ export class SseEventWriter {
   }
 
   push(event: string, payload: Record<string, unknown>, id?: string): void {
-    if (this.closed) return;
+    if (this.closed || !this.canSend(event, payload) || this.closed) return;
     const frame = `${id ? `id: ${id}\n` : ""}event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
     if (!this.blocked) {
       if (this.response.write(frame)) return;
@@ -66,6 +94,8 @@ export class SseEventWriter {
     this.clearStallTimer();
     while (this.pending.length && !this.blocked) {
       const next = this.pending.shift()!;
+      if (!this.canSend(next.event, next.payload)) continue;
+      if (this.closed) return;
       if (!this.response.write(next.frame)) this.blocked = true;
     }
     if (this.blocked) this.startStallTimer();
@@ -82,7 +112,7 @@ export class SseEventWriter {
     this.stallTimer = undefined;
   }
 
-  private readonly close = (): void => {
+  public readonly close = (): void => {
     if (this.closed) return;
     this.closed = true;
     this.pending.length = 0;

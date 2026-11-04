@@ -1,4 +1,21 @@
-import { findItunesPreview, trustedPreviewUrl } from "./previewPlayback";
+import { canStreamPreview, findItunesPreview, trustedPreviewUrl } from "./previewPlayback";
+
+test("checks a trusted preview through the playback proxy with a bounded range", async () => {
+  const originalFetch = global.fetch;
+  const cancel = jest.fn(async () => {});
+  global.fetch = jest.fn(async () => ({ ok: true, body: { cancel } }));
+  try {
+    const preview = "https://cdns-preview-a.dzcdn.net/file.mp3";
+    await expect(canStreamPreview(preview)).resolves.toBe(true);
+    expect(global.fetch).toHaveBeenCalledWith(`/api/playback/preview?url=${encodeURIComponent(preview)}`,
+      expect.objectContaining({ headers: { Range: "bytes=0-0" } }));
+    expect(cancel).toHaveBeenCalled();
+    await expect(canStreamPreview("https://example.com/file.mp3")).resolves.toBe(false);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
 
 test("finds an exact iTunes preview using the artist and title", async () => {
   const fetchImpl = jest.fn(async () => ({

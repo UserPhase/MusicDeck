@@ -1,3 +1,6 @@
+import { EditionBadges } from "../components/common/EditionBadges";
+import { collectorMetadata } from "../hooks/useCollectorFilters";
+import TrackActionScope from "../components/TrackActionScope";
 import {
   useEffect,
   useState,
@@ -16,22 +19,25 @@ import { HeroArtwork } from "../components/Layout/FullHero";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
-import AlbumDeleteButton from "../components/AlbumDeleteButton";
+import AlbumImportButton from "../components/AlbumImportButton";
+import AlbumLikeButton from "../components/AlbumLikeButton";
+import AlbumEditionPicker from "../components/AlbumEditionPicker";
 import { useServerDeletion } from "../context/ServerDeletionContext";
+import { usePrivacy } from "../context/PrivacyContext";
+import { toAlbumRouteIdFromApiId, toArtistRouteIdFromApiId } from "../utils/idResolver";
 
-import {
-  getPlaylists,
-  addSongToPlaylist as addSongToPlaylistRequest,
-} from "../api/playlists";
 
 import {
   usePlayer,
 } from "../context/PlayerContext";
 
-function Album() {
+function Album({ albumId, backTo = "/library" } = {}) {
   const deletion = useServerDeletion();
 
-  const { id } = useParams();
+  const params = useParams();
+  const id = toAlbumRouteIdFromApiId(albumId ?? params.id);
+  const external = /^(external_|extdetail_)/.test(id);
+  const { canMetadata } = usePrivacy();
 
 
   const [album, setAlbum] =
@@ -76,33 +82,13 @@ function Album() {
 
 
   /*
-   * Playlist menu
-   */
-
-  const [
-    playlistMenuSong,
-    setPlaylistMenuSong,
-  ] = useState(null);
-
-
-  const [
-    playlists,
-    setPlaylists,
-  ] = useState([]);
-
-
-  const [
-    playlistsLoading,
-    setPlaylistsLoading,
-  ] = useState(false);
-
-
-  /*
    * Load album
    */
 
   useEffect(() => {
     let cancelled = false;
+
+    if (external && !canMetadata) return () => { cancelled = true; };
 
     async function loadAlbum() {
 
@@ -110,6 +96,7 @@ function Album() {
 
         setLoading(true);
         setError(null);
+        setAlbum(null);
 
 
         const data =
@@ -152,156 +139,22 @@ function Album() {
       cancelled = true;
     };
 
-  }, [id]);
-
-
-  /*
-   * Close playlist menu when
-   * clicking anywhere else.
-   */
-
-  useEffect(() => {
-
-    function handleDocumentClick() {
-
-      setPlaylistMenuSong(null);
-
-    }
-
-
-    document.addEventListener(
-      "click",
-      handleDocumentClick
-    );
-
-
-    return () => {
-
-      document.removeEventListener(
-        "click",
-        handleDocumentClick
-      );
-
-    };
-
-  }, []);
-
-
-  /*
-   * Load playlists
-   */
-
-  async function loadPlaylists() {
-
-    try {
-
-      setPlaylistsLoading(true);
-
-
-      const data =
-        await getPlaylists();
-
-
-      setPlaylists(data);
-
-    } catch (err) {
-
-      console.error(
-        "Could not load playlists:",
-        err
-      );
-
-    } finally {
-
-      setPlaylistsLoading(false);
-
-    }
-
-  }
-
-
-  /*
-   * Open / close playlist menu
-   */
-
-  async function togglePlaylistMenu(
-    song
-  ) {
-
-    if (
-      playlistMenuSong?.id === song.id
-    ) {
-
-      setPlaylistMenuSong(null);
-
-      return;
-
-    }
-
-
-    setPlaylistMenuSong(song);
-
-
-    /*
-     * Load playlists the first time
-     * the menu is opened.
-     */
-
-    if (
-      playlists.length === 0
-    ) {
-
-      await loadPlaylists();
-
-    }
-
-  }
-
-
-  /*
-   * Add song to playlist
-   */
-
-  async function addSongToPlaylist(
-    playlist,
-    song
-  ) {
-
-    try {
-
-      await addSongToPlaylistRequest(
-        playlist.id,
-        song.id
-      );
-
-
-      /*
-       * Close the menu after adding.
-       */
-
-      setPlaylistMenuSong(null);
-
-    } catch (err) {
-
-      console.error(
-        "Could not add song to playlist:",
-        err
-      );
-
-    }
-
-  }
+  }, [id, external, canMetadata]);
 
 
   /*
    * Loading
    */
 
-  if (loading) {
+  if (external && !canMetadata) return <div className="privacy-banner" role="status">
+    External releases are disabled by server privacy policy. <Link to={backTo}>Back to your library</Link>
+  </div>;
+
+  if (loading || (album && String(album.id) !== id)) {
 
     return (
 
-      <div className="album-page">
+      <div className="album-page" data-view-loading="true">
 
         <div className="loading">
           Loading album...
@@ -328,7 +181,7 @@ function Album() {
       <div className="album-page">
 
         <Link
-          to="/library"
+          to={backTo}
           className="album-back"
         >
           ← Back
@@ -366,9 +219,12 @@ function Album() {
     }
 
 
+    const startIndex = external ? songs.findIndex((song) => song.isDownloaded || song.availability?.libraryAvailable || song.source?.kind === "library" || song.previewUrl) : 0;
+    if (startIndex < 0) return;
     playQueue(
       songs,
-      0
+      startIndex,
+      { type: "album", id: album.id, name: album.name, coverArt: album.coverArt }
     );
 
   }
@@ -378,13 +234,14 @@ function Album() {
 
     <div
       className="album-page detail-hero-gradient"
+      data-view-loading={String(album.id) !== id}
     >
 
 
       {/* BACK */}
 
       <Link
-        to="/library"
+        to={backTo}
         className="album-back"
       >
         ← Back
@@ -414,6 +271,10 @@ function Album() {
           <h1>
             {album.name}
           </h1>
+          <EditionBadges item={{ ...album, metadata: {
+            ...album.metadata,
+            formats: [...new Set(songs.flatMap(song => collectorMetadata(song).formats))],
+          } }} />
 
 
           {/* ARTIST */}
@@ -422,7 +283,7 @@ function Album() {
 
             <Link
               to={
-                `/artist/${album.artistId}`
+                `/artist/${encodeURIComponent(toArtistRouteIdFromApiId(album.artistId))}`
               }
               className="album-artist"
             >
@@ -489,6 +350,8 @@ function Album() {
 
           {/* ACTIONS */}
 
+          <AlbumEditionPicker album={album} />
+
         </div>
 
       </div>
@@ -502,7 +365,7 @@ function Album() {
               className="album-play"
               onClick={playAlbum}
               disabled={
-                songs.length === 0
+                songs.length === 0 || (external && !songs.some((song) => song.isDownloaded || song.availability?.libraryAvailable || song.source?.kind === "library" || song.previewUrl))
               }
             >
 
@@ -528,23 +391,19 @@ function Album() {
               tracks={songs}
               quality={downloadQuality}
               label="album"
+              collectionId={album.id}
+              collectionName={album.name || album.title}
             />
+            {external && <AlbumImportButton album={album} />}
 
 
             {/* LIKE */}
 
-            <button
-              type="button"
-              className="detail-secondary-action album-action"
-              aria-label="Like album"
-            >
-              ♡
-            </button>
+            <AlbumLikeButton key={album.id} album={album} />
 
 
             {/* MORE */}
 
-            <AlbumDeleteButton album={album} />
 
       </div>
 
@@ -556,7 +415,8 @@ function Album() {
         <TrackListHeader showAlbum={false} />
 
 
-        {songs.map(
+        <TrackActionScope tracks={songs} dataKey={album?.id}>
+                {songs.map(
           (song, index) => {
 
           const isDownloaded =
@@ -577,67 +437,13 @@ function Album() {
             artistFallback={isDownloaded ? song.artist : `${song.artist} · Not downloaded`}
             onPlay={handleTrackPlayback}
             onSelectSource={playSongFromSource}
-            onToggleMenu={togglePlaylistMenu}
-            menu={playlistMenuSong?.id === song.id ? (
-              <div className="playlist-menu">
-
-                  <div className="playlist-menu-title">
-                    Add to playlist
-                  </div>
 
 
-                  {playlistsLoading && (
-
-                    <div className="playlist-menu-item">
-                      Loading...
-                    </div>
-
-                  )}
-
-
-                  {!playlistsLoading &&
-                    playlists.map(
-                      (playlist) => (
-
-                      <button
-                        key={playlist.id}
-                        className="playlist-menu-item"
-                        onClick={() =>
-                          addSongToPlaylist(
-                            playlist,
-                            song
-                          )
-                        }
-                      >
-
-                        <span>
-                          ♫
-                        </span>
-
-
-                        <span>
-                          {playlist.name}
-                        </span>
-
-                      </button>
-
-                    ))}
-
-
-                  {!playlistsLoading &&
-                    playlists.length === 0 && (
-
-                    <div className="playlist-menu-empty">
-                      No playlists yet
-                    </div>
-
-                  )}
-              </div>
-            ) : null}
           />
 
           );
         })}
+        </TrackActionScope>
 
       </div>
 

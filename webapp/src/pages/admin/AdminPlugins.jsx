@@ -8,6 +8,7 @@ import {
 } from "../../api/musicdeck";
 import { useAdminData } from "./useAdminData";
 import { AdminBadge, AdminPageHeader } from "../../components/admin/ui";
+import ExtensionSettings from "../../components/admin/ExtensionSettings";
 
 
 function AdminPlugins() {
@@ -285,6 +286,7 @@ function AdminPlugins() {
           )}
         </div>
       </section>
+      <ExtensionSettings />
     </div>
   );
 }

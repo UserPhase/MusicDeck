@@ -93,10 +93,11 @@ test("shows Admin Dashboard only for admin users", () => {
   expect(screen.getByRole("menuitem", { name: /admin dashboard/i })).toBeInTheDocument();
 });
 
-test("uses a real button for a live-search play result", async () => {
+test("uses a play button and separate artist links for a live-search result", async () => {
   jest.useFakeTimers();
   searchNavidrome.mockResolvedValue({
-    songs: [{ id: "track-1", title: "Digital Love", artist: "Daft Punk" }],
+    songs: [{ id: "track-1", title: "Digital Love", artist: "Daft Punk, Guest",
+      artistCredits: [{ id: "daft-punk", name: "Daft Punk" }, { id: "guest", name: "Guest" }] }],
   });
 
   renderTopbar({ username: "sam", displayName: "Sam", role: "user" });
@@ -110,6 +111,8 @@ test("uses a real button for a live-search play result", async () => {
   });
 
   expect(await screen.findByRole("button", { name: "Digital Love" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Daft Punk" })).toHaveAttribute("href", "/artist/daft-punk");
+  expect(screen.getByRole("link", { name: "Guest" })).toHaveAttribute("href", "/artist/guest");
   const suggestionPanel = screen.getByRole("button", { name: "Digital Love" }).closest(".search-dropdown");
   expect(suggestionPanel.parentElement).toBe(document.body);
   expect(suggestionPanel).toHaveClass("glass-dropdown");

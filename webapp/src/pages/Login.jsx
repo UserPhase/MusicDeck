@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 
-function Login() {
+function Login({ redirectTo } = {}) {
   const navigate = useNavigate();
   const { signIn } = useAuth();
 
@@ -20,7 +20,8 @@ function Login() {
     try {
       await signIn(username, password);
 
-      navigate("/library/playlists");
+      navigate(redirectTo === "/playlist-share" && /^#token=[a-f0-9]{64}$/.test(window.location.hash)
+        ? `/playlist-share${window.location.hash}` : "/library/playlists");
     } catch (error) {
       setError(error.message);
     } finally {

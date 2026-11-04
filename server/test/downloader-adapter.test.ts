@@ -113,6 +113,30 @@ describe("Reverb-Style Downloader Architecture", () => {
   });
 
   describe("spotDL Progress Parsing & Error Classification", () => {
+    it("forwards stdout/stderr diagnostics after redacting configured credentials", async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "spotdl-task-log-"));
+      const onLog = vi.fn();
+      const secret = "configured-client-secret";
+      const runner: ProcessRunner = {
+        run(_command, _args, options) {
+          options?.onStdoutLine?.(`Downloading 50% client_secret=${secret}`);
+          options?.onStderrLine?.(`Trace ${secret} password=private-password`);
+          const result = Promise.resolve({ exitCode: 1, stdout: "", stderr: "Download failed", signal: null });
+          return { pid: undefined, kill: () => {}, promise: result, completion: result };
+        },
+      };
+      try {
+        const adapter = new SpotDLDownloaderAdapter({ runner, clientId: "configured-client-id", clientSecret: secret });
+        await adapter.download({ sourceUrl: "https://www.youtube.com/watch?v=fJ9rUzIMcZQ", outputDirectory: directory }, {
+          jobId: "task-log", tmpDir: directory, signal: new AbortController().signal, onLog,
+        });
+        expect(onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("Downloading 50%"));
+        expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("Trace [REDACTED]"));
+        expect(JSON.stringify(onLog.mock.calls)).not.toContain(secret);
+        expect(JSON.stringify(onLog.mock.calls)).not.toContain("private-password");
+      } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    });
+
     it("parses spotDL percentage and speed progress correctly", () => {
       const line1 = "Downloading Bohemian Rhapsody: 45%|████▌     | 4.5M/10.0M [00:02<00:02, 2.8MB/s]";
       const progress1 = parseSpotDLProgress(line1);
@@ -228,8 +252,8 @@ describe("Reverb-Style Downloader Architecture", () => {
         expect(args).toContain("download");
         expect(args).toContain("https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv");
         expect(args).toContain("--output");
-        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
-        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "320k"]);
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "m4a"]);
+        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "disable"]);
         expect(args).not.toContain("--embed-metadata");
 
         expect(result.status).toBe("completed");
@@ -301,8 +325,8 @@ describe("Reverb-Style Downloader Architecture", () => {
         const args = (runner.run as any).mock.calls[0][1] as string[];
         expect(args).toContain("save");
         expect(args).not.toContain("download");
-        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
-        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "320k"]);
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "m4a"]);
+        expect(args.slice(args.indexOf("--bitrate"), args.indexOf("--bitrate") + 2)).toEqual(["--bitrate", "disable"]);
         expect(result).toMatchObject({ status: "completed", playlistLength: 1, playlistTracks: [{ isrc: "USABC1234567" }] });
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -378,7 +402,7 @@ describe("Reverb-Style Downloader Architecture", () => {
 
         const args = (runner.run as any).mock.calls[0][1] as string[];
         expect(args[args.indexOf("--output") + 1]).toBe(path.join(root, "{artist}", "{album}", "{artist} - {title}.{output-ext}"));
-        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "mp3"]);
+        expect(args.slice(args.indexOf("--format"), args.indexOf("--format") + 2)).toEqual(["--format", "m4a"]);
         expect(args.slice(args.indexOf("--overwrite"), args.indexOf("--overwrite") + 2)).toEqual(["--overwrite", "skip"]);
         expect(args).toContain("--add-unavailable");
         expect(result.files).toMatchObject([{ path: existing, playlistPosition: 1 }]);
@@ -637,6 +661,11 @@ describe("Reverb-Style Downloader Architecture", () => {
       const acquisitionProviders = new AcquisitionProviderRegistry();
       acquisitionProviders.register(new DownloaderAcquisitionProvider(spotdlAdapter));
 
+      const analyzeImportedFile = vi.fn(async (file: { path: string }) => {
+        expect(fs.existsSync(file.path)).toBe(true);
+        expect(eventsEmitted.some(event => event.event === "acquisition.completed")).toBe(false);
+      });
+
       const acquisitionService = new AcquisitionService(
         db,
         acquisitionProviders,
@@ -649,6 +678,7 @@ describe("Reverb-Style Downloader Architecture", () => {
           maxConcurrentDownloads: 1,
           autoScan: true,
           downloaderRegistry,
+          analyzeImportedFile,
         }
       );
 
@@ -687,6 +717,7 @@ describe("Reverb-Style Downloader Architecture", () => {
       const updatedJob = acquisitionService.getJob(job.id);
       expect(updatedJob?.status).toBe("completed");
       expect(updatedJob?.files?.length).toBe(1);
+      expect(analyzeImportedFile).toHaveBeenCalledOnce();
 
       // Verify the final file was imported into the music root
       const importedPath = updatedJob?.files?.[0].path;

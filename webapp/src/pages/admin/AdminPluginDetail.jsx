@@ -63,10 +63,10 @@ function AdminPluginDetail() {
   const values =
     configValues ??
     Object.fromEntries(
-      (plugin.configFields || []).map((field) => [
-        field.key,
-        field.secret ? "" : String(plugin.config?.[field.key] ?? ""),
-      ])
+      (plugin.configFields || []).map((field) => {
+        const value = plugin.config?.[field.key] ?? field.default ?? "";
+        return [field.key, field.secret ? "" : typeof value === "boolean" ? value : String(value)];
+      })
     );
   const permissions = approvedPermissions ?? plugin.approvedPermissions ?? [];
 
@@ -273,6 +273,7 @@ function AdminPluginDetail() {
                   <label key={field.key}>
                     <span>{field.label}</span>
                     <select
+                      aria-describedby={field.description ? `plugin-field-${field.key}-description` : undefined}
                       value={values[field.key] || field.default || ""}
                       onChange={(event) =>
                         setConfigValues({
@@ -287,6 +288,7 @@ function AdminPluginDetail() {
                         </option>
                       ))}
                     </select>
+                    {field.description && <small id={`plugin-field-${field.key}-description`} className="hint">{field.description}</small>}
                   </label>
                 );
               }

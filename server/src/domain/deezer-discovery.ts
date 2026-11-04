@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { normalizeExternalTrack } from "../services/discovery/externalTrackNormalizer.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 const artwork = z.string().url().nullable().optional();
 const artist = z.object({
@@ -137,7 +138,7 @@ export class DeezerDiscoveryService {
   private cache: { value: ExternalCharts; expiresAt: number } | null = null;
   private pending: Promise<ExternalCharts> | null = null;
 
-  constructor(private readonly fetchChart: typeof fetch = fetch) {}
+  constructor(private readonly fetchChart: typeof fetch = fetch) { this.fetchChart = gateFetch(fetchChart); }
 
   async getCharts(): Promise<ExternalCharts> {
     if (this.cache && Date.now() < this.cache.expiresAt) return this.cache.value;

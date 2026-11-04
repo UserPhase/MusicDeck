@@ -17,6 +17,11 @@ import type {
 import { DefaultProcessRunner, type ProcessHandle, type ProcessRunner } from "./process-runner.js";
 import type { AcquiredFile } from "./acquisition.js";
 import { DeezerImportMatcher } from "../services/discovery/deezerImportMatcher.js";
+import { canonicalManualAcquisitionUrl, canonicalSpotifyUrl, validateSpotDLRequest } from "./acquisition-url-policy.js";
+import { privacyFetch as fetch, currentPrivacyManager, gateFetch } from "../services/PrivacyManager.js";
+import { parseSpotDLOutputFormat, spotDLFormatArgs, SPOTDL_FORMATS, type SpotDLOutputFormat } from "./spotdl-format.js";
+import { SUPPORTED_AUDIO_EXTENSIONS } from "./audio-containers.js";
+import { isPlaceholderArtist, isPlaceholderAlbumArtist } from "../utils/artistMetadata.js";
 
 const isWindows = process.platform === "win32";
 
@@ -111,22 +116,13 @@ export function autoDetectFFmpegPath(): string {
   return "ffmpeg";
 }
 
-const AUDIO_EXTENSIONS = new Set([
-  ".flac",
-  ".mp3",
-  ".m4a",
-  ".ogg",
-  ".opus",
-  ".wav",
-  ".aac",
-  ".alac",
-  ".aiff",
-]);
+const AUDIO_EXTENSIONS = new Set(SUPPORTED_AUDIO_EXTENSIONS);
 
 /** Shared on-disk layout for direct spotDL acquisitions and Spotify playlists. */
 export const SPOTDL_LIBRARY_TEMPLATE = "{artists}/{album}/{artists} - {title}.{output-ext}";
 
 export type SpotDLAdapterOptions = {
+  outputFormat?: SpotDLOutputFormat;
   spotdlPath?: string;
   ffmpegPath?: string;
   processRunner?: ProcessRunner;
@@ -147,29 +143,10 @@ export type SpotDLDiagnosticResult = {
   ffmpegPath: string;
 };
 
-/**
- * Hosts spotDL's underlying audio-provider backends actually understand for
- * a "manual audio URL" input (YouTube / YouTube Music, SoundCloud, Bandcamp).
- * Generic direct-file links (e.g. a `.flac`/`.mp3` URL from an unrelated
- * HTTP-hosting site) are NOT valid spotDL inputs — those belong to a plain
- * HTTP downloader adapter instead. Restricting this prevents spotDL from
- * greedily claiming candidates it cannot actually handle, which otherwise
- * wastes a full download attempt (and can hang) before falling back.
- */
-const SPOTDL_SUPPORTED_MANUAL_HOSTS = [
-  "youtube.com",
-  "m.youtube.com",
-  "music.youtube.com",
-  "youtu.be",
-  "soundcloud.com",
-  "bandcamp.com",
-];
-
 export function isSpotDLCompatibleManualUrl(raw: string): boolean {
   try {
-    const u = new URL(raw);
-    const host = u.hostname.replace(/^www\./, "").toLowerCase();
-    return SPOTDL_SUPPORTED_MANUAL_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+    canonicalManualAcquisitionUrl(raw);
+    return true;
   } catch {
     return false;
   }
@@ -237,11 +214,13 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
   private clientId?: string;
   private clientSecret?: string;
   private cookieFile?: string;
+  private outputFormat: SpotDLOutputFormat;
   private readonly fetchImpl: typeof fetch;
   private readonly deezerImportMatcher: DeezerImportMatcher;
   private readonly activeHandles = new Map<string, ProcessHandle>();
 
   constructor(options: SpotDLAdapterOptions = {}) {
+    this.outputFormat = parseSpotDLOutputFormat(options.outputFormat);
     this.spotdlPath = options.spotdlPath || process.env.SPOTDL_PATH || autoDetectSpotDLPath();
     this.ffmpegPath = options.ffmpegPath || process.env.FFMPEG_PATH || autoDetectFFmpegPath();
     this.processRunner = options.processRunner || options.runner || new DefaultProcessRunner();
@@ -249,7 +228,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
     this.clientId = options.clientId || process.env.SPOTIFY_CLIENT_ID;
     this.clientSecret = options.clientSecret || process.env.SPOTIFY_CLIENT_SECRET;
     this.cookieFile = options.cookieFile || process.env.SPOTDL_COOKIE_FILE;
-    this.fetchImpl = options.fetchImpl || fetch;
+    this.fetchImpl = gateFetch(options.fetchImpl || fetch);
     this.deezerImportMatcher = new DeezerImportMatcher(this.fetchImpl);
   }
 
@@ -260,11 +239,14 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
    * Any option left undefined keeps its previously configured value.
    */
   configure(options: SpotDLAdapterOptions): void {
+    // Validate before applying any of the other runtime settings.
+    const outputFormat = options.outputFormat === undefined ? this.outputFormat : parseSpotDLOutputFormat(options.outputFormat);
     if (options.spotdlPath !== undefined) this.spotdlPath = options.spotdlPath || autoDetectSpotDLPath();
     if (options.ffmpegPath !== undefined) this.ffmpegPath = options.ffmpegPath || autoDetectFFmpegPath();
     if (options.clientId !== undefined) this.clientId = options.clientId || undefined;
     if (options.clientSecret !== undefined) this.clientSecret = options.clientSecret || undefined;
     if (options.cookieFile !== undefined) this.cookieFile = options.cookieFile || undefined;
+    this.outputFormat = outputFormat;
   }
 
   getMediaToolPaths(): { ffmpegPath: string; ffprobePath: string; pythonPath: string } {
@@ -286,6 +268,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
   }
 
   canHandle(request: DownloadRequest): boolean {
+    try { validateSpotDLRequest(request); } catch { return false; }
     if (request.spotifyTrackUrl && request.spotifyTrackUrl.trim().length > 0) {
       return true;
     }
@@ -293,9 +276,6 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       return true;
     }
     if (this.capabilities.directUrl && request.sourceUrl && isSpotDLCompatibleManualUrl(request.sourceUrl)) {
-      return true;
-    }
-    if (request.candidate?.provider === this.id) {
       return true;
     }
     if (this.capabilities.textSearch && request.query && request.query.trim().length > 0) {
@@ -337,17 +317,21 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
   }
 
   async fetchPlaylistTracks(playlistUrl: string, context: DownloadContext): Promise<DownloadResult> {
+    currentPrivacyManager()?.assertExternalAllowed("imports");
     const outputDir = context.tmpDir;
     fs.mkdirSync(outputDir, { recursive: true });
     const saveFile = "musicdeck-source.spotdl";
-    const args = ["--log-level", "DEBUG", "--format", "mp3", "--bitrate", "320k", "--save-file", saveFile];
+    const args = ["--log-level", "DEBUG", ...spotDLFormatArgs(this.outputFormat), "--save-file", saveFile];
     if (this.clientId && this.clientSecret) {
       args.push("--client-id", this.clientId, "--client-secret", this.clientSecret);
     }
     args.push("save", playlistUrl);
 
     try {
+      await context.checkpoint?.();
+      context.signal.throwIfAborted();
       const handle = this.processRunner.run(this.spotdlPath, args, {
+        privacyCategory: "imports",
         cwd: outputDir,
         signal: context.signal,
         timeoutMs: 120_000,
@@ -382,10 +366,10 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
     type Metadata = NonNullable<DownloadResult["playlistTracks"]>[number];
     const merge = (candidate: Metadata): Metadata => ({ ...candidate, ...source,
       title: source.title?.trim() || candidate.title,
-      artist: source.artist?.trim() && !/unknown/i.test(source.artist) ? source.artist : candidate.artist,
-      artists: [...new Set([...(source.artists || []), ...(candidate.artists || [])].map((name) => name.trim()).filter((name) => name && !/unknown/i.test(name)))],
+      artist: !isPlaceholderArtist(source.artist) ? source.artist : candidate.artist,
+      artists: [...new Set([...(source.artists || []), ...(candidate.artists || [])].map((name) => name.trim()).filter((name) => !isPlaceholderArtist(name)))],
       album: source.album?.trim() || candidate.album,
-      albumArtist: source.albumArtist?.trim() && !/unknown/i.test(source.albumArtist) ? source.albumArtist : candidate.albumArtist,
+      albumArtist: !isPlaceholderAlbumArtist(source.albumArtist) ? source.albumArtist : candidate.albumArtist,
       year: source.year || candidate.year, artworkUrl: source.artworkUrl || candidate.artworkUrl,
       isrc: source.isrc || candidate.isrc, duration: source.duration || candidate.duration,
       url: source.url, position: source.position,
@@ -404,11 +388,11 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
     }
     const text = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
     const acceptable = (candidate: Metadata) => (!recovered.title || text(candidate.title) === text(recovered.title))
-      && (!recovered.artist || /unknown/i.test(recovered.artist) || text(candidate.artist) === text(recovered.artist))
+      && (isPlaceholderArtist(recovered.artist) || text(candidate.artist) === text(recovered.artist))
       && (!recovered.album || text(candidate.album || "") === text(recovered.album))
       && (!recovered.duration || Math.abs(candidate.duration - recovered.duration) <= 4);
     // Without a usable identity, a broad search must not guess at an unrelated song.
-    if (!recovered.isrc && (!recovered.title || !recovered.artist || /unknown/i.test(recovered.artist))) return null;
+    if (!recovered.isrc && (!recovered.title || isPlaceholderArtist(recovered.artist))) return null;
     const read = async (endpoint: URL): Promise<any> => {
       const response = await this.fetchImpl(endpoint, { signal: AbortSignal.timeout(8000), redirect: "error" });
       if (!response.ok) throw new Error("Metadata provider unavailable");
@@ -431,7 +415,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
         const merged = merge(candidate); if (complete(merged)) return merged;
       }
     } catch { /* Try the independent keyless provider below. */ }
-    if (recovered.title && recovered.artist && !/unknown/i.test(recovered.artist)) {
+    if (recovered.title && !isPlaceholderArtist(recovered.artist)) {
       try {
         const endpoint = new URL("https://itunes.apple.com/search");
         endpoint.searchParams.set("term", `${recovered.artist} ${recovered.title}`);
@@ -450,12 +434,19 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
   }
 
   async download(request: DownloadRequest, context: DownloadContext): Promise<DownloadResult> {
+    currentPrivacyManager()?.assertExternalAllowed("imports");
+    try {
+      validateSpotDLRequest(request);
+    } catch {
+      return { status: "failed", files: [], error: { code: "invalid-input", message: "Invalid or unsupported acquisition input" } };
+    }
     const outputDir = context.tmpDir;
     fs.mkdirSync(outputDir, { recursive: true });
 
     // Handle Manual Audio URL + Spotify Metadata URL pipe syntax (Reverb model: "<audio-url>|<spotify-url>")
-    const manualUrl = request.sourceUrl ? normalizeManualUrl(request.sourceUrl.replace(/\|/g, "")) : undefined;
-    const spotifyUrl = request.spotifyTrackUrl;
+    const manualUrl = request.sourceUrl ? canonicalManualAcquisitionUrl(request.sourceUrl) : undefined;
+    const spotifyUrl = request.spotifyTrackUrl ? canonicalSpotifyUrl(request.spotifyTrackUrl)
+      : request.spotifyTrackId ? `https://open.spotify.com/track/${request.spotifyTrackId}` : undefined;
 
     let target: string | undefined;
     const diagnostics: DownloadDiagnostics = { strategy: "spotify", audioProvider: request.audioProvider, output: "" };
@@ -466,9 +457,12 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
     } else if (manualUrl) {
       target = manualUrl;
     } else if (request.query) {
-      target = request.query;
+      target = request.query.trim().startsWith("https://open.spotify.com/") ? canonicalSpotifyUrl(request.query.trim()) : request.query.trim();
     } else if (request.requestedTrack) {
       target = [request.requestedTrack.artist, request.requestedTrack.title].filter(Boolean).join(" - ");
+      try { validateSpotDLRequest({ ...request, query: target }); } catch {
+        return { status: "failed", files: [], error: { code: "invalid-input", message: "Invalid or unsupported acquisition input" } };
+      }
     }
 
     if (!target) {
@@ -495,8 +489,9 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
       "--id3-separator", "; ",
       "--log-level", "DEBUG",
       "--output", outputTemplate,
-      "--format", "mp3",
-      "--bitrate", "320k",
+      ...spotDLFormatArgs(this.outputFormat),
+      // Reuse existing audio when an administrator changes the chosen format.
+      "--detect-formats", ...SPOTDL_FORMATS,
       // spotDL's download operation embeds metadata itself. --embed-metadata
       // is a yt-dlp option and makes spotDL reject the entire command.
       "--generate-lrc",
@@ -586,12 +581,21 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
         fs.writeFileSync(manifest, JSON.stringify([spotDLSong(metadata)]), { mode: 0o600 });
         args[args.length - 1] = manifest;
       }
+      await context.checkpoint?.();
+      context.signal.throwIfAborted();
       handle = this.processRunner.run(this.spotdlPath, args, {
+        privacyCategory: "imports",
         cwd: outputDir,
         signal: context.signal,
         timeoutMs: request.timeoutMs || this.timeoutMs,
-        onStdoutLine: onProgressLine,
-        onStderrLine: onProgressLine,
+        onStdoutLine: (line) => {
+          context.onLog?.("stdout", redactSpotDLDiagnostics(line, [this.clientId, this.clientSecret, this.cookieFile]));
+          onProgressLine(line);
+        },
+        onStderrLine: (line) => {
+          context.onLog?.("stderr", redactSpotDLDiagnostics(line, [this.clientId, this.clientSecret, this.cookieFile]));
+          onProgressLine(line);
+        },
         onStdoutChunk: captureOutput,
         onStderrChunk: captureOutput,
         // Prevent narrow Rich console wrapping from truncating track names in errors.
@@ -732,7 +736,7 @@ export class SpotDLDownloaderAdapter implements DownloaderAdapter {
     let ffmpegVersion: string | undefined;
 
     try {
-      const spotdlHandle = this.processRunner.run(this.spotdlPath, ["--version"], { timeoutMs: 5000 });
+      const spotdlHandle = this.processRunner.run(this.spotdlPath, ["--version"], { timeoutMs: 5000, privacyCategory: "imports" });
       const spotdlRes = await spotdlHandle.promise;
       if (spotdlRes.exitCode === 0 && spotdlRes.stdout.trim()) {
         spotdlInstalled = true;
@@ -841,10 +845,10 @@ function readPlaylistMetadata(filePath: string): Pick<DownloadResult, "playlistT
       const names = new Map<string, string>();
       for (const name of [primary, ...artistNames]) {
         const key = name.trim().normalize("NFKC").toLowerCase();
-        if (key && !names.has(key) && !/unknown/i.test(key)) names.set(key, name.trim());
+        if (!isPlaceholderArtist(key) && !names.has(key)) names.set(key, name.trim());
       }
       const artists = [...names.values()];
-      const artist = primary && !/unknown/i.test(primary) ? primary : artists[0] || "";
+      const artist = !isPlaceholderArtist(primary) ? primary : artists[0] || "";
       const date = [song.year, song.release_date, song.date, nestedAlbum.release_date, nestedAlbum.date]
         .find((value): value is string | number => typeof value === "string" || typeof value === "number");
       const image = Array.isArray(nestedAlbum.images) ? nestedAlbum.images.find((image: unknown) => image && typeof image === "object" && typeof (image as Record<string, unknown>).url === "string") as { url: string } | undefined : undefined;

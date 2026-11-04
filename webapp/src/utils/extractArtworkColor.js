@@ -1,7 +1,11 @@
+import { isBrowserIntegrationAllowed } from "../services/privacyPolicy";
+
 // A tiny canvas sampler keeps the hero in step with whichever artwork a provider supplies.
 export function extractArtworkColor(url) {
   return new Promise((resolve) => {
-    if (!url || typeof Image === "undefined") {
+    if (!url || typeof Image === "undefined" || (!isBrowserIntegrationAllowed("artwork") && (
+      !url.startsWith("/") || url.startsWith("//") || url.startsWith("/api/artwork/external/")
+    ))) {
       resolve(null);
       return;
     }

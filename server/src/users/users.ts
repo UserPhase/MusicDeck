@@ -3,6 +3,8 @@ import type { Role, User } from "../types.js";
 import { hashPassword } from "../auth/passwords.js";
 import { createId } from "../utils/ids.js";
 import { avatarUrlFor } from "./avatars.js";
+import { revokeUserSessions } from "../auth/sessions.js";
+import { notifySessionChanges } from "../auth/session-events.js";
 
 export function toPublicUser(row: any): User {
   return {
@@ -104,34 +106,33 @@ export async function updateUser(
     password?: string;
   }
 ) {
-  const existing = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+  const passwordHash = input.password ? await hashPassword(input.password) : undefined;
 
-  if (!existing) {
-    return null;
-  }
+  const updated = db.transaction(() => {
+    const existing = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+    if (!existing) return null;
+    db.prepare(`
+      UPDATE users
+      SET display_name = ?, avatar_ref = ?, role = ?, disabled = ?, external_search_enabled = ?, external_playback_enabled = ?, password_hash = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      input.displayName ?? existing.display_name,
+      input.avatarRef === undefined ? existing.avatar_ref : input.avatarRef,
+      input.role ?? existing.role,
+      input.disabled === undefined ? existing.disabled : input.disabled ? 1 : 0,
+      input.externalSearchEnabled === undefined ? existing.external_search_enabled : input.externalSearchEnabled ? 1 : 0,
+      input.externalPlaybackEnabled === undefined ? existing.external_playback_enabled : input.externalPlaybackEnabled ? 1 : 0,
+      passwordHash ?? existing.password_hash,
+      new Date().toISOString(),
+      userId
+    );
 
-  const passwordHash = input.password
-    ? await hashPassword(input.password)
-    : existing.password_hash;
-
-  db.prepare(`
-    UPDATE users
-    SET display_name = ?, avatar_ref = ?, role = ?, disabled = ?, external_search_enabled = ?, external_playback_enabled = ?, password_hash = ?, updated_at = ?
-    WHERE id = ?
-  `).run(
-    input.displayName ?? existing.display_name,
-    input.avatarRef === undefined ? existing.avatar_ref : input.avatarRef,
-    input.role ?? existing.role,
-    input.disabled === undefined ? existing.disabled : input.disabled ? 1 : 0,
-    input.externalSearchEnabled === undefined ? existing.external_search_enabled : input.externalSearchEnabled ? 1 : 0,
-    input.externalPlaybackEnabled === undefined ? existing.external_playback_enabled : input.externalPlaybackEnabled ? 1 : 0,
-    passwordHash,
-    new Date().toISOString(),
-    userId
-  );
-
-  ensureMasterAdmin(db);
-  return getUserById(db, userId);
+    if (passwordHash !== undefined || input.disabled === true) revokeUserSessions(db, userId);
+    ensureMasterAdmin(db);
+    return getUserById(db, userId);
+  })();
+  if (updated) notifySessionChanges(db);
+  return updated;
 }
 
 export async function updateOwnProfile(
@@ -164,5 +165,6 @@ export async function updateOwnProfile(
 
 export function deleteUser(db: Db, userId: string) {
   const result = db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+  if (result.changes) notifySessionChanges(db);
   return result.changes > 0;
 }

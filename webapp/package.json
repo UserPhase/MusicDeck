@@ -12,18 +12,27 @@
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2"
+    "@testing-library/react": "^16.3.2",
+    "@types/jest": "^27.5.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "fake-indexeddb": "^6.2.7",
+    "typescript": "~5.9.3"
   },
   "scripts": {
     "start": "react-scripts start",
-    "build": "react-scripts build",
+    "build": "node scripts/build.cjs",
     "test": "react-scripts test",
+    "test:touch": "node scripts/verify-track-touch.cjs",
     "eject": "react-scripts eject"
   },
   "jest": {
     "moduleNameMapper": {
       "^react-router/dom$": "<rootDir>/node_modules/react-router/dist/development/dom-export.js"
     }
+  },
+  "overrides": {
+    "typescript": "$typescript"
   },
   "eslintConfig": {
     "extends": [

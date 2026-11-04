@@ -21,15 +21,14 @@
 
 services:
   musicdeck-web:
-    image: ${MUSICDECK_IMAGE_WEB:-ghcr.io/userphase/musicdeck-web}:${MUSICDECK_VERSION:-latest}
+    image: ${MUSICDECK_IMAGE_WEB:-ghcr.io/userphase/musicdeck-web}:${MUSICDECK_VERSION:-sha-752688b}
     container_name: musicdeck-web
     depends_on:
       musicdeck-server:
         condition: service_healthy
     ports:
-      # Bind to loopback so browsers reach production only through a TLS
-      # reverse proxy. Set MUSICDECK_WEB_BIND only when that proxy runs on
-      # another host/container, and firewall the published port accordingly.
+      # Loopback suits a same-host TLS proxy. The LAN onboarding .env template
+      # explicitly overrides this; restrict any non-loopback port with a firewall.
       - "${MUSICDECK_WEB_BIND:-127.0.0.1}:${MUSICDECK_WEB_PORT:-8080}:80"
     restart: unless-stopped
     healthcheck:
@@ -40,7 +39,7 @@ services:
       start_period: 10s
 
   musicdeck-server:
-    image: ${MUSICDECK_IMAGE_SERVER:-ghcr.io/userphase/musicdeck-server}:${MUSICDECK_VERSION:-latest}
+    image: ${MUSICDECK_IMAGE_SERVER:-ghcr.io/userphase/musicdeck-server}:${MUSICDECK_VERSION:-sha-752688b}
     container_name: musicdeck-server
     environment:
       NODE_ENV: production
@@ -48,20 +47,37 @@ services:
       # in by musicdeck-web can reach it. This is an internal container
       # address, not a host-exposed port.
       MUSICDECK_HOST: 0.0.0.0
-      MUSICDECK_PORT: 8080
-      # Must be the HTTPS URL browsers use through the TLS reverse proxy.
-      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:?Set MUSICDECK_PUBLIC_URL in .env to https://music.example.com}
+      LOCAL_ONLY_MODE: ${LOCAL_ONLY_MODE:-false}
+      MUSICDECK_PORT: 4534
+      # Exact browser origin: HTTPS is recommended; HTTP is only for trusted LANs.
+      MUSICDECK_PUBLIC_URL: ${MUSICDECK_PUBLIC_URL:?Set MUSICDECK_PUBLIC_URL in .env to your browser-facing URL}
       # Defaults to MUSICDECK_PUBLIC_URL — only set MUSICDECK_CORS_ORIGIN
       # separately if browsers reach MusicDeck through a different origin
       # than the one MusicDeck itself reports (uncommon).
       MUSICDECK_CORS_ORIGIN: ${MUSICDECK_CORS_ORIGIN:-${MUSICDECK_PUBLIC_URL}}
       MUSICDECK_DB_PATH: /app/data/musicdeck.sqlite
       MUSICDECK_SESSION_SECRET: ${MUSICDECK_SESSION_SECRET:?Set MUSICDECK_SESSION_SECRET in .env}
-      # Production requires HTTPS and secure cookies; use docker-compose.dev.yml
-      # for the loopback-only local HTTP stack.
-      MUSICDECK_SECURE_COOKIES: "true"
+      # HTTPS remains the default. Explicitly set false only for trusted-LAN HTTP.
+      MUSICDECK_SECURE_COOKIES: ${MUSICDECK_SECURE_COOKIES:-true}
       MUSICDECK_ADMIN_USERNAME: ${MUSICDECK_ADMIN_USERNAME:-admin}
       MUSICDECK_ADMIN_PASSWORD: ${MUSICDECK_ADMIN_PASSWORD:?Set MUSICDECK_ADMIN_PASSWORD in .env}
+      MUSICDECK_TRUSTED_PROXIES: ${MUSICDECK_TRUSTED_PROXIES:-}
+      MUSICDECK_LOGIN_WINDOW_MS: ${MUSICDECK_LOGIN_WINDOW_MS:-900000}
+      MUSICDECK_LOGIN_IP_MAX: ${MUSICDECK_LOGIN_IP_MAX:-20}
+      MUSICDECK_LOGIN_ACCOUNT_MAX: ${MUSICDECK_LOGIN_ACCOUNT_MAX:-10}
+      MUSICDECK_LOGIN_MAX_CONCURRENT: ${MUSICDECK_LOGIN_MAX_CONCURRENT:-4}
+      MUSICDECK_LOGIN_MAX_ENTRIES: ${MUSICDECK_LOGIN_MAX_ENTRIES:-10000}
+      MUSICDECK_ACQUISITION_MAX_PENDING: ${MUSICDECK_ACQUISITION_MAX_PENDING:-50}
+      MUSICDECK_ACQUISITION_MAX_PENDING_PER_USER: ${MUSICDECK_ACQUISITION_MAX_PENDING_PER_USER:-10}
+      MUSICDECK_ACQUISITION_SUBMISSION_WINDOW_MS: ${MUSICDECK_ACQUISITION_SUBMISSION_WINDOW_MS:-60000}
+      MUSICDECK_ACQUISITION_SUBMISSIONS_PER_USER: ${MUSICDECK_ACQUISITION_SUBMISSIONS_PER_USER:-20}
+      MUSICDECK_ACQUISITION_SUBMISSIONS_GLOBAL: ${MUSICDECK_ACQUISITION_SUBMISSIONS_GLOBAL:-100}
+      MUSICDECK_ACQUISITION_MAX_RATE_ENTRIES: ${MUSICDECK_ACQUISITION_MAX_RATE_ENTRIES:-10000}
+      MUSICDECK_ACQUISITION_RETENTION_MS: ${MUSICDECK_ACQUISITION_RETENTION_MS:-604800000}
+      MUSICDECK_ACQUISITION_MAX_RETAINED_JOBS: ${MUSICDECK_ACQUISITION_MAX_RETAINED_JOBS:-1000}
+      MUSICDECK_ACQUISITION_CLEANUP_INTERVAL_MS: ${MUSICDECK_ACQUISITION_CLEANUP_INTERVAL_MS:-60000}
+      MUSICDECK_ACQUISITION_SSE_PER_USER: ${MUSICDECK_ACQUISITION_SSE_PER_USER:-3}
+      MUSICDECK_ACQUISITION_SSE_GLOBAL: ${MUSICDECK_ACQUISITION_SSE_GLOBAL:-20}
       # Run as the host account that owns MUSIC_ROOT. This lets the non-root
       # server create artist/album folders on the bind-mounted library.
       PUID: ${PUID:-1000}
@@ -71,17 +87,19 @@ services:
       MUSIC_BACKEND: ${MUSIC_BACKEND:-navidrome}
       # Internal service-to-service URLs. LAN clients never see or use these
       # hostnames/ports — MusicDeck Server proxies all provider access.
-      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_URL: ${NAVIDROME_URL:-http://navidrome:4533}
       NAVIDROME_USERNAME: ${NAVIDROME_USERNAME:-}
       NAVIDROME_PASSWORD: ${NAVIDROME_PASSWORD:-}
-      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_URL: ${JELLYFIN_URL:-http://jellyfin:8096}
       JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
       # MusicDeck Server writes acquired/downloaded music into the SAME
       # host folder the selected backend scans (mounted below), so downloads
       # via spotDL/On-Demand Library appear in the library automatically.
       MUSICDECK_MUSIC_ROOT: /music
       MUSICDECK_SPOTIFY_IMPORT_SUBDIR: "${MUSICDECK_SPOTIFY_IMPORT_SUBDIR:-Spotify Imports}"
-      SPOTDL_AUTO_UPDATE: ${SPOTDL_AUTO_UPDATE:-1}
+      # Set to 1 only when you explicitly want startup-time downloader refreshes.
+      # Default 0 keeps image-pinned Python tooling reproducible.
+      SPOTDL_AUTO_UPDATE: ${SPOTDL_AUTO_UPDATE:-0}
     volumes:
       - musicdeck-data:/app/data
       - musicdeck-config:/app/config
@@ -101,7 +119,7 @@ services:
       start_period: 20s
 
   navidrome:
-    image: deluan/navidrome:latest
+    image: ${NAVIDROME_IMAGE:-deluan/navidrome:0.64.2}
     container_name: navidrome
     # Started only when MUSIC_BACKEND=navidrome (COMPOSE_PROFILES is set
     # from MUSIC_BACKEND in .env).
@@ -116,10 +134,9 @@ services:
     volumes:
       - ${NAVIDROME_DATA:-./navidrome-data}:/data
       - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
-    # Host port is OPTIONAL — only needed if you want to manage Navidrome
-    # directly (e.g. creating the MusicDeck service account on first run).
+    # Direct setup and admin access is restricted to the Docker host.
     ports:
-      - "${NAVIDROME_PORT:-4533}:4533"
+      - "127.0.0.1:${NAVIDROME_PORT:-4533}:4533"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4533/app/ >/dev/null"]
       interval: 30s
@@ -128,7 +145,7 @@ services:
       start_period: 30s
 
   jellyfin:
-    image: jellyfin/jellyfin:latest
+    image: ${JELLYFIN_IMAGE:-jellyfin/jellyfin:12.4}
     container_name: jellyfin
     # Started only when MUSIC_BACKEND=jellyfin.
     profiles: ["jellyfin"]
@@ -137,12 +154,11 @@ services:
       - ${JELLYFIN_CONFIG:-./jellyfin-config}:/config
       - ${JELLYFIN_CACHE:-./jellyfin-cache}:/cache
       - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
-    # Host port is OPTIONAL — only needed for direct Jellyfin setup/admin
-    # access (e.g. creating the API key MusicDeck uses).
+    # Direct setup and admin access is restricted to the Docker host.
     ports:
-      - "${JELLYFIN_PORT:-8096}:8096"
+      - "127.0.0.1:${JELLYFIN_PORT:-8096}:8096"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8096/health >/dev/null"]
+      test: ["CMD", "curl", "--noproxy", "127.0.0.1", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8096/health"]
       interval: 30s
       timeout: 5s
       retries: 5

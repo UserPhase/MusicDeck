@@ -16,7 +16,7 @@ import type { SessionUser } from "../src/types.js";
 import { createFakeBackend } from "./helpers.js";
 
 const directories: string[] = []; const databases: Database.Database[] = [];
-const user = { id: "owner", disabled: false } as SessionUser;
+const user = { id: "owner", role: "user", externalPlaybackEnabled: true, disabled: false } as SessionUser;
 const url = "https://open.spotify.com/playlist/test14";
 type Source = NonNullable<DownloadResult["playlistTracks"]>[number];
 const song = (position: number): Source => ({ position, url: `https://open.spotify.com/track/song${position}`,
@@ -46,6 +46,23 @@ function playlists() {
 }
 
 describe("Spotify import failure accounting", () => {
+  test("legitimate Unknown artist names reach tag verification and playlist linking", async () => {
+    const source = { ...song(1), artist: "Unknown Mortal Orchestra", artists: ["Unknown Mortal Orchestra", "Unknown T"], albumArtist: "Unknown Mortal Orchestra" };
+    const downloader = { fetchPlaylistTracks: vi.fn(async () => ({ status: "completed", files: [], playlistTracks: [source] })),
+      resolveTrackMetadata: vi.fn(), download: vi.fn() };
+    const root = temporary(); const file = path.join(root, "song.mp3"); fs.writeFileSync(file, "audio");
+    const backend = createFakeBackend({ search: vi.fn(async () => ({ artists: [], albums: [], tracks: [local(source)] })) as any,
+      getTrackFilePath: vi.fn(async () => file) });
+    const verifyAndTag = vi.fn(async () => ({ repaired: false }));
+    const lists = playlists();
+    const service = new SpotifyPlaylistImportService(backend, lists as unknown as PlaylistService, downloader as unknown as DownloaderAdapter,
+      root, oembed, "Spotify Imports", { verifyAndTag } as unknown as AudioTaggerService);
+    const job = await finish(service, service.start(url, user).id);
+    expect(job).toMatchObject({ status: "completed", completedCount: 1, failedCount: 0 });
+    expect(verifyAndTag).toHaveBeenCalledWith(file, expect.objectContaining({ artists: ["Unknown Mortal Orchestra", "Unknown T"], albumArtist: "Unknown Mortal Orchestra" }), root);
+    expect(downloader.resolveTrackMetadata).not.toHaveBeenCalled(); expect(downloader.download).not.toHaveBeenCalled();
+    expect(lists.addProviderTrack).toHaveBeenCalledOnce();
+  });
   test.each([true, false])("retries missing audio once in fresh staging and continues the playlist: recovery=%s", async (recover) => {
     const root = temporary(); const sources = [song(1), song(2)]; let scanned = false; let firstAttempts = 0;
     const downloader = {
@@ -158,12 +175,18 @@ describe("physical file safety and existing repair", () => {
     const backend = createFakeBackend({ search: vi.fn(async (query) => ({ artists: [], albums: [], tracks: scanned ? [local(sources.find((source) => source.title === query)!)] : [] })) as any,
       scanLibrary: vi.fn(async () => { scanned = true; return { scanning: false }; }) });
     const tagger = { verifyAndTag: vi.fn(async () => ({ repaired: false })) }; const lists = playlists(); const { repo } = repository();
+    const analyze = vi.fn(async (filePath: string) => {
+      expect(fs.existsSync(filePath)).toBe(true);
+      expect(scanned).toBe(false);
+      if (locked === "work") throw new Error("Optional analysis unavailable");
+    });
     const service = new SpotifyPlaylistImportService(backend, lists as unknown as PlaylistService, downloader as unknown as DownloaderAdapter,
-      root, oembed, "Spotify Imports", tagger as unknown as AudioTaggerService, repo);
+      root, oembed, "Spotify Imports", tagger as unknown as AudioTaggerService, repo, undefined, undefined, analyze);
     const job = await finish(service, service.start(url, user).id);
     expect(job).toMatchObject({ status: "completed", completedCount: 2, failedCount: 0 });
     expect(lists.addProviderTrack).toHaveBeenCalledTimes(2); expect(backend.scanLibrary).toHaveBeenCalledOnce();
     expect(downloader.download).toHaveBeenCalledTimes(2);
+    expect(analyze).toHaveBeenCalledTimes(2);
     for (const entry of job.manifest!) {
       expect(fs.readFileSync(entry.filePath!, "utf8")).toBe(`audio ${entry.position}`);
       if (locked !== "work") expect(entry.cleanupWarnings?.[0]).toContain("EPERM");
@@ -316,5 +339,17 @@ describe("spotDL source metadata", () => {
     expect(result.playlistLength).toBe(14); expect(result.playlistTracks).toHaveLength(2);
     expect(result.playlistTracks![0]).toMatchObject({ position: 1, title: "", artist: "" });
     expect(result.playlistTracks![1].artists!.map((artist) => artist.toLowerCase())).toEqual(["primary", "guest"]);
+  });
+  test("spotDL metadata parsing keeps Unknown artists while rejecting only exact placeholders", async () => {
+    const directory = temporary();
+    const runner = { run: vi.fn((_command, _args, options) => {
+      fs.writeFileSync(path.join(options.cwd, "musicdeck-source.spotdl"), JSON.stringify([
+        { url: song(1).url, name: "Hunnybee", artist: "Unknown Mortal Orchestra", artists: ["Unknown Mortal Orchestra", "Unknown T", "Unknown Artist", "UNSPECIFIED"], list_length: 1 },
+      ]));
+      return { promise: Promise.resolve({ exitCode: 0, stdout: "", stderr: "" }) };
+    }) };
+    const result = await new SpotDLDownloaderAdapter({ runner: runner as unknown as ProcessRunner }).fetchPlaylistTracks(url,
+      { jobId: "unknown-artist-parser", tmpDir: directory, signal: new AbortController().signal });
+    expect(result.playlistTracks?.[0]).toMatchObject({ artist: "Unknown Mortal Orchestra", artists: ["Unknown Mortal Orchestra", "Unknown T"] });
   });
 });

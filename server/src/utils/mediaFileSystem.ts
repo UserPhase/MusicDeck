@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { safeMusicPath, flushFile, flushDirectory } from "../services/media/safeMusicPath.js";
 import { isSpotifyArtworkUrl } from "./spotifyArtworkUrl.js";
+import { privacyArtworkFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 const MAX_ARTWORK_BYTES = 5 * 1024 * 1024;
 
@@ -23,7 +24,7 @@ export async function saveAlbumArtworkToFolder(
     }
   });
   if (!missing.length) return false;
-  const response = await fetchImpl(imageUrl, { signal: AbortSignal.timeout(8_000), redirect: "error" });
+  const response = await gateFetch(fetchImpl, "artwork")(imageUrl, { signal: AbortSignal.timeout(8_000), redirect: "error" });
   if (!response.ok || response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "image/jpeg") {
     await response.body?.cancel();
     throw new Error(`Spotify artwork returned invalid image response (${response.status})`);

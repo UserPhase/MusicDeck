@@ -1,12 +1,13 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Home from "./Home";
-import { getAlbum, getAlbums, getArtistPortrait, getArtistTracks, getArtists, getCoverUrl, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
+import { getReleaseFeed } from "../api/artistFollows";
+import { getAlbum, getAlbums, getArtistPortrait, getArtistTracks, getArtists, getCoverUrl, getMediaCheckpoints, getMusicBrainzArtistPortrait, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
 import { toUnifiedTrack } from "../types/track";
-import { addSongToPlaylist, getPlaylists } from "../api/playlists";
+import { addSongToPlaylist, editPlaylistTracks, getPlaylists } from "../api/playlists";
 
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
@@ -15,35 +16,47 @@ jest.mock("../api/musicdeck", () => ({
   getArtists: jest.fn(),
   getArtistPortrait: jest.fn(async () => null),
   getCoverUrl: jest.fn(),
+  getMediaCheckpoints: jest.fn(),
+  getMusicBrainzArtistPortrait: jest.fn(),
   getRecentlyAddedSongs: jest.fn(),
   getRecommendations: jest.fn(),
+  getSavedDiscoveries: jest.fn(async () => ({ discoveries: [] })),
 }));
 
 jest.mock("../context/AuthContext", () => ({ useAuth: jest.fn() }));
+jest.mock("../api/artistFollows", () => ({ getReleaseFeed: jest.fn(async () => ({ releases: [], artists: [], hasMore: false })) }));
 jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
-jest.mock("../utils/downloadManager", () => ({ isDownloadedToDevice: async () => false, downloadToDevice: jest.fn() }));
-jest.mock("../api/playlists", () => ({ getPlaylists: jest.fn(), addSongToPlaylist: jest.fn() }));
+jest.mock("../utils/downloadManager", () => ({
+  isDownloadedToDevice: async () => false, readOfflineTrack: async () => null, deleteOfflineTrack: async () => {}, downloadToDevice: jest.fn(),
+  isDeviceDownloadPending: () => false, subscribeDeviceDownload: () => () => {},
+}));
+jest.mock("../api/playlists", () => ({ getPlaylists: jest.fn(), addSongToPlaylist: jest.fn(), editPlaylistTracks: jest.fn() }));
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
+const resumeMedia = jest.fn();
 const album = { id: "album-1", name: "Discovery", artist: "Daft Punk", coverArt: "art-1" };
 const song = { id: "track-1", title: "Digital Love", artist: "Daft Punk", artistId: "artist-1", coverArt: "art-1", duration: 241 };
 const artist = { id: "artist-1", name: "Daft Punk", coverArt: "artist-art", playCount: 0 };
 
-function renderHome({ recentlyPlayed = [song], albums = [album], artists = [artist], recommendations = [song] } = {}) {
+function renderHome({ recentlyPlayed = [song], albums = [album], artists = [artist], recommendations = [song], checkpoints = [] } = {}) {
   jest.clearAllMocks();
+  getReleaseFeed.mockResolvedValue({ releases: [], artists: [], hasMore: false });
   getCoverUrl.mockImplementation((id) => id ? `/api/artwork/${id}` : null);
-  useAuth.mockReturnValue({ session: { displayName: "Sam", username: "sam" } });
-  usePlayer.mockReturnValue({ playSong, playQueue, recentlyPlayed });
+  useAuth.mockReturnValue({ session: { id: "sam", displayName: "Sam", username: "sam" } });
+  usePlayer.mockReturnValue({ playSong, playQueue, resumeMedia, recentlyPlayed });
+  getMediaCheckpoints.mockResolvedValue({ items: checkpoints });
   getAlbums.mockResolvedValue(albums);
   getRecentlyAddedSongs.mockResolvedValue([song]);
   getArtists.mockResolvedValue(artists);
   getArtistPortrait.mockResolvedValue(null);
+  getMusicBrainzArtistPortrait.mockResolvedValue(null);
   getArtistTracks.mockResolvedValue([song]);
   getRecommendations.mockResolvedValue({ sections: [{ id: "mix", items: recommendations }] });
   getAlbum.mockResolvedValue({ song: [song] });
   getPlaylists.mockResolvedValue([{ id: "playlist-1", name: "Favorites" }]);
   addSongToPlaylist.mockResolvedValue({ success: true });
+  editPlaylistTracks.mockResolvedValue({ id: "playlist-1" });
 
   return render(<MemoryRouter><Home /></MemoryRouter>);
 }
@@ -51,6 +64,11 @@ function renderHome({ recentlyPlayed = [song], albums = [album], artists = [arti
 async function waitForHome() {
   expect(await screen.findByRole("heading", { name: "Discover Albums" })).toBeInTheDocument();
 }
+
+test("checks the same portrait fallback as artist pages for artists missing pictures", async () => {
+  renderHome();
+  await waitFor(() => expect(getMusicBrainzArtistPortrait).toHaveBeenCalledWith(artist.id));
+});
 
 test("renders the artist shelves and discovery sections with a personalized greeting", async () => {
   renderHome();
@@ -110,7 +128,7 @@ test("opens artists using the same linked portrait card as Explore", async () =>
   expect(section.querySelector("button")).toBeNull();
 });
 
-test("plays a continued-listening track", async () => {
+test("plays a recently heard track from the Continue Listening fallback", async () => {
   renderHome();
   await waitForHome();
 
@@ -120,11 +138,25 @@ test("plays a continued-listening track", async () => {
   fireEvent.click(screen.getAllByRole("button", { name: /digital love/i })[0]);
   expect(playSong).toHaveBeenCalledWith(toUnifiedTrack(song, "home"), 0);
   fireEvent.click(screen.getAllByRole("button", { name: "More options for Digital Love" })[0]);
+  fireEvent.click(screen.getByRole("menuitem", { name: /Add to Playlist/ }));
   await screen.findByRole("menuitem", { name: "Favorites" });
   expect(screen.getAllByRole("menu")).toHaveLength(1);
   fireEvent.click(screen.getByRole("menuitem", { name: "Favorites" }));
-  await waitFor(() => expect(addSongToPlaylist).toHaveBeenCalledWith("playlist-1", "track-1"));
+  await waitFor(() => expect(editPlaylistTracks).toHaveBeenCalledWith("playlist-1", { action: "add", trackIds: ["track-1"] }));
   expect(playSong).toHaveBeenCalledTimes(1);
+});
+
+test("prefers saved collection progress and resumes the bookmarked track and position", async () => {
+  renderHome({ checkpoints: [{
+    type: "album", mediaId: album.id, title: album.name, trackId: song.id,
+    trackIndex: 0, trackCount: 1, positionSeconds: 102.125, progress: .42, capturedAt: 1,
+  }] });
+  const shelf = within(screen.getByRole("region", { name: "Continue Listening" }));
+  expect(await shelf.findByRole("img", { name: "42% complete" })).toBeInTheDocument();
+  expect(shelf.queryByText(song.title)).not.toBeInTheDocument();
+  fireEvent.click(shelf.getByRole("button", { name: "Resume from Track 1 - 1:42" }));
+  await waitFor(() => expect(resumeMedia).toHaveBeenCalledWith([song], 0,
+    expect.objectContaining({ type: "album", id: album.id }), 102.125));
 });
 
 test("plays an album through its fetched queue", async () => {
@@ -134,18 +166,33 @@ test("plays an album through its fetched queue", async () => {
   fireEvent.click(screen.getAllByRole("button", { name: /play discovery/i })[0]);
   await waitFor(() => {
     expect(getAlbum).toHaveBeenCalledWith("album-1");
-    expect(playQueue).toHaveBeenCalledWith([song], 0);
+    expect(playQueue).toHaveBeenCalledWith([song], 0, {
+      type: "album", id: "album-1", name: "Discovery", coverArt: "art-1",
+    });
   });
 });
 
-test("keeps the listening hero useful when history is empty", async () => {
+test("shows an empty listening state instead of recently added songs when history is empty", async () => {
   renderHome({ recentlyPlayed: [] });
   await waitForHome();
 
   await waitFor(() => {
     const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
-    expect(section.querySelectorAll(".track")).toHaveLength(1);
+    expect(section.querySelectorAll(".track")).toHaveLength(0);
+    expect(section).toHaveTextContent("Start listening and your recent music will appear here.");
   });
+});
+
+test("shows only the last six listened songs in history order with cover artwork", async () => {
+  const history = Array.from({ length: 8 }, (_, index) => ({ ...song, id: `recent-${index}`, title: `Recent song ${index}` }));
+  renderHome({ recentlyPlayed: history });
+  await waitForHome();
+
+  const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
+  expect(section.querySelector(".home-track-list")).toHaveClass("home-continue-grid");
+  expect(Array.from(section.querySelectorAll(".track-title")).map((title) => title.textContent)).toEqual(history.slice(0, 6).map((track) => track.title));
+  expect(section.querySelectorAll(".track-cover-art")).toHaveLength(6);
+  expect(section.querySelectorAll(".track-number-text")).toHaveLength(0);
 });
 
 test("ranks local discover albums and artists from listening-based recommendations", async () => {

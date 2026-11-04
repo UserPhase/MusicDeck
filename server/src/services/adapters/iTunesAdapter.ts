@@ -1,5 +1,6 @@
 import type { ExternalArtworkTokenStore } from "../../domain/external-catalog.js";
 import type { ExternalAlbum, ExternalArtist, ExternalTrack, MetadataAdapter } from "./MetadataAdapter.js";
+import { privacyFetch as fetch, gateFetch } from "../PrivacyManager.js";
 
 type ItunesItem = {
   trackId?: number; collectionId?: number; artistId?: number;
@@ -14,7 +15,7 @@ export class iTunesAdapter implements MetadataAdapter {
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly artworkTokens?: ExternalArtworkTokenStore,
     private readonly limit = 15
-  ) {}
+  ) { this.fetchImpl = gateFetch(fetchImpl); }
 
   private artwork(url: string | undefined) {
     const large = url?.replace(/100x100bb\.(jpg|png)/i, "1000x1000bb.$1");
@@ -50,7 +51,9 @@ export class iTunesAdapter implements MetadataAdapter {
       artwork: this.artwork(item.artworkUrl100), previewUrl: item.previewUrl || null,
       provider: "external", source: { kind: "external", count: 0, externalAvailable: true },
       availability: null,
-      metadata: { durationSeconds: item.trackTimeMillis == null ? null : Math.round(item.trackTimeMillis / 1000), itunesTrackId: item.trackId },
+      metadata: { durationSeconds: item.trackTimeMillis == null ? null : Math.round(item.trackTimeMillis / 1000), itunesTrackId: item.trackId,
+        artistId: item.artistId != null ? `external_itunes_artist_${item.artistId}` : null,
+        albumId: item.collectionId != null ? `external_itunes_album_${item.collectionId}` : null },
     }]);
   }
 
@@ -61,7 +64,8 @@ export class iTunesAdapter implements MetadataAdapter {
       title: item.collectionName, subtitle: item.artistName || null,
       artist: item.artistName || null, album: null,
       artwork: this.artwork(item.artworkUrl100), provider: "external",
-      source: { kind: "external", count: 0 }, availability: null, metadata: {},
+      source: { kind: "external", count: 0 }, availability: null,
+      metadata: { artistId: item.artistId != null ? `external_itunes_artist_${item.artistId}` : null },
     }]);
   }
 

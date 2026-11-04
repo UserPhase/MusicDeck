@@ -1,5 +1,15 @@
 const EXTERNAL_PREFIX = "ext:";
 
+/** Older discovery cards used shorter IDs than the album detail API. */
+export function toAlbumRouteIdFromApiId(rawId) {
+  const value = String(rawId ?? "").trim();
+  const legacy = value.match(/^(deezer|itunes|spotify)_album_(.+)$/i);
+  if (legacy) return `external_${legacy[1].toLowerCase()}_album_${legacy[2]}`;
+  const prefixed = value.match(/^ext:(deezer|itunes|spotify):(.+)$/i);
+  if (prefixed) return `external_${prefixed[1].toLowerCase()}_album_${decodeExternalId(prefixed[2])}`;
+  return value;
+}
+
 function decodeExternalId(value) {
   try {
     return decodeURIComponent(value);

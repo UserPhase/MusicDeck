@@ -1,3 +1,4 @@
+import TrackActionScope from "../components/TrackActionScope";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -6,7 +7,7 @@ import { usePlayer } from "../context/PlayerContext";
 import { getCoverUrl, getListeningHistory, getListeningStatistics, getListeningTrack,
   LISTENING_ACTIVITY_CHANGED_EVENT } from "../api/musicdeck";
 import TrackRow from "../components/TrackRow";
-import useTrackPlaylistMenu from "../hooks/useTrackPlaylistMenu";
+
 import { toArtistRouteIdFromApiId } from "../utils/idResolver";
 import { LoadingState, EmptyState, ErrorState } from "../components/ui/PageState";
 import "../styles/listening-activity.css";
@@ -124,7 +125,7 @@ export default function ListeningActivity() {
   const { session } = useAuth();
   const { playSong } = usePlayer();
   const client = useQueryClient();
-  const menus = useTrackPlaylistMenu(setNotice);
+
   useEffect(() => {
     const timer = setTimeout(() => setQuery(search.trim()), 250);
     return () => clearTimeout(timer);
@@ -203,14 +204,14 @@ export default function ListeningActivity() {
             {!groups.length ? <EmptyState>{query ? "No listens match your search." : "No listening history for this period. Your next listen starts here."}</EmptyState> :
               groups.map(([date, events]) => <section className="activity-date-group" key={date}>
                 <h2>{date}<span>{events.length} listens shown</span></h2>
-                <div className="track-list track-list--compact" role="table" aria-label={`${date} listening history`}>
+                <TrackActionScope tracks={events.map((event) => event.track)} getItemKey={(index) => events[index].id} dataKey={`${date}:${period}:${query}`}><div className="track-list track-list--compact" role="table" aria-label={`${date} listening history`}>
                   {events.map((event, index) => <div className="activity-history-row" key={event.id}>
                     <TrackRow song={event.track} index={index} onPlay={play} showArtwork showAlbum={false} preserveDeleted
-                      onToggleMenu={(song, e) => menus.toggleMenu(song, e, event.id)}
-                      menu={menus.isOpen(event.track, event.id) ? menus.renderMenu(event.track) : null} />
+
+                       />
                     <time dateTime={event.playedAt}>{new Date(event.playedAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</time>
                   </div>)}
-                </div>
+                </div></TrackActionScope>
               </section>)}
             {history.hasNextPage && <button className="activity-load-more" type="button" disabled={history.isFetchingNextPage}
               onClick={() => history.fetchNextPage()}>{history.isFetchingNextPage ? "Loading..." : "Load more history"}</button>}

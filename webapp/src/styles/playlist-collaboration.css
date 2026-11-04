@@ -1,0 +1,47 @@
+.playlist-share-backdrop { position: fixed; inset: 0; z-index: 1400; background: #000b; display: grid; place-items: center; padding: 24px; }
+.playlist-share-dialog { width: min(640px, 100%); max-height: min(880px, 92dvh); overflow-y: auto; padding: 28px; background: #17151c; border: 1px solid #ffffff24; border-radius: 16px; color: #f4f2f8; box-shadow: 0 24px 100px #0009; }
+.playlist-share-dialog header { display: flex; justify-content: space-between; gap: 20px; align-items: start; }
+.playlist-share-dialog h2 { font-size: 26px; line-height: 1.2; letter-spacing: -.035em; overflow-wrap: anywhere; margin: 8px 0 24px; }
+.playlist-share-eyebrow { font-size: 10px; letter-spacing: .15em; color: var(--accent, #b98af5); margin: 0; font-weight: 700; }
+.playlist-share-dialog button, .playlist-party-panel button { cursor: pointer; border: 1px solid #ffffff25; border-radius: 6px; background: #ffffff08; color: inherit; padding: 8px 12px; font: inherit; font-size: 12px; }
+.playlist-share-dialog button:hover:not(:disabled), .playlist-party-panel button:hover:not(:disabled) { background: #ffffff16; border-color: #b98af570; }
+.playlist-share-dialog button:disabled, .playlist-party-panel button:disabled { opacity: .45; cursor: default; }
+.playlist-share-dialog :focus-visible, .playlist-party-panel :focus-visible { outline: 2px solid var(--accent, #b98af5); outline-offset: 3px; }
+.playlist-share-modes { border: 0; padding: 0; margin: 0 0 24px; }
+.playlist-share-modes legend { font-size: 13px; margin-bottom: 12px; font-weight: 600; }
+.playlist-share-modes > label { display: flex; gap: 12px; align-items: start; border: 1px solid #ffffff14; border-radius: 8px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
+.playlist-share-modes > label.is-active { background: #ae79f011; border-color: #ae79f078; }
+.playlist-share-modes input { accent-color: var(--accent, #b98af5); margin: 3px 0 0; }
+.playlist-share-modes strong { font-size: 13px; font-weight: 600; }
+.playlist-share-dialog small { display: block; font-size: 11px; color: #aaa5b5; margin-top: 4px; line-height: 1.5; }
+.playlist-share-dialog label, .playlist-share-dialog h3 { font-size: 13px; }
+.playlist-share-dialog input:not([type=radio]), .playlist-share-dialog select { min-width: 0; box-sizing: border-box; background: #ffffff06; border: 1px solid #ffffff25; border-radius: 6px; color: inherit; padding: 9px 10px; font: inherit; font-size: 12px; }
+.playlist-share-dialog select option { background: #201d28; }
+.playlist-share-members > input, .playlist-share-copy input { width: 100%; margin-top: 8px; }
+.playlist-share-dialog ul, .playlist-party-panel ul { list-style: none; padding: 0; margin: 12px 0; }
+.playlist-share-dialog li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff0c; }
+.playlist-share-member-name, .playlist-share-links li > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.playlist-share-member-name strong { font-size: 13px; }
+.playlist-contributor { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%; background: #ae79f020; color: #d8b8ff; border: 1px solid #ae79f030; font-size: 10px; font-weight: 700; vertical-align: middle; overflow: hidden; }
+.playlist-contributor img { width: 100%; height: 100%; object-fit: cover; }
+.track-title > .playlist-contributor { width: 21px; height: 21px; font-size: 8px; margin-left: 8px; }
+.playlist-share-user-results { max-height: 180px; overflow-y: auto; margin-top: 12px; }
+.playlist-share-user-results > button { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; margin-bottom: 5px; border: 0; }
+.playlist-share-user-results > button > span:last-child { margin-left: auto; }
+.playlist-share-note, .playlist-share-links p { font-size: 11px; color: #aaa5b5; line-height: 1.6; }
+.playlist-share-links { border-top: 1px solid #ffffff14; margin-top: 24px; padding-top: 20px; }
+.playlist-invitation-row { display: flex; gap: 8px; margin-top: 10px; }
+.playlist-invitation-row select { flex: 1; }
+.playlist-share-copy { display: block; margin-top: 14px; }
+.playlist-share-error { color: #f1a5ac; font-size: 12px; line-height: 1.6; }
+.playlist-share-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 28px; padding-top: 20px; border-top: 1px solid #ffffff14; }
+.playlist-share-dialog .playlist-share-primary { color: #17111f; background: var(--accent, #b98af5); border-color: transparent; font-weight: 700; }
+.playlist-share-dialog .playlist-share-primary:hover:not(:disabled) { background: #c6a2f7; }
+.playlist-party-panel { margin: 24px 0; border: 1px solid #ffffff16; border-radius: 10px; padding: 16px; font-size: 13px; }
+.playlist-party-panel summary { cursor: pointer; font-weight: 600; }
+.playlist-party-panel p { font-size: 12px; color: #aaa5b5; line-height: 1.6; }
+.playlist-party-panel > button, .playlist-party-panel > span { margin: 6px 10px 6px 0; }
+.playlist-party-panel li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid #ffffff0d; }
+.playlist-party-panel li small { display: block; color: #aaa5b5; margin-top: 5px; }
+.playlist-party-panel li button { margin: 3px; }
+@media (max-width: 600px) { .playlist-share-backdrop { padding: 10px; } .playlist-share-dialog { padding: 20px; max-height: 94dvh; } .playlist-share-dialog h2 { font-size: 23px; } .playlist-share-dialog li { flex-wrap: wrap; } .playlist-share-member-name { min-width: 110px; } .playlist-share-modes > label { padding: 10px; } .playlist-party-panel li { align-items: start; flex-direction: column; } .playlist-share-dialog select { max-width: 130px; } .playlist-invitation-row { flex-wrap: wrap; } }

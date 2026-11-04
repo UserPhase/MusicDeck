@@ -7,6 +7,7 @@ import type { SessionUser, Track } from "../types.js";
 import { createId } from "../utils/ids.js";
 import type { DownloadResult, DownloaderAdapter, DownloadDiagnostics, DownloadErrorCode, DownloadRequest } from "./downloader-adapter.js";
 import { SPOTDL_LIBRARY_TEMPLATE } from "./spotdl-downloader-adapter.js";
+import { SPOTDL_FORMATS } from "./spotdl-format.js";
 import type { AcquiredFile } from "./acquisition.js";
 import type { PlaylistService } from "./playlist-service.js";
 import { AudioTaggerService, type CanonicalAudioMetadata } from "../services/media/audioTaggerService.js";
@@ -16,6 +17,10 @@ import type { SqliteImportJobRepository, StoredImportJob } from "../infrastructu
 import type { SqliteImportedArtworkRepository } from "../infrastructure/persistence/sqliteImportedArtworkRepository.js";
 import { saveAlbumArtworkToFolder } from "../utils/mediaFileSystem.js";
 import { isSpotifyArtworkUrl } from "../utils/spotifyArtworkUrl.js";
+import type { ImportedAudio } from "../services/media/loudnessService.js";
+import type { TaskManager, TaskRunContext } from "../services/TaskManager.js";
+import { privacyFetch as fetch, currentPrivacyManager, gateFetch } from "../services/PrivacyManager.js";
+import { isPlaceholderArtist, isPlaceholderAlbumArtist } from "../utils/artistMetadata.js";
 
 export type ImportEntryStatus = "PENDING" | "DOWNLOADED" | "READY" | "COMPLETED"
   | "FAILED_METADATA_MISSING" | "FAILED_DOWNLOAD" | "FAILED_TAGGING" | "FAILED_INDEXING" | "FAILED_LINKING";
@@ -59,6 +64,18 @@ function spotifyPlaylistDescription(description: string | null | undefined, play
 
 type SpotifyTrackMetadata = NonNullable<DownloadResult["playlistTracks"]>[number];
 
+export class PlaylistImportForbiddenError extends Error {
+  readonly statusCode = 403;
+  constructor(message = "Downloads are not enabled for this user") { super(message); }
+}
+
+export function assertPlaylistImportPermission(user: SessionUser | null): asserts user is SessionUser {
+  if (user?.disabled) throw new PlaylistImportForbiddenError("Import owner is disabled");
+  if (!user || user.disabled || (user.role !== "admin" && !user.externalPlaybackEnabled)) {
+    throw new PlaylistImportForbiddenError();
+  }
+}
+
 /** Accept only a Spotify playlist identity, then rebuild the URL ourselves. */
 export function parseSpotifyPlaylistUrl(value: string): { id: string; url: string } | null {
   try {
@@ -73,6 +90,68 @@ export function parseSpotifyPlaylistUrl(value: string): { id: string; url: strin
 export class SpotifyPlaylistImportService {
   private readonly jobs = new Map<string, SpotifyImportJob>();
   private tail: Promise<void> = Promise.resolve();
+  private taskManager?: TaskManager;
+  private resolveUser?: (id: string) => SessionUser | null;
+  private readonly taskContexts = new Map<string, TaskRunContext>();
+
+  bindTaskManager(manager: TaskManager): void {
+    this.taskManager = manager;
+  }
+
+  bindUserResolver(resolveUser: (id: string) => SessionUser | null): void {
+    this.resolveUser = resolveUser;
+  }
+
+  private authorizedUser(user: SessionUser): SessionUser {
+    const current = this.resolveUser ? this.resolveUser(user.id) : user;
+    assertPlaylistImportPermission(current);
+    return current;
+  }
+
+  async runManagedJob(jobId: string, context: TaskRunContext): Promise<void> {
+    const record = this.records.get(jobId);
+    if (!record || record.job.status !== "queued" || this.taskContexts.has(jobId)) {
+      throw new Error("Playlist import job is not queued or is already running");
+    }
+    this.taskContexts.set(jobId, context);
+    try {
+      await this.executeRecord(record);
+      context.throwIfCancelled();
+      if (this.get(jobId, record.user.id)?.status === "failed") throw new Error("Spotify playlist import failed");
+    } finally {
+      this.taskContexts.delete(jobId);
+    }
+  }
+
+  private async taskCheckpoint(job: SpotifyImportJob): Promise<void> {
+    const task = this.taskContexts.get(job.id);
+    await task?.checkpoint();
+    task?.throwIfCancelled();
+    const record = this.records.get(job.id);
+    if (record) this.authorizedUser(record.user);
+  }
+
+  private downloadContext(job: SpotifyImportJob, tmpDir: string, suffix = "") {
+    const task = this.taskContexts.get(job.id);
+    return {
+      jobId: job.id + suffix,
+      tmpDir,
+      signal: task?.signal ?? new AbortController().signal,
+      checkpoint: () => this.taskCheckpoint(job),
+      onLog: (source: "stdout" | "stderr", message: string) => task?.log?.(source, message),
+      onProgress: (progress: { percent?: number; stage?: string; speedBytesPerSecond?: number }) => {
+        const total = job.expectedCount ?? 1;
+        const before = Math.max(0, (job.currentTrack ?? 1) - 1);
+        task?.report({
+          percent: (before + (progress.percent ?? 0) / 100) / total * 100,
+          itemsProcessed: job.completedCount ?? 0,
+          totalItems: job.expectedCount ?? null,
+          message: [progress.stage ?? job.stage, job.currentTrackName].filter(Boolean).join(" - "),
+          speedBytesPerSecond: progress.speedBytesPerSecond,
+        });
+      },
+    };
+  }
 
   constructor(
     private readonly backend: MusicBackend,
@@ -85,7 +164,8 @@ export class SpotifyPlaylistImportService {
     private readonly repository?: SqliteImportJobRepository,
     private readonly importedArtwork?: SqliteImportedArtworkRepository,
     private readonly reportArtworkWarning: (message: string, error: unknown) => void = console.warn,
-  ) {}
+    private readonly analyzeImportedFile?: (filePath: string, metadata: ImportedAudio) => Promise<void>,
+  ) { this.fetchImpl = gateFetch(fetchImpl, "imports"); }
   private readonly records = new Map<string, StoredImportJob>();
   private checkpoint(job: SpotifyImportJob): void {
     if (job.manifest) {
@@ -96,44 +176,74 @@ export class SpotifyPlaylistImportService {
     }
     const record = this.records.get(job.id);
     if (record) this.repository?.save(record);
+    this.taskContexts.get(job.id)?.report({
+      itemsProcessed: (job.completedCount ?? 0) + (job.failedCount ?? 0),
+      totalItems: job.expectedCount ?? null,
+      message: [job.stage, job.currentTrackName].filter(Boolean).join(" - "),
+    });
   }
   private enqueue(record: StoredImportJob): void {
     const { job, user } = record;
     this.records.set(job.id, record); this.jobs.set(job.id, job);
-    this.tail = this.tail.then(async () => {
-      try {
-        if (user.disabled) throw new Error("Import owner is disabled");
-        const spotify = parseSpotifyPlaylistUrl(record.playlistUrl);
-        if (!spotify) throw new Error("Stored playlist URL is invalid");
-        job.status = "running"; job.stage = "fetching"; this.checkpoint(job);
-        await this.run(job, spotify, user);
-      } catch (error) {
-        job.status = "failed";
-        job.error = error instanceof Error ? error.message : "Spotify playlist import failed";
-        for (const entry of job.manifest || []) if (!entry.status.startsWith("FAILED_") && entry.status !== "COMPLETED") {
-          entry.status = "FAILED_DOWNLOAD"; entry.error = job.error;
-        }
-      } finally {
-        try { this.checkpoint(job); }
-        catch (error) {
+    if (this.taskManager) {
+      const manager = this.taskManager;
+      const payload = { kind: "playlist", jobId: job.id };
+      const task = manager.findPending("SPOTDL_IMPORT", payload)
+        ?? manager.findPending("SPOTDL_DOWNLOAD", payload)
+        ?? manager.enqueue("SPOTDL_IMPORT", payload, user.id);
+      void manager.waitForSettlement(task.id).then((settled) => {
+        if (settled.state === "CANCELLED" && job.status === "queued") {
           job.status = "failed";
-          job.error = `Could not persist import checkpoint: ${error instanceof Error ? error.message : String(error)}`;
+          job.error = "Playlist import cancelled";
+          this.checkpoint(job);
+          this.records.delete(job.id);
         }
-        this.records.delete(job.id);
-        if (this.jobs.size > 100) {
-          for (const [id, previous] of this.jobs) {
-            if (this.jobs.size <= 100) break;
-            if (!["queued", "running"].includes(previous.status)) this.jobs.delete(id);
-          }
+      }).catch((error) => console.error("Could not observe playlist import task", error));
+      return;
+    }
+    this.tail = this.tail.then(() => this.executeRecord(record));
+  }
+
+  private async executeRecord(record: StoredImportJob): Promise<void> {
+    const { job } = record;
+    try {
+      currentPrivacyManager()?.assertExternalAllowed("imports");
+      await this.taskCheckpoint(job);
+      const user = this.authorizedUser(record.user);
+      const spotify = parseSpotifyPlaylistUrl(record.playlistUrl);
+      if (!spotify) throw new Error("Stored playlist URL is invalid");
+      job.status = "running"; job.stage = "fetching"; this.checkpoint(job);
+      await this.run(job, spotify, user);
+    } catch (error) {
+      job.status = "failed";
+      job.error = error instanceof Error ? error.message : "Spotify playlist import failed";
+      for (const entry of job.manifest || []) if (!entry.status.startsWith("FAILED_") && entry.status !== "COMPLETED") {
+        entry.status = "FAILED_DOWNLOAD"; entry.error = job.error;
+      }
+    } finally {
+      try { this.checkpoint(job); }
+      catch (error) {
+        job.status = "failed";
+        job.error = `Could not persist import checkpoint: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      this.records.delete(job.id);
+      if (this.jobs.size > 100) {
+        for (const [id, previous] of this.jobs) {
+          if (this.jobs.size <= 100) break;
+          if (!["queued", "running"].includes(previous.status)) this.jobs.delete(id);
         }
       }
-    });
+    }
   }
   /** Resume from durable per-track checkpoints; completed jobs remain queryable in SQLite. */
   resumeInterrupted(resolveUser?: (id: string) => SessionUser | null): void {
+    if (resolveUser) this.bindUserResolver(resolveUser);
     for (const record of this.repository?.unfinished() || []) {
       if (resolveUser) record.user = resolveUser(record.job.userId) || { ...record.user, disabled: true };
-      if (!this.jobs.has(record.job.id)) this.enqueue(record);
+      if (!this.jobs.has(record.job.id)) {
+        record.job.status = "queued";
+        this.enqueue(record);
+      }
     }
   }
 
@@ -141,8 +251,12 @@ export class SpotifyPlaylistImportService {
     const artists = [...new Set([source.artist, ...(source.artists || [])]
       .flatMap((value) => value.split(/\s*;\s*|\s+\/\s+/)).map((value) => value.trim()).filter(Boolean))];
     return { title: source.title, artists, album: source.album || file?.album || "",
-      albumArtist: source.albumArtist && !/unknown/i.test(source.albumArtist) ? source.albumArtist : artists[0], year: source.year,
+      albumArtist: !isPlaceholderAlbumArtist(source.albumArtist) ? source.albumArtist : artists[0], year: source.year,
       isrc: source.isrc, artworkUrl: source.artworkUrl };
+  }
+  private async analyzeForPlayback(filePath: string, metadata: ImportedAudio): Promise<void> {
+    try { await this.analyzeImportedFile?.(filePath, metadata); }
+    catch (error) { console.warn("Imported track loudness analysis unavailable; playback will analyze on demand", error); }
   }
   private async ingestAlbumArtwork(
     source: SpotifyTrackMetadata, filePath: string | undefined,
@@ -180,7 +294,12 @@ export class SpotifyPlaylistImportService {
     if (warning) owner.cleanupWarnings = [...(owner.cleanupWarnings || []), warning];
   }
   private async tagAndPublish(file: AcquiredFile, source: SpotifyTrackMetadata, stagingDir: string, root: string, entry: ImportEntry): Promise<AcquiredFile> {
-    if (!this.audioTagger) { safeMusicPath(root, file.path); return file; }
+    if (!this.audioTagger) {
+      safeMusicPath(root, file.path);
+      await this.analyzeForPlayback(file.path, { title: source.title, artist: source.artist,
+        album: source.album || file.album || "", durationSeconds: file.durationSeconds || source.duration });
+      return file;
+    }
     safeMusicPath(stagingDir, file.path);
     const destination = safeMusicPath(root, path.resolve(root, path.relative(stagingDir, file.path)), true);
     const metadata = this.canonical(source, file);
@@ -205,9 +324,13 @@ export class SpotifyPlaylistImportService {
         }
       } finally { await this.cleanup(pendingDir, entry); }
     }
+    await this.analyzeForPlayback(destination, { title: metadata.title, artist: metadata.artists.join("; "),
+      album: metadata.album, durationSeconds: file.durationSeconds || source.duration });
     return { ...file, path: destination, name: path.basename(destination), size: fs.statSync(destination).size };
   }
   start(playlistUrl: string, user: SessionUser): SpotifyImportJob {
+    user = this.authorizedUser(user);
+    currentPrivacyManager()?.assertExternalAllowed("imports");
     const spotify = parseSpotifyPlaylistUrl(playlistUrl);
     if (!spotify) throw new Error("Please enter a valid open.spotify.com/playlist URL");
     if ([...this.jobs.values()].filter((job) => job.status === "queued" || job.status === "running").length >= 5)
@@ -303,7 +426,7 @@ export class SpotifyPlaylistImportService {
     for (const value of artists) {
       const artist = sanitize(value); const album = sanitize(source.album); const title = sanitize(source.title);
       if (!artist || !album || !title || `${artist} - ${title}.mp3`.length >= 255) continue;
-      for (const extension of ["mp3", "flac", "m4a"]) {
+      for (const extension of SPOTDL_FORMATS) {
         const destination = safeMusicPath(root, path.join(root, artist, album, `${artist} - ${title}.${extension}`));
         if (fs.existsSync(destination) && fs.statSync(destination).isFile() && fs.statSync(destination).size) return destination;
       }
@@ -319,7 +442,7 @@ export class SpotifyPlaylistImportService {
         const detailsPromise = this.spotifyDetails(spotify.url);
         const providerPromise = this.downloader.fetchPlaylistDetails?.(spotify.id);
         const result = await this.downloader.fetchPlaylistTracks!(spotify.url, {
-          jobId: job.id + "-metadata", tmpDir: work, signal: new AbortController().signal,
+          ...this.downloadContext(job, work, "-metadata"),
         });
         if (result.status !== "completed" || !result.playlistTracks?.length) throw new Error(result.error?.message || "Could not read Spotify playlist tracks");
         const total = Math.max(result.playlistLength || 0, result.playlistTracks.length,
@@ -346,6 +469,7 @@ export class SpotifyPlaylistImportService {
         this.checkpoint(job);
       }
       // A crash after source checkpoint but before playlist creation reuses the deterministic identity.
+      await this.taskCheckpoint(job);
       if (!job.playlistId) {
         if (!job.playlistName) {
           const [details, provider] = await Promise.all([this.spotifyDetails(spotify.url), this.downloader.fetchPlaylistDetails?.(spotify.id)]);
@@ -364,6 +488,7 @@ export class SpotifyPlaylistImportService {
       const ready = new Map<string, ImportEntry>();
       let needsScan = entries.some((entry) => entry.status === "DOWNLOADED" || entry.requiresScan);
       for (const entry of entries) {
+        await this.taskCheckpoint(job);
         if (entry.status === "COMPLETED" || entry.status === "READY") {
           ready.set(sourceKey(entry.source), entry); continue;
         }
@@ -375,7 +500,7 @@ export class SpotifyPlaylistImportService {
         if (!usableMetadata(source, Boolean(this.audioTagger))) {
           try {
             const recovered = await this.downloader.resolveTrackMetadata?.(source, {
-              jobId: job.id + "-metadata-" + entry.position, tmpDir: work, signal: new AbortController().signal,
+              ...this.downloadContext(job, work, "-metadata-" + entry.position),
             });
             if (recovered) source = entry.source = { ...recovered, position: entry.position };
           } catch (error) { entry.error = error instanceof Error ? error.message : String(error); }
@@ -433,11 +558,15 @@ export class SpotifyPlaylistImportService {
               timeoutMs: broadenAudioSearch ? 120_000 : 300_000,
               broadenAudioSearch,
               audioProvider,
-            }, { jobId: job.id + "-track-" + entry.position, tmpDir: staging,
-              signal: new AbortController().signal,
-              onProgress: (progress) => { if (progress.message) job.currentTrackName = progress.message; },
+            }, {
+              ...this.downloadContext(job, staging, "-track-" + entry.position),
+              onProgress: (progress) => {
+                this.downloadContext(job, staging).onProgress(progress);
+                if (progress.message) job.currentTrackName = progress.message;
+              },
             });
             let result = await download();
+            await this.taskCheckpoint(job);
             const recordAttempt = (result: DownloadResult) => {
               entry.downloadAttempts = [...(entry.downloadAttempts || []).slice(-3), {
                 status: result.status, error: result.error?.message, errorCode: result.error?.code, diagnostics: result.diagnostics,
@@ -450,30 +579,38 @@ export class SpotifyPlaylistImportService {
             // spotDL falls through providers when SEARCH finds no match, but stops
             // after a selected URL fails to DOWNLOAD. Isolate each recovery source.
             for (const provider of ["soundcloud", "youtube", "youtube-music"] as const) {
+              await this.taskCheckpoint(job);
               if (!canRecover(result)) break;
               // A fresh staging directory prevents a partial first attempt being skipped as existing audio.
               await this.cleanup(staging, entry);
               staging = fs.mkdtempSync(path.join(work, "track-retry-"));
               job.currentTrackName = `Retrying via ${provider}: ${source.artist} - ${source.title}`; this.checkpoint(job);
               result = await download(true, provider);
+              await this.taskCheckpoint(job);
               recordAttempt(result);
             }
             if (result.status !== "completed" || !result.files.length) {
               this.fail(entry, "FAILED_DOWNLOAD", result.error?.message || "Audio was unavailable"); this.checkpoint(job); continue;
             }
             const file = result.files[0];
+            await this.taskCheckpoint(job);
             entry.filePath = this.audioTagger ? path.resolve(root, path.relative(staging, file.path)) : file.path;
             this.checkpoint(job);
             try { await this.tagAndPublish(file, source, staging, root, entry); }
             catch (error) { this.fail(entry, "FAILED_TAGGING", error); this.checkpoint(job); continue; }
           }
           entry.status = "DOWNLOADED"; needsScan = true; ready.set(sourceKey(source), entry); this.checkpoint(job);
-        } catch (error) { this.fail(entry, "FAILED_DOWNLOAD", error); this.checkpoint(job); }
+        } catch (error) {
+          this.taskContexts.get(job.id)?.throwIfCancelled();
+          this.fail(entry, "FAILED_DOWNLOAD", error);
+          this.checkpoint(job);
+        }
         finally { await this.cleanup(staging, entry); this.checkpoint(job); }
       }
       // Download all tracks before indexing; one stalled scan cannot stop the next download.
       const artworkDirectories = new Set<string>();
       for (const entry of entries) {
+        await this.taskCheckpoint(job);
         const filePath = ["DOWNLOADED", "READY", "COMPLETED"].includes(entry.status) ? entry.filePath : undefined;
         if (await this.ingestAlbumArtwork(entry.source, filePath, entry, artworkDirectories)) {
           needsScan = true; entry.requiresScan = true;
@@ -481,6 +618,7 @@ export class SpotifyPlaylistImportService {
         this.checkpoint(job);
       }
       if (needsScan) {
+        await this.taskCheckpoint(job);
         job.stage = "scanning"; this.checkpoint(job);
         const pending = entries.filter((entry) => entry.status === "DOWNLOADED");
         try {
@@ -491,6 +629,7 @@ export class SpotifyPlaylistImportService {
           const deadline = Date.now() + 120_000;
           do {
             for (const entry of unresolved) {
+              await this.taskCheckpoint(job);
               try {
                 const track = await this.findLibraryTrack(entry.source);
                 if (track) { entry.providerTrackId = String(track.id); entry.status = "READY"; unresolved.delete(entry); this.checkpoint(job); }
@@ -501,12 +640,14 @@ export class SpotifyPlaylistImportService {
           } while (Date.now() < deadline);
           for (const entry of unresolved) this.fail(entry, "FAILED_INDEXING", "Downloaded audio was not indexed by the library");
         } catch (error) {
+          this.taskContexts.get(job.id)?.throwIfCancelled();
           for (const entry of entries) if (entry.status === "DOWNLOADED" || (entry.status === "READY" && entry.requiresScan))
             this.fail(entry, "FAILED_INDEXING", error);
         }
         this.checkpoint(job);
       }
       for (const entry of entries) {
+        await this.taskCheckpoint(job);
         if (entry.status !== "READY" || !entry.providerTrackId) continue;
         try {
           const alreadyCompleted = entries.some((other) => other.status === "COMPLETED" && other.providerTrackId === entry.providerTrackId);
@@ -564,10 +705,9 @@ export class SpotifyPlaylistImportService {
       playlistM3uName: m3uName,
       timeoutMs: 30 * 60 * 1000,
     }, {
-      jobId: job.id,
-      tmpDir: outputDir,
-      signal: new AbortController().signal,
+      ...this.downloadContext(job, outputDir),
       onProgress: (progress) => {
+        this.downloadContext(job, outputDir).onProgress(progress);
         if (!job.expectedCount) {
           const metadata = readLivePlaylistLength(path.join(outputDir, "musicdeck-source.spotdl"));
           if (metadata) job.expectedCount = metadata;
@@ -605,6 +745,7 @@ export class SpotifyPlaylistImportService {
     // spotDL can exit 0 after individual songs fail. Retry those Spotify IDs
     // independently, preserving their original positions in the playlist.
     for (const track of sourceTracks) {
+      await this.taskCheckpoint(job);
       if (filesByPosition.has(track.position) || !/^https:\/\/open\.spotify\.com\/track\/[a-zA-Z0-9]+/.test(track.url)) continue;
       const retryManifest = `musicdeck-retry-${track.position}.m3u8`;
       const retryDir = fs.mkdtempSync(path.join(os.tmpdir(), "musicdeck-spotify-retry-"));
@@ -619,9 +760,7 @@ export class SpotifyPlaylistImportService {
           broadenAudioSearch: true,
           timeoutMs: 120_000,
         }, {
-          jobId: `${job.id}-retry-${track.position}`,
-          tmpDir: retryDir,
-          signal: new AbortController().signal,
+          ...this.downloadContext(job, retryDir, `-retry-${track.position}`),
         });
       } finally {
         // Retry manifests and metadata are temporary; only the main M3U
@@ -640,16 +779,20 @@ export class SpotifyPlaylistImportService {
     }
 
     const available = sourceTracks.filter((track) => filesByPosition.has(track.position));
+    await this.taskCheckpoint(job);
     if (!available.length) throw new Error("spotDL could not obtain audio for any playlist tracks");
     job.downloadedCount = available.length;
     const m3uLines = ["#EXTM3U"];
     for (const track of available) {
+      await this.taskCheckpoint(job);
       const file = filesByPosition.get(track.position)!;
       safeMusicPath(root, file.path);
       const withinRoot = path.relative(root, file.path);
       if (withinRoot === ".." || withinRoot.startsWith(`..${path.sep}`) || path.isAbsolute(withinRoot)) {
         throw new Error("A downloaded track was placed outside the music library");
       }
+      await this.analyzeForPlayback(file.path, { title: track.title, artist: track.artist,
+        album: track.album || file.album || "", durationSeconds: file.durationSeconds || track.duration });
       const relative = path.relative(outputDir, file.path);
       m3uLines.push(`#EXTINF:${Math.round(track.duration)},${track.artist} - ${track.title}`);
       m3uLines.push(relative.replaceAll(path.sep, "/"));
@@ -658,17 +801,23 @@ export class SpotifyPlaylistImportService {
 
     const artworkDirectories = new Set<string>();
     for (const track of sourceTracks) {
+      await this.taskCheckpoint(job);
       await this.ingestAlbumArtwork(track, filesByPosition.get(track.position)?.path, job, artworkDirectories);
     }
     job.stage = "scanning";
     // Best effort: the playlist poll below still finds the import if Navidrome scans on its own schedule.
-    await this.backend.scanLibrary().catch(() => undefined);
+    await this.taskCheckpoint(job);
+    await this.backend.scanLibrary().catch((error) => {
+      this.taskContexts.get(job.id)?.throwIfCancelled();
+      console.warn("Could not scan library after playlist import", error);
+    });
 
     // Navidrome's scanner can finish before M3U auto-import becomes visible.
     let importedId: string | null = null;
     let providerCount = 0;
     const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {
+      await this.taskCheckpoint(job);
       const candidates = (await this.backend.listPlaylists()).filter((playlist) => !previousIds.has(playlist.id));
       const expectedName = path.parse(m3uName).name.toLowerCase();
       const matching = candidates.find((playlist) => playlist.name.toLowerCase() === expectedName);
@@ -688,6 +837,7 @@ export class SpotifyPlaylistImportService {
     }
 
     const [details, providerDetails] = await Promise.all([titlePromise, providerDetailsPromise]);
+    await this.taskCheckpoint(job);
     const playlistName = providerDetails?.title || details.title || `Spotify Playlist ${spotify.id.slice(0, 8)}`;
     const playlist = await this.playlists.adoptProviderPlaylist(importedId, user, playlistName);
     await this.playlists.update(playlist.id, {
@@ -726,6 +876,6 @@ function sourceKey(source: SpotifyTrackMetadata): string {
     || [source.artist, source.title, source.album || "", String(source.duration)].map(normalizeSongText).join("|");
 }
 function usableMetadata(source: SpotifyTrackMetadata, strict: boolean): boolean {
-  return Boolean(source.title?.trim() && source.artist?.trim() && !/unknown/i.test(source.artist)
+  return Boolean(source.title?.trim() && !isPlaceholderArtist(source.artist)
     && (!strict || (source.album?.trim() && /\b\d{4}\b/.test(source.year || ""))));
 }

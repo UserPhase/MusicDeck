@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 
 import Playlist from "./Playlist";
 
@@ -9,6 +9,10 @@ import {
   updatePlaylist,
   setPlaylistArtwork,
   clearPlaylistArtwork,
+  reorderPlaylistItems,
+  editPlaylistTracks,
+  getPlaylists,
+  getPlaylistRecommendations,
 } from "../api/playlists";
 
 import {
@@ -16,6 +20,8 @@ import {
 } from "../api/musicdeck";
 
 import { usePlayer } from "../context/PlayerContext";
+import { downloadToDevice } from "../utils/downloadManager";
+import { offlineAuditor } from "../services/storage/OfflineAuditor";
 
 
 jest.mock("../api/playlists", () => ({
@@ -25,22 +31,37 @@ jest.mock("../api/playlists", () => ({
   deletePlaylist: jest.fn(),
   setPlaylistArtwork: jest.fn(),
   clearPlaylistArtwork: jest.fn(),
+  reorderPlaylistItems: jest.fn(),
+  editPlaylistTracks: jest.fn(),
+  getPlaylists: jest.fn(),
+  getPlaylistRecommendations: jest.fn(),
 }));
 
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(),
   getStreamUrl: jest.fn(),
+  getSavedDiscoveries: jest.fn(async () => ({ discoveries: [] })),
 }));
 
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: jest.fn(),
 }));
+jest.mock("../context/AuthContext", () => ({ useAuth: () => ({ session: { id: "playlist-user", role: "user" } }) }));
+
 
 jest.mock("../components/TrackDownloadButton", () => () => null);
 jest.mock("../components/AvailabilityHint", () => () => null);
+jest.mock("../utils/downloadManager", () => ({
+  downloadToDevice: jest.fn(async () => ({})),
+  readOfflineTrack: jest.fn(async () => null),
+  subscribeDeviceDownload: () => () => {},
+  isDeviceDownloadPending: () => false,
+}));
 
 
 const collagePlaylist = {
+  permissions: { canRead: true, canEditTracks: true, canManage: true },
+  sharingMode: "PRIVATE",
   id: "mdpl_1",
   name: "Evening Drive",
   coverArt: "mdplart_collage_mdpl_1",
@@ -57,10 +78,13 @@ const customPlaylist = {
 const playContext = jest.fn();
 const togglePlay = jest.fn();
 const addToQueue = jest.fn();
+const queueTracks = jest.fn();
+const playTracksNext = jest.fn();
 
 
-function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
+function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}, withNavigation = false) {
   jest.clearAllMocks();
+  getPlaylistRecommendations.mockResolvedValue({ items: [], message: null, canModify: true });
 
   getCoverUrl.mockImplementation((id, size) =>
     id ? `/api/artwork/${id}${size ? `?size=${size}` : ""}` : null
@@ -71,6 +95,8 @@ function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
     playContext,
     playQueue: jest.fn(),
     addToQueue,
+    queueTracks,
+    playTracksNext,
     playSongFromSource: jest.fn(),
     currentSong: null,
     isPlaying: false,
@@ -88,12 +114,219 @@ function renderPlaylist(playlist = collagePlaylist, playerOverrides = {}) {
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={["/playlist/mdpl_1"]}>
         <Routes>
-          <Route path="/playlist/:id" element={<Playlist />} />
+          <Route path="/playlist/:id" element={<>{withNavigation && <Link to="/playlist/mdpl_other">Open another playlist</Link>}<Playlist /></>} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>
   );
 }
+
+const editablePlaylist = {
+  ...collagePlaylist,
+  itemIds: ["first", "missing", "second", "third"],
+  songCount: 4,
+  entry: [
+    { id: "same", playlistItemId: "first", title: "First", artist: "Artist", isDownloaded: true },
+    { id: "two", playlistItemId: "second", title: "Second", artist: "Artist", isDownloaded: true },
+    { id: "same", playlistItemId: "third", title: "Third", artist: "Artist", isDownloaded: true },
+  ],
+};
+test("viewer access keeps playback available while withholding sharing, artwork and track edit controls", async () => {
+  renderPlaylist({ ...editablePlaylist, sharingMode: "SHARED_READ", permissions: { canRead: true, canEditTracks: false, canManage: false } });
+  await screen.findByRole("row", { name: "First by Artist" });
+  expect(screen.queryByRole("button", { name: "Share playlist" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Choose photo for Evening Drive" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "More options" }));
+  expect(screen.getByRole("menuitem", { name: "Edit details" })).toBeDisabled();
+  expect(screen.getByRole("menuitem", { name: "Delete playlist" })).toBeDisabled();
+  expect(screen.queryByRole("menuitem", { name: "Remove from Playlist" })).not.toBeInTheDocument();
+  expect(screen.getByText(/Viewer access/)).toBeInTheDocument();
+});
+
+test("grabbing a playlist track selects it without opening a separate batch action bar", async () => {
+  renderPlaylist(editablePlaylist);
+  const row = await screen.findByRole("row", { name: "First by Artist" });
+  fireEvent.dragStart(row, { dataTransfer: { setData: jest.fn(), setDragImage: jest.fn() } });
+  expect(row).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByRole("complementary", { name: "Selected track actions" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: "Selected track actions" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /selected/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Move Up" })).not.toBeInTheDocument();
+  fireEvent.dragEnd(row);
+});
+
+test("selection distinguishes duplicate occurrences and queues the selected group in playlist order", async () => {
+  renderPlaylist(editablePlaylist);
+  fireEvent.click(await screen.findByRole("row", { name: "First by Artist" }));
+  fireEvent.click(screen.getByRole("row", { name: "Third by Artist" }), { ctrlKey: true });
+  expect(screen.queryByRole("complementary", { name: "Selected track actions" })).not.toBeInTheDocument();
+  fireEvent.contextMenu(screen.getByRole("row", { name: "Third by Artist" }), { clientX: 400, clientY: 250 });
+  expect(screen.getByRole("row", { name: "First by Artist" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("row", { name: "Second by Artist" })).toHaveAttribute("aria-selected", "false");
+  fireEvent.click(screen.getByRole("menuitem", { name: "Play Next" }));
+  await waitFor(() => expect(playTracksNext).toHaveBeenCalledWith([editablePlaylist.entry[0], editablePlaylist.entry[2]]));
+  fireEvent.contextMenu(screen.getByRole("row", { name: "Third by Artist" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Add to Queue/ }));
+  await waitFor(() => expect(queueTracks).toHaveBeenCalledWith([editablePlaylist.entry[0], editablePlaylist.entry[2]]));
+});
+
+test("Ctrl/Cmd+A selects the entire playlist without row focus and background clicks clear it", async () => {
+  renderPlaylist(editablePlaylist);
+  await screen.findByRole("row", { name: "First by Artist" });
+  const rows = () => screen.getAllByRole("row").filter((row) => row.hasAttribute("aria-selected"));
+  fireEvent.keyDown(document.body, { key: "a", ctrlKey: true });
+  rows().forEach((row) => expect(row).toHaveAttribute("aria-selected", "true"));
+  fireEvent.click(screen.getByRole("heading", { name: "Evening Drive" }));
+  rows().forEach((row) => expect(row).toHaveAttribute("aria-selected", "false"));
+  fireEvent.keyDown(document.body, { key: "a", metaKey: true });
+  rows().forEach((row) => expect(row).toHaveAttribute("aria-selected", "true"));
+  fireEvent.contextMenu(screen.getByRole("row", { name: "Second by Artist" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /Add to Queue/ }));
+  await waitFor(() => expect(queueTracks).toHaveBeenCalledWith(editablePlaylist.entry));
+  rows().forEach((row) => expect(row).toHaveAttribute("aria-selected", "true"));
+  fireEvent.click(document.body);
+  rows().forEach((row) => expect(row).toHaveAttribute("aria-selected", "false"));
+  expect(screen.queryByRole("button", { name: /selected/i })).not.toBeInTheDocument();
+});
+
+test("select-all keeps native text editing and stops handling keys after leaving the playlist", async () => {
+  const view = renderPlaylist(editablePlaylist);
+  const row = await screen.findByRole("row", { name: "First by Artist" });
+  const input = document.createElement("input");
+  input.setAttribute("aria-label", "Search music");
+  document.body.append(input);
+  try {
+    input.focus();
+    expect(fireEvent.keyDown(input, { key: "a", ctrlKey: true })).toBe(true);
+    expect(row).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit details" }));
+    expect(fireEvent.keyDown(screen.getByRole("textbox", { name: "Name" }), { key: "a", ctrlKey: true })).toBe(true);
+    expect(row).toHaveAttribute("aria-selected", "false");
+    view.unmount();
+    expect(fireEvent.keyDown(document.body, { key: "a", ctrlKey: true })).toBe(true);
+  } finally { input.remove(); }
+});
+
+test("right-clicking an unselected row replaces the old selection and opens actions without playback", async () => {
+  renderPlaylist(editablePlaylist);
+  fireEvent.click(await screen.findByRole("row", { name: "First by Artist" }));
+  const second = screen.getByRole("row", { name: "Second by Artist" });
+  fireEvent.contextMenu(second, { clientX: 120, clientY: 180 });
+  const menu = screen.getByRole("menu", { name: "Actions for Second" });
+  expect(menu).toHaveStyle({ top: "180px" });
+  expect(screen.getByRole("row", { name: "First by Artist" })).toHaveAttribute("aria-selected", "false");
+  expect(second).toHaveAttribute("aria-selected", "true");
+  expect(playContext).not.toHaveBeenCalled();
+  expect(within(menu).getByRole("menuitem", { name: "Add to Playlist..." })).toBeInTheDocument();
+  expect(within(menu).getByRole("menuitem", { name: "Remove from Playlist" })).toBeInTheDocument();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: /Add to Queue/ }));
+  await waitFor(() => expect(queueTracks).toHaveBeenCalledWith([editablePlaylist.entry[1]]));
+});
+
+test("keyboard reordering preserves unavailable slots and rolls back on failure without a floating toolbar", async () => {
+  let rejectEdit;
+  reorderPlaylistItems.mockImplementation(() => new Promise((_resolve, reject) => { rejectEdit = reject; }));
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  renderPlaylist(editablePlaylist);
+  fireEvent.click(await screen.findByRole("row", { name: "Third by Artist" }));
+  fireEvent.keyDown(screen.getByRole("row", { name: "Third by Artist" }), { key: "ArrowUp", altKey: true });
+  expect(reorderPlaylistItems).toHaveBeenCalledWith("mdpl_1", ["first", "missing", "third", "second"], editablePlaylist.itemIds);
+  expect(screen.getAllByRole("row").filter((row) => row.hasAttribute("aria-selected")).map((row) => row.getAttribute("aria-label")))
+    .toEqual(["First by Artist", "Third by Artist", "Second by Artist"]);
+  expect(screen.getByRole("row", { name: "Third by Artist" })).toHaveAttribute("draggable", "false");
+  expect(screen.queryByRole("complementary", { name: "Selected track actions" })).not.toBeInTheDocument();
+  await act(async () => rejectEdit(new Error("Playlist changed elsewhere. Reload and try again.")));
+  expect(screen.getAllByRole("row").filter((row) => row.hasAttribute("aria-selected")).map((row) => row.getAttribute("aria-label")))
+    .toEqual(["First by Artist", "Second by Artist", "Third by Artist"]);
+  expect(screen.getByRole("row", { name: "Third by Artist" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("button", { name: "Reload playlist" })).toBeEnabled();
+  expect(screen.getAllByRole("alert").some((alert) => alert.textContent.includes("changed elsewhere"))).toBe(true);
+  log.mockRestore();
+});
+
+test("batch removal removes only selected occurrences and keeps selection on failure", async () => {
+  renderPlaylist(editablePlaylist);
+  const confirm = jest.spyOn(window, "confirm").mockReturnValue(true);
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  editPlaylistTracks.mockRejectedValueOnce(new Error("Network offline"));
+  fireEvent.click(await screen.findByRole("row", { name: "First by Artist" }));
+  fireEvent.contextMenu(screen.getByRole("row", { name: "First by Artist" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Remove from Playlist" }));
+  await waitFor(() => expect(editPlaylistTracks).toHaveBeenCalledWith("mdpl_1", {
+    action: "remove", itemIds: ["first"], expectedItemIds: editablePlaylist.itemIds,
+  }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Network offline");
+  fireEvent.contextMenu(screen.getByRole("row", { name: "First by Artist" }));
+  expect(screen.getByRole("row", { name: "First by Artist" })).toHaveAttribute("aria-selected", "true");
+  editPlaylistTracks.mockResolvedValueOnce({
+    ...editablePlaylist, itemIds: ["missing", "second", "third"], songCount: 3, entry: editablePlaylist.entry.slice(1),
+  });
+  fireEvent.click(screen.getByRole("menuitem", { name: "Remove from Playlist" }));
+  await waitFor(() => expect(screen.queryByRole("row", { name: "First by Artist" })).not.toBeInTheDocument());
+  expect(screen.getByRole("row", { name: "Third by Artist" })).toBeInTheDocument();
+  expect(screen.queryByRole("complementary", { name: "Selected track actions" })).not.toBeInTheDocument();
+  confirm.mockRestore();
+  log.mockRestore();
+});
+
+test("Add to Playlist loads destinations and sends one idempotent batch", async () => {
+  renderPlaylist(editablePlaylist);
+  getPlaylists.mockResolvedValue([{ id: "destination", name: "Road Trip" }]);
+  editPlaylistTracks.mockResolvedValue(editablePlaylist);
+  fireEvent.keyDown(await screen.findByRole("row", { name: "First by Artist" }), { key: "a", ctrlKey: true });
+  fireEvent.contextMenu(screen.getByRole("row", { name: "First by Artist" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Add to Playlist..." }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Road Trip" }));
+  await waitFor(() => expect(editPlaylistTracks).toHaveBeenCalledWith("destination", {
+    action: "add", trackIds: ["same", "two"],
+  }));
+  await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+});
+
+test("downloads deduplicate song IDs and clearly report partial failures", async () => {
+  renderPlaylist(editablePlaylist);
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  const audit = jest.spyOn(offlineAuditor, "recordDownloaded").mockResolvedValue({ status: "verified" });
+  downloadToDevice.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("Network offline"));
+  fireEvent.keyDown(await screen.findByRole("row", { name: "First by Artist" }), { key: "a", ctrlKey: true });
+  fireEvent.contextMenu(screen.getByRole("row", { name: "First by Artist" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Download Selected" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("1 completed; 1 failed");
+  expect(downloadToDevice).toHaveBeenCalledTimes(2);
+  expect(downloadToDevice.mock.calls.map(([trackId]) => trackId)).toEqual(["same", "two"]);
+  expect(screen.getByRole("alert")).toHaveTextContent("Network offline");
+  audit.mockRestore();
+  log.mockRestore();
+});
+
+test("a successful reorder response cannot overwrite a different playlist after navigation", async () => {
+  let finish;
+  reorderPlaylistItems.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  renderPlaylist(editablePlaylist, {}, true);
+  fireEvent.click(await screen.findByRole("row", { name: "Third by Artist" }));
+  fireEvent.keyDown(screen.getByRole("row", { name: "Third by Artist" }), { key: "ArrowUp", altKey: true });
+  getPlaylist.mockResolvedValueOnce({ ...collagePlaylist, id: "mdpl_other", name: "Other Playlist" });
+  fireEvent.click(screen.getByRole("link", { name: "Open another playlist" }));
+  expect(await screen.findByRole("heading", { name: "Other Playlist" })).toBeInTheDocument();
+  await act(async () => finish({ ...editablePlaylist, entry: [...editablePlaylist.entry].reverse() }));
+  expect(screen.getByRole("heading", { name: "Other Playlist" })).toBeInTheDocument();
+  expect(screen.queryByRole("row", { name: "First by Artist" })).not.toBeInTheDocument();
+});
+
+test("a failed keyboard reorder cannot display stale errors on a different playlist", async () => {
+  let fail;
+  reorderPlaylistItems.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  renderPlaylist(editablePlaylist, {}, true);
+  fireEvent.keyDown(await screen.findByRole("row", { name: "Third by Artist" }), { key: "ArrowUp", altKey: true });
+  getPlaylist.mockResolvedValueOnce({ ...collagePlaylist, id: "mdpl_other", name: "Other Playlist" });
+  fireEvent.click(screen.getByRole("link", { name: "Open another playlist" }));
+  expect(await screen.findByRole("heading", { name: "Other Playlist" })).toBeInTheDocument();
+  await act(async () => fail(new Error("Old playlist network failure")));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  log.mockRestore();
+});
 
 
 test("clicking a playlist row starts its full playback context", async () => {
@@ -206,6 +439,26 @@ function imageFile(name = "cover.png", type = "image/png", size = 1024) {
   Object.defineProperty(file, "size", { value: size });
   return file;
 }
+
+test("opens edit details from the title and saves the chosen cover with the name", async () => {
+  renderPlaylist();
+  fireEvent.click(await screen.findByRole("button", { name: "Evening Drive" }));
+  const dialog = screen.getByRole("dialog", { name: "Edit details" });
+  const fileInput = within(dialog).getByLabelText("Playlist cover image");
+  const picker = jest.spyOn(fileInput, "click");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Choose playlist cover" }));
+  expect(picker).toHaveBeenCalled();
+  fireEvent.change(fileInput, { target: { files: [imageFile()] } });
+  expect(await within(dialog).findByAltText("New cover preview")).toBeInTheDocument();
+  expect(setPlaylistArtwork).not.toHaveBeenCalled();
+  fireEvent.change(within(dialog).getByRole("textbox", { name: "Name" }), { target: { value: "Night Drive" } });
+  updatePlaylist.mockResolvedValue({ ...collagePlaylist, name: "Night Drive" });
+  setPlaylistArtwork.mockResolvedValue(customPlaylist);
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(await screen.findByRole("heading", { name: "Night Drive" })).toBeInTheDocument();
+  expect(setPlaylistArtwork).toHaveBeenCalledWith("mdpl_1", "data:image/png;base64,AAAA");
+  expect(screen.queryByRole("dialog", { name: "Edit details" })).not.toBeInTheDocument();
+});
 
 
 beforeAll(() => {

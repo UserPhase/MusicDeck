@@ -15,11 +15,16 @@ export function useQueueReorder({ queue, queueIndex, moveQueueItem, enabled, lis
 
   // Keys belong to occurrences, not track IDs (even two occurrences of one object).
   if (identity.current.queue !== queue) {
-    const remaining = [...identity.current.entries];
+    const remaining = new Map();
+    for (const entry of identity.current.entries) {
+      let bucket = remaining.get(entry.song);
+      if (!bucket) { bucket = { entries: [], index: 0 }; remaining.set(entry.song, bucket); }
+      bucket.entries.push(entry);
+    }
     identity.current.entries = queue.map((song) => {
-      const index = remaining.findIndex((entry) => entry.song === song);
-      return index >= 0
-        ? remaining.splice(index, 1)[0]
+      const bucket = remaining.get(song);
+      return bucket && bucket.index < bucket.entries.length
+        ? bucket.entries[bucket.index++]
         : { song, key: `queue-entry-${identity.current.nextId++}` };
     });
     identity.current.queue = queue;

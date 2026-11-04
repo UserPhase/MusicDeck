@@ -1,4 +1,5 @@
 import {
+  request,
   getPlaylists as fetchPlaylists,
   getPlaylist as fetchPlaylist,
   patchPlaylist as requestUpdatePlaylist,
@@ -8,7 +9,15 @@ import {
   deletePlaylist as requestDeletePlaylist,
   setPlaylistArtwork as requestSetPlaylistArtwork,
   clearPlaylistArtwork as requestClearPlaylistArtwork,
+  reorderPlaylistItems,
+  editPlaylistTracks,
 } from "./musicdeck";
+
+export { reorderPlaylistItems, editPlaylistTracks };
+
+export function getPlaylistRecommendations(playlistId, source = "library", signal) {
+  return request(`/api/v1/playlists/${encodeURIComponent(playlistId)}/recommendations?${new URLSearchParams({ source })}`, { signal });
+}
 
 
 /*

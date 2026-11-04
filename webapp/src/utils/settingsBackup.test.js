@@ -15,6 +15,11 @@ function backup(preferences) {
 
 beforeEach(() => localStorage.clear());
 
+test.each(["256", "direct"])("preserves the %s streaming preference in portable backups", (quality) => {
+  localStorage.setItem("playerStreamQuality", quality);
+  expect(validateSettingsBackup(createSettingsBackup())).toEqual({ playerStreamQuality: quality });
+});
+
 test("exports only portable preference keys", () => {
   localStorage.setItem("playerLayoutDensity", "compact");
   localStorage.setItem("accessToken", "secret");
@@ -22,6 +27,21 @@ test("exports only portable preference keys", () => {
   expect(createSettingsBackup().preferences).toEqual({
     playerLayoutDensity: "compact",
   });
+});
+
+test("backs up shuffle mode but never exports private listening history", () => {
+  localStorage.setItem("playerShuffleMode", "smart");
+  localStorage.setItem("musicdeck:shuffle-history:v1:user-1", JSON.stringify([{ id: "private-track", playedAt: Date.now() }]));
+  const exported = createSettingsBackup();
+  expect(exported.preferences).toEqual({ playerShuffleMode: "smart" });
+  expect(validateSettingsBackup(exported)).toEqual({ playerShuffleMode: "smart" });
+  expect(() => validateSettingsBackup(backup({ playerShuffleMode: "invalid" }))).toThrow(/invalid preference/i);
+});
+
+test("album-aware playback is portable and strictly boolean", () => {
+  localStorage.setItem("playerAlbumAware", "true");
+  expect(validateSettingsBackup(createSettingsBackup())).toEqual({ playerAlbumAware: "true" });
+  expect(() => validateSettingsBackup(backup({ playerAlbumAware: "enabled" }))).toThrow(/invalid preference/i);
 });
 
 test("rejects invalid values before writing any preference", () => {

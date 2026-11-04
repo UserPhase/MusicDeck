@@ -1,0 +1,31 @@
+.sonic-extension { width: var(--content-rail-width, 100%); margin-inline: auto; padding-block: clamp(14px, 3vw, 32px); }
+.sonic-extension h1 { margin: 0; font-size: clamp(1.8rem, 4vw, 3rem); }
+.sonic-extension p { color: var(--text-secondary); }
+.sonic-kicker { text-transform: uppercase; letter-spacing: .15em; font-size: .74rem; }
+.sonic-card {
+  margin-top: 16px;
+  padding: clamp(14px, 3vw, 24px);
+  background: var(--card);
+  border: 1px solid var(--layout-divider, #ffffff22);
+  border-inline-start: 3px solid var(--color-accent, #a855f7);
+  border-radius: 8px;
+}
+.sonic-count { font: 700 clamp(1.7rem, 4vw, 2.7rem) ui-monospace, monospace; }
+.sonic-count span { font-family: inherit; font-weight: 500; font-size: .9rem; color: var(--text-secondary); }
+.sonic-card progress { width: 100%; accent-color: var(--color-accent, #a855f7); margin-top: 10px; }
+.sonic-actions, .sonic-fields { display: flex; flex-wrap: wrap; gap: 10px; }
+.sonic-fields label { flex: 1 1 150px; display: grid; gap: 5px; min-width: 0; }
+.sonic-card fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.sonic-toggle { display: flex; gap: 8px; align-items: center; margin: 14px 0; }
+.sonic-card button, .sonic-card select, .sonic-card input[type="number"] {
+  min-height: 36px;
+  box-sizing: border-box;
+  max-width: 100%;
+  color: inherit;
+  background: var(--card-hover);
+  border: 1px solid var(--border-hover, #ffffff30);
+  border-radius: 5px;
+  padding: 5px 9px;
+}
+.sonic-card button:disabled { opacity: .5; }
+.sonic-extension :focus-visible { outline: 2px solid var(--color-accent, #a855f7); outline-offset: 2px; }

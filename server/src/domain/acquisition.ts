@@ -21,6 +21,27 @@ import {
 } from "./downloader-adapter.js";
 import type { ProcessRunner } from "./process-runner.js";
 import { SpotDLDownloaderAdapter, SPOTDL_LIBRARY_TEMPLATE } from "./spotdl-downloader-adapter.js";
+import { AcquisitionValidationError, canonicalSpotifyUrl, validateCandidateDownloadUrls } from "./acquisition-url-policy.js";
+import { AcquisitionCapacityError, resolveAcquisitionLimits, type AcquisitionLimits } from "./acquisition-limits.js";
+import { serverLogs } from "../utils/logger.js";
+import type { TaskManager, TaskRunContext } from "../services/TaskManager.js";
+import { currentPrivacyManager } from "../services/PrivacyManager.js";
+
+export class AcquisitionJobError extends Error {
+  constructor(public readonly code: "ACQUISITION_NOT_FOUND" | "ACQUISITION_NOT_RETRYABLE") {
+    super(code === "ACQUISITION_NOT_FOUND" ? "Job not found" : "Only settled failed or cancelled jobs can be retried");
+  }
+}
+
+function safeAcquisitionFailure(code: string | null): string {
+  switch (code) {
+    case "NO_CANDIDATES": return "No candidates found for requested recording";
+    case "NO_ACQUIREABLE_SOURCE": return "No acquireable source found for requested recording";
+    case "SERVER_RESTARTED": return "Acquisition was interrupted by server restart";
+    case "CANCELLED": return "Cancelled by user";
+    default: return "Acquisition failed. Please retry or contact an administrator.";
+  }
+}
 
 export type AcquisitionJobStatus =
   | "queued"
@@ -40,6 +61,8 @@ export type AcquisitionJob = {
   sourceCandidateId?: string;
   requestedTrackId?: string;
   requestedAlbumId?: string;
+  requestedTitle?: string;
+  requestedArtist?: string;
   containerId?: string;
   autoPlay?: boolean;
   stage?: string;
@@ -83,6 +106,8 @@ export type AcquisitionContext = {
     stage?: string
   ) => void;
   signal: AbortSignal;
+  checkpoint?: () => Promise<void>;
+  onLog?: (source: "stdout" | "stderr", message: string) => void;
 };
 
 export type AcquiredFile = {
@@ -147,6 +172,9 @@ export class DownloaderAcquisitionProvider implements AcquisitionProvider {
   }
 
   canAcquire(candidate: SourceCandidate): boolean | Promise<boolean> {
+    if (this.adapter.id === "spotdl") {
+      try { validateCandidateDownloadUrls(candidate); } catch { return false; }
+    }
     if (candidate.provider === this.id || candidate.provider === this.adapter.id) return true;
     const spotifyUrl =
       candidate.metadata?.acquisitionInputs?.spotifyTrackUrl ||
@@ -174,6 +202,7 @@ export class DownloaderAcquisitionProvider implements AcquisitionProvider {
   }
 
   async acquire(candidate: SourceCandidate, context: AcquisitionContext): Promise<AcquisitionResult> {
+    if (this.adapter.id === "spotdl") validateCandidateDownloadUrls(candidate);
     const rawSpotifyUrl =
       candidate.metadata?.acquisitionInputs?.spotifyTrackUrl ||
       candidate.metadata?.spotifyTrackUrl ||
@@ -195,6 +224,8 @@ export class DownloaderAcquisitionProvider implements AcquisitionProvider {
       jobId: context.jobId,
       tmpDir: context.tmpDir,
       signal: context.signal,
+      checkpoint: context.checkpoint,
+      onLog: context.onLog,
       onProgress: (prog: DownloadProgress) => {
         context.onProgress(prog.bytesDownloaded || 0, prog.totalBytes, {
           percent: prog.percent,
@@ -491,6 +522,9 @@ type ContainerJobMemory = {
 };
 
 export type AcquisitionServiceOptions = {
+  analyzeImportedFile?: (file: AcquiredFile) => Promise<void>;
+  limits?: Partial<AcquisitionLimits>;
+  now?: () => number;
   musicRoot?: string;
   downloadDir?: string;
   baseDir?: string;
@@ -509,10 +543,51 @@ export type AcquisitionServiceOptions = {
 };
 
 export class AcquisitionService {
+  private taskManager?: TaskManager;
+  private readonly managedTasks = new Map<string, string>();
+
+  bindTaskManager(manager: TaskManager): void {
+    this.taskManager = manager;
+    const interrupted = this.db.prepare("SELECT id FROM acquisition_jobs WHERE status = 'failed' AND error_code = 'SERVER_RESTARTED'")
+      .all() as Array<{ id: string }>;
+    for (const job of interrupted) {
+      for (const type of ["SPOTDL_IMPORT", "SPOTDL_DOWNLOAD"] as const) {
+        const pending = manager.findPending(type, { kind: "acquisition", jobId: job.id });
+        if (pending) void manager.cancel(pending.id).catch((error) => {
+          console.error("Could not reconcile interrupted acquisition task", error);
+        });
+      }
+    }
+    this.scheduleNext();
+  }
+
+  async runManagedJob(jobId: string, context: TaskRunContext): Promise<void> {
+    const current = this.getJob(jobId);
+    if (!current || current.status !== "queued" || this.activeControllers.has(jobId)) {
+      throw new Error("Acquisition job is not queued or is already running");
+    }
+    await this.processJob(jobId, context);
+    const job = this.getJob(jobId);
+    if (job?.status === "cancelled") {
+      const error = new Error("Acquisition cancelled");
+      error.name = "AbortError";
+      throw error;
+    }
+    if (job?.status !== "completed") throw new Error(job?.errorMessage ?? "Acquisition failed");
+  }
   private readonly queue: string[] = [];
   private readonly activeControllers = new Map<string, AbortController>();
   private readonly inFlightContainers = new Map<string, ContainerJobMemory>();
   private readonly jobInputs = new Map<string, { candidate?: SourceCandidate; result?: UnifiedSearchResult; spotifyTrackUrl?: string }>();
+  private readonly admissions = new Map<string, number>();
+  private readonly submissionBuckets = new Map<string, { count: number; expires: number }>();
+  private globalSubmissions = { count: 0, expires: 0 };
+  private readonly runningJobs = new Set<string>();
+  private readonly workers = new Set<Promise<void>>();
+  private readonly limits: AcquisitionLimits;
+  private readonly now: () => number;
+  private readonly cleanupTimer: NodeJS.Timeout;
+  private stopped = false;
   private activeCount = 0;
   private isProcessing = false;
   private readonly baseMusicDir: string;
@@ -530,6 +605,8 @@ export class AcquisitionService {
     private readonly pluginsOrEmit: any,
     private readonly options: AcquisitionServiceOptions = {}
   ) {
+    this.limits = resolveAcquisitionLimits(options.limits);
+    this.now = options.now || Date.now;
     this.registry = registry;
     this.sourcePipeline = options.sourcePipeline;
     this.spotifyResolver = options.spotifyResolver || new SpotifyTrackResolver({ db: this.db, fetchImpl: options.fetchImpl });
@@ -552,6 +629,67 @@ export class AcquisitionService {
     fs.mkdirSync(this.tmpRoot, { recursive: true });
 
     this.recoverUnfinishedJobs();
+    this.cleanupHistory();
+    this.cleanupTimer = setInterval(() => {
+      try { this.cleanupHistory(); } catch (error) { console.error("Acquisition retention cleanup failed", error); }
+    }, this.limits.cleanupIntervalMs);
+    this.cleanupTimer.unref();
+  }
+
+  private reserveSubmission(userId: string, ownerId = userId): () => void {
+    if (this.stopped) throw new AcquisitionCapacityError();
+    this.cleanupHistory();
+    const now = this.now();
+    for (const [id, bucket] of this.submissionBuckets) {
+      if (bucket.expires <= now) this.submissionBuckets.delete(id);
+    }
+    if (this.globalSubmissions.expires <= now) this.globalSubmissions = { count: 0, expires: now + this.limits.submissionWindowMs };
+    let bucket = this.submissionBuckets.get(userId);
+    if ((!bucket && this.submissionBuckets.size >= this.limits.maxRateEntries)
+      || this.globalSubmissions.count >= this.limits.submissionsGlobal
+      || (bucket && bucket.count >= this.limits.submissionsPerUser)) {
+      throw new AcquisitionCapacityError(Math.max(1, Math.ceil(((bucket?.expires ?? this.globalSubmissions.expires) - now) / 1000)));
+    }
+    if (!bucket) {
+      bucket = { count: 0, expires: now + this.limits.submissionWindowMs };
+      this.submissionBuckets.set(userId, bucket);
+    }
+    bucket.count++;
+    this.globalSubmissions.count++;
+    const pending = this.db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) AS own FROM acquisition_jobs WHERE status = 'queued'").get(ownerId) as { total: number; own: number | null };
+    const reserved = [...this.admissions.values()].reduce((sum, count) => sum + count, 0);
+    if (pending.total + reserved >= this.limits.maxPending
+      || (pending.own || 0) + (this.admissions.get(ownerId) || 0) >= this.limits.maxPendingPerUser) {
+      throw new AcquisitionCapacityError();
+    }
+    this.admissions.set(ownerId, (this.admissions.get(ownerId) || 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = (this.admissions.get(ownerId) || 1) - 1;
+      if (count) this.admissions.set(ownerId, count);
+      else this.admissions.delete(ownerId);
+    };
+  }
+
+  public cleanupHistory(): void {
+    for (const [id, bucket] of this.submissionBuckets) {
+      if (bucket.expires <= this.now()) this.submissionBuckets.delete(id);
+    }
+    const exclusions = [...this.runningJobs];
+    const terminal = `status IN ('completed', 'failed', 'cancelled')${exclusions.length ? ` AND id NOT IN (${exclusions.map(() => "?").join(",")})` : ""}`;
+    this.db.prepare(`DELETE FROM acquisition_jobs WHERE ${terminal}
+      AND (updated_at < ? OR id IN (
+        SELECT id FROM acquisition_jobs WHERE ${terminal} ORDER BY updated_at DESC, id DESC LIMIT -1 OFFSET ?
+      ))`).run(...exclusions, new Date(this.now() - this.limits.retentionMs).toISOString(), ...exclusions, this.limits.maxRetainedJobs);
+    for (const id of this.jobInputs.keys()) {
+      const job = this.getJob(id);
+      if (!job || ["completed", "failed", "cancelled"].includes(job.status)) this.jobInputs.delete(id);
+    }
+    for (const [key, value] of this.inFlightContainers) {
+      if (!this.runningJobs.has(value.jobId)) this.inFlightContainers.delete(key);
+    }
   }
 
   public getMusicRoot(): string {
@@ -701,6 +839,8 @@ export class AcquisitionService {
       sourceCandidateId: row.source_candidate_id || undefined,
       requestedTrackId: row.requested_track_id || undefined,
       requestedAlbumId: row.requested_album_id || undefined,
+      requestedTitle: typeof row.requested_title === "string" ? row.requested_title : undefined,
+      requestedArtist: typeof row.requested_artist === "string" ? row.requested_artist : undefined,
       containerId: row.container_id || undefined,
       stage: row.stage || undefined,
       autoPlay: Boolean(row.auto_play),
@@ -713,7 +853,7 @@ export class AcquisitionService {
       },
       files,
       errorCode: row.error_code || undefined,
-      errorMessage: row.error_message || undefined,
+      errorMessage: row.error_message ? safeAcquisitionFailure(row.status === "cancelled" ? "CANCELLED" : row.error_code) : undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       completedAt: row.completed_at || undefined,
@@ -741,7 +881,7 @@ export class AcquisitionService {
     const current = this.db.prepare("SELECT * FROM acquisition_jobs WHERE id = ?").get(jobId) as any;
     if (!current) return;
 
-    const now = new Date().toISOString();
+    const now = new Date(this.now()).toISOString();
     const status = updates.status || current.status;
     const sourceProvider = updates.sourceProvider !== undefined ? updates.sourceProvider : (current.source_provider ?? null);
     const sourceCandidateId = updates.sourceCandidateId !== undefined ? updates.sourceCandidateId : (current.source_candidate_id ?? null);
@@ -754,7 +894,8 @@ export class AcquisitionService {
     const filesJson = updates.files !== undefined ? JSON.stringify(updates.files) : (current.files_json ?? "[]");
     const errorCode = updates.errorCode !== undefined ? updates.errorCode : (current.error_code ?? null);
     const errorMessage = updates.errorMessage !== undefined ? updates.errorMessage : (current.error_message ?? null);
-    const completedAt = updates.completedAt !== undefined ? updates.completedAt : (current.completed_at ?? null);
+    const completedAt = updates.completedAt !== undefined ? updates.completedAt
+      : ["completed", "failed", "cancelled"].includes(status) ? (current.completed_at || now) : null;
 
     this.db.prepare(`
       UPDATE acquisition_jobs SET
@@ -817,10 +958,38 @@ export class AcquisitionService {
     userIdOrInput: string | (AcquisitionCreateOptions & { userId: string }),
     maybeInput?: AcquisitionCreateOptions
   ): Promise<AcquisitionJob> {
+    currentPrivacyManager()?.assertExternalAllowed("imports");
     const userId = typeof userIdOrInput === "string" ? userIdOrInput : userIdOrInput.userId;
     const input: AcquisitionCreateOptions = typeof userIdOrInput === "string" ? (maybeInput || {}) : userIdOrInput;
+    for (const url of [input.spotifyTrackUrl, input.spotifyUrl]) {
+      if (url !== undefined) canonicalSpotifyUrl(url);
+    }
+    if (input.result) {
+      validateCandidateDownloadUrls({ id: input.result.id, provider: "spotdl", metadata: input.result.metadata });
+    }
+    if (Buffer.byteLength(JSON.stringify(input)) > 65_536) throw new AcquisitionValidationError();
+    const release = this.reserveSubmission(userId);
+    try {
+      return await this.createReservedJob(userId, input, release);
+    } finally {
+      release();
+      this.cleanupHistory();
+    }
+  }
+
+  private async createReservedJob(userId: string, input: AcquisitionCreateOptions, release: () => void): Promise<AcquisitionJob> {
+    if (input.candidate) {
+      try {
+        validateCandidateDownloadUrls(input.candidate);
+      } catch (error) {
+        // Only a server-registered provider accepting the candidate under its
+        // own policy can handle other sources. SpotDL always revalidates.
+        const providers = await this.registry.findProviders(input.candidate);
+        if (input.candidate.provider === "spotdl" || !providers.some((provider) => !(provider instanceof DownloaderAcquisitionProvider))) throw error;
+      }
+    }
     const id = createId("acq");
-    const now = new Date().toISOString();
+    const now = new Date(this.now()).toISOString();
 
     const trackId = input.trackId || (input.result?.type === "track" ? input.result.id : undefined);
     const albumId = input.albumId || (input.result?.type === "album" ? input.result.id : undefined);
@@ -933,32 +1102,41 @@ export class AcquisitionService {
       }
     }
 
-    // Create queued job
-    this.db.prepare(`
-      INSERT INTO acquisition_jobs (
-        id, user_id, status, source_provider, source_candidate_id,
-        requested_track_id, requested_album_id, container_id,
-        bytes_downloaded, total_bytes, percent, stage, speed_bytes_per_second, auto_play, files_json,
-        created_at, updated_at
-      ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, null, 0, 'queued', null, ?, '[]', ?, ?)
-    `).run(
-      id,
-      userId,
-      candidate?.provider || input.sourceProvider || null,
-      candidate?.id || null,
-      trackId || null,
-      albumId || null,
-      containerId || null,
-      input.autoPlay ? 1 : 0,
-      now,
-      now
-    );
-
-    this.jobInputs.set(id, {
-      candidate,
-      result,
-      spotifyTrackUrl: input.spotifyTrackUrl || input.spotifyUrl,
-    });
+    const retainedInput = { candidate, result, spotifyTrackUrl: input.spotifyTrackUrl || input.spotifyUrl };
+    // The duplicate check and insert share one synchronous transaction, so
+    // concurrent submissions for the same item cannot both create a job.
+    const activeDuplicateId = this.db.transaction((): string | null => {
+      const duplicate = this.findActiveDuplicate(userId, { trackId, albumId });
+      if (duplicate) return duplicate;
+      this.db.prepare(`
+        INSERT INTO acquisition_jobs (
+          id, user_id, status, source_provider, source_candidate_id,
+          requested_track_id, requested_album_id, container_id,
+          bytes_downloaded, total_bytes, percent, stage, speed_bytes_per_second, auto_play, files_json,
+          created_at, updated_at
+        ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, null, 0, 'queued', null, ?, '[]', ?, ?)
+      `).run(
+        id,
+        userId,
+        candidate?.provider || input.sourceProvider || null,
+        candidate?.id || null,
+        trackId || null,
+        albumId || null,
+        containerId || null,
+        input.autoPlay ? 1 : 0,
+        now,
+        now
+      );
+      this.db.prepare("INSERT INTO acquisition_job_inputs (job_id, input_json) VALUES (?, ?)").run(
+        id, JSON.stringify(retainedInput)
+      );
+      return null;
+    })();
+    if (activeDuplicateId) {
+      const existing = this.getJob(activeDuplicateId);
+      if (existing) return existing;
+    }
+    this.jobInputs.set(id, retainedInput);
 
     const job = this.getJob(id)!;
     this.emitEvent("acquisition.created", {
@@ -973,9 +1151,31 @@ export class AcquisitionService {
     });
 
     this.queue.push(id);
+    release();
     this.scheduleNext();
 
     return job;
+  }
+
+  /**
+   * Returns this user's unfinished job for the same requested item, if any.
+   * Matching is per user so job details never leak across accounts; jobs from
+   * different users for one album still share a download via container reuse.
+   */
+  private findActiveDuplicate(
+    userId: string,
+    item: { trackId?: string; albumId?: string }
+  ): string | null {
+    const active = "status IN ('queued', 'discovering', 'downloading', 'processing', 'importing')";
+    let row: { id: string } | undefined;
+    if (item.trackId) {
+      row = this.db.prepare(`SELECT id FROM acquisition_jobs WHERE user_id = ? AND ${active}
+        AND requested_track_id = ? ORDER BY created_at, rowid LIMIT 1`).get(userId, item.trackId) as { id: string } | undefined;
+    } else if (item.albumId) {
+      row = this.db.prepare(`SELECT id FROM acquisition_jobs WHERE user_id = ? AND ${active}
+        AND requested_album_id = ? AND requested_track_id IS NULL ORDER BY created_at, rowid LIMIT 1`).get(userId, item.albumId) as { id: string } | undefined;
+    }
+    return row?.id ?? null;
   }
 
   getJob(jobId: string, userId?: string, isAdmin = false): AcquisitionJob | null {
@@ -992,15 +1192,18 @@ export class AcquisitionService {
   }
 
   listJobs(userId?: string, isAdmin = false): AcquisitionJob[] {
-    let query = "SELECT * FROM acquisition_jobs";
+    let query = `SELECT jobs.*,
+      CASE WHEN json_valid(inputs.input_json) THEN COALESCE(json_extract(inputs.input_json, '$.result.title'), json_extract(inputs.input_json, '$.candidate.title')) END AS requested_title,
+      CASE WHEN json_valid(inputs.input_json) THEN COALESCE(json_extract(inputs.input_json, '$.result.artist'), json_extract(inputs.input_json, '$.candidate.artist')) END AS requested_artist
+      FROM acquisition_jobs jobs LEFT JOIN acquisition_job_inputs inputs ON inputs.job_id = jobs.id`;
     const params: any[] = [];
 
     if (userId && !isAdmin) {
-      query += " WHERE user_id = ?";
+      query += " WHERE jobs.user_id = ?";
       params.push(userId);
     }
 
-    query += " ORDER BY created_at DESC LIMIT 100";
+    query += " ORDER BY jobs.created_at DESC LIMIT 100";
     const rows = this.db.prepare(query).all(...params) as any[];
     return rows.map((r) => this.mapRowToJob(r));
   }
@@ -1016,16 +1219,27 @@ export class AcquisitionService {
     const controller = this.activeControllers.get(jobId);
     if (controller) {
       controller.abort();
-      this.activeControllers.delete(jobId);
     }
+    const taskId = this.managedTasks.get(jobId);
+    if (taskId && this.taskManager) {
+      const task = this.taskManager.get(taskId);
+      if (task && ["QUEUED", "PROCESSING", "PAUSED"].includes(task.state)) {
+        await this.taskManager.cancel(taskId);
+      }
+    }
+    const queuedIndex = this.queue.indexOf(jobId);
+    if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
+    this.jobInputs.delete(jobId);
 
     this.updateJobInDb(jobId, { status: "cancelled", errorMessage: "Cancelled by user" });
 
     const tmpDir = path.join(this.tmpRoot, jobId);
-    if (fs.existsSync(tmpDir)) {
+    if (!controller && fs.existsSync(tmpDir)) {
       try {
         fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {}
+      } catch (error) {
+        console.warn("Could not remove cancelled acquisition staging files", error);
+      }
     }
 
     this.emitEvent("acquisition.cancelled", { jobId, userId: job.userId, status: "cancelled" });
@@ -1033,41 +1247,74 @@ export class AcquisitionService {
   }
 
   async retryJob(jobId: string, userId?: string, isAdmin = false): Promise<AcquisitionJob> {
+    currentPrivacyManager()?.assertExternalAllowed("imports");
     const job = this.getJob(jobId, userId, isAdmin);
-    if (!job) throw new Error("Job not found");
+    if (!job) throw new AcquisitionJobError("ACQUISITION_NOT_FOUND");
+    if (!["failed", "cancelled"].includes(job.status) || this.runningJobs.has(jobId)) {
+      throw new AcquisitionJobError("ACQUISITION_NOT_RETRYABLE");
+    }
+    const release = this.reserveSubmission(userId || job.userId, job.userId);
+    try {
+      if (!this.getJob(jobId)) throw new AcquisitionJobError("ACQUISITION_NOT_FOUND");
+      const saved = this.db.prepare("SELECT input_json FROM acquisition_job_inputs WHERE job_id = ?").get(jobId) as { input_json: string } | undefined;
+      if (saved) this.jobInputs.set(jobId, JSON.parse(saved.input_json));
+      this.db.prepare("UPDATE acquisition_jobs SET error_code = NULL, error_message = NULL, completed_at = NULL, total_bytes = NULL WHERE id = ?").run(jobId);
+      this.updateJobInDb(jobId, { status: "queued", stage: "queued", bytesDownloaded: 0, percent: 0 });
 
-    this.updateJobInDb(jobId, {
-      status: "queued",
-      bytesDownloaded: 0,
-      totalBytes: undefined,
-      percent: 0,
-      errorCode: undefined,
-      errorMessage: undefined,
-    });
-
-    const updated = this.getJob(jobId)!;
-    this.queue.push(jobId);
-    this.scheduleNext();
-    return updated;
+      const updated = this.getJob(jobId)!;
+      this.queue.push(jobId);
+      release();
+      this.scheduleNext();
+      return updated;
+    } finally { release(); }
   }
 
   private scheduleNext(): void {
-    if (this.isProcessing) return;
+    if (this.isProcessing || this.stopped) return;
 
     const maxConcurrent = this.getMaxConcurrent();
     while (this.activeCount < maxConcurrent && this.queue.length > 0) {
       const jobId = this.queue.shift()!;
+      this.runningJobs.add(jobId);
       this.activeCount++;
-      this.processJob(jobId)
-        .catch(() => {})
+      const worker = this.dispatchJob(jobId)
+        .catch((error) => {
+          console.error("Acquisition worker failed", error);
+          this.updateJobInDb(jobId, { status: "failed", errorCode: "ACQUISITION_FAILED", errorMessage: "Acquisition worker failed" });
+        })
         .finally(() => {
+          this.runningJobs.delete(jobId);
+          this.managedTasks.delete(jobId);
+          this.jobInputs.delete(jobId);
+          for (const [key, value] of this.inFlightContainers) {
+            if (value.jobId === jobId) this.inFlightContainers.delete(key);
+          }
           this.activeCount--;
+          this.cleanupHistory();
           this.scheduleNext();
+          this.workers.delete(worker);
         });
+      this.workers.add(worker);
     }
   }
 
-  private async processJob(jobId: string): Promise<void> {
+  private async dispatchJob(jobId: string): Promise<void> {
+    if (!this.taskManager) return this.processJob(jobId);
+    const job = this.getJob(jobId);
+    if (!job) throw new Error("Acquisition job not found");
+    const task = this.taskManager.enqueue("SPOTDL_IMPORT", { kind: "acquisition", jobId }, job.userId);
+    this.managedTasks.set(jobId, task.id);
+    const settled = await this.taskManager.waitForSettlement(task.id);
+    if (settled.state === "CANCELLED" && this.getJob(jobId)?.status === "queued") {
+      this.updateJobInDb(jobId, { status: "cancelled", errorCode: "CANCELLED", errorMessage: "Cancelled by user" });
+      this.emitEvent("acquisition.cancelled", { jobId, userId: job.userId, status: "cancelled" });
+    }
+    if (settled.state === "FAILED" && this.getJob(jobId)?.status === "queued") {
+      throw new Error("Managed acquisition worker failed");
+    }
+  }
+
+  private async processJob(jobId: string, task?: TaskRunContext): Promise<void> {
     const job = this.getJob(jobId);
     if (!job || job.status === "cancelled" || job.status === "completed") {
       return;
@@ -1078,6 +1325,13 @@ export class AcquisitionService {
 
     const controller = new AbortController();
     this.activeControllers.set(jobId, controller);
+    const abort = () => controller.abort();
+    task?.signal.addEventListener("abort", abort, { once: true });
+    if (task?.signal.aborted) controller.abort();
+    const checkpoint = async () => {
+      await task?.checkpoint();
+      controller.signal.throwIfAborted();
+    };
 
     const jobInput = this.jobInputs.get(jobId);
     this.jobInputs.delete(jobId);
@@ -1085,6 +1339,7 @@ export class AcquisitionService {
     let result = jobInput?.result;
 
     try {
+      await checkpoint();
       // 1. Resolve recording (result) if not yet resolved
       if (!result) {
         if (job.requestedTrackId) {
@@ -1299,6 +1554,8 @@ export class AcquisitionService {
         jobId,
         tmpDir,
         signal: controller.signal,
+        checkpoint,
+        onLog: (source, message) => task?.log?.(source, message),
         onProgress: (bytesDownloaded, totalBytes, percentOrDetails, speedBytesPerSecond, stage) => {
           const now = Date.now();
           let percentVal: number | undefined;
@@ -1319,6 +1576,10 @@ export class AcquisitionService {
 
           if (now - lastProgressUpdate > 250 || percent === 100 || stageVal) {
             lastProgressUpdate = now;
+            task?.report({
+              percent, speedBytesPerSecond: speedVal,
+              message: [stageVal ?? "downloading", candidate?.artist, candidate?.title].filter(Boolean).join(" - "),
+            });
             this.updateJobInDb(jobId, {
               bytesDownloaded,
               totalBytes,
@@ -1341,7 +1602,7 @@ export class AcquisitionService {
       };
 
       for (const pair of candidateProviderPairs) {
-        if (controller.signal.aborted) break;
+        await checkpoint();
 
         selectedCandidate = pair.candidate;
         selectedProvider = pair.provider;
@@ -1377,6 +1638,7 @@ export class AcquisitionService {
 
       const validatedFiles: AcquiredFile[] = [];
       for (const file of acquisitionResult.files) {
+        await checkpoint();
         const val = validateAudioFile(file.path);
         if (!val.valid) {
           throw new Error(`Audio validation failed for ${path.basename(file.path)}: ${val.reason}`);
@@ -1392,6 +1654,7 @@ export class AcquisitionService {
       const importedFiles: Array<{ path: string; title?: string; artist?: string; album?: string; size?: number; status: string }> = [];
 
       for (let i = 0; i < validatedFiles.length; i++) {
+        await checkpoint();
         const file = validatedFiles[i];
         const artistName = file.artist || selectedCandidate?.artist || result?.artist || "Unknown Artist";
         const albumName = file.album || selectedCandidate?.album || result?.album || "Unknown Album";
@@ -1431,6 +1694,11 @@ export class AcquisitionService {
         if (!stat.isFile() || stat.size === 0) {
           throw new Error(`Imported audio file was not written to MUSIC_ROOT: ${destPath}`);
         }
+        try {
+          await this.options.analyzeImportedFile?.({ ...file, path: destPath, title: trackTitle, artist: artistName, album: albumName });
+        } catch (error) {
+          console.warn("Imported track loudness analysis unavailable; playback will analyze on demand", error);
+        }
         importedFiles.push({
           path: destPath,
           title: trackTitle,
@@ -1438,6 +1706,11 @@ export class AcquisitionService {
           album: albumName,
           size: stat.size,
           status: alreadyPresent ? "already_in_library" : "imported",
+        });
+        task?.report({
+          itemsProcessed: i + 1,
+          totalItems: validatedFiles.length,
+          message: "Importing tracks",
         });
 
         // Register in LibraryService
@@ -1452,9 +1725,14 @@ export class AcquisitionService {
       // Trigger backend library scan if auto-scan is enabled
       if (this.isAutoScanEnabled()) {
         try {
-          await this.catalog.scanLibrary();
-        } catch {}
+          const scan = await this.catalog.scanLibrary(task);
+          if (scan.failures.length) console.warn("Some library providers could not be scanned after import", scan.failures);
+        } catch (error) {
+          controller.signal.throwIfAborted();
+          console.warn("Could not scan library after import", error);
+        }
       }
+      await checkpoint();
 
       // 6. Complete job
       const completedAt = new Date().toISOString();
@@ -1507,7 +1785,13 @@ export class AcquisitionService {
           : isNoAcquireable
             ? "NO_ACQUIREABLE_SOURCE"
             : "ACQUISITION_FAILED";
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = safeAcquisitionFailure(errorCode);
+      if (!isAborted) {
+        serverLogs.push({
+          level: "error", source: "server", message: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined, meta: { jobId, operation: "acquisition" },
+        });
+      }
 
       this.updateJobInDb(jobId, {
         status,
@@ -1522,6 +1806,7 @@ export class AcquisitionService {
         this.emitEvent("acquisition.failed", { jobId, userId: job.userId, status: "failed", stage: "failed", errorCode, errorMessage, autoPlay: job.autoPlay });
       }
     } finally {
+      task?.signal.removeEventListener("abort", abort);
       this.activeControllers.delete(jobId);
       if (candidate?.container?.id) {
         this.inFlightContainers.delete(candidate.container.id);
@@ -1534,7 +1819,9 @@ export class AcquisitionService {
       if (fs.existsSync(tmpDir)) {
         try {
           fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {}
+        } catch (error) {
+          console.warn("Could not remove acquisition staging files", error);
+        }
       }
     }
   }
@@ -1652,9 +1939,11 @@ export class AcquisitionService {
 
   async triggerLibraryScan(): Promise<{ scanned: boolean }> {
     try {
-      await this.catalog.scanLibrary();
-      return { scanned: true };
-    } catch {
+      const scan = await this.catalog.scanLibrary();
+      if (scan.failures.length) console.warn("Some library providers could not be scanned", scan.failures);
+      return { scanned: scan.attempted > 0 && scan.failures.length === 0 };
+    } catch (error) {
+      console.warn("Library scan failed", error);
       return { scanned: false };
     }
   }
@@ -1716,7 +2005,15 @@ export class AcquisitionService {
     return results;
   }
 
-  shutdown(): void {
+  async shutdown(): Promise<void> {
+    this.stopped = true;
+    clearInterval(this.cleanupTimer);
+    for (const taskId of this.managedTasks.values()) {
+      const task = this.taskManager?.get(taskId);
+      if (task && ["QUEUED", "PROCESSING", "PAUSED"].includes(task.state)) {
+        await this.taskManager!.cancel(taskId);
+      }
+    }
     for (const controller of this.activeControllers.values()) {
       try {
         controller.abort();
@@ -1724,5 +2021,10 @@ export class AcquisitionService {
     }
     this.activeControllers.clear();
     this.queue.length = 0;
+    this.jobInputs.clear();
+    this.inFlightContainers.clear();
+    this.submissionBuckets.clear();
+    this.eventListeners.clear();
+    await Promise.allSettled([...this.workers]);
   }
 }

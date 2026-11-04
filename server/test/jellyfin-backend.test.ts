@@ -7,6 +7,31 @@ import { loadConfig } from "../src/config.js";
 
 const CONFIG = { url: "http://jellyfin.test", apiKey: "test-api-key" };
 
+test("enumerates all album pages with Jellyfin StartIndex and rejects a repeated page", async () => {
+  const albums = Array.from({ length: 2001 }, (_, index) => ({ Id: String(index), Name: "Album" }));
+  const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+    const url = new URL(String(input));
+    const offset = Number(url.searchParams.get("StartIndex"));
+    return jsonResponse({ Items: albums.slice(offset, offset + 500), TotalRecordCount: albums.length });
+  });
+  const backend = new JellyfinBackend(CONFIG, fetchImpl);
+  expect(await backend.listAllAlbums()).toHaveLength(2001);
+  expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).searchParams.get("StartIndex")))
+    .toEqual(["0", "500", "1000", "1500", "2000"]);
+  fetchImpl.mockImplementation(async () => jsonResponse({ Items: albums.slice(0, 500) }));
+  await expect(backend.listAllAlbums()).rejects.toThrow("did not advance");
+});
+
+test("library scans enumerate Jellyfin pages beyond the first 500 tracks", async () => {
+  const tracks = Array.from({ length: 501 }, (_, index) => ({ Id: String(index), Name: "Track" }));
+  const fetchImpl = vi.fn(async (url: URL) => {
+    const offset = Number(url.searchParams.get("StartIndex"));
+    return jsonResponse({ Items: tracks.slice(offset, offset + 500), TotalRecordCount: 501 });
+  });
+  expect(await makeBackend(fetchImpl).listTracks()).toHaveLength(501);
+  expect(fetchImpl.mock.calls.map(([url]) => url.searchParams.get("StartIndex"))).toEqual(["0", "500"]);
+});
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -74,6 +99,11 @@ describe("Jellyfin mapper", () => {
     expect(track.artistName).toBe("A, B");
   });
 
+  test("maps Jellyfin's string-array Artists without losing contributing performers", () => {
+    const track = mapJellyfinTrack({ ...trackFixture, Artists: ["A", "B"], AlbumArtists: [{ Id: "album-artist", Name: "Various Artists" }] });
+    expect(track.artistName).toBe("A, B");
+  });
+
   test("missing artwork yields null artworkId/artworkUrl", () => {
     const track = mapJellyfinTrack({ ...trackFixture, ImageTags: undefined });
 
@@ -116,6 +146,13 @@ describe("Jellyfin mapper", () => {
 });
 
 describe("JellyfinBackend requests", () => {
+  test("reads artist lists from Jellyfin's Items query-result envelope", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ Items: [{ Id: "artist-1", Name: "Artist", Type: "MusicArtist" }], TotalRecordCount: 1 }));
+    const backend = makeBackend(fetchImpl);
+    expect(await backend.listArtists()).toEqual([expect.objectContaining({ id: "artist-1", name: "Artist" })]);
+    expect(new URL(String((fetchImpl.mock.calls[0] as unknown[])[0])).pathname).toBe("/Artists");
+  });
+
   test("sends X-Emby-Token header and never places the key in the URL", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ Items: [] }));
     const backend = makeBackend(fetchImpl);
@@ -210,7 +247,7 @@ describe("JellyfinBackend requests", () => {
     const fetchImpl = vi.fn(async (url: URL) => {
       const requestUrl = String(url);
       if (requestUrl.includes("/Audio/jf-track-1/Lyrics")) {
-        return jsonResponse({ Lyrics: [{ Text: "First line" }, { Text: "Second line" }] });
+        return jsonResponse({ Lyrics: [{ Text: "First line", Start: 0 }, { Text: "Second line", Start: 125_000_000 }] });
       }
       if (requestUrl.includes("Ids=jf-track-1")) {
         return jsonResponse({ Items: [trackFixture] });
@@ -219,7 +256,7 @@ describe("JellyfinBackend requests", () => {
     });
     const backend = makeBackend(fetchImpl);
 
-    await expect(backend.getLyrics("jf-track-1")).resolves.toBe("First line\nSecond line");
+    await expect(backend.getLyrics("jf-track-1")).resolves.toBe("[0:00.000]First line\n[0:12.500]Second line");
     await expect(backend.getArtistBiographyForTrack("jf-track-1")).resolves.toBe("An artist story.");
   });
 
@@ -236,12 +273,23 @@ describe("JellyfinBackend requests", () => {
     const [url, init] = fetchImpl.mock.calls[0] as any[];
     expect(String(url)).toContain("/Audio/jf-track-1/stream");
     expect(String(url)).toContain("MaxStreamingBitrate=320000");
+    expect(String(url)).toContain("AudioCodec=mp3");
+    expect(String(url)).toContain("Container=mp3");
     expect(String(url)).not.toContain("static=true");
     expect(String(url)).not.toContain("test-api-key");
     expect(init.headers.Range).toBe("bytes=0-0");
     expect(init.headers["X-Emby-Token"]).toBe("test-api-key");
     expect(result.status).toBe(206);
     expect(result.headers.get("content-type")).toContain("audio/flac");
+    expect(result.audioStream).toEqual({ direct: false, requestedBitrateKbps: 320 });
+  });
+
+  test("requests explicit static passthrough without a bitrate cap", async () => {
+    const fetchImpl = vi.fn(async (_input: Parameters<typeof fetch>[0]) => new Response(null, { status: 200 }));
+    const result = await makeBackend(fetchImpl).fetchStream("jf-track-1");
+    expect(String(fetchImpl.mock.calls[0][0])).toContain("static=true");
+    expect(String(fetchImpl.mock.calls[0][0])).not.toContain("AudioCodec");
+    expect(result.audioStream).toEqual({ direct: true, requestedBitrateKbps: null });
   });
 
   test("fetches artwork by item ID with auth header", async () => {

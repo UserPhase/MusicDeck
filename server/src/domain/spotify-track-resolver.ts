@@ -2,6 +2,8 @@ import type { Db } from "../db/database.js";
 import type { UnifiedSearchResult } from "./search.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
+
 export type SpotifyResolveConfidence = "high" | "medium" | "low";
 
 export type SpotifyResolutionMode = "public-web" | "web-api" | "auto";
@@ -399,7 +401,7 @@ export class SpotifyTrackResolver {
 
   constructor(options: SpotifyTrackResolverOptions = {}) {
     this.db = options.db;
-    this.fetchImpl = options.fetchImpl || fetch;
+    this.fetchImpl = gateFetch(options.fetchImpl || fetch);
     this.mode = options.mode || "auto";
     this.publicWebBaseUrl = options.publicWebBaseUrl || "https://open.spotify.com";
     this.staticToken = options.token;
@@ -714,4 +716,3 @@ export class SpotifyTrackResolver {
     return null;
   }
 }
-

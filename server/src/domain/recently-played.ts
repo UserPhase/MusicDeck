@@ -2,6 +2,7 @@ import type { Db } from "../db/database.js";
 import type { CatalogService } from "./catalog.js";
 import type { Track } from "../types.js";
 import { createId } from "../utils/ids.js";
+import { tasteProfile } from "../services/TasteProfileManager.js";
 
 const RECENTLY_PLAYED_LIMIT = 50;
 const RECENTLY_PLAYED_RETENTION = 100;
@@ -19,11 +20,11 @@ export function canUseProviderHistory(db: Db): boolean {
 export async function listRecentlyPlayed(
   db: Db,
   catalog: CatalogService,
-  userId: string
+  userId: string, tasteOnly = false
 ) {
   const rows = db.prepare(`
     SELECT track_id, MAX(played_at) AS played_at
-    FROM recently_played
+    FROM ${tasteOnly ? "taste_recently_played" : "recently_played"}
     WHERE user_id = ? AND played_at >= ?
     GROUP BY track_id
     ORDER BY played_at DESC
@@ -55,7 +56,7 @@ export async function listRecentlyPlayed(
   // played timestamp in the catalog, even when MusicDeck has no local event.
   const cutoff = Date.parse(listeningWindowStart());
   const positions = new Map(tracks.map((track, index) => [track.id, index]));
-  for (const track of canUseProviderHistory(db) ? catalogTracks : []) {
+  for (const track of canUseProviderHistory(db) && (!tasteOnly || tasteProfile(db).canUseProviderHistory(userId)) ? catalogTracks : []) {
     const playedTime = Date.parse(track.lastPlayedAt || "");
     if (!Number.isFinite(playedTime) || playedTime < cutoff) continue;
     const playedAt = track.lastPlayedAt!;
@@ -79,12 +80,14 @@ export function addRecentlyPlayed(
   db: Db,
   userId: string,
   trackId: string,
-  playedAt = new Date().toISOString()
+  playedAt = new Date().toISOString(),
+  taste?: { excluded: boolean; sessionId?: string; recordingKey?: string | null }
 ) {
+  const excluded = taste?.excluded ?? tasteProfile(db).decision(userId, { trackId, startedAt: playedAt }).excluded;
   db.prepare(`
-    INSERT INTO recently_played (id, user_id, track_id, played_at)
-    VALUES (?, ?, ?, ?)
-  `).run(createId("recent"), userId, trackId, playedAt);
+    INSERT INTO recently_played (id, user_id, track_id, played_at,taste_excluded,playback_session_id,taste_recording_key)
+    VALUES (?, ?, ?, ?,?,?,?)
+  `).run(createId("recent"), userId, trackId, playedAt, Number(excluded), taste?.sessionId ?? null, taste?.recordingKey ?? null);
 
   db.prepare(`
     DELETE FROM recently_played

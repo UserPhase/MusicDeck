@@ -1,11 +1,11 @@
-import type { Album, Artist, Track } from "../../types.js";
+import type { Album, Artist, Track, TrackArtistCredit } from "../../types.js";
+import { withTrackContent } from "../../services/media/contentRevision.js";
 
 /**
  * Jellyfin → MusicDeck domain transformations.
  *
  * All Jellyfin response shapes are converted here so the backend never leaks
- * raw Jellyfin payloads. MusicDeck conventions are preserved: plural Jellyfin
- * artist fields collapse to a single display name, RunTimeTicks convert to
+ * raw Jellyfin payloads. MusicDeck conventions are preserved: RunTimeTicks convert to
  * seconds, and artwork references use the item's own ID (Jellyfin addresses
  * artwork as /Items/{itemId}/Images/Primary).
  *
@@ -31,7 +31,8 @@ function firstName(list: unknown): string | null {
 function joinNames(list: unknown): string | null {
   if (Array.isArray(list) && list.length > 0) {
     const names = list
-      .map((entry) => (entry && typeof entry === "object" && "Name" in entry ? String((entry as { Name: unknown }).Name) : null))
+      .map((entry) => typeof entry === "string" ? entry
+        : entry && typeof entry === "object" && "Name" in entry ? String((entry as { Name: unknown }).Name) : null)
       .filter(Boolean);
     if (names.length > 0) {
       return names.join(", ");
@@ -73,23 +74,48 @@ function identityHints(item: any, musicBrainzKey: string) {
 
 export function mapJellyfinTrack(item: any): Track {
   const trackId = String(item.Id);
+  const audio = item.MediaStreams?.find((stream: { Type?: string }) => stream.Type === "Audio");
+  const artistItems: TrackArtistCredit[] = Array.isArray(item.ArtistItems)
+    ? item.ArtistItems.flatMap((artist: { Id?: unknown; Name?: unknown } | null) =>
+      typeof artist?.Name === "string" && artist.Name.trim()
+        ? [{ id: id(artist.Id), name: artist.Name.trim() }]
+        : [])
+    : [];
+  const artistCredits = artistItems.length ? artistItems : Array.isArray(item.Artists) && item.Artists.length > 1
+    ? item.Artists.flatMap((name: unknown) => typeof name === "string" && name.trim()
+      ? [{ id: null, name: name.trim() }]
+      : [])
+    : [];
 
-  return {
+  return withTrackContent({
     id: trackId,
     providerId: trackId,
+    audioMetadata: {
+      codec: audio?.Codec ?? null,
+      container: typeof item.Container === "string" ? item.Container : null,
+      bitrateKbps: (audio?.BitRate ?? 0) / 1000 || null,
+      sampleRateHz: audio?.SampleRate ?? null,
+      bitDepth: audio?.BitDepth ?? null,
+      channels: audio?.Channels ?? null,
+    },
     title: item.Name || "Unknown title",
     artistId: id(item.ArtistItems?.[0]?.Id ?? item.AlbumArtists?.[0]?.Id),
-    artistName: joinNames(item.Artists) || firstName(item.AlbumArtists) || "Unknown artist",
+    artistName: joinNames(item.Artists) || artistItems.map(({ name }) => name).join(", ") || firstName(item.AlbumArtists) || "Unknown artist",
+    ...(artistCredits.length ? { artistCredits } : {}),
     albumId: id(item.AlbumId),
     albumName: item.Album || "Unknown album",
     durationSeconds: ticksToSeconds(item.RunTimeTicks),
+    genres: Array.isArray(item.Genres) ? item.Genres.filter((value: unknown): value is string => typeof value === "string") : [],
+    moods: Array.isArray(item.Moods) ? item.Moods.filter((value: unknown): value is string => typeof value === "string") : [],
+    year: typeof item.ProductionYear === "number" ? item.ProductionYear : null,
+    bpm: typeof item.Bpm === "number" && Number.isFinite(item.Bpm) ? item.Bpm : null,
     trackNumber: typeof item.IndexNumber === "number" ? item.IndexNumber : null,
     artworkId: item.ImageTags?.Primary ? trackId : null,
     artworkUrl: item.ImageTags?.Primary ? `/api/artwork/${encodeURIComponent(trackId)}` : null,
     streamUrl: `/api/tracks/${encodeURIComponent(trackId)}/stream`,
     replayGain: replayGain(item),
     identityHints: identityHints(item, "MusicBrainzTrack"),
-  };
+  }, { path: item.Path ?? item.MediaSources?.[0]?.Path, size: item.MediaSources?.[0]?.Size, etag: item.Etag });
 }
 
 export function mapJellyfinAlbum(item: any): Album {

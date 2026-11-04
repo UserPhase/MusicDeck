@@ -1,6 +1,11 @@
 import { artworkCandidates, resolveArtworkUrl } from "./resolveArtworkUrl";
 import { getCoverUrl } from "../api/musicdeck";
 
+test("album summaries try the resolved artwork before an opaque provider cover", () => {
+  expect(artworkCandidates({ albumArtworkUrl: "/api/albums/md_album/artwork", coverArt: "opaque" }, 180))
+    .toEqual(["/api/albums/md_album/artwork?size=180", "/api/artwork/opaque?size=180"]);
+});
+
 test("handles native IDs, absolute URLs, and authenticated relative URLs", () => {
   expect(getCoverUrl("al-1234", 230)).toBe("/api/artwork/al-1234?size=230");
   expect(getCoverUrl("https://cdn.example.test/cover.jpg", 230)).toBe("https://cdn.example.test/cover.jpg");

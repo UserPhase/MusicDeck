@@ -191,13 +191,10 @@ describe("authenticated API", () => {
 test("migration preserves legacy plays without inventing durations or duplicating recent mirrors", () => {
   const db = new Database(":memory:");
   try {
-    db.exec(`CREATE TABLE schema_migrations(id INTEGER PRIMARY KEY,name TEXT,applied_at TEXT);
-      CREATE TABLE listening_events(id TEXT PRIMARY KEY,user_id TEXT,track_id TEXT,event_type TEXT,completion_ratio REAL,created_at TEXT);
-      CREATE TABLE recently_played(id TEXT PRIMARY KEY,user_id TEXT,track_id TEXT,played_at TEXT);
-      INSERT INTO listening_events VALUES ('old','u','t','complete',1,'2026-10-01T12:00:00.000Z');
+    runMigrations(db, 24);
+    db.exec("INSERT OR IGNORE INTO roles(name,description) VALUES('user','Listener'); INSERT INTO users(id,username,password_hash,display_name,role,created_at,updated_at) VALUES('u','legacy-user','unused','Legacy user','user','2026','2026')");
+    db.exec(`INSERT INTO listening_events(id,user_id,track_id,event_type,completion_ratio,created_at) VALUES ('old','u','t','complete',1,'2026-10-01T12:00:00.000Z');
       INSERT INTO recently_played VALUES ('mirror','u','t','2026-10-01T12:00:01.000Z'),('unmirrored','u','t2','2026-09-01T12:00:00.000Z');`);
-    const insert = db.prepare("INSERT INTO schema_migrations VALUES (?, 'existing', '')");
-    for (let id = 1; id <= 24; id++) insert.run(id);
     runMigrations(db);
     const rows = db.prepare("SELECT counted,listened_seconds FROM listening_events").all();
     expect(rows).toHaveLength(2);

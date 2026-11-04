@@ -1,7 +1,9 @@
 import type { CatalogProvider, SearchResult } from "../catalog-provider.js";
+import { formatLyrics } from "../../utils/format-lyrics.js";
 import type { StreamProvider, StreamResult } from "../stream-provider.js";
 import type { Album, Artist, Track } from "../../types.js";
 import { mapJellyfinAlbum, mapJellyfinArtist, mapJellyfinTrack } from "./jellyfin-mapper.js";
+import { privacyFetch as fetch, gateFetch } from "../../services/PrivacyManager.js";
 
 export type JellyfinConfig = {
   url: string;
@@ -29,7 +31,7 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
   constructor(config: JellyfinConfig, fetchImpl: typeof fetch = fetch) {
     this.baseUrl = config.url.replace(/\/$/, "");
     this.apiKey = config.apiKey;
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = gateFetch(fetchImpl);
   }
 
   private buildUrl(path: string, params: Record<string, unknown> = {}) {
@@ -96,6 +98,26 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
     }, mapJellyfinAlbum);
   }
 
+  async listAllAlbums(): Promise<Album[]> {
+    const albums = new Map<string, Album>();
+    for (let offset = 0; ; offset += 500) {
+      const result = await this.request<{ Items?: any[]; TotalRecordCount?: number }>("Items", {
+        IncludeItemTypes: "MusicAlbum", Recursive: true, SortBy: "SortName",
+        Limit: 500, StartIndex: offset,
+      });
+      const page = result.Items || [];
+      const before = albums.size;
+      for (const item of page) {
+        const album = mapJellyfinAlbum(item);
+        albums.set(album.id, album);
+      }
+      if (page.length && albums.size === before) throw new Error("Jellyfin did not advance its album listing");
+      if (page.length < 500 || (result.TotalRecordCount !== undefined && offset + page.length >= result.TotalRecordCount)) {
+        return [...albums.values()];
+      }
+    }
+  }
+
   async getAlbum(albumId: string): Promise<Album | null> {
     const result = await this.request<{ Items?: any[] }>("Items", {
       Ids: albumId,
@@ -114,8 +136,8 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
   }
 
   async listArtists(): Promise<Artist[]> {
-    const result = await this.request<any[]>("Artists", { SortBy: "SortName" });
-    return (Array.isArray(result) ? result : []).map(mapJellyfinArtist);
+    const result = await this.request<{ Items?: any[] }>("Artists", { SortBy: "SortName" });
+    return (result.Items || []).map(mapJellyfinArtist);
   }
 
   async getArtist(artistId: string): Promise<Artist | null> {
@@ -156,17 +178,26 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
   }
 
   async listTracks(): Promise<Track[]> {
-    return this.listItems({
-      IncludeItemTypes: "Audio",
-      Recursive: true,
-      SortBy: "SortName",
-    }, mapJellyfinTrack);
+    const tracks = new Map<string, Track>();
+    for (let offset = 0; ; offset += 500) {
+      const result = await this.request<{ Items?: any[]; TotalRecordCount?: number }>("Items", {
+        IncludeItemTypes: "Audio", Recursive: true, SortBy: "SortName", Limit: 500, StartIndex: offset,
+        Fields: "Genres,ArtistItems,AlbumArtists,ProductionYear,MediaSources,Path",
+      });
+      const page = result.Items || [];
+      const before = tracks.size;
+      for (const item of page) { const track = mapJellyfinTrack(item); tracks.set(track.id, track); }
+      if (page.length && tracks.size === before) throw new Error("Jellyfin did not advance its track listing");
+      if (page.length < 500 || (result.TotalRecordCount !== undefined && offset + page.length >= result.TotalRecordCount)) break;
+    }
+    return [...tracks.values()];
   }
 
   async getTrack(trackId: string): Promise<Track | null> {
     const result = await this.request<{ Items?: any[] }>("Items", {
       Ids: trackId,
       IncludeItemTypes: "Audio",
+      Fields: "MediaStreams,MediaSources,Path",
     });
     const item = result.Items?.[0];
     return item ? mapJellyfinTrack(item) : null;
@@ -204,10 +235,13 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
         : Array.isArray(result?.lyrics)
           ? result.lyrics
           : [];
-      const text = lines
-        .map((line: any) => typeof line === "string" ? line : line?.Text ?? line?.text ?? "")
-        .join("\n")
-        .trim();
+      const text = formatLyrics(lines.map((line: any) => {
+        const start = line?.Start ?? line?.start;
+        return {
+          text: typeof line === "string" ? line : line?.Text ?? line?.text ?? "",
+          startMs: typeof start === "number" ? start / 10_000 : undefined,
+        };
+      }));
       return text || null;
     } catch {
       return null;
@@ -299,6 +333,8 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
       this.buildUrl(`Audio/${encodeURIComponent(trackId)}/stream`, {
         static: maxBitRate ? undefined : "true",
         MaxStreamingBitrate: maxBitRate ? maxBitRate * 1000 : undefined,
+        AudioCodec: maxBitRate ? "mp3" : undefined,
+        Container: maxBitRate ? "mp3" : undefined,
       }),
       {
         headers: {
@@ -312,6 +348,7 @@ export class JellyfinBackend implements CatalogProvider, StreamProvider {
       body: response.body,
       status: response.status,
       headers: response.headers,
+      audioStream: { direct: !maxBitRate, requestedBitrateKbps: maxBitRate ?? null },
     };
   }
 

@@ -70,6 +70,17 @@ function renderLayout(preset, path = "/") {
   );
 }
 
+test.each(["/library/albums", "/new-releases", "/downloads", "/smart-playlist/1", "/listening-activity"])("uses the wide content rail for %s", (path) => {
+  const { container } = renderLayout("spotify", path);
+  expect(container.querySelector(".main-content")).toHaveClass("main-content--wide");
+  expect(container.querySelector(".main-content")).not.toHaveClass("main-content--detail");
+});
+
+test.each(["/liked", "/playlist/1", "/album/1", "/artist/1", "/artist/1/album/2"])("uses the detail content rail for %s", (path) => {
+  const { container } = renderLayout("spotify", path);
+  expect(container.querySelector(".main-content")).toHaveClass("main-content--wide", "main-content--detail");
+});
+
 beforeEach(() => {
   mounts = 0;
   mockMatchMedia(false);
@@ -162,7 +173,7 @@ test("every preset falls back to the unified mobile shell below 768px", () => {
   expect(screen.getByTestId("player-bar")).toBeInTheDocument();
   const nav = screen.getByRole("navigation", { name: "Mobile navigation" });
   expect(nav).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Explore" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("link", { name: "Discover" })).toHaveAttribute("aria-current", "page");
   expect(screen.getByRole("button", { name: "Open menu" })).toBeInTheDocument();
 });
 

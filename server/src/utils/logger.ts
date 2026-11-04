@@ -279,8 +279,7 @@ export function parsePinoLine(line: string): LogInput | null {
 }
 
 /**
- * Destination for Fastify's pino logger: forwards each line to the original
- * output (Docker/terminal logs keep working) and records a structured copy.
+ * Redact both the terminal/Docker output and the structured admin-log copy.
  */
 export function createLogCaptureStream(
   buffer: LogBuffer = serverLogs,
@@ -288,8 +287,14 @@ export function createLogCaptureStream(
 ) {
   return {
     write(chunk: string) {
-      target.write(chunk);
-      for (const line of String(chunk).split("\n")) {
+      const safeChunk = String(chunk).split("\n").map((line) => {
+        if (!line.trim()) return line;
+        let value: unknown;
+        try { value = JSON.parse(line); } catch { return redactText(line); }
+        return JSON.stringify(redactValue(value));
+      }).join("\n");
+      target.write(safeChunk);
+      for (const line of safeChunk.split("\n")) {
         if (!line.trim()) continue;
         const parsed = parsePinoLine(line);
         if (parsed) record(buffer, parsed);

@@ -1,4 +1,5 @@
 import type { Db } from "../db/database.js";
+import { redactConfig as redactConfiguration } from "../utils/config-redaction.js";
 import type { CatalogService } from "../domain/catalog.js";
 import type { LibraryInsightsService } from "../domain/library-insights.js";
 import type { RecommendationProvider, RecommendationRegistry } from "../domain/recommendations.js";
@@ -8,6 +9,7 @@ import type { SourceProviderRegistry } from "../domain/source-provider-registry.
 import type { CandidateResolver, SourceContainerProvider, SourceDetailProvider, SourceDiscoveryProvider, SourcePipelineRegistry } from "../domain/source-discovery.js";
 import type { AcquisitionProvider, AcquisitionProviderRegistry } from "../domain/acquisition.js";
 import { classifyPluginError, ClassifiedPluginError, withPluginTimeout, type PluginErrorStatus } from "./plugin-errors.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 export const PLUGIN_CAPABILITIES = new Set([
   "search",
@@ -52,7 +54,6 @@ export const PLUGIN_EVENTS = new Set([
   "playlist.created",
   "playlist.updated",
   "favorite.changed",
-  "rating.changed",
   "library.updated",
   "search.performed",
   "acquisition.created",
@@ -98,6 +99,8 @@ export type UIExtension = {
 };
 
 export type MusicDeckPlugin = {
+  /** Validate settings before persistence, including while a plugin is disabled. */
+  validateConfig?(config: Record<string, unknown>): void;
   manifest: MusicDeckPluginManifest;
   register?(context: MusicDeckPluginContext): void | Promise<void>;
   test?(context: MusicDeckPluginContext): Promise<{ ok: boolean; message?: string }>;
@@ -217,11 +220,7 @@ function readJson(value: string, fallback: unknown) {
 }
 
 function redactConfig(manifest: MusicDeckPluginManifest, config: Record<string, unknown>) {
-  const fields = new Map((manifest.config?.fields || []).map((field) => [field.key, field]));
-  return Object.fromEntries(Object.entries(config).map(([key, value]) => [
-    key,
-    fields.get(key)?.secret || /(key|token|secret|password)/i.test(key) ? Boolean(value) : value,
-  ]));
+  return redactConfiguration(config, "presence", new Set((manifest.config?.fields || []).filter((field) => field.secret).map((field) => field.key)));
 }
 
 function requiredConfigMissing(manifest: MusicDeckPluginManifest, config: Record<string, unknown>) {
@@ -362,7 +361,7 @@ export class PluginRegistry {
     // network.request permission, fetch throws a classified permission error
     // instead of crashing on an undefined bridge (which would surface as an
     // opaque plugin_error/500).
-    const networkFetch = withPluginTimeout(this.bridges.fetchImpl || fetch);
+    const networkFetch = withPluginTimeout(gateFetch(this.bridges.fetchImpl || fetch));
     context.network = has("network.request")
       ? { fetch: networkFetch }
       : {
@@ -568,6 +567,7 @@ export class PluginRegistry {
 
     const row = this.rows().get(pluginId);
     const config = input.config ?? readJson(row?.config_json || "{}", {});
+    state.plugin.validateConfig?.(config as Record<string, unknown>);
     const permissions = input.permissions ?? readJson(row?.permissions_json || "[]", []);
     const enabled = input.enabled ?? Boolean(row?.enabled);
 
@@ -610,6 +610,10 @@ export class PluginRegistry {
         configFields: (state.plugin.manifest.config?.fields || []).map((field) => ({
           key: field.key,
           label: field.label || field.key,
+          type: field.type,
+          options: field.options,
+          description: field.description,
+          ...(!field.secret && field.default !== undefined ? { default: field.default } : {}),
           secret: Boolean(field.secret),
           required: Boolean(field.required),
           configured: config[field.key] !== undefined && config[field.key] !== null && config[field.key] !== "",

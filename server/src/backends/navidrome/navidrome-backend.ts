@@ -1,9 +1,14 @@
 import crypto from "node:crypto";
+import { formatLyrics } from "../../utils/format-lyrics.js";
 import path from "node:path";
 import type { MusicBackend, SearchResult, StreamResult } from "../music-backend.js";
 import type { Album, Artist, Playlist, Track } from "../../types.js";
 import { mapAlbum, mapArtist, mapPlaylist, mapTrack } from "./mappers.js";
-import { NavidromeArtwork } from "../../services/media/navidromeArtwork.js";
+import { ARTWORK_VERDICT_HEADER, NavidromeArtwork } from "../../services/media/navidromeArtwork.js";
+import { isDefaultPlaceholder } from "../../services/media/placeholderDetector.js";
+import { privacyFetch as fetch, gateFetch } from "../../services/PrivacyManager.js";
+import { isNativeArtistPicture } from "../../domain/artist-image.js";
+import { isTrackCreditedTo } from "../../utils/artistMetadata.js";
 
 export type NavidromeConfig = {
   url: string;
@@ -16,7 +21,7 @@ type ArtistDetailResponse = {
 };
 
 type ArtistInfoResponse = {
-  artistInfo2?: { largeImageUrl?: unknown; mediumImageUrl?: unknown };
+  artistInfo2?: { largeImageUrl?: unknown; mediumImageUrl?: unknown; smallImageUrl?: unknown };
 };
 
 const NAVIDROME_REQUEST_TIMEOUT_MS = 15_000;
@@ -33,12 +38,13 @@ export class NavidromeBackend implements MusicBackend {
   private readonly fetchImpl: typeof fetch;
   private readonly artwork = new NavidromeArtwork();
   private readonly artistDetails = new Map<string, { expiresAt: number; value: Promise<ArtistDetailResponse> }>();
+  private readonly albumTrackCovers = new Map<string, { expiresAt: number; value: Promise<string | null> }>();
 
   constructor(config: NavidromeConfig, fetchImpl: typeof fetch = fetch) {
     this.baseUrl = config.url.replace(/\/$/, "");
     this.username = config.username;
     this.password = config.password;
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = gateFetch(fetchImpl);
   }
 
   private authParams() {
@@ -132,6 +138,20 @@ export class NavidromeBackend implements MusicBackend {
     return (result.albumList2?.album || []).map(mapAlbum);
   }
 
+  async listAllAlbums(): Promise<Album[]> {
+    const albums = new Map<string, Album>();
+    for (let offset = 0; ; offset += 500) {
+      const result = await this.request("getAlbumList2", {
+        type: "alphabeticalByName", size: 500, offset,
+      });
+      const page = (result.albumList2?.album || []).map(mapAlbum);
+      const before = albums.size;
+      for (const album of page) albums.set(album.id, album);
+      if (page.length && albums.size === before) throw new Error("Navidrome did not advance its album listing");
+      if (page.length < 500) return [...albums.values()];
+    }
+  }
+
   async getAlbum(albumId: string): Promise<Album | null> {
     const album = await this.getAlbumRaw(albumId);
     return album ? mapAlbum(album) : null;
@@ -139,7 +159,7 @@ export class NavidromeBackend implements MusicBackend {
 
   async getAlbumTracks(albumId: string): Promise<Track[]> {
     const album = await this.getAlbumRaw(albumId);
-    return (album?.song || []).map(mapTrack);
+    return (album?.song || []).map((song: any) => mapTrack({ ...song, originalReleaseDate: song.originalReleaseDate ?? album?.originalReleaseDate }));
   }
 
   async listArtists(): Promise<Artist[]> {
@@ -160,7 +180,8 @@ export class NavidromeBackend implements MusicBackend {
       result.artist.artistImageUrl,
       info?.artistInfo2?.mediumImageUrl,
       info?.artistInfo2?.largeImageUrl,
-    ].find((image): image is string => typeof image === "string" && /^https:\/\//i.test(image)) || null;
+      info?.artistInfo2?.smallImageUrl,
+    ].find((image) => isNativeArtistPicture(image)) || null;
     return { ...mapArtist(result.artist), imageUrl };
   }
 
@@ -178,9 +199,10 @@ export class NavidromeBackend implements MusicBackend {
     try {
       const result = await this.request("getTopSongs", { id: artistId, count }, AbortSignal.timeout(1_200));
       const songs = (result.topSongs?.song || [])
-        .filter((song: any) => String(song.artistId || "") === artistId)
+        .map(mapTrack)
+        .filter((track: Track) => isTrackCreditedTo(track, artistId))
         .slice(0, count);
-      if (songs.length) return songs.map(mapTrack);
+      if (songs.length) return songs;
     } catch {
       // The optional server-side top-songs integration may not be configured.
     }
@@ -191,9 +213,9 @@ export class NavidromeBackend implements MusicBackend {
         query: detail.artist.name, artistCount: 0, albumCount: 0, songCount: count,
       });
       return (result.searchResult3?.song || [])
-        .filter((song: any) => String(song.artistId || "") === artistId)
-        .slice(0, count)
-        .map(mapTrack);
+        .map(mapTrack)
+        .filter((track: Track) => isTrackCreditedTo(track, artistId))
+        .slice(0, count);
     } catch {
       return [];
     }
@@ -203,14 +225,28 @@ export class NavidromeBackend implements MusicBackend {
     const albums = await this.getArtistAlbums(artistId);
     const albumResults = await Promise.all(albums.map((album) => this.getAlbumRaw(album.id)));
     return albumResults.flatMap((album) => (album?.song || [])
-      .filter((song: any) => String(song.artistId || "") === artistId)
-      .map(mapTrack));
+      .map(mapTrack)
+      .filter((track: Track) => isTrackCreditedTo(track, artistId)));
   }
 
   async listTracks(): Promise<Track[]> {
-    const albums = await this.listAlbums(500);
-    const albumResults = await Promise.all(albums.map((album) => this.getAlbumRaw(album.id)));
-    return albumResults.flatMap((album) => (album?.song || []).map(mapTrack));
+    const albums = new Set<string>();
+    const tracks = new Map<string, Track>();
+    for (let offset = 0; ; offset += 500) {
+      const result = await this.request("getAlbumList2", { type: "alphabeticalByName", size: 500, offset });
+      const page: { id: string }[] = result.albumList2?.album || [];
+      const fresh = page.filter(album => !albums.has(String(album.id)));
+      if (page.length && !fresh.length) throw new Error("Navidrome did not advance its album listing");
+      for (const album of fresh) albums.add(String(album.id));
+      for (let index = 0; index < fresh.length; index += 4) {
+        const details = await Promise.all(fresh.slice(index, index + 4).map(album => this.getAlbumRaw(String(album.id))));
+        for (const album of details) for (const song of album?.song || []) {
+          const track = mapTrack(song); tracks.set(track.id, track);
+        }
+      }
+      if (page.length < 500) break;
+    }
+    return [...tracks.values()];
   }
 
   async getTrack(trackId: string): Promise<Track | null> {
@@ -240,14 +276,17 @@ export class NavidromeBackend implements MusicBackend {
       const structured = result.lyricsList?.structuredLyrics;
       const candidates = Array.isArray(structured) ? structured : structured ? [structured] : [];
 
+      let unsynced: string | null = null;
       for (const candidate of candidates) {
         const lines = Array.isArray(candidate?.line) ? candidate.line : [];
-        const text = lines
-          .map((line: any) => typeof line === "string" ? line : line?.value ?? line?.text ?? "")
-          .join("\n")
-          .trim();
-        if (text) return text;
+        const text = formatLyrics(lines.map((line: any) => ({
+          text: typeof line === "string" ? line : line?.value ?? line?.text ?? "",
+          startMs: candidate.synced === true ? line?.start : undefined,
+        })), candidate.offset);
+        if (text && candidate.synced === true && /^\[(?:offset:|\d+:)/.test(text)) return text;
+        if (text) unsynced ??= text;
       }
+      if (unsynced) return unsynced;
 
       const plain = typeof result.lyricsList?.lyrics === "string"
         ? result.lyricsList.lyrics
@@ -380,7 +419,7 @@ export class NavidromeBackend implements MusicBackend {
   }
 
   async reorderPlaylistTracks(playlistId: string, trackIds: string[]): Promise<Playlist | null> {
-    await this.request("updatePlaylist", {
+    await this.request("createPlaylist", {
       playlistId,
       songId: trackIds,
     });
@@ -415,6 +454,7 @@ export class NavidromeBackend implements MusicBackend {
     const response = await this.fetchImpl(this.buildUrl("stream", {
       id: trackId,
       maxBitRate,
+      format: maxBitRate ? "mp3" : "raw",
     }), {
       headers: range ? { Range: range } : undefined,
     });
@@ -423,7 +463,38 @@ export class NavidromeBackend implements MusicBackend {
       body: response.body,
       status: response.status,
       headers: response.headers,
+      audioStream: { direct: !maxBitRate, requestedBitrateKbps: maxBitRate ?? null },
     };
+  }
+
+  /**
+   * Navidrome's cached album cover can be the default placeholder even when the
+   * album's tracks carry embedded art (e.g. art embedded after the first scan).
+   * Resolve the album's first track cover so every surface can show the same
+   * image the player does. Cached per album artwork ID; failures are not cached.
+   */
+  private albumTrackCoverId(albumArtworkId: string): Promise<string | null> {
+    const cached = this.albumTrackCovers.get(albumArtworkId);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const entry = {
+      expiresAt: Number.POSITIVE_INFINITY,
+      value: this.getAlbumRaw(albumArtworkId.slice(3)).then((album) => {
+        const songs = album?.song;
+        if (!Array.isArray(songs)) return null;
+        const cover = songs.find((song: any) => typeof song?.coverArt === "string" && song.coverArt)?.coverArt;
+        return typeof cover === "string" && cover ? cover : null;
+      }),
+    };
+    entry.value = entry.value.then((id) => {
+      entry.expiresAt = Date.now() + (id ? 60 * 60_000 : 5 * 60_000);
+      return id;
+    }, () => {
+      if (this.albumTrackCovers.get(albumArtworkId) === entry) this.albumTrackCovers.delete(albumArtworkId);
+      return null;
+    });
+    this.albumTrackCovers.set(albumArtworkId, entry);
+    if (this.albumTrackCovers.size > 256) this.albumTrackCovers.delete(this.albumTrackCovers.keys().next().value!);
+    return entry.value;
   }
 
   async fetchArtwork(artworkId: string, size?: number): Promise<StreamResult> {
@@ -432,7 +503,17 @@ export class NavidromeBackend implements MusicBackend {
     const fetchCover = (id: string) => this.fetchImpl(
       this.buildUrl("getCoverArt", { id, size }), { signal: AbortSignal.timeout(5_000) }
     );
-    return this.artwork.read(artworkId, size, () => fetchCover(artworkId), () => fetchCover("al-0"));
+    const result = await this.artwork.read(artworkId, size, () => fetchCover(artworkId), (referenceId) => fetchCover(referenceId));
+    const uncertain = result.headers.get(ARTWORK_VERDICT_HEADER) === "uncertain";
+    if ((result.status !== 404 && !uncertain) || !artworkId.startsWith("al-") || isDefaultPlaceholder(artworkId)) return result;
+    // The album cover is a confirmed or suspected placeholder: prefer the
+    // album's own track art (the image Now Playing already shows).
+    const trackCoverId = await this.albumTrackCoverId(artworkId);
+    if (!trackCoverId || trackCoverId === artworkId) return result;
+    const fallback = await this.artwork.read(trackCoverId, size, () => fetchCover(trackCoverId), (referenceId) => fetchCover(referenceId));
+    // Keep an unproven original over nothing: it might be genuine folder art.
+    if (fallback.status === 404) return result.status === 404 ? fallback : result;
+    return fallback;
   }
 
   async requestLibraryRescan(): Promise<void> {

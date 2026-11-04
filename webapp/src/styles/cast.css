@@ -1,0 +1,18 @@
+.cast-control { display: inline-flex; position: relative; min-width: 0; flex-shrink: 0; }
+.cast-button { max-width: 170px; }
+.cast-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-button:disabled { opacity: .5; cursor: not-allowed; }
+.cast-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.cast-error { position: absolute; bottom: 100%; right: 0; z-index: 40; width: min(290px, 75vw); padding: 12px; background: var(--panel-chrome); color: var(--text); border: 1px solid var(--panel-border); border-radius: 8px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; white-space: normal; }
+.cast-control--device { display: flex; flex-direction: column; width: 100%; gap: 10px; }
+.remote-device-dialog .cast-control--device .cast-button { justify-content: flex-start; width: 100%; max-width: none; gap: 14px; min-height: 72px; padding: 14px; border-radius: 10px; text-align: left; }
+.cast-control--device .cast-button:hover:not(:disabled) { border-color: var(--accent); background: rgb(var(--tint-rgb) / 8%); }
+.cast-control--device .cast-device-copy { display: grid; gap: 5px; flex: 1; min-width: 0; }
+.cast-control--device .cast-device-copy strong { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.cast-control--device .cast-device-copy small, .cast-device-hint { color: var(--text-muted); font-size: 11px; line-height: 1.5; white-space: normal; }
+.cast-control--device .cast-device-action { color: var(--accent-text); font-size: 11px; flex-shrink: 0; }
+.cast-control--device .cast-error { position: static; box-sizing: border-box; width: 100%; }
+.remote-device-dialog .cast-control--device .cast-button span { display: block; }
+.remote-device-dialog .cast-control--device .cast-button .cast-device-copy { display: grid; }
+.header-player-actions .cast-error { bottom: auto; top: 100%; }
+@media (max-width: 560px) { .cast-button { max-width: 110px; } }

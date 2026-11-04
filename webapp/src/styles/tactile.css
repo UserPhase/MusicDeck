@@ -44,7 +44,7 @@
 .album-play, .playlist-play, .artist-play, .liked-play,
 .explore-featured-actions button,
 .tactile-btn-icon,
-.heart, .control, .track-like, .detail-secondary-action, .liked-action,
+.heart, .control, .detail-secondary-action, .liked-action,
 .tactile-pill,
 .now-preview-import,
 .play-overlay, .explore-album-play, .track-play {
@@ -95,8 +95,7 @@
 
 .tactile-btn-icon:active:not(:disabled),
 .heart:active:not(:disabled),
-.control:active:not(:disabled),
-.track-like:active:not(:disabled) {
+.control:active(:not(:disabled)) {
   transform: scale(0.8);
   transition-duration: var(--tactile-press-ms);
   transition-timing-function: var(--tactile-press);
@@ -245,7 +244,7 @@
   .tactile-btn-primary, .play-button, .account-avatar-remove, .account-secondary, .queue-sidebar-segmented button,
   .album-play, .playlist-play, .artist-play, .liked-play,
   .explore-featured-actions button,
-  .tactile-btn-icon, .heart, .control, .track-like, .detail-secondary-action, .liked-action,
+  .tactile-btn-icon, .heart, .control, .detail-secondary-action, .liked-action,
   .tactile-pill, .now-preview-import,
   .play-overlay, .explore-album-play, .track-play {
     transition-duration: 1ms !important;

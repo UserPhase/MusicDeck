@@ -2,6 +2,7 @@ import type { Album, Artist, Track } from "../types.js";
 import type { ExternalArtworkTokenStore, ExternalAlbumDetail, ExternalArtistDetail } from "./external-catalog.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 import type { UnifiedSearchResult } from "./search.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 const BASE_URL = "https://itunes.apple.com";
 const CACHE_MS = 7 * 24 * 60 * 60_000;
@@ -98,7 +99,9 @@ export class ItunesArtistCatalog {
   private readonly cache = new Map<string, { expiresAt: number; value: Promise<CachedCatalog | null> }>();
   private readonly albumCache = new Map<string, { expiresAt: number; value: Promise<ExternalAlbumDetail | null> }>();
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch, private readonly artwork?: ExternalArtworkTokenStore) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch, private readonly artwork?: ExternalArtworkTokenStore) {
+    this.fetchImpl = gateFetch(fetchImpl);
+  }
 
   private async request(path: "search" | "lookup", params: Record<string, string>): Promise<ItunesItem[]> {
     const url = new URL(path, `${BASE_URL}/`);
@@ -114,38 +117,49 @@ export class ItunesArtistCatalog {
     if (cache.size > MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
   }
 
-  private async fetchCatalog(artist: Artist, localAlbums: Album[]): Promise<CachedCatalog | null> {
-    const search = await this.request("search", {
-      term: artist.name, media: "music", entity: "album", limit: "50",
-    });
+  private async fetchCatalog(artist: Artist, localAlbums: Album[], localTracks: Track[]): Promise<CachedCatalog | null> {
+    const [search, songs] = await Promise.all([
+      this.request("search", { term: artist.name, media: "music", entity: "album", limit: "50" }).catch(() => []),
+      this.request("search", { term: artist.name, media: "music", entity: "song", limit: "50" }).catch(() => []),
+    ]);
     const localKeys = new Set(localAlbums
       .filter((album) => album.artistId === artist.id)
       .map((album) => itunesReleaseKey(album.name)));
-    const groups = new Map<number, { score: number; albums: ItunesItem[] }>();
-    for (const item of search) {
+    const groups = new Map<number, { matches: Set<string>; albums: ItunesItem[]; tracks: ItunesItem[] }>();
+    for (const item of [...search, ...songs.filter((song) => song.trackId != null && song.trackName)]) {
       if (item.collectionId == null || item.artistId == null || !item.collectionName
         || !artistCreditMatches(item.artistName, artist.name)) continue;
-      const group = groups.get(item.artistId) || { score: 0, albums: [] };
+      const group = groups.get(item.artistId) || { matches: new Set<string>(), albums: [], tracks: [] };
       group.albums.push(item);
-      if (localKeys.has(itunesReleaseKey(item.collectionName))) group.score += 1;
+      const release = itunesReleaseKey(item.collectionName);
+      if (localKeys.has(release)) group.matches.add(`release:${release}`);
+      if (item.trackId != null && item.trackName) {
+        group.tracks.push(item);
+        const title = itunesReleaseKey(item.trackName);
+        const duration = typeof item.trackTimeMillis === "number" ? item.trackTimeMillis / 1000 : null;
+        if (duration != null && localTracks.some((track) => itunesReleaseKey(track.title) === title
+          && track.durationSeconds != null && Math.abs(track.durationSeconds - duration) <= 10)) {
+          group.matches.add(`track:${title}`);
+        }
+      }
       groups.set(item.artistId, group);
     }
-    const ranked = [...groups].sort((left, right) => right[1].score - left[1].score);
+    const ranked = [...groups].sort((left, right) => right[1].matches.size - left[1].matches.size);
     // A name alone is not proof of identity. If the store lacks a local
-    // release anchor (or multiple IDs tie), keep the trusted local catalog.
-    if (!ranked.length || ranked[0][1].score === 0
-      || ranked[1]?.[1].score === ranked[0][1].score) return null;
+    // release or recording anchor (or multiple IDs tie), keep the local catalog.
+    if (!ranked.length || ranked[0][1].matches.size === 0
+      || ranked[1]?.[1].matches.size === ranked[0][1].matches.size) return null;
     const [itunesArtistId, matched] = ranked[0];
 
     // ID lookup is less prone to search false positives and returns releases
     // beyond the search page. Keep the search result if lookup is unavailable.
     const [albums, tracks] = await Promise.all([
       this.request("lookup", { id: String(itunesArtistId), entity: "album", limit: "200" })
-        .catch(() => matched.albums),
+        .catch(() => []),
       this.request("lookup", { id: String(itunesArtistId), entity: "song", limit: "25" })
         .catch(() => [] as ItunesItem[]),
     ]);
-    return { artistId: itunesArtistId, albums: albums.some((item) => item.wrapperType === "collection") ? albums : matched.albums, tracks };
+    return { artistId: itunesArtistId, albums: [...albums, ...matched.albums, ...tracks], tracks: [...tracks, ...matched.tracks] };
   }
 
   async resolve(artist: Artist, localAlbums: Album[], localTracks: Track[]): Promise<ItunesArtistCatalogResult | null> {
@@ -156,7 +170,7 @@ export class ItunesArtistCatalog {
     if (cached && cached.expiresAt > Date.now()) {
       value = cached.value;
     } else {
-      value = this.fetchCatalog(artist, localAlbums).catch(() => null);
+      value = this.fetchCatalog(artist, localAlbums, localTracks).catch(() => null);
       const entry = { expiresAt: Date.now() + CACHE_MS, value };
       this.cache.set(key, entry);
       this.trimCache(this.cache);
@@ -184,9 +198,11 @@ export class ItunesArtistCatalog {
         identity: { id: `itunes:album:${item.collectionId}`, strength: "provider" as const },
       }];
     });
+    const seenTracks = new Set<number>();
     const tracks = catalog.tracks.flatMap((item): UnifiedSearchResult[] => {
       if (item.trackId == null || !item.trackName || item.artistId !== catalog.artistId
-        || !artistCreditMatches(item.artistName, artist.name)) return [];
+        || !artistCreditMatches(item.artistName, artist.name) || seenTracks.has(item.trackId)) return [];
+      seenTracks.add(item.trackId);
       const artworkId = this.artwork?.token(upscaleItunesArtwork(item.artworkUrl100), [".mzstatic.com"]) || null;
       return [{
         type: "track", id: `external_itunes_track_${item.trackId}`,

@@ -3,6 +3,7 @@ import type { Db } from "../db/database.js";
 import type { CanonicalIdentity, UnifiedSearchResult } from "./search.js";
 import { normalizeMusicText } from "./music-identity.js";
 import { SpotifyAuthClient, SpotifyAuthError, describeSpotifyErrorBody, hasSpotifyCredentials, resolveSpotifyCredentials, type SpotifyCredentials } from "./spotify-auth.js";
+import { privacyFetch as fetch, currentPrivacyManager, gateFetch } from "../services/PrivacyManager.js";
 
 export type ExternalArtworkRecord = {
   url: string;
@@ -173,7 +174,8 @@ export class SpotifyExternalCatalogProvider implements ExternalCatalogProvider {
   }
 
   fetchArtwork(url: string) {
-    return this.fetchImpl(url);
+    currentPrivacyManager()?.assertExternalAllowed("artwork");
+    return gateFetch(this.fetchImpl, "artwork")(url);
   }
 
   private token(url: unknown): string | null {
@@ -410,6 +412,7 @@ function deezerDuration(value: unknown): number | null {
 export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
   readonly id = "deezer";
   readonly name = "Deezer";
+  private readonly pendingArtists = new Map<string, Promise<ExternalArtistDetail | null>>();
 
   // Deezer's public catalog endpoints require no credentials, so this
   // provider is always available for detail lookups regardless of the
@@ -612,24 +615,34 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
     };
   }
 
-  async getArtist(id: string): Promise<ExternalArtistDetail | null> {
-    if (!/^external_deezer_artist_[0-9]+$/.test(id)) return null;
+  getArtist(id: string): Promise<ExternalArtistDetail | null> {
+    if (!/^external_deezer_artist_[0-9]+$/.test(id)) return Promise.resolve(null);
+    const pending = this.pendingArtists.get(id);
+    if (pending) return pending;
+    const lookup = this.loadArtist(id).finally(() => this.pendingArtists.delete(id));
+    this.pendingArtists.set(id, lookup);
+    return lookup;
+  }
+
+  private async loadArtist(id: string): Promise<ExternalArtistDetail | null> {
     const artistId = id.slice("external_deezer_artist_".length);
 
     let artist: any;
-    let albumPayload: { data?: any[]; total?: number };
-    let topTracksPayload: { data?: any[] };
+    type Page = { data?: any[]; total?: number };
+    let albumPayload: Page;
+    let topTracksPayload: Page;
     try {
       [artist, albumPayload, topTracksPayload] = await Promise.all([
         this.request<any>(`/artist/${artistId}`),
-        this.request<{ data?: any[]; total?: number }>(`/artist/${artistId}/albums`, { limit: "100" }),
-        this.request<{ data?: any[] }>(`/artist/${artistId}/top`, { limit: "50" }),
+        this.request<Page>(`/artist/${artistId}/albums`, { limit: "100" }).catch((): Page => ({})),
+        this.request<Page>(`/artist/${artistId}/top`, { limit: "50" }).catch((): Page => ({})),
       ]);
     } catch {
       return null;
     }
 
     if (!artist?.name) return null;
+    const search = this.request<Page>("/search/track", { q: artist.name, limit: "50" }).catch((): Page => ({}));
 
     // Deezer pages artist discographies. The first 50 entries can omit valid
     // singles, especially for prolific collaborators; bound pagination so an
@@ -643,8 +656,15 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       albumItems.push(...page.data);
     }
 
-    const albums = albumItems.flatMap((item) => {
-      if (item?.id == null || (item.artist?.id != null && String(item.artist.id) !== artistId)) return [];
+    const credited = [...(topTracksPayload.data || []), ...((await search).data || [])]
+      .filter((item) => String(item?.artist?.id) === artistId);
+    const seenAlbums = new Set<string>();
+    const albums = [
+      ...albumItems.filter((item) => item?.artist?.id == null || String(item.artist.id) === artistId),
+      ...credited.map((item) => item.album),
+    ].flatMap((item) => {
+      if (item?.id == null || !item.title || seenAlbums.has(String(item.id))) return [];
+      seenAlbums.add(String(item.id));
       return [{
         id: `external_deezer_album_${item.id}`,
         title: item.title || "Unknown album",
@@ -654,8 +674,13 @@ export class DeezerExternalCatalogProvider implements ExternalCatalogProvider {
       }];
     });
 
-    const tracks = (topTracksPayload.data || [])
-      .filter((item) => item.artist?.id != null && String(item.artist.id) === artistId)
+    const seenTracks = new Set<string>();
+    const tracks = credited
+      .filter((item) => {
+        if (item.id == null || seenTracks.has(String(item.id))) return false;
+        seenTracks.add(String(item.id));
+        return true;
+      })
       .map((item) => this.track(item))
       .filter((item): item is UnifiedSearchResult => Boolean(item));
 
@@ -687,8 +712,9 @@ export class ExternalCatalogRegistry {
   private readonly providers: ExternalCatalogProvider[];
 
   constructor(readonly fetchImpl: typeof fetch = fetch, db?: Db) {
-    this.provider = new SpotifyExternalCatalogProvider(() => this.config, fetchImpl, this.artworkTokens, db);
-    this.deezerProvider = new DeezerExternalCatalogProvider(fetchImpl, this.artworkTokens);
+    this.fetchImpl = gateFetch(fetchImpl);
+    this.provider = new SpotifyExternalCatalogProvider(() => this.config, this.fetchImpl, this.artworkTokens, db);
+    this.deezerProvider = new DeezerExternalCatalogProvider(this.fetchImpl, this.artworkTokens);
     this.providers = [this.provider, this.deezerProvider];
   }
 
@@ -774,6 +800,7 @@ export class ExternalCatalogRegistry {
    * served through this same fetch path.
    */
   fetchArtwork(url: string) {
-    return this.fetchImpl(url);
+    currentPrivacyManager()?.assertExternalAllowed("artwork");
+    return gateFetch(this.fetchImpl, "artwork")(url);
   }
 }

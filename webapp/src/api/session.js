@@ -4,8 +4,8 @@ import {
 } from "./musicdeck";
 
 
-export async function getAuthSession() {
-  const session = await getCurrentSession();
+export async function getAuthSession(signal) {
+  const session = await getCurrentSession(signal);
   return session.authenticated ? session.user : null;
 }
 

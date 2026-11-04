@@ -16,6 +16,22 @@ afterEach(async () => {
 });
 
 describe("silence-trim API", () => {
+  test("returns the matching trimming profile and validates analysis parameters", async () => {
+    const { app } = await setup();
+    const { cookie } = await login(app);
+    const headers = { cookie };
+    const tracks = await app.inject({ url: "/api/tracks", headers });
+    const trackId = tracks.json().tracks[0].id;
+    const url = `/api/tracks/${trackId}/silence-analysis`;
+    for (const thresholdDb of [-35, -28]) {
+      expect((await app.inject({ method: "POST", url, headers, payload: { thresholdDb, minSilenceSeconds: 0.8 } })).statusCode).toBe(200);
+    }
+    const saved = await app.inject({ url: `${url}?thresholdDb=-35&minSilenceSeconds=0.8`, headers });
+    expect(saved.json().analysis).toMatchObject({ thresholdDb: -35, minSilenceSeconds: 0.8 });
+    expect((await app.inject({ url: `${url}?thresholdDb=-50&minSilenceSeconds=0.8`, headers })).json()).toEqual({ analysis: null });
+    expect((await app.inject({ url: `${url}?thresholdDb=20`, headers })).statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url, headers, payload: { minSilenceSeconds: 0 } })).statusCode).toBe(400);
+  });
   test("returns null analysis for a track that has never been analyzed", async () => {
     const { app } = await setup();
     const { cookie } = await login(app);

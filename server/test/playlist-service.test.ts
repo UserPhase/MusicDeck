@@ -40,6 +40,116 @@ afterEach(async () => {
 });
 
 describe("MusicDeck-owned playlists", () => {
+  test("owner-private lists, detail, search, and artwork preserve admin and legacy access", async () => {
+    const { app, db, playlists, backend } = await setup();
+    const alice = (await createUser(db, { username: "alice", password: "alice-password" }))!;
+    const bob = (await createUser(db, { username: "bob", password: "bob-password" }))!;
+    const aliceCookie = (await login(app, "alice", "alice-password")).cookie;
+    const bobCookie = (await login(app, "bob", "bob-password")).cookie;
+    const adminCookie = (await login(app)).cookie;
+    const create = async (cookie: string | undefined, name: string) => {
+      const response = await app.inject({
+        method: "POST", url: "/api/playlists", headers: { cookie }, payload: { name },
+      });
+      expect(response.statusCode).toBe(201);
+      return response.json().playlist as { id: string; ownerUserId: string };
+    };
+    const alicePlaylist = await create(aliceCookie, "Private Alice Mix");
+    const bobPlaylist = await create(bobCookie, "Private Bob Mix");
+    expect(alicePlaylist.ownerUserId).toBe(alice.id);
+    expect(bobPlaylist.ownerUserId).toBe(bob.id);
+    vi.mocked(backend.listPlaylists).mockResolvedValue([{
+      id: "legacy-shared", providerId: "legacy-shared", name: "Shared Mix",
+      description: null, artworkId: null, artworkUrl: null, songCount: 0, tracks: [],
+    }]);
+    const legacy = await playlists.list(alice);
+    const shared = legacy.find((playlist) => playlist.ownerUserId === null)!;
+    expect(shared).toBeDefined();
+    const image = Buffer.from("custom-private-artwork");
+    playlists.setCustomArtwork(alicePlaylist.id, image, "image/png");
+    await playlists.addTrack(alicePlaylist.id, "track-1");
+    const artworkUrl = (await playlists.get(alicePlaylist.id, alice))!.artworkUrl!;
+    const privateResponse = await app.inject({
+      url: `/api/playlists/${alicePlaylist.id}`, headers: { cookie: bobCookie },
+    });
+    const missingResponse = await app.inject({
+      url: "/api/playlists/does-not-exist", headers: { cookie: bobCookie },
+    });
+    expect(privateResponse.statusCode).toBe(404);
+    expect(privateResponse.json()).toEqual(missingResponse.json());
+    expect(privateResponse.body).not.toContain("Private Alice");
+
+    for (const [cookie, own, other] of [
+      [aliceCookie, alicePlaylist.id, bobPlaylist.id],
+      [bobCookie, bobPlaylist.id, alicePlaylist.id],
+    ]) {
+      const list = await app.inject({ url: "/api/playlists", headers: { cookie } });
+      const ids = list.json().playlists.map((playlist: { id: string }) => playlist.id);
+      expect(ids).toContain(own);
+      expect(ids).toContain(shared.id);
+      expect(ids).not.toContain(other);
+      expect((await app.inject({ url: `/api/playlists/${own}`, headers: { cookie } })).statusCode).toBe(200);
+      expect((await app.inject({ url: `/api/playlists/${shared.id}`, headers: { cookie } })).statusCode).toBe(200);
+      expect((await app.inject({ url: `/api/playlists/${other}`, headers: { cookie } })).statusCode).toBe(404);
+    }
+    for (const phase of ["", "&phase=local"]) {
+      const search = await app.inject({
+        url: `/api/search?q=Private&types=playlists&mode=library${phase}`, headers: { cookie: bobCookie },
+      });
+      expect(search.statusCode).toBe(200);
+      expect(search.body).toContain("Private Bob Mix");
+      expect(search.body).not.toContain("Private Alice Mix");
+    }
+    expect(await playlists.search("Private")).toEqual([]);
+    expect((await app.inject({ url: artworkUrl, headers: { cookie: bobCookie } })).statusCode).toBe(404);
+    for (const cookie of [aliceCookie, adminCookie]) {
+      const art = await app.inject({ url: artworkUrl, headers: { cookie } });
+      expect(art.statusCode).toBe(200);
+      expect(art.rawPayload).toEqual(image);
+    }
+    vi.mocked(backend.getTrack).mockClear();
+    expect(await playlists.get(alicePlaylist.id, bob)).toBeNull();
+    expect(backend.getTrack).not.toHaveBeenCalled();
+    const adminList = await app.inject({ url: "/api/playlists", headers: { cookie: adminCookie } });
+    expect(adminList.json().playlists.map((playlist: { id: string }) => playlist.id))
+      .toEqual(expect.arrayContaining([alicePlaylist.id, bobPlaylist.id, shared.id]));
+    expect((await app.inject({ url: `/api/playlists/${alicePlaylist.id}`, headers: { cookie: adminCookie } })).statusCode).toBe(200);
+    expect((await app.inject({
+      method: "PATCH", url: `/api/playlists/${shared.id}`, headers: { cookie: bobCookie },
+      payload: { name: "Shared Legacy Mix" },
+    })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PATCH", url: `/api/playlists/${shared.id}`, headers: { cookie: adminCookie },
+      payload: { name: "Shared Legacy Mix" } })).statusCode).toBe(200);
+  });
+
+  test("regular owner can edit, add, reorder, and delete without weakening mutation authorization", async () => {
+    const { app, db } = await setup(createFakeBackend({ getTrack: vi.fn(async (id: string) => track(id)) }));
+    await createUser(db, { username: "owner", password: "owner-password" });
+    await createUser(db, { username: "other", password: "other-password" });
+    const { cookie } = await login(app, "owner", "owner-password");
+    const outsider = (await login(app, "other", "other-password")).cookie;
+    const created = await app.inject({ method: "POST", url: "/api/playlists", headers: { cookie }, payload: { name: "Mix" } });
+    const url = `/api/playlists/${created.json().playlist.id}`;
+    expect((await app.inject({ method: "PATCH", url, headers: { cookie }, payload: { name: "Edited" } })).statusCode).toBe(200);
+    for (const trackId of ["t-1", "t-2"]) {
+      expect((await app.inject({ method: "POST", url: `${url}/tracks`, headers: { cookie }, payload: { trackId } })).statusCode).toBe(200);
+    }
+    const reordered = await app.inject({
+      method: "PUT", url: `${url}/tracks/reorder`, headers: { cookie }, payload: { trackIds: ["t-2", "t-1"] },
+    });
+    expect(reordered.statusCode).toBe(200);
+    expect(reordered.json().playlist.tracks.map((item: Track) => item.id)).toEqual(["t-2", "t-1"]);
+    for (const method of ["PATCH", "DELETE", "PUT"] as const) {
+      const denied = await app.inject({
+        method, url: method === "PUT" ? `${url}/tracks/reorder` : url,
+        headers: { cookie: outsider },
+        ...(method === "PATCH" ? { payload: { name: "Stolen" } } : method === "PUT" ? { payload: { trackIds: [] } } : {}),
+      });
+      expect(denied.statusCode).toBe(403);
+    }
+    expect((await app.inject({ method: "DELETE", url, headers: { cookie } })).statusCode).toBe(204);
+    expect((await app.inject({ url, headers: { cookie } })).statusCode).toBe(404);
+  });
   test("reuses a durable import identity and cannot duplicate or change its ownership", async () => {
     const backend = createFakeBackend({ createPlaylist: vi.fn() }); const context = await setup(backend);
     const { response } = await login(context.app);
@@ -128,7 +238,7 @@ describe("MusicDeck-owned playlists", () => {
   test("rejects empty playlist updates and overlong details", async () => {
     await setup();
     const { cookie, playlistId } = await createPlaylistViaApi();
-    const requestUpdate = (payload: unknown) => current!.app.inject({
+    const requestUpdate = (payload: Record<string, unknown>) => current!.app.inject({
       method: "PATCH",
       url: `/api/playlists/${playlistId}`,
       headers: { cookie },

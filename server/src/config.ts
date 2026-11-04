@@ -1,5 +1,8 @@
 import dotenv from "dotenv";
 import fs from "node:fs";
+import { isIP } from "node:net";
+import { DEFAULT_LOGIN_RATE_LIMIT, type LoginRateLimitConfig } from "./auth/login-rate-limiter.js";
+import { DEFAULT_ACQUISITION_LIMITS, type AcquisitionLimits } from "./domain/acquisition-limits.js";
 
 dotenv.config();
 
@@ -7,12 +10,17 @@ dotenv.config();
 export type MusicBackendKind = "navidrome" | "jellyfin";
 
 export type AppConfig = {
+  localOnlyMode: boolean;
+  trustedProxies: string[];
+  loginRateLimit: LoginRateLimitConfig;
+  acquisitionLimits: AcquisitionLimits;
   host: string;
   port: number;
   publicUrl: string;
   corsOrigin: string;
   sessionSecret: string;
   databasePath: string;
+  extensionsDir: string;
   backend: MusicBackendKind;
   navidrome: {
     url: string;
@@ -36,6 +44,33 @@ export type AppConfig = {
 
 function readEnv(name: string, fallback = "") {
   return process.env[name] || fallback;
+}
+
+function readPositiveInteger(name: string, fallback: number) {
+  const value = Number(readEnv(name, String(fallback)));
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function readTrustedProxies() {
+  const value = readEnv("MUSICDECK_TRUSTED_PROXIES").trim();
+  if (!value) return [];
+  return value.split(",").map((entry) => {
+    const proxy = entry.trim();
+    const [address, prefix, extra] = proxy.split("/");
+    const version = isIP(address);
+    if (!version || extra !== undefined || (prefix !== undefined && (
+      !/^\d+$/.test(prefix) || Number(prefix) < 0 || Number(prefix) > (version === 4 ? 32 : 128)
+    ))) {
+      throw new Error("MUSICDECK_TRUSTED_PROXIES must contain only explicit IP addresses or CIDRs");
+    }
+    if (prefix !== undefined && Number(prefix) === 0) {
+      throw new Error("MUSICDECK_TRUSTED_PROXIES must not trust all network addresses");
+    }
+    return proxy;
+  });
 }
 
 function readSecret(name: string, fallback = "") {
@@ -130,14 +165,29 @@ function readBackend(): MusicBackendKind {
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const isProduction = process.env.NODE_ENV === "production";
+  const localOnlyValue = readEnv("LOCAL_ONLY_MODE", "false").toLowerCase();
+  if (!["true", "false", "1", "0"].includes(localOnlyValue)) throw new Error("LOCAL_ONLY_MODE must be true, false, 1 or 0");
 
   const config: AppConfig = {
+    localOnlyMode: ["true", "1"].includes(localOnlyValue),
+    trustedProxies: readTrustedProxies(),
+    acquisitionLimits: Object.fromEntries(Object.entries(DEFAULT_ACQUISITION_LIMITS).map(([key, fallback]) => [
+      key, readPositiveInteger(`MUSICDECK_ACQUISITION_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}`, fallback),
+    ])) as AcquisitionLimits,
+    loginRateLimit: {
+      windowMs: readPositiveInteger("MUSICDECK_LOGIN_WINDOW_MS", DEFAULT_LOGIN_RATE_LIMIT.windowMs),
+      ipMax: readPositiveInteger("MUSICDECK_LOGIN_IP_MAX", DEFAULT_LOGIN_RATE_LIMIT.ipMax),
+      accountMax: readPositiveInteger("MUSICDECK_LOGIN_ACCOUNT_MAX", DEFAULT_LOGIN_RATE_LIMIT.accountMax),
+      maxConcurrent: readPositiveInteger("MUSICDECK_LOGIN_MAX_CONCURRENT", DEFAULT_LOGIN_RATE_LIMIT.maxConcurrent),
+      maxEntries: readPositiveInteger("MUSICDECK_LOGIN_MAX_ENTRIES", DEFAULT_LOGIN_RATE_LIMIT.maxEntries),
+    },
     host: readEnv("MUSICDECK_HOST", "127.0.0.1"),
     port: Number(readEnv("MUSICDECK_PORT", "4534")),
     publicUrl: readEnv("MUSICDECK_PUBLIC_URL", "http://localhost:4534"),
     corsOrigin: readEnv("MUSICDECK_CORS_ORIGIN", "http://localhost:3000"),
     sessionSecret: readSecret("MUSICDECK_SESSION_SECRET", "change-this-in-development"),
     databasePath: readDbPath(),
+    extensionsDir: readEnv("MUSICDECK_EXTENSIONS_DIR", "./extensions"),
     backend: readBackend(),
     navidrome: {
       url: readEnv("NAVIDROME_URL", "http://localhost:4533"),

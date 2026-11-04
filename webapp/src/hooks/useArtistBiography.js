@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { getTrackArtistBiography } from "../api/musicdeck";
 import { getCachedWikipediaBiography, getWikipediaBiography } from "../services/biographyFallback";
+import { usePrivacy } from "../context/PrivacyContext";
 
 export function useArtistBiography({ artistId, artistName, trackId, enabled = true }) {
+  const { canMetadata } = usePrivacy();
   const [biography, setBiography] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -31,6 +33,10 @@ export function useArtistBiography({ artistId, artistName, trackId, enabled = tr
       }
       // Preserve a short native bio if Wikipedia is unavailable.
       if (trimmed) setBiography({ text: trimmed, source: "server", url: null });
+      if (!canMetadata) {
+        setLoading(false);
+        return;
+      }
       const fallback = await getWikipediaBiography(artistId || artistName, artistName);
       if (active) {
         setBiography(fallback || (trimmed ? { text: trimmed, source: "server", url: null } : null));
@@ -44,7 +50,7 @@ export function useArtistBiography({ artistId, artistName, trackId, enabled = tr
       }
     });
     return () => { active = false; };
-  }, [artistId, artistName, trackId, enabled]);
+  }, [artistId, artistName, trackId, enabled, canMetadata]);
 
   return { biography, loading, error };
 }

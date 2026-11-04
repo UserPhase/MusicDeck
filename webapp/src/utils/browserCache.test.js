@@ -40,6 +40,7 @@ describe("browser cache utilities", () => {
   test("clears cached entries while preserving preferences and login data", async () => {
     localStorage.setItem("userPreferences", "preserve-me");
     localStorage.setItem("playerCrossfadeDuration", "7");
+    localStorage.setItem("playerAlbumAware", "true");
     localStorage.setItem("playerAccentColor", "#1ed760");
     localStorage.setItem("auth.token", "keep-me");
     localStorage.setItem("accessToken", "keep-me-too");
@@ -52,6 +53,7 @@ describe("browser cache utilities", () => {
 
     expect(localStorage.getItem("userPreferences")).toBe("preserve-me");
     expect(localStorage.getItem("playerCrossfadeDuration")).toBe("7");
+    expect(localStorage.getItem("playerAlbumAware")).toBe("true");
     expect(localStorage.getItem("playerAccentColor")).toBe("#1ed760");
     expect(localStorage.getItem("auth.token")).toBe("keep-me");
     expect(localStorage.getItem("accessToken")).toBe("keep-me-too");
@@ -59,5 +61,18 @@ describe("browser cache utilities", () => {
     expect(localStorage.getItem("cachedArtwork")).toBeNull();
     expect(localStorage.getItem("normalizedTrackMetadata")).toBeNull();
     expect(localStorage.getItem("unrelatedApplicationState")).toBe("leave-me-alone");
+  });
+
+  test("generic cache cleanup preserves deliberate download databases", async () => {
+    const previous = window.indexedDB;
+    const deleted = [];
+    Object.defineProperty(window, "indexedDB", { configurable: true, value: {
+      databases: async () => [{ name: "musicdeck-offline" }, { name: "musicdeck-downloads" }, { name: "musicdeck-cache" }],
+      deleteDatabase: (name) => { deleted.push(name); const request = {}; queueMicrotask(() => request.onsuccess?.()); return request; },
+    } });
+    try {
+      await clearLocalBrowserCache();
+      expect(deleted).toEqual(["musicdeck-cache"]);
+    } finally { Object.defineProperty(window, "indexedDB", { configurable: true, value: previous }); }
   });
 });

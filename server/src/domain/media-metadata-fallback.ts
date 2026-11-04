@@ -1,5 +1,6 @@
 import { normalizeMusicText } from "./music-identity.js";
 import { upscaleItunesArtwork } from "./itunes-artist-catalog.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 export type ArtistBiographyResult = { text: string; source: "wikipedia"; url: string };
 type AlbumCandidate = { collectionName?: string; artistName?: string; artworkUrl100?: string };
@@ -12,7 +13,7 @@ export class MediaMetadataFallback {
   private active = 0;
   private readonly waiting: Array<() => void> = [];
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch) { this.fetchImpl = gateFetch(fetchImpl); }
 
   private cached<T>(
     cache: Map<string, { expiresAt: number; value: Promise<T | null> }>,

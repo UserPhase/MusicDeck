@@ -1,4 +1,5 @@
 import type { SpotifyImportTrackMetadata } from "../../domain/downloader-adapter.js";
+import { privacyFetch as fetch, gateFetch } from "../PrivacyManager.js";
 
 type Json = Record<string, unknown>;
 const object = (value: unknown): Json => value && typeof value === "object" && !Array.isArray(value) ? value as Json : {};
@@ -11,7 +12,7 @@ export type DeezerImportMatch = { track: SpotifyImportTrackMetadata | null; deta
 /** Metadata only: Deezer preview URLs must never become full-song download inputs. */
 export class DeezerImportMatcher {
   private readonly cache = new Map<string, { expires: number; value: DeezerImportMatch }>();
-  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch) { this.fetchImpl = gateFetch(fetchImpl); }
 
   async match(source: SpotifyImportTrackMetadata, signal: AbortSignal): Promise<DeezerImportMatch> {
     const key = JSON.stringify([isrcKey(source.isrc), normalize(source.artist), normalize(source.title), source.duration]);

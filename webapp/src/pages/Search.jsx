@@ -1,3 +1,5 @@
+import { EditionBadges } from "../components/common/EditionBadges";
+import TrackActionScope from "../components/TrackActionScope";
 import {
   useEffect,
   useRef,
@@ -9,34 +11,26 @@ import {
   useSearchParams,
 } from "react-router-dom";
 
-import {
-  searchNavidrome,
-  getCoverUrl,
-  getUserSettings,
-  startRadio,
-  updateUserSettings,
-} from "../api/musicdeck";
+import { searchNavidrome, getCoverUrl, getUserSettings, updateUserSettings } from "../api/musicdeck";
 
 import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
 import SourceIndicator from "../components/SourceIndicator";
 import LightHero from "../components/Layout/LightHero";
+import { useViewStateValue } from "../hooks/useViewStateStore";
 import InLibraryBadge from "../components/InLibraryBadge";
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
-import AlbumDeleteButton from "../components/AlbumDeleteButton";
 import { useServerDeletion } from "../context/ServerDeletionContext";
-import { toArtistRouteIdFromApiId } from "../utils/idResolver";
+import { usePrivacy } from "../context/PrivacyContext";
+import { toAlbumRouteIdFromApiId, toArtistRouteIdFromApiId } from "../utils/idResolver";
+import TrackArtistLinks from "../components/TrackArtistLinks";
 import {
   EmptyState,
   ErrorState,
   LoadingState,
 } from "../components/ui/PageState";
 
-import {
-  getPlaylists,
-  addSongToPlaylist as addSongToPlaylistRequest,
-} from "../api/playlists";
 
 import {
   usePlayer,
@@ -58,8 +52,9 @@ function Search() {
   ] = useSearchParams();
 
 
-  const query =
-    searchParams.get("q") || "";
+  const [savedQuery, setSavedQuery] = useViewStateValue("/search", "query", "");
+  const query = searchParams.has("q") ? searchParams.get("q") || "" : savedQuery;
+  useEffect(() => { setSavedQuery(query); }, [query, setSavedQuery]);
 
 
   const [
@@ -79,6 +74,7 @@ function Search() {
     setLoading,
   ] = useState(Boolean(query.trim()));
   const [externalLoading, setExternalLoading] = useState(false);
+  const [resolvedSearch, setResolvedSearch] = useState("");
 
 
   const [
@@ -86,14 +82,16 @@ function Search() {
     setError,
   ] = useState(null);
 
-  const [sourceMode, setSourceMode] = useState("hybrid");
-  const hasChosenSourceMode = useRef(false);
+  const [savedFilters, setSavedFilters] = useViewStateValue("/search", "filters", {});
+  const [preferredSourceMode, setSourceMode] = useState(() => ["library", "hybrid", "external"].includes(savedFilters.sourceMode) ? savedFilters.sourceMode : "hybrid");
+  const { canMetadata } = usePrivacy();
+  const sourceMode = canMetadata ? preferredSourceMode : "library";
+  const hasChosenSourceMode = useRef(Boolean(savedFilters.sourceMode));
 
 
   const {
     playContext,
     playSongFromSource,
-    playQueue,
   } = usePlayer();
 
   function handleTrackPlayback(song, index) {
@@ -105,49 +103,6 @@ function Search() {
     });
   }
 
-
-  const [
-    playlistMenuSong,
-    setPlaylistMenuSong,
-  ] = useState(null);
-
-  const [
-    playlists,
-    setPlaylists,
-  ] = useState([]);
-
-  const [
-    playlistsLoading,
-    setPlaylistsLoading,
-  ] = useState(false);
-
-  const [
-    addingToPlaylist,
-    setAddingToPlaylist,
-  ] = useState(false);
-
-
-  useEffect(() => {
-
-    function handleDocumentClick() {
-      setPlaylistMenuSong(null);
-    }
-
-    document.addEventListener(
-      "mousedown",
-      handleDocumentClick
-    );
-
-    return () => {
-
-      document.removeEventListener(
-        "mousedown",
-        handleDocumentClick
-      );
-
-    };
-
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -167,129 +122,6 @@ function Search() {
       cancelled = true;
     };
   }, []);
-
-
-  /*
-   * Load playlists
-   */
-
-  async function loadPlaylists() {
-
-    try {
-
-      setPlaylistsLoading(true);
-
-      const data =
-        await getPlaylists();
-
-      setPlaylists(data);
-
-    } catch (error) {
-
-      console.error(
-        "Could not load playlists:",
-        error
-      );
-
-    } finally {
-
-      setPlaylistsLoading(false);
-
-    }
-
-  }
-
-
-  /*
-   * Open / close playlist menu
-   */
-
-  async function togglePlaylistMenu(song) {
-
-    if (
-      playlistMenuSong?.id === song.id
-    ) {
-
-      setPlaylistMenuSong(null);
-
-      return;
-
-    }
-
-
-    setPlaylistMenuSong(song);
-
-    if (playlists.length === 0) {
-
-      await loadPlaylists();
-
-    }
-
-  }
-
-
-  /*
-   * Add song to playlist
-   */
-
-  async function addSongToPlaylist(
-    event,
-    playlist,
-    song
-  ) {
-
-    event.stopPropagation();
-
-    if (addingToPlaylist) {
-      return;
-    }
-
-    try {
-
-      setAddingToPlaylist(true);
-
-      await addSongToPlaylistRequest(
-        playlist.id,
-        song.id
-      );
-
-      setPlaylistMenuSong(null);
-
-    } catch (error) {
-
-      console.error(
-        "Could not add song to playlist:",
-        error
-      );
-
-    } finally {
-
-      setAddingToPlaylist(false);
-
-    }
-
-  }
-
-  async function startTrackRadio(song) {
-    try {
-      const tracks = await startRadio({
-        type: "track",
-        id: song.id,
-        title: song.title,
-        artist: song.artist,
-        album: song.album,
-        artistId: song.metadata?.artistId || null,
-        albumId: song.metadata?.albumId || null,
-      });
-
-      if (tracks.length > 0) {
-        setPlaylistMenuSong(null);
-        playQueue(tracks, 0);
-      }
-    } catch (error) {
-      console.error("Could not start radio:", error);
-    }
-  }
 
 
   /*
@@ -352,6 +184,7 @@ function Search() {
           }
         });
       const outcomes = await Promise.allSettled([local, external].filter(Boolean));
+      if (!cancelled) setResolvedSearch(`${query}\u001f${sourceMode}`);
       if (!cancelled && outcomes.every((outcome) => outcome.status === "rejected")) {
         setError(outcomes[0]?.reason?.message || "Could not search your music.");
       }
@@ -370,6 +203,7 @@ function Search() {
 
     hasChosenSourceMode.current = true;
     setSourceMode(mode);
+    setSavedFilters({ sourceMode: mode });
     updateUserSettings({ "catalog.sourceMode": mode }).catch(() => {});
   }
 
@@ -406,7 +240,7 @@ function Search() {
 
     return (
 
-      <div className="search-page">
+      <div className="search-page" data-view-loading="true">
 
         <SearchHero title="Search" />
 
@@ -454,7 +288,7 @@ function Search() {
 
   return (
 
-    <div className="search-page">
+    <div className="search-page" data-view-loading={externalLoading || resolvedSearch !== `${query}\u001f${sourceMode}`}>
 
 
       {/* HEADER */}
@@ -463,7 +297,7 @@ function Search() {
 
 
       <div className="search-mode" role="group" aria-label="Search source">
-        {["library", "hybrid", "external"].map((mode) => (
+        {(canMetadata ? ["library", "hybrid", "external"] : ["library"]).map((mode) => (
           <button
             key={mode}
             type="button"
@@ -575,46 +409,23 @@ function Search() {
                   (album) => deletion?.deletedAlbums.has(String(album.id)) ? null : (
 
                     <div key={album.id} className="album-card-shell">
-                    <Link
-                      to={`/album/${album.id}`}
-                      className="see-all"
-                    >
-
-                      <div className="album-cover">
-
-                        {album.coverArt && (
-
-            <img
-              src={
-                getCoverUrl(
-                  album.coverArt
-                )
-              }
-              alt={
-                `${album.title} cover`
-              }
-            />
-
-                        )}
-
-                      </div>
-
-
-                      <div className="album-title search-album-title">
-                        <span className="search-album-title-text">{album.title}</span>
-                        <InLibraryBadge visible={album.provider === "external" && album.inLibrary} />
-                      </div>
-
-
+                      <Link className="see-all"
+                        to={`/album/${encodeURIComponent(toAlbumRouteIdFromApiId(album.localAlbumId || album.id))}`}>
+                        <div className="album-cover">
+                          {album.coverArt && <img src={getCoverUrl(album.coverArt)} alt={`${album.title} cover`} />}
+                        </div>
+                        <div className="album-title search-album-title">
+                          <span className="search-album-title-text">{album.title}</span>
+                          <InLibraryBadge visible={album.provider === "external" && album.inLibrary} />
+                        </div>
+                      </Link>
                       <div className="album-artist">
-                        {album.artist ||
-                          "Unknown artist"}
+                        <TrackArtistLinks song={album} />
                         <AvailabilityHint availability={album.availability} />
                         <SourceIndicator source={album.source} />
+                        <EditionBadges item={album} />
                       </div>
 
-                    </Link>
-                    <AlbumDeleteButton album={album} />
                     </div>
 
                   )
@@ -648,6 +459,7 @@ function Search() {
 
                 <TrackListHeader />
 
+                <TrackActionScope tracks={results.track} dataKey={`${query}:${sourceMode}`}>
                 {results.track.map(
                   (song, index) => (
                     <TrackRow
@@ -656,85 +468,17 @@ function Search() {
                       index={index}
                       showDownloadStatus={false}
                       showSourceIndicator
-                      artistId={song.metadata?.artistId}
-                      albumId={song.metadata?.albumId}
                       duration={song.metadata?.durationSeconds}
                       sources={song.source?.options}
                       onPlay={handleTrackPlayback}
                       onSelectSource={playSongFromSource}
-                      onToggleMenu={togglePlaylistMenu}
-                      menu={playlistMenuSong?.id === song.id ? (
-                        <div className="playlist-menu">
 
-                            <div className="playlist-menu-title">
-                              Add to playlist
-                            </div>
 
-                            <button
-                              type="button"
-                              className="playlist-menu-item"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                startTrackRadio(song);
-                              }}
-                            >
-                              <span>◉</span>
-                              <span>Start radio</span>
-                            </button>
-
-                            {playlistsLoading && (
-
-                              <div className="playlist-menu-item">
-                                Loading...
-                              </div>
-
-                            )}
-
-                            {!playlistsLoading &&
-                              playlists.map(
-                                (playlist) => (
-
-                                <button
-                                  key={playlist.id}
-                                  className="playlist-menu-item"
-                                  disabled={
-                                    addingToPlaylist
-                                  }
-                                  onClick={(event) =>
-                                    addSongToPlaylist(
-                                      event,
-                                      playlist,
-                                      song
-                                    )
-                                  }
-                                >
-
-                                  <span>
-                                    ♫
-                                  </span>
-
-                                  <span>
-                                    {playlist.name}
-                                  </span>
-
-                                </button>
-
-                              ))}
-
-                            {!playlistsLoading &&
-                              playlists.length === 0 && (
-
-                              <div className="playlist-menu-empty">
-                                No playlists yet
-                              </div>
-
-                            )}
-                        </div>
-                      ) : null}
                     />
 
                   )
                 )}
+        </TrackActionScope>
 
               </div>
 

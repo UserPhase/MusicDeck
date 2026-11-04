@@ -1,21 +1,28 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { deleteServerAlbum, deleteServerTrack } from "../api/adminMedia";
 import { useAuth } from "./AuthContext";
 
+/** @typedef {{ id: string | number, title?: string, name?: string }} DeletableItem */
+/** @type {import("react").Context<null | {
+ * deletedTracks: Set<string>, deletedAlbums: Set<string>,
+ * canDelete: boolean,
+ * openTrack: (item: DeletableItem) => void, openAlbum: (item: DeletableItem) => void
+ * }>} */
 const ServerDeletionContext = createContext(null);
 
 export function ServerDeletionProvider({ children }) {
   const { session } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
+  const canDelete = session?.role === "admin" && /^\/admin\/library\/(tracks|albums)\/?$/.test(location.pathname);
   const [target, setTarget] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [toast, setToast] = useState(null);
   const [deletedTracks, setDeletedTracks] = useState(() => new Set());
   const [deletedAlbums, setDeletedAlbums] = useState(() => new Set());
+  useEffect(() => { if (!canDelete) setTarget(null); }, [canDelete]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -33,13 +40,13 @@ export function ServerDeletionProvider({ children }) {
   }, [target, busy]);
 
   const open = (kind, item) => {
-    if (session?.role !== "admin" || !item?.id) return;
+    if (!canDelete || !item?.id) return;
     setError("");
     setTarget({ kind, id: item.id, title: item.title || item.name || "Untitled" });
   };
 
   const confirm = async () => {
-    if (!target || busy || session?.role !== "admin") return;
+    if (!target || busy || !canDelete) return;
     setBusy(true);
     setError("");
     try {
@@ -54,7 +61,6 @@ export function ServerDeletionProvider({ children }) {
         detail: { trackIds, albumId: target.kind === "album" ? target.id : null },
       }));
       setToast({ type: result.warning ? "error" : "success", text: result.warning || (target.kind === "track" ? "Track deleted from server." : "Album deleted from server.") });
-      if (target.kind === "album" && location.pathname === `/album/${target.id}`) navigate("/library/albums");
       setTarget(null);
     } catch (failure) {
       setError(failure.message || "Could not delete the file from the server.");
@@ -63,7 +69,7 @@ export function ServerDeletionProvider({ children }) {
     }
   };
 
-  return <ServerDeletionContext.Provider value={{ openTrack: (item) => open("track", item), openAlbum: (item) => open("album", item), deletedTracks, deletedAlbums }}>
+  return <ServerDeletionContext.Provider value={{ canDelete, openTrack: (item) => open("track", item), openAlbum: (item) => open("album", item), deletedTracks, deletedAlbums }}>
     {children}
     {target && createPortal(
       <div className="server-delete-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setTarget(null); }}>

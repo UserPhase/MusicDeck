@@ -13,7 +13,7 @@ import type { ProcessRunner } from "../src/domain/process-runner.js";
 import type { SessionUser } from "../src/types.js";
 import { closeTestServer, createFakeBackend, createTestServer, login } from "./helpers.js";
 
-const user = { id: "user-1" } as SessionUser;
+const user = { id: "user-1", role: "user", externalPlaybackEnabled: true, disabled: false } as SessionUser;
 const directories: string[] = [];
 
 afterEach(() => {

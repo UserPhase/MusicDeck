@@ -1,5 +1,5 @@
 .glass-dropdown,
-:is(.playlist-menu, .ui-menu-popover, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown) {
+:is(.playlist-menu, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown) {
   background: var(--glass-menu-bg);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
@@ -22,14 +22,14 @@
 }
 
 :is(.glass-dropdown, .playlist-menu, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown)
-  :is(.playlist-menu-item, .ui-menu-item, .account-menu-item, .search-dropdown-song, .search-dropdown-more, [role="menuitem"]) {
+  :is(.playlist-menu-item, .account-menu-item, .search-dropdown-song, .search-dropdown-more, [role="menuitem"]) {
   color: var(--glass-menu-text);
   border-radius: 8px;
   transition: background-color 150ms ease, color 150ms ease;
 }
 
 :is(.glass-dropdown, .playlist-menu, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown)
-  :is(.playlist-menu-item, .ui-menu-item, .account-menu-item, .search-dropdown-song, .search-dropdown-more, [role="menuitem"]):is(:hover, :focus-visible):not(:disabled):not([aria-disabled="true"]):not(.playlist-delete):not(.server-delete-menu-item) {
+  :is(.playlist-menu-item, .account-menu-item, .search-dropdown-song, .search-dropdown-more, [role="menuitem"]):is(:hover, :focus-visible):not(:disabled):not([aria-disabled="true"]):not(.playlist-delete):not(.server-delete-menu-item) {
   background: var(--glass-menu-hover);
   color: var(--glass-menu-text);
 }
@@ -39,18 +39,11 @@
   outline-offset: -2px;
 }
 
-:is(.glass-dropdown, .playlist-menu) :is(.playlist-menu-title, .ui-menu-title, .playlist-menu-empty, .track-context-menu-copy small) {
+:is(.glass-dropdown, .playlist-menu) :is(.playlist-menu-title, .playlist-menu-empty, .track-context-menu-copy small) {
   color: var(--glass-menu-text-muted);
 }
 
-.glass-dropdown .downloads-menu-action {
-  color: var(--glass-menu-text-secondary);
-}
 
-.glass-dropdown .downloads-menu-action:is(:hover, :focus-visible) {
-  background: var(--glass-menu-hover);
-  color: var(--glass-menu-text);
-}
 
 :is(.glass-dropdown, .playlist-menu) :is(.playlist-delete, .server-delete-menu-item) {
   color: var(--glass-menu-danger);
@@ -75,7 +68,7 @@
 
 @supports not ((backdrop-filter: blur(16px)) or (-webkit-backdrop-filter: blur(16px))) {
   .glass-dropdown,
-  :is(.playlist-menu, .ui-menu-popover, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown) {
+  :is(.playlist-menu, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown) {
     background: var(--glass-menu-solid);
   }
   .track-context-menu > .playlist-menu { background: transparent; }

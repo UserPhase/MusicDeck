@@ -1,0 +1,15 @@
+.continue-collection-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 14px; }
+.resume-collection { display: flex; align-items: center; gap: 16px; min-width: 0; padding: 18px; border: 1px solid var(--panel-border); border-radius: 14px; background: var(--panel-chrome); }
+.resume-ring { position: relative; flex: 0 0 48px; width: 48px; height: 48px; display: grid; place-items: center; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.resume-ring svg { position: absolute; inset: 0; width: 48px; height: 48px; transform: rotate(-90deg); fill: none; stroke-width: 3; }
+.resume-ring-track { stroke: var(--border); }
+.resume-ring-value { stroke: var(--accent); stroke-linecap: round; }
+.resume-ring small { font-size: 9px; color: var(--text-muted); }
+.resume-collection-body { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; min-width: 0; }
+.resume-collection-title { color: var(--text); font-size: 16px; font-weight: 700; text-decoration: none; overflow-wrap: anywhere; }
+.resume-collection-meta { color: var(--text-muted); font-size: 12px; }
+.resume-collection-action { color: var(--accent-text); font: inherit; font-size: 13px; font-weight: 650; border: 1px solid var(--border); border-radius: 7px; padding: 8px 11px; background: rgb(var(--tint-rgb) / 4%); text-align: left; cursor: pointer; }
+.resume-collection-action:hover:not(:disabled) { border-color: var(--accent); background: rgb(var(--tint-rgb) / 8%); }
+.resume-collection-action:disabled { opacity: .6; cursor: wait; }
+.resume-collection-action:focus-visible, .resume-collection-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.resume-error { color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; }

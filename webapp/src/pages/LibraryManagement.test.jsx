@@ -3,21 +3,20 @@ import { MemoryRouter } from "react-router-dom";
 
 import LibraryHealth from "./LibraryHealth";
 import Tracks from "./Tracks";
+import { getPlaylists } from "../api/playlists";
 import {
-  filterLibraryTracks,
+  getTrackPage,
   getAllSongs,
   getLibraryHealth,
   getLibraryStatistics,
-  setMediaRating,
 } from "../api/musicdeck";
 
 jest.mock("../api/musicdeck", () => ({
-  filterLibraryTracks: jest.fn(),
+  getTrackPage: jest.fn(),
   getAllSongs: jest.fn(),
   getCoverUrl: jest.fn((id) => (id ? `/artwork/${id}` : null)),
   getLibraryHealth: jest.fn(),
   getLibraryStatistics: jest.fn(),
-  setMediaRating: jest.fn(async () => ({ ok: true })),
 }));
 
 jest.mock("../api/playlists", () => ({
@@ -34,7 +33,7 @@ jest.mock("../context/PlayerContext", () => ({
 
 beforeEach(() => {
   jest.clearAllMocks();
-  setMediaRating.mockResolvedValue({ ok: true });
+  getPlaylists.mockResolvedValue([]);
 });
 
 test("renders library health and collection statistics", async () => {
@@ -70,9 +69,12 @@ test("renders library health and collection statistics", async () => {
   expect(screen.getByText("Played")).toBeInTheDocument();
 });
 
-test("applies composable track filters and sets ratings", async () => {
+test("applies composable track filters", async () => {
   getAllSongs.mockResolvedValue([{ id: "track-1", title: "Song", artist: "Artist", album: "Album", duration: 120 }]);
-  filterLibraryTracks.mockResolvedValue([{ id: "track-1", title: "Song", artist: "Artist", album: "Album", duration: 120, rating: 5 }]);
+  getTrackPage.mockResolvedValue({
+    items: [{ id: "track-1", title: "Song", artist: "Artist", album: "Album", duration: 120 }],
+    total: 1,
+  });
 
   render(
     <MemoryRouter>
@@ -85,14 +87,13 @@ test("applies composable track filters and sets ratings", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Unplayed" }));
 
   await waitFor(() => {
-    expect(filterLibraryTracks).toHaveBeenCalledWith([
+    expect(getTrackPage).toHaveBeenCalledWith(expect.objectContaining({ filters: [
       { field: "favorite", op: "boolean", value: true },
       { field: "played", op: "boolean", value: false },
-    ]);
+    ] }));
   });
   expect(await screen.findByText("Song")).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: /more options/i }));
-  fireEvent.click(screen.getByRole("button", { name: /rate song 5 stars/i }));
-  expect(setMediaRating).toHaveBeenCalledWith("track", "track-1", 5);
+  expect(screen.queryByRole("menuitem", { name: /rate song/i })).not.toBeInTheDocument();
 });

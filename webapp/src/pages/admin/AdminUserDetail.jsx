@@ -27,7 +27,9 @@ const PREFERENCE_FIELDS = [
     options: [
       ["original", "Original file"],
       ["320", "High (320 kbps)"],
+      ["256", "256 kbps"],
       ["128", "Data saver (128 kbps)"],
+      ["direct", "Direct passthrough"],
     ],
   },
   {

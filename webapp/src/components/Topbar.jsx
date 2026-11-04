@@ -1,3 +1,4 @@
+import TrackArtistLinks from "./TrackArtistLinks";
 import {
   Link,
   useLocation,
@@ -23,19 +24,19 @@ import {
   useAuth,
 } from "../context/AuthContext";
 
-import DownloadsMenu from "./DownloadsMenu";
 import FloatingPanel from "./ui/FloatingPanel";
 import UserAvatar from "./UserAvatar";
 import { useImport } from "../context/ImportContext";
 import { BrandWordmark } from "../context/BrandingContext";
+import { useViewStateValue } from "../hooks/useViewStateStore";
 
 // Primary destinations for header-navigation layouts (YouTube Music, SoundCloud).
 export const HEADER_NAV_ITEMS = [
   { to: "/", label: "Home", exact: true },
-  { to: "/explore", label: "Explore" },
+  { to: "/explore", label: "Discover" },
+  { to: "/saved-discoveries", label: "Saved Discoveries" },
   { to: "/library/playlists", label: "Library", match: "/library" },
   { to: "/liked", label: "Liked Songs" },
-  { to: "/listening-activity", label: "Listening Activity" },
 ];
 
 export function isHeaderNavItemActive(item, pathname) {
@@ -78,7 +79,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
   const [
     searchQuery,
     setSearchQuery,
-  ] = useState("");
+  ] = useViewStateValue("/search", "query", "");
 
   const [
     searchResults,
@@ -349,26 +350,6 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
 
   /*
-   * OPEN ARTIST
-   */
-
-  function handleArtistClick(
-    event,
-    artistId
-  ) {
-
-    event.stopPropagation();
-
-    setShowDropdown(false);
-
-    navigate(
-      `/artist/${artistId}`
-    );
-
-  }
-
-
-  /*
    * RENDER
    */
 
@@ -555,30 +536,8 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
                         </button>
 
 
-                        {song.artistId ? (
-
-                          <button
-                            type="button"
-                            className="search-dropdown-artist"
-                            onClick={(event) =>
-                              handleArtistClick(
-                                event,
-                                song.artistId
-                              )
-                            }
-                          >
-                            {song.artist ||
-                              "Unknown artist"}
-                          </button>
-
-                        ) : (
-
-                          <div className="search-dropdown-artist">
-                            {song.artist ||
-                              "Unknown artist"}
-                          </div>
-
-                        )}
+                        <TrackArtistLinks song={song} className="search-dropdown-artist"
+                          onNavigate={() => setShowDropdown(false)} />
 
                       </div>
 
@@ -667,7 +626,20 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
             <span>Importing 1 Playlist...</span>
           </button>
         )}
-        {user && <DownloadsMenu />}
+        {user && <>
+          <Link to="/downloads" className="topbar-page-icon" aria-label="Downloads" title="Downloads"
+            aria-current={location.pathname === "/downloads" ? "page" : undefined}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M12 3v12m-4-4 4 4 4-4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" />
+            </svg>
+          </Link>
+          <Link to="/listening-activity" className="topbar-page-icon" aria-label="Listening Activity" title="Listening Activity"
+            aria-current={location.pathname === "/listening-activity" ? "page" : undefined}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" />
+            </svg>
+          </Link>
+        </>}
 
         {user ? (
 

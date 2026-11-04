@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { Db } from "../db/database.js";
 import type { CatalogService } from "./catalog.js";
 import { createId } from "../utils/ids.js";
+import { tasteProfile } from "../services/TasteProfileManager.js";
 
 const text = z.string().max(500);
 export const playbackEventSchema = z.object({
@@ -12,6 +13,11 @@ export const playbackEventSchema = z.object({
   listenedSeconds: z.number().finite().min(0).max(86_400),
   durationSeconds: z.number().finite().positive().max(86_400).nullable(),
   finished: z.boolean(),
+  clientName: z.string().trim().min(1).max(100).optional(),
+  privateListening: z.boolean().optional(),
+  excludeFromTaste: z.boolean().optional(),
+  playlistId: z.string().min(1).max(300).nullable().optional(),
+  reportedAt: z.string().datetime().optional(),
   track: z.object({
     title: text,
     artist: text,
@@ -25,7 +31,7 @@ export const playbackEventSchema = z.object({
 export type PlaybackEvent = z.infer<typeof playbackEventSchema>;
 type EventRow = {
   id: string; track_id: string; created_at: string; listened_seconds: number | null;
-  duration_seconds: number | null; counted: number; finished: number; track_json: string | null;
+  duration_seconds: number | null; counted: number; finished: number; track_json: string | null; taste_excluded: number; context_playlist_id: string | null;
 };
 export type ActivityPeriod = "7" | "30" | "90" | "year" | "all";
 
@@ -36,7 +42,16 @@ export function listeningThreshold(db: Db): number {
   return value;
 }
 
-export function recordPlayback(db: Db, userId: string, event: PlaybackEvent, now = Date.now()) {
+/** Scrobble point: 50% of the track or 20 s of actual listening, whichever comes first. */
+export const SCROBBLE_MAX_SECONDS = 20;
+export function scrobblePointSeconds(durationSeconds: number | null | undefined): number {
+  return durationSeconds && durationSeconds > 0
+    ? Math.min(SCROBBLE_MAX_SECONDS, durationSeconds / 2)
+    : SCROBBLE_MAX_SECONDS;
+}
+
+export function recordPlayback(db: Db, userId: string, event: PlaybackEvent, now = Date.now(),
+  outbox?: (id: string, seconds: number, duration: number | null) => void) {
   const started = Date.parse(event.startedAt);
   if (started > now + 5000 || started < now - 30 * 86_400_000) {
     throw new Error("Playback start timestamp is outside the supported session window");
@@ -48,6 +63,8 @@ export function recordPlayback(db: Db, userId: string, event: PlaybackEvent, now
     if (previous && (previous.track_id !== event.trackId || previous.created_at !== event.startedAt)) {
       throw new Error("Playback session cannot be reused for another listen");
     }
+    if (event.reportedAt && (Date.parse(event.reportedAt) < started || Date.parse(event.reportedAt) > now + 5000)) throw new Error("Playback report timestamp is outside the supported session window");
+    const policy = tasteProfile(db).decision(userId, { ...event, playlistId: previous ? previous.context_playlist_id : event.playlistId, reportedAt: event.reportedAt ?? new Date(now).toISOString() }), excluded = Boolean(previous?.taste_excluded || policy.excluded);
     // Cumulative reports can arrive twice or out of order. Never add a retry's
     // seconds, and never credit more real time than the session could contain.
     const seconds = Math.max(previous?.listened_seconds || 0,
@@ -56,14 +73,19 @@ export function recordPlayback(db: Db, userId: string, event: PlaybackEvent, now
     const threshold = Math.min(listeningThreshold(db), duration ?? Infinity);
     const counted = Boolean(previous?.counted) || seconds >= threshold;
     const newlyCounted = counted && !previous?.counted;
+    // Derived from stored seconds, so retries and out-of-order reports scrobble once.
+    const scrobbledBefore = previous
+      ? (previous.listened_seconds || 0) >= scrobblePointSeconds(previous.duration_seconds)
+      : false;
+    const scrobbleDue = !scrobbledBefore && seconds >= scrobblePointSeconds(duration);
     const id = previous?.id || createId("listen");
     const finished = Boolean(previous?.finished) || event.finished;
     const ratio = duration ? Math.min(1, seconds / duration) : null;
     if (previous) {
       db.prepare(`UPDATE listening_events SET listened_seconds = ?, duration_seconds = ?, counted = ?,
-        finished = ?, event_type = ?, completion_ratio = ?, updated_at = ? WHERE id = ? AND user_id = ?`)
+        finished = ?, event_type = ?, completion_ratio = ?, updated_at = ?,taste_excluded=?,taste_recording_key=COALESCE(taste_recording_key,?) WHERE id = ? AND user_id = ?`)
         .run(seconds, duration, Number(counted), Number(finished), counted ? "complete" : "progress", ratio,
-          new Date(now).toISOString(), id, userId);
+          new Date(now).toISOString(), Number(excluded), policy.recordingKey, id, userId);
     } else {
       const artistName = event.track.artist.trim().toLowerCase();
       const albumName = event.track.album.trim().toLowerCase();
@@ -72,13 +94,17 @@ export function recordPlayback(db: Db, userId: string, event: PlaybackEvent, now
         (albumName && albumName !== "unknown album" ? `${artistKey || ""}\u001f${albumName}` : null);
       db.prepare(`INSERT INTO listening_events
         (id,user_id,track_id,event_type,completion_ratio,created_at,playback_session_id,
-         listened_seconds,duration_seconds,counted,finished,updated_at,track_json,artist_key,album_key)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+         listened_seconds,duration_seconds,counted,finished,updated_at,track_json,artist_key,album_key,client_name,taste_excluded,context_playlist_id,taste_recording_key)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id, userId, event.trackId, counted ? "complete" : "progress", ratio, event.startedAt,
           event.playbackSessionId, seconds, duration, Number(counted), Number(finished),
-          new Date(now).toISOString(), JSON.stringify(event.track), artistKey, albumKey);
+          new Date(now).toISOString(), JSON.stringify(event.track), artistKey, albumKey, event.clientName ?? null, Number(excluded), policy.playlistId, policy.recordingKey);
     }
-    return { id, counted, newlyCounted, listenedSeconds: seconds };
+    outbox?.(id, seconds, duration);
+    const tasteChanged = excluded !== Boolean(previous?.taste_excluded) && Boolean(previous);
+    if (tasteChanged || (!excluded && (newlyCounted || event.finished))) tasteProfile(db).bump(userId);
+    if (excluded) db.prepare("UPDATE recently_played SET taste_excluded=1 WHERE user_id=? AND playback_session_id=? AND taste_excluded=0").run(userId, event.playbackSessionId);
+    return { id, counted, newlyCounted, scrobbleDue, listenedSeconds: seconds, tasteExcluded: excluded, tasteChanged, recordingKey: policy.recordingKey };
   })();
 }
 
@@ -138,8 +164,8 @@ export async function listeningHistory(db: Db, catalog: CatalogService, userId: 
     nextCursor: more && last ? Buffer.from(JSON.stringify({ at: last.created_at, id: last.id })).toString("base64url") : null };
 }
 
-export async function activityRecent(db: Db, catalog: CatalogService, userId: string) {
-  const rows = db.prepare(`SELECT * FROM listening_events WHERE user_id = ? AND counted = 1
+export async function activityRecent(db: Db, catalog: CatalogService, userId: string, tasteOnly = false) {
+  const rows = db.prepare(`SELECT * FROM ${tasteOnly ? "taste_listening_events" : "listening_events"} WHERE user_id = ? AND counted = 1
     ORDER BY created_at DESC, id DESC LIMIT 50`).all(userId) as EventRow[];
   return (await hydrateActivity(rows, catalog)).map((item) => ({ ...item.track, playedAt: item.playedAt }));
 }

@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 import { getSpotifyPlaylistImport, startSpotifyPlaylistImport } from "../api/playlists";
 import { useAuth } from "./AuthContext";
+import { assertBrowserIntegrationAllowed } from "../services/privacyPolicy";
 
 const ImportContext = createContext(null);
 const active = (job) => job && (job.status === "queued" || job.status === "running");
@@ -59,6 +60,7 @@ export function ImportProvider({ children }) {
   }, [notice]);
 
   const startImport = useCallback(async (url) => {
+    assertBrowserIntegrationAllowed("imports");
     const started = await startSpotifyPlaylistImport(url);
     setJob(started);
     setIsMinimized(false);

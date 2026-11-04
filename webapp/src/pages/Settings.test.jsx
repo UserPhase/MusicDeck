@@ -4,38 +4,119 @@ import Settings from "./Settings";
 import {
   getUserSettings,
   updateUserSettings,
+  getDataExportSummary,
 } from "../api/musicdeck";
-import {
-  clearLocalBrowserCache,
-  getBrowserStorageUsage,
-} from "../utils/browserCache";
+import { calculateStorageUsage, clearImageCache } from "../services/storage/StorageManager";
 
 
 jest.mock("../api/musicdeck", () => ({
   USER_SETTINGS_CHANGED_EVENT: "musicdeck:user-settings-changed",
   analyzeSilence: jest.fn(async () => ({ status: "completed" })),
   getUserSettings: jest.fn(),
+  getDataExportSummary: jest.fn(async () => ({
+    playlists: [], counts: { playlists: 0, playlistTracks: 0, history: 0, favorites: 0, feedback: 0, ratings: 0, settings: 0, smartPlaylists: 0, savedDiscoveries: 0 },
+    estimatedBytes: { history: 0, favorites: 0, settings: 0, json: 0, zip: 0 }, notes: [],
+  })),
+  downloadUserData: jest.fn(),
+  getLoudnessScan: jest.fn(async () => null),
+  getSilenceScan: jest.fn(async () => null),
+  startSilenceScan: jest.fn(),
+  startLoudnessScan: jest.fn(),
   updateUserSettings: jest.fn(),
 }));
 
-jest.mock("../utils/browserCache", () => ({
-  clearLocalBrowserCache: jest.fn(async () => ({})),
-  formatStorageSize: jest.fn((bytes) => `${bytes / (1024 * 1024)} MB`),
-  getBrowserStorageUsage: jest.fn(async () => ({
+jest.mock("../services/storage/StorageManager", () => ({
+  clearImageCache: jest.fn(async () => 1),
+  purgeStaleWebCache: jest.fn(async () => 0),
+  purgeOfflineTracks: jest.fn(async () => 0),
+  calculateStorageUsage: jest.fn(async () => ({
     supported: true,
     usage: 10 * 1024 * 1024,
     quota: 100 * 1024 * 1024,
+    offlineTracks: 0, offlineBytes: 0,
   })),
 }));
 
 
 beforeEach(() => {
   jest.clearAllMocks();
-  getBrowserStorageUsage.mockResolvedValue({
+  getDataExportSummary.mockResolvedValue({
+    playlists: [], counts: { playlists: 0, playlistTracks: 0, history: 0, favorites: 0, feedback: 0, ratings: 0, settings: 0, smartPlaylists: 0, savedDiscoveries: 0 },
+    estimatedBytes: { history: 0, favorites: 0, settings: 0, json: 0, zip: 0 }, notes: [],
+  });
+  calculateStorageUsage.mockResolvedValue({
     supported: true,
     usage: 10 * 1024 * 1024,
     quota: 100 * 1024 * 1024,
+    offlineTracks: 0, offlineBytes: 0,
   });
+
+});
+
+test("loads smart shuffle, applies mode changes locally and includes the choice in account settings", async () => {
+  localStorage.removeItem("playerShuffleMode");
+  getUserSettings.mockResolvedValue([{ key: "playback.shuffleMode", value: '"smart"' }]);
+  updateUserSettings.mockResolvedValue([]);
+  render(<Settings />);
+  expect(await screen.findByRole("radio", { name: "Smart Shuffle" })).toBeChecked();
+  fireEvent.click(screen.getByRole("radio", { name: "Standard Shuffle" }));
+  expect(localStorage.getItem("playerShuffleMode")).toBe("standard");
+  fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith(expect.objectContaining({ "playback.shuffleMode": "standard" })));
+});
+
+test("loads album awareness and persists the changed policy locally and to the account", async () => {
+  getUserSettings.mockResolvedValue([{ key: "playback.albumAware", value: "true" }]);
+  updateUserSettings.mockResolvedValue([]);
+  render(<Settings />);
+  const toggle = await screen.findByRole("checkbox", { name: "Album-aware playback" });
+  await waitFor(() => expect(toggle).toBeChecked());
+  fireEvent.click(toggle);
+  expect(localStorage.getItem("playerAlbumAware")).toBe("false");
+  fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith(expect.objectContaining({ "playback.albumAware": false })));
+});
+
+test("loads an account loudness target and saves the selected preset", async () => {
+  getUserSettings.mockResolvedValue([{ key: "playback.normalization.targetLufs", value: "-18" }]);
+  updateUserSettings.mockResolvedValue([]);
+  render(<Settings />);
+  const target = await screen.findByRole("combobox", { name: "Loudness target" });
+  expect(target).toHaveValue("-18");
+  fireEvent.change(target, { target: { value: "-14" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith(expect.objectContaining({ "playback.normalization.targetLufs": -14 })));
+});
+
+test("groups loudness controls under normalization and disables them independently of silence trimming", async () => {
+  getUserSettings.mockResolvedValue([
+    { key: "playback.normalization.enabled", value: "false" },
+    { key: "playback.normalization.targetLufs", value: "-18" },
+    { key: "playback.silenceTrim.enabled", value: "true" },
+  ]);
+  render(<Settings />);
+  const group = await screen.findByRole("group", { name: "Volume normalization options" });
+  const target = screen.getByRole("combobox", { name: "Loudness target" });
+  const scan = screen.getByRole("button", { name: "Scan all tracks" });
+  expect(group).toContainElement(target);
+  expect(group).toContainElement(scan);
+  expect(target).toBeDisabled();
+  expect(scan).toBeDisabled();
+  expect(screen.getByRole("checkbox", { name: "Automatic Silence Trimming" })).toBeChecked();
+  const silenceGroup = screen.getByRole("group", { name: "Library silence scan" });
+  expect(silenceGroup).toContainElement(screen.getByRole("button", { name: "Re-analyze current track" }));
+  expect(silenceGroup).toContainElement(screen.getByRole("button", { name: "Analyze all tracks" }));
+  expect(screen.getByRole("button", { name: "Analyze all tracks" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Volume Normalization" }));
+  expect(target).toBeEnabled();
+  expect(target).toHaveValue("-18");
+  expect(scan).toBeEnabled();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Volume Normalization" }));
+  expect(target).toBeDisabled();
+  expect(target).toHaveValue("-18");
+  expect(scan).toBeDisabled();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Automatic Silence Trimming" }));
+  expect(screen.getByRole("button", { name: "Analyze all tracks" })).toBeDisabled();
 });
 
 
@@ -47,7 +128,7 @@ test("loads and updates user settings", async () => {
     { key: "playback.crossfadeDuration", value: "3" },
     { key: "playback.streamQuality", value: "\"original\"" },
     { key: "playback.downloadQuality", value: "\"320kbps\"" },
-    { key: "playback.replayGain.enabled", value: "false" },
+    { key: "playback.normalization.enabled", value: "false" },
     { key: "ui.layoutDensity", value: "\"comfortable\"" },
     { key: "ui.autoOpenSidebar", value: "false" },
     { key: "playback.autoplay.enabled", value: "false" },
@@ -77,7 +158,7 @@ test("loads and updates user settings", async () => {
   fireEvent.click(screen.getByRole("checkbox", { name: /volume normalization/i }));
   expect(localStorage.getItem("playerStreamQuality")).toBe("320");
   expect(localStorage.getItem("playerDownloadQuality")).toBe("256kbps");
-  expect(localStorage.getItem("playerReplayGainEnabled")).toBe("true");
+  expect(localStorage.getItem("playerNormalizationEnabled")).toBe("true");
   fireEvent.click(screen.getByRole("radio", { name: /compact/i }));
   expect(localStorage.getItem("playerLayoutDensity")).toBe("compact");
   fireEvent.click(screen.getByRole("radio", { name: /vinyl mint/i }));
@@ -94,9 +175,13 @@ test("loads and updates user settings", async () => {
       "playback.silenceTrim.thresholdDb": -35,
       "playback.silenceTrim.minSilenceSeconds": 0.5,
       "playback.crossfadeDuration": 7,
+      "playback.transitionMode": "crossfade",
+      "playback.shuffleMode": "standard",
+      "playback.albumAware": false,
       "playback.streamQuality": "320",
       "playback.downloadQuality": "256kbps",
-      "playback.replayGain.enabled": true,
+      "playback.normalization.enabled": true,
+      "playback.normalization.targetLufs": -16,
       "ui.layoutDensity": "compact",
       "ui.accentColor": "#10B981",
       "ui.autoOpenSidebar": true,
@@ -104,6 +189,37 @@ test("loads and updates user settings", async () => {
     });
   });
   expect(await screen.findByText(/settings saved/i)).toBeInTheDocument();
+});
+
+
+test("transition mode loads from the account, gates the crossfade slider, and saves", async () => {
+  localStorage.clear();
+  getUserSettings.mockResolvedValue([
+    { key: "playback.crossfadeDuration", value: "4" },
+    { key: "playback.transitionMode", value: "\"gapless\"" },
+  ]);
+  updateUserSettings.mockResolvedValue([]);
+  render(<Settings />);
+
+  const gapless = await screen.findByRole("radio", { name: "Gapless" });
+  await waitFor(() => expect(gapless).toBeChecked());
+  const slider = screen.getByRole("slider", { name: /crossfade duration/i });
+  expect(slider).toBeDisabled();
+  expect(slider).toHaveValue("4");
+
+  fireEvent.click(screen.getByRole("radio", { name: "Crossfade" }));
+  expect(localStorage.getItem("playerTransitionMode")).toBe("crossfade");
+  expect(slider).toBeEnabled();
+  fireEvent.change(slider, { target: { value: "10" } });
+  expect(screen.getByText("10 s")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("radio", { name: "Off" }));
+  expect(slider).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
+  await waitFor(() => expect(updateUserSettings).toHaveBeenCalledWith(expect.objectContaining({
+    "playback.transitionMode": "none",
+    "playback.crossfadeDuration": 10,
+  })));
 });
 
 
@@ -225,11 +341,11 @@ test("shows storage usage and clears only the local media cache", async () => {
     "aria-valuenow",
     "10",
   );
-  fireEvent.click(screen.getByRole("button", { name: /clear cache/i }));
+  fireEvent.click(screen.getByRole("button", { name: /clear cover art cache/i }));
 
   await waitFor(() => {
-    expect(clearLocalBrowserCache).toHaveBeenCalledTimes(1);
+    expect(clearImageCache).toHaveBeenCalledTimes(1);
   });
-  expect(getBrowserStorageUsage).toHaveBeenCalledTimes(2);
-  expect(await screen.findByText(/preferences and session are still intact/i)).toBeInTheDocument();
+  await waitFor(() => expect(calculateStorageUsage).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText(/preferences and login are unchanged/i)).toBeInTheDocument();
 });

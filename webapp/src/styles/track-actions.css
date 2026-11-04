@@ -1,0 +1,33 @@
+.track-selection-controls { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-height: 56px; padding: 8px 0 12px; color: var(--text-secondary, #aaa); font-size: .78rem; }
+.track-selection-controls button, .universal-track-toolbar button { border: 1px solid var(--border, #444); border-radius: 6px; padding: 10px 14px; background: var(--card, #202020); color: var(--text, #eee); cursor: pointer; font: inherit; min-height: 44px; }
+.track-selection-controls button[aria-pressed="true"] { border-color: var(--accent, #d1ad77); color: var(--accent, #e5bd7e); }
+.track-selectable { touch-action: pan-y pinch-zoom; -webkit-touch-callout: none; }
+.track-selectable .track-title-text { -webkit-user-select: none; user-select: none; }
+.track-selectable a { -webkit-touch-callout: default; -webkit-user-select: text; user-select: text; }
+.track-selection-mode .track-number > :not(.track-selection-checkbox) { display: none; }
+.track-selection-checkbox { appearance: auto; accent-color: var(--accent, #d1ad77); width: 22px; height: 22px; cursor: pointer; margin: 0; }
+.track-selection-mode .track-number { min-height: 44px; display: flex; align-items: center; justify-content: center; }
+.track.track-selection-mode.is-selected { background: color-mix(in srgb, var(--accent, #d1ad77) 16%, transparent); box-shadow: inset 3px 0 var(--accent, #d1ad77); }
+.universal-track-toolbar { position: fixed; bottom: calc(var(--player-height, 90px) + 14px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); z-index: 1000; display: flex; align-items: center; gap: 8px; max-width: calc(100vw - 32px); padding: 12px 16px; border: 1px solid var(--border, #555); border-radius: 12px; box-shadow: 0 12px 36px #0009; background: var(--bg-app, #171717); font-size: .8rem; }
+.universal-track-toolbar strong { white-space: nowrap; padding-right: 8px; font-variant-numeric: tabular-nums; }
+.universal-track-toolbar button:last-of-type { border-color: var(--accent, #d1ad77); }
+.track-context-menu.universal-track-context-menu { position: fixed; z-index: 1200; width: 280px; box-sizing: border-box; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; }
+.universal-track-context-menu [role="menuitem"], .universal-track-context-menu [role="menuitemcheckbox"] { min-height: 44px; }
+.universal-track-context-menu [role="group"] button { min-height: 44px; }
+.universal-track-context-menu .track-context-menu-error, .track-action-notice { padding: 10px 14px; line-height: 1.5; font-size: .8rem; overflow-wrap: anywhere; }
+.universal-track-context-menu .track-action-notice { color: var(--text-secondary, #bbb); }
+.track-selection-controls button:focus-visible, .universal-track-toolbar button:focus-visible, .track-selection-checkbox:focus-visible { outline: 2px solid var(--accent, #d1ad77); outline-offset: 3px; }
+.universal-track-toolbar button:disabled, .track-selection-controls button:disabled { opacity: .45; cursor: default; }
+@media (max-width: 600px) {
+  .track-selection-controls { display: grid; grid-template-columns: auto minmax(0, 1fr); justify-content: flex-start; }
+  .track-selection-controls span { max-width: 38ch; }
+  .universal-track-toolbar { width: calc(100vw - 24px); max-width: none; padding: 10px; flex-wrap: wrap; box-sizing: border-box; gap: 6px; }
+  .universal-track-toolbar strong { flex: 1; }
+  .universal-track-toolbar button:last-of-type { width: 100%; }
+  .universal-track-toolbar button { flex: 0 1 auto; }
+}
+
+.universal-track-context-menu .track-context-menu-copy > span { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.35; }
+.track-action-scope-error { color: var(--danger-text, #fda4af); border-left: 2px solid currentColor; padding: 10px 14px; line-height: 1.5; }
+.track-action-scope-error button { margin-left: 12px; border: 1px solid currentColor; padding: 6px 10px; background: transparent; color: inherit; border-radius: 5px; cursor: pointer; }
+.track-action-scope { display: contents; }

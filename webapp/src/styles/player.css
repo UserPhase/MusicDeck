@@ -1,6 +1,7 @@
 .player { position: fixed; left: 0; right: 0; bottom: 0; height: var(--player-height); padding: 0 24px; background: var(--player-bg); border-top: 1px solid rgb(var(--tint-rgb) / 10%); display: grid; grid-template-columns: minmax(220px, 1fr) minmax(400px, 1.5fr) minmax(220px, 1fr); align-items: center; gap: 20px; z-index: 20; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
 .player-toast { position: absolute; left: 50%; bottom: calc(100% + 10px); max-width: min(380px, calc(100vw - 32px)); padding: 9px 13px; border: 1px solid var(--border-hover); border-radius: 8px; background: color-mix(in srgb, var(--card) 94%, transparent); color: var(--text-secondary); box-shadow: 0 10px 28px rgb(0 0 0 / 34%); font-size: 12px; transform: translateX(-50%); }
-.player-right { display: flex; align-items: center; justify-content: flex-end; gap: 18px; min-width: 0; }
+.player-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2); min-width: 0; }
+.player-streaming-controls { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
 .now-playing { display: flex; align-items: center; min-width: 0; }
 .now-cover { width: 56px; height: 56px; flex-shrink: 0; overflow: hidden; border-radius: 5px; }
 .now-cover img { width: 100%; height: 100%; object-fit: cover; }
@@ -9,9 +10,6 @@
 .now-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .audio-badge { display: inline-flex; align-items: center; width: fit-content; padding: 2px 6px; border: 1px solid transparent; border-radius: 6px; font-size: 10px; font-weight: 700; line-height: 1; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .audio-badge-preview { border-color: #a855f7; background: rgb(88 28 135 / 50%); color: #d8b4fe; }
-.audio-badge-lossless { border-color: color-mix(in srgb, var(--badge-lossless) 20%, transparent); background: color-mix(in srgb, var(--badge-lossless) 10%, transparent); color: var(--badge-lossless); }
-.audio-badge-high { border-color: color-mix(in srgb, var(--badge-high) 20%, transparent); background: color-mix(in srgb, var(--badge-high) 10%, transparent); color: var(--badge-high); }
-.audio-badge-standard { border-color: transparent; background: var(--nav-active); color: var(--text-muted); }
 .now-audio-badge { margin-left: 8px; vertical-align: middle; }
 .now-preview-import { margin-left: 8px; padding: 3px 7px; border: 1px solid rgb(168 85 247 / 55%); border-radius: 999px; background: rgb(88 28 135 / 32%); color: #e9d5ff; font-size: 10px; font-weight: 700; line-height: 1.2; white-space: nowrap; cursor: pointer; transition: background 150ms ease, border-color 150ms ease, color 150ms ease; }
 .now-preview-import:hover:not(:disabled) { border-color: #c084fc; background: rgb(126 34 206 / 44%); color: var(--text); }
@@ -72,8 +70,11 @@
 .player-queue-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
 .player-queue-artist { margin-top: 2px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .player-queue-empty { padding: 20px; color: var(--text-muted); font-size: 13px; text-align: center; }
-.volume { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-muted); }
+.volume { display: flex; align-items: center; gap: var(--space-1); min-width: 0; color: var(--text-muted); }
+.player-mute-button { display: grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.player-mute-button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.player-mute-button:hover { color: var(--text); background: var(--card-hover); }
+.player-mute-button:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
 .volume input { width: 100px; max-width: 100%; accent-color: var(--accent); cursor: pointer; }
 .player-volume { width: 100px; accent-color: var(--accent); cursor: pointer; }
 .now-artist { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 12px; text-decoration: none; }
-.now-artist:hover { color: var(--text); }

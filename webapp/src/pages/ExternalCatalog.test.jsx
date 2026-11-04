@@ -22,12 +22,20 @@ import {
   hydrateExternalPreviews,
   getExplore,
   getRecommendations,
+  getPersonalizedDiscovery,
   searchNavidrome,
   matchLibraryItems,
   setMediaFavorite,
 } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
 import { getWikipediaBiography } from "../services/biographyFallback";
+import { canStreamPreview, findItunesPreview } from "../utils/previewPlayback";
+
+jest.mock("../utils/previewPlayback", () => ({
+  ...jest.requireActual("../utils/previewPlayback"),
+  canStreamPreview: jest.fn(),
+  findItunesPreview: jest.fn(),
+}));
 
 // Mirrors App.js, which provides the shared artist-overview query client.
 function render(ui, options) {
@@ -41,6 +49,7 @@ function render(ui, options) {
 
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
+  getLikedAlbums: jest.fn(async () => []),
   getAlbums: jest.fn(async () => []),
   getArtist: jest.fn(),
   getArtistPortrait: jest.fn(async () => null),
@@ -55,6 +64,7 @@ jest.mock("../api/musicdeck", () => ({
   hydrateExternalPreviews: jest.fn(),
   getExplore: jest.fn(),
   getRecommendations: jest.fn(async () => ({ sections: [], degraded: false })),
+  getPersonalizedDiscovery: jest.fn(),
   searchNavidrome: jest.fn(),
   matchLibraryItems: jest.fn(async () => []),
   setMediaFavorite: jest.fn(),
@@ -76,6 +86,7 @@ jest.mock("../context/PlayerContext", () => ({
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
+const playContext = jest.fn();
 const playSongFromSource = jest.fn();
 const chartArtwork = "https://cdn-images.dzcdn.net/images/cover/chart/1000x1000.jpg";
 const chartArtistArtwork = "https://cdn-images.dzcdn.net/images/artist/chart/1000x1000.jpg";
@@ -88,8 +99,11 @@ const chartData = {
 beforeEach(() => {
   artistOverviewQueryClient.clear();
   jest.clearAllMocks();
+  canStreamPreview.mockImplementation(async url => Boolean(url));
+  findItunesPreview.mockResolvedValue(null);
   getCoverUrl.mockImplementation((id) => (id ? typeof id === "object" ? id.url : `/artwork/${id}` : null));
   getAlbums.mockResolvedValue([]);
+  getArtist.mockResolvedValue({ album: [] });
   getArtistTracks.mockResolvedValue([]);
   getArtistPortrait.mockResolvedValue(null);
   getMusicBrainzArtistPortrait.mockResolvedValue(null);
@@ -113,9 +127,11 @@ beforeEach(() => {
   getArtistTopTracks.mockResolvedValue([]);
   hydrateExternalPreviews.mockResolvedValue([]);
   getRecommendations.mockResolvedValue({ sections: [], degraded: false });
+  getPersonalizedDiscovery.mockResolvedValue({ tracks: [], artists: [], albums: [], personalized: true, degraded: false, message: null });
   usePlayer.mockReturnValue({
     playSong,
     playQueue,
+    playContext,
     playSongFromSource,
   });
 });
@@ -158,6 +174,31 @@ test("renders an external album in the shared album page", async () => {
   expect(screen.getByText("External Song")).toBeInTheDocument();
   expect(screen.getByLabelText(/available externally/i)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /play preview of external song/i })).toBeInTheDocument();
+});
+
+test("clicking an undownloaded discovery album opens its complete album page rather than search", async () => {
+  getAlbum.mockResolvedValue({ id: "external_deezer_album_201", name: "Chart Album", artist: "Chart Artist",
+    trackCount: 2, localTrackCount: 0, source: { kind: "external", count: 0 }, coverArt: { url: chartArtwork },
+    song: [
+      { id: "external_deezer_track_1", title: "First Discovery Track", artist: "Chart Artist", duration: 180,
+        provider: "deezer", source: { kind: "external", count: 0 }, previewUrl: "https://cdns-preview-a.dzcdn.net/first.mp3" },
+      { id: "external_deezer_track_2", title: "Second Discovery Track", artist: "Chart Artist", duration: 200,
+        provider: "deezer", source: { kind: "external", count: 0 }, previewUrl: "https://cdns-preview-a.dzcdn.net/second.mp3" },
+    ] });
+  render(<MemoryRouter initialEntries={["/explore"]}><Routes>
+    <Route path="/explore" element={<Explore />} />
+    <Route path="/album/:id" element={<Album />} />
+    <Route path="/search" element={<p>Unexpected search page</p>} />
+  </Routes></MemoryRouter>);
+  fireEvent.click(await screen.findByRole("link", { name: "Open Chart Album" }));
+  expect(await screen.findByRole("heading", { name: "Chart Album" })).toBeInTheDocument();
+  expect(screen.queryByText("Unexpected search page")).not.toBeInTheDocument();
+  expect(getAlbum).toHaveBeenCalledWith("external_deezer_album_201");
+  expect(screen.getByText("0 / 2 in library")).toBeInTheDocument();
+  expect(screen.getByText("First Discovery Track")).toBeInTheDocument();
+  expect(screen.getByText("Second Discovery Track")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Play preview of First Discovery Track" }));
+  expect(playContext).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ title: "First Discovery Track" })]), 0, expect.objectContaining({ type: "album" }));
 });
 
 test("renders an external artist in the shared artist page and links albums", async () => {
@@ -485,7 +526,8 @@ test("artist page shows keyless catalog albums and popular tracks without inflat
     tracks: [{ id: "local-track", title: "Local Song", artistId: "queen-id", artist: "Queen" }],
     topTracks: [
       { id: "external_deezer_track_43", title: "Popular Queen Song", artistId: "queen-id", artist: "Queen", source: { kind: "external", count: 0 } },
-      { id: "local-track", title: "Local Song", artistId: "queen-id", artist: "Queen" },
+      { id: "local-track", title: "Local Song", artistId: "queen-id", artist: "Queen", source: { kind: "library", count: 1 },
+        metadata: { audioMetadata: { codec: "flac" } } },
     ],
     localAlbumCount: 1,
     localSongCount: 1,
@@ -508,6 +550,9 @@ test("artist page shows keyless catalog albums and popular tracks without inflat
   const rows = within(screen.getByRole("table", { name: "Artist tracks" })).getAllByRole("row");
   expect(rows[1]).toHaveAttribute("aria-label", "Popular Queen Song by Queen");
   expect(rows[2]).toHaveAttribute("aria-label", "Local Song by Queen");
+  expect(within(rows[1]).queryByLabelText("In your library")).not.toBeInTheDocument();
+  expect(within(rows[2]).queryByLabelText("In your library")).not.toBeInTheDocument();
+  expect(within(rows[2]).getByText("FLAC")).toBeInTheDocument();
 });
 
 test("artist page shows local music before slower external enrichment finishes", async () => {
@@ -555,19 +600,18 @@ test("artist page shows local music before slower external enrichment finishes",
 
 test("renders personalized Explore songs alongside Deezer charts", async () => {
   getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
-  getRecommendations.mockResolvedValue({
-    sections: [{
-      id: "discover",
-      title: "Discover something new",
-      items: [{
-        id: "md_track_1",
+  getPersonalizedDiscovery.mockResolvedValue({
+      tracks: [{
+        id: "external_deezer_track_1",
         type: "track",
         title: "Recommended Song",
         artist: "Artist One",
         coverArt: "art-1",
+        external: true,
+        previewUrl: "https://cdns-preview-a.dzcdn.net/recommended.mp3",
         metadata: { recommendationReason: "Because you listen to Artist One" },
       }],
-    }],
+    artists: [], albums: [], personalized: true,
     degraded: false,
   });
 
@@ -591,8 +635,9 @@ test("renders personalized Explore songs alongside Deezer charts", async () => {
   expect([...document.querySelectorAll(".explore-page section h2")].map((heading) => heading.textContent)).toEqual(headings);
   const artists = screen.getByRole("heading", { name: "Artists Popular Externally" }).closest("section");
   expect(within(artists).getByRole("link", { name: "Chart Artist" })).toBeInTheDocument();
-  expect(artists.querySelector("img")).not.toBeInTheDocument();
   expect(artists.querySelector(".artist-avatar-fallback text")).toHaveTextContent("CA");
+  // External chart artists supply their own photo, which fades in over the initials.
+  await waitFor(() => expect(artists.querySelector("img.artist-avatar-photo")).toHaveAttribute("src", chartArtistArtwork));
   const albums = screen.getByRole("heading", { name: "Albums Popular Externally" }).closest("section");
   expect(albums.querySelector("img")).toHaveAttribute("src", chartArtwork);
   expect(screen.getByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
@@ -625,7 +670,7 @@ test("hydrates missing Explore chart previews after rendering the initial rows",
 });
 
 test("renders Explore discovery using neutral results", async () => {
-  getExplore.mockResolvedValue({
+  getPersonalizedDiscovery.mockResolvedValue({
     albums: [{
       id: "external_itunes_album_10",
       title: "External Album",
@@ -639,7 +684,7 @@ test("renders Explore discovery using neutral results", async () => {
       coverArt: null,
       source: { kind: "external", count: 0 },
     }],
-    songs: [{
+    tracks: [{
       id: "external_itunes_30",
       title: "External Song",
       artist: "External Artist",
@@ -664,30 +709,98 @@ test("renders Explore discovery using neutral results", async () => {
   });
 });
 
-test("resolves a Deezer featured album locally before playing or saving it", async () => {
+test("previews a Deezer featured album through its detail route without requiring a local copy", async () => {
   getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
   getRecommendations.mockResolvedValue({ sections: [], degraded: false });
   searchNavidrome.mockResolvedValue({
     results: { album: [{ id: "catalog-chart-album", title: "Chart Album", artist: "Chart Artist" }] },
   });
-  getAlbum.mockResolvedValue({ song: [{ id: "resolved-track" }] });
+  const stale = "https://cdns-preview-a.dzcdn.net/stale.mp3";
+  canStreamPreview.mockImplementation(async url => Boolean(url && url !== stale));
+  getAlbum.mockResolvedValue({ song: [
+    { id: "stale-track", external: true, previewUrl: stale },
+    { id: "resolved-track", external: true, previewUrl: "https://cdns-preview-a.dzcdn.net/album.mp3" },
+  ] });
   setMediaFavorite.mockResolvedValue({ ok: true });
 
   render(<MemoryRouter><Explore /></MemoryRouter>);
   const featured = (await screen.findByRole("heading", { name: "Chart Album" })).closest("article");
   fireEvent.click(within(featured).getByRole("button", { name: /play/i }));
-  await waitFor(() => expect(playQueue).toHaveBeenCalledWith([{ id: "resolved-track" }], 0));
-  expect(searchNavidrome).toHaveBeenCalledWith("Chart Album", { mode: "library" });
+  await waitFor(() => expect(playQueue).toHaveBeenCalledWith([expect.objectContaining({ id: "resolved-track" })], 0,
+    expect.objectContaining({ type: "album", id: "external_deezer_album_201", name: "Chart Album" })));
+  expect(getAlbum).toHaveBeenCalledWith("external_deezer_album_201");
+  expect(searchNavidrome).not.toHaveBeenCalled();
 
-  fireEvent.click(within(featured).getByRole("button", { name: "Save to Library" }));
-  await waitFor(() => expect(setMediaFavorite).toHaveBeenCalledWith("album", "catalog-chart-album", true));
+  expect(within(featured).getByRole("link", { name: "View album" })).toHaveAttribute("href", "/album/external_deezer_album_201");
+  expect(screen.queryByRole("button", { name: /Save for later|Save to Library|Add to Library/i })).not.toBeInTheDocument();
+  expect(setMediaFavorite).not.toHaveBeenCalled();
 });
 
-test("plays a Deezer chart track directly so the player can use its embedded preview", async () => {
-  getExplore.mockResolvedValue({ albums: [], artists: [], songs: [], degraded: false });
+test("falls back to iTunes when a Deezer chart track has no playable preview", async () => {
+  const fallback = "https://audio-ssl.itunes.apple.com/chart-song.m4a";
+  findItunesPreview.mockResolvedValue(fallback);
   render(<MemoryRouter><Explore /></MemoryRouter>);
 
   fireEvent.click(await screen.findByRole("button", { name: "Play Chart Song" }));
-  await waitFor(() => expect(playSong).toHaveBeenCalledWith(expect.objectContaining({ title: "Chart Song" })));
+  await waitFor(() => expect(playSong).toHaveBeenCalledWith(expect.objectContaining({
+    title: "Chart Song", previewUrl: fallback, source: { kind: "external", count: 0 },
+  })));
+  expect(searchNavidrome).not.toHaveBeenCalled();
+});
+
+test("all Discover shelves use external favourites and adjacent picks instead of library recommendations", async () => {
+  const source = { kind: "external", count: 0 };
+  const track = { id: "external_deezer_track_901", title: "Fresh Favourite Song", artist: "Favourite Artist", external: true, source,
+    previewUrl: "https://cdns-preview-a.dzcdn.net/fresh.mp3", discoveryGroup: "favourite", recommendationReason: "More from Favourite Artist" };
+  getExplore.mockResolvedValue({ songs: [{ id: "owned-track", title: "Owned track" }], artists: [], albums: [] });
+  getRecommendations.mockResolvedValue({ sections: [{ id: "discover", items: [{ id: "owned-track", title: "Owned track" }] }] });
+  getPersonalizedDiscovery.mockResolvedValue({
+    tracks: [track, { ...track, id: "external_deezer_track_902", title: "Adjacent Song", artist: "Adjacent Artist", discoveryGroup: "adjacent" }],
+    artists: [{ id: "external_deezer_artist_91", name: "Favourite Artist", external: true, source,
+      recommendationReason: "More from Favourite Artist" }, { id: "external_deezer_artist_92", name: "Adjacent Artist", external: true, source }],
+    albums: [{ id: "external_deezer_album_91", title: "Fresh Favourite Album", artist: "Favourite Artist", external: true, source },
+      { id: "external_deezer_album_92", title: "Adjacent Album", artist: "Adjacent Artist", external: true, source }],
+    personalized: true, degraded: false,
+  });
+  render(<MemoryRouter><Explore /></MemoryRouter>);
+  const songs = within(screen.getByRole("region", { name: "Discover Songs" }));
+  fireEvent.click(await songs.findByRole("button", { name: /Play.*Fresh Favourite Song/ }));
+  await waitFor(() => expect(playSong).toHaveBeenCalledWith(expect.objectContaining({ id: track.id, previewUrl: track.previewUrl, external: true })));
+  expect(songs.getByText("Adjacent Song")).toBeInTheDocument();
+  const artists = within(screen.getByRole("region", { name: "Discover Artists" }));
+  expect(artists.getByText("New artists connected to your favourites")).toBeInTheDocument();
+  expect(artists.getByRole("link", { name: "Favourite Artist" })).toHaveAttribute("href", "/artist/ext%3Adeezer%3A91");
+  expect(artists.getByRole("link", { name: "Adjacent Artist" })).toHaveAttribute("href", "/artist/ext%3Adeezer%3A92");
+  const albums = within(screen.getByRole("region", { name: "Discover Albums" }));
+  expect(albums.getByRole("link", { name: "Open Fresh Favourite Album" })).toHaveAttribute("href", "/album/external_deezer_album_91");
+  expect(albums.getByRole("link", { name: "Open Adjacent Album" })).toHaveAttribute("href", "/album/external_deezer_album_92");
+  expect(screen.queryByText("Owned track")).not.toBeInTheDocument();
+  expect(getExplore).not.toHaveBeenCalled();
+  expect(getRecommendations).not.toHaveBeenCalled();
+  expect(getPersonalizedDiscovery).toHaveBeenCalledTimes(1);
+});
+
+test("charts render while personalised discovery loads and a discovery failure never falls back to owned music", async () => {
+  let rejectDiscovery;
+  getPersonalizedDiscovery.mockImplementation(() => new Promise((_resolve, reject) => { rejectDiscovery = reject; }));
+  getExplore.mockResolvedValue({ songs: [{ id: "owned", title: "Owned fallback" }], artists: [], albums: [] });
+  render(<MemoryRouter><Explore /></MemoryRouter>);
+  expect(await screen.findByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
+  expect(within(screen.getByRole("region", { name: "Discover Songs" })).getByLabelText("Loading section")).toBeInTheDocument();
+  await act(async () => rejectDiscovery(new Error("Discovery unavailable")));
+  expect(within(screen.getByRole("region", { name: "Discover Songs" })).getByRole("status")).toHaveTextContent("Discovery unavailable");
+  expect(screen.queryByText("Owned fallback")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
+});
+
+test("missing albums preview their first available song without searching the library", async () => {
+  getPersonalizedDiscovery.mockResolvedValue({ tracks: [], artists: [], albums: [
+    { id: "external_deezer_album_777", title: "Missing Album", artist: "Artist", external: true }], personalized: true });
+  const preview = { id: "preview", previewUrl: "https://cdns-preview-a.dzcdn.net/album-preview.mp3" };
+  getAlbum.mockResolvedValue({ name: "Missing Album", song: [{ id: "no-preview" }, preview] });
+  render(<MemoryRouter><Explore /></MemoryRouter>);
+  fireEvent.click(await screen.findByRole("button", { name: "Play Missing Album" }));
+  await waitFor(() => expect(playQueue).toHaveBeenCalledWith([expect.objectContaining({ ...preview, source: { kind: "external", count: 0 } })], 0,
+    expect.objectContaining({ type: "album", id: "external_deezer_album_777" })));
   expect(searchNavidrome).not.toHaveBeenCalled();
 });

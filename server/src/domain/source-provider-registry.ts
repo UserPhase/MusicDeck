@@ -8,6 +8,8 @@ import type { PlayableSource, SourceProvider, SourceResolutionOptions } from "./
 import { normalizeMusicText } from "./music-identity.js";
 import { compareSourceQuality, SourcePipelineProvider, type SourcePipelineRegistry } from "./source-discovery.js";
 import { classifyPluginError } from "../plugins/plugin-errors.js";
+import { redactConfig } from "../utils/config-redaction.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 type ConfigRow = {
   provider_id: string;
@@ -25,10 +27,7 @@ function readConfig(json: string) {
 }
 
 function publicConfig(config: Record<string, unknown>) {
-  return Object.fromEntries(Object.entries(config).map(([key, value]) => [
-    key,
-    /(key|token|secret|password)/i.test(key) ? Boolean(value) : value,
-  ]));
+  return redactConfig(config, "presence");
 }
 
 type StoredSource = {
@@ -342,11 +341,12 @@ export class SourceProviderRegistry {
     fetchImpl?: typeof fetch,
     private readonly pipeline?: SourcePipelineRegistry
   ) {
+    const network = gateFetch(fetchImpl);
     this.providers = [
       new LibrarySourceProvider(library, providers),
-      new DeezerPreviewSourceProvider(fetchImpl),
-      new ItunesPreviewSourceProvider(fetchImpl),
-      ...(pipeline ? [new SourcePipelineProvider(pipeline, fetchImpl)] : []),
+      new DeezerPreviewSourceProvider(network),
+      new ItunesPreviewSourceProvider(network),
+      ...(pipeline ? [new SourcePipelineProvider(pipeline, network)] : []),
     ];
   }
 

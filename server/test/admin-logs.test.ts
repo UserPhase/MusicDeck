@@ -134,6 +134,24 @@ describe("log capture", () => {
     expect(buffer.list().map((e) => [e.level, e.message])).toEqual([["info", "one"], ["error", "two"]]);
   });
 
+  test("Docker/terminal output is redacted before forwarding, not just in the admin buffer", () => {
+    const buffer = new LogBuffer();
+    const written: string[] = [];
+    const stream = createLogCaptureStream(buffer, { write: (chunk) => { written.push(chunk); } });
+    stream.write(JSON.stringify({
+      level: 50, msg: "operation failed", err: { message: "Provider token=fixture-secret-value", stack: "EACCES password=fixture-password-value" },
+      details: { credentials: { value: "opaque-credential-value" } },
+    }) + "\n");
+    const output = written.join("");
+    for (const secret of ["fixture-secret-value", "fixture-password-value", "opaque-credential-value"]) {
+      expect(output).not.toContain(secret);
+      expect(JSON.stringify(buffer.list())).not.toContain(secret);
+    }
+    expect(output).toContain("operation failed");
+    expect(output).toContain("[REDACTED]");
+    expect(JSON.parse(output).err.stack).toContain("EACCES");
+  });
+
   test("formats console arguments and keeps the first error stack", () => {
     const error = new Error("disk full");
     const formatted = formatConsoleArgs(["Import failed", error, { id: 3 }]);

@@ -13,6 +13,8 @@ export type SearchResult = {
  */
 export interface CatalogProvider {
   listAlbums(limit?: number): Promise<Album[]>;
+  /** Complete enumeration for a paginated library snapshot. */
+  listAllAlbums?(): Promise<Album[]>;
   getAlbum(albumId: string): Promise<Album | null>;
   getAlbumTracks(albumId: string): Promise<Track[]>;
   listArtists(): Promise<Artist[]>;

@@ -67,6 +67,19 @@ Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin.
     - MUSICDECK_PUBLIC_URL: Your server's LAN IP (e.g., http://192.168.1.50:8080).
       - Tip (Find your Server IP): Run  `ip -4  addr` in your server terminal. Look for your primary network interface (e.g., enp3s0 or eth0) and use the IP address listed after inet.
 
+  - For restricted LAN access, set `MUSICDECK_WEB_BIND`, `NAVIDROME_BIND`, and
+    `JELLYFIN_BIND` to that host LAN IP. `127.0.0.1` permits host-local access
+    only; `0.0.0.0` (the onboarding template) binds all IPv4 interfaces, not just
+    your LAN. Firewall published ports to trusted networks and never
+    port-forward these setup/admin interfaces to the internet. See
+    [network restrictions](./docs/SELF_HOSTING.md#backend-bindings-and-network-restrictions).
+
+  - The template enables HTTP on a trusted LAN with
+    `MUSICDECK_SECURE_COOKIES=false`. Prefer HTTPS for long-term use; for a
+    same-host TLS proxy, set `MUSICDECK_WEB_BIND=127.0.0.1`,
+    `MUSICDECK_SECURE_COOKIES=true`, and an HTTPS public URL. HTTP exposes
+    credentials/session traffic to observers on the network.
+
 - Set MusicDeck credentials:
 
   - MUSICDECK_SESSION_SECRET: Set a long random string (e.g., run 'openssl rand -hex 32' in a terminal).
@@ -84,7 +97,7 @@ Option A: Navidrome Setup
     docker compose pull && docker compose up -d
 ```
 
-  - Open http://[YOUR_SERVER_IP]:4533 in your browser and create the admin account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD from your .env.
+  - From another device on your LAN, open http://[YOUR_SERVER_IP]:4533 and create the account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD. No SSH or Compose edits are required; the host binding and port can be configured in `.env`.
 
 Option B: Jellyfin Setup
 
@@ -94,7 +107,7 @@ Option B: Jellyfin Setup
     docker compose pull && docker compose up -d jellyfin
 ```
     
-  - Open http://[YOUR_SERVER_IP]:8096 in your browser, complete the initial setup wizard, and log in.
+  - From another device on your LAN, open http://[YOUR_SERVER_IP]:8096, complete the setup wizard, and log in. Keep the binding reachable by that LAN device until the API key is created; ongoing direct access remains available.
 
   - Go to Dashboard -> API Keys, create a new API key (e.g., named "MusicDeck"), and copy the key string.
 
@@ -206,4 +219,3 @@ disabled deterministic example source provider) that future external providers
 will use without exposing provider URLs or credentials to the browser. Future
 search providers use the same normalized result contract and are managed from
 this section.
-

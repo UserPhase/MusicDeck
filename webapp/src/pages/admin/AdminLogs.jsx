@@ -1,6 +1,7 @@
 import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { adminLogsStreamUrl, clearAdminLogs, getAdminLogs } from "../../api/musicdeck";
+import "../../styles/admin-logs.css";
 
 export const MAX_CLIENT_LOGS = 1000;
 

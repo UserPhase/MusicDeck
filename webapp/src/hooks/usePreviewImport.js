@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { createAcquisition } from "../api/musicdeck";
+import { usePrivacy } from "../context/PrivacyContext";
 
 const LABELS = {
   idle: "Import full song",
@@ -14,6 +15,7 @@ const LABELS = {
  * surface (bottom bar, Apple header player, drawer player).
  */
 export function usePreviewImport(currentSong) {
+  const { canImport } = usePrivacy();
   const [importState, setImportState] = useState("idle");
 
   useEffect(() => {
@@ -21,7 +23,7 @@ export function usePreviewImport(currentSong) {
   }, [currentSong?.id]);
 
   async function importPreviewTrack() {
-    if (!currentSong || importState === "loading") return;
+    if (!canImport || !currentSong || importState === "loading") return;
     setImportState("loading");
     try {
       await createAcquisition({

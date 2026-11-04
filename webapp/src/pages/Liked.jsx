@@ -1,3 +1,4 @@
+import TrackActionScope from "../components/TrackActionScope";
 import {
   useEffect,
   useRef,
@@ -13,10 +14,6 @@ import TrackRow from "../components/TrackRow";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
 import FloatingPanel from "../components/ui/FloatingPanel";
 
-import {
-  getPlaylists,
-  addSongToPlaylist as addSongToPlaylistRequest,
-} from "../api/playlists";
 
 import {
   usePlayer,
@@ -64,51 +61,6 @@ function Liked() {
   function handleTrackPlayback(song, index) {
     playContext(songs, index, playbackContext);
   }
-
-
-  const [
-    playlistMenuSong,
-    setPlaylistMenuSong,
-  ] = useState(null);
-
-
-  const [
-    playlists,
-    setPlaylists,
-  ] = useState([]);
-
-  const [
-    playlistsLoading,
-    setPlaylistsLoading,
-  ] = useState(false);
-
-  const [
-    addingToPlaylist,
-    setAddingToPlaylist,
-  ] = useState(false);
-
-
-  useEffect(() => {
-
-    function handleDocumentClick() {
-      setPlaylistMenuSong(null);
-    }
-
-    document.addEventListener(
-      "mousedown",
-      handleDocumentClick
-    );
-
-    return () => {
-
-      document.removeEventListener(
-        "mousedown",
-        handleDocumentClick
-      );
-
-    };
-
-  }, []);
 
 
   /*
@@ -190,108 +142,6 @@ function Liked() {
       0,
       playbackContext
     );
-
-  }
-
-
-  /*
-   * Load playlists
-   */
-
-  async function loadPlaylists() {
-
-    try {
-
-      setPlaylistsLoading(true);
-
-      const data =
-        await getPlaylists();
-
-      setPlaylists(data);
-
-    } catch (error) {
-
-      console.error(
-        "Could not load playlists:",
-        error
-      );
-
-    } finally {
-
-      setPlaylistsLoading(false);
-
-    }
-
-  }
-
-
-  /*
-   * Open / close playlist menu
-   */
-
-  async function togglePlaylistMenu(song) {
-
-    if (
-      playlistMenuSong?.id === song.id
-    ) {
-
-      setPlaylistMenuSong(null);
-
-      return;
-
-    }
-
-
-    setPlaylistMenuSong(song);
-
-    if (playlists.length === 0) {
-
-      await loadPlaylists();
-
-    }
-
-  }
-
-
-  /*
-   * Add song to playlist
-   */
-
-  async function addSongToPlaylist(
-    event,
-    playlist,
-    song
-  ) {
-
-    event.stopPropagation();
-
-    if (addingToPlaylist) {
-      return;
-    }
-
-    try {
-
-      setAddingToPlaylist(true);
-
-      await addSongToPlaylistRequest(
-        playlist.id,
-        song.id
-      );
-
-      setPlaylistMenuSong(null);
-
-    } catch (error) {
-
-      console.error(
-        "Could not add song to playlist:",
-        error
-      );
-
-    } finally {
-
-      setAddingToPlaylist(false);
-
-    }
 
   }
 
@@ -460,7 +310,7 @@ function Liked() {
 
       {/* TRACK LIST */}
 
-      <div className="track-list" role="table" aria-label="Liked tracks">
+      <TrackActionScope tracks={songs} dataKey="liked-tracks"><div className="track-list" role="table" aria-label="Liked tracks">
 
         <TrackListHeader />
 
@@ -480,63 +330,8 @@ function Liked() {
               index={index}
               onPlay={handleTrackPlayback}
               onSelectSource={playSongFromSource}
-              onToggleMenu={togglePlaylistMenu}
-              menu={playlistMenuSong?.id === song.id ? (
-                <div className="playlist-menu">
 
-                    <div className="playlist-menu-title">
-                      Add to playlist
-                    </div>
 
-                    {playlistsLoading && (
-
-                      <div className="playlist-menu-item">
-                        Loading...
-                      </div>
-
-                    )}
-
-                    {!playlistsLoading &&
-                      playlists.map(
-                        (playlist) => (
-
-                        <button
-                          key={playlist.id}
-                          className="playlist-menu-item"
-                          disabled={
-                            addingToPlaylist
-                          }
-                          onClick={(event) =>
-                            addSongToPlaylist(
-                              event,
-                              playlist,
-                              song
-                            )
-                          }
-                        >
-
-                          <span>
-                            ♫
-                          </span>
-
-                          <span>
-                            {playlist.name}
-                          </span>
-
-                        </button>
-
-                      ))}
-
-                    {!playlistsLoading &&
-                      playlists.length === 0 && (
-
-                      <div className="playlist-menu-empty">
-                        No playlists yet
-                      </div>
-
-                    )}
-                </div>
-              ) : null}
             />
 
           )
@@ -545,7 +340,7 @@ function Liked() {
 
         )}
 
-      </div>
+      </div></TrackActionScope>
 
     </div>
 

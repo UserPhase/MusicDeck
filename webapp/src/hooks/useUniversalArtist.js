@@ -2,8 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 
 import { getArtistOverview } from "../api/musicdeck";
 import { parseArtistId, toArtistApiId } from "../utils/idResolver";
+import { usePrivacy } from "../context/PrivacyContext";
 
 export function useUniversalArtist(rawId, userId) {
+  const { canMetadata } = usePrivacy();
   const parsed = parseArtistId(rawId);
   const apiId = toArtistApiId(rawId);
   const isExternal = parsed.type !== "local";
@@ -19,7 +21,7 @@ export function useUniversalArtist(rawId, userId) {
   const external = useQuery({
     queryKey: ["artist-external", parsed.type, parsed.id],
     queryFn: () => getArtistOverview(apiId),
-    enabled: Boolean(apiId) && shouldUseExternal,
+    enabled: canMetadata && Boolean(apiId) && shouldUseExternal,
     staleTime: 24 * 60 * 60_000,
     gcTime: 7 * 24 * 60 * 60_000,
     retry: 1,

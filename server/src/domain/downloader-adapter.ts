@@ -55,6 +55,8 @@ export type DownloadContext = {
   tmpDir: string;
   signal: AbortSignal;
   onProgress?: (progress: DownloadProgress) => void;
+  checkpoint?: () => Promise<void>;
+  onLog?: (source: "stdout" | "stderr", message: string) => void;
 };
 
 export type DownloadErrorCode =

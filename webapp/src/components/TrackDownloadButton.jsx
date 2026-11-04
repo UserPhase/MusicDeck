@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createAcquisition, getAcquisition } from "../api/musicdeck";
+import { usePrivacy } from "../context/PrivacyContext";
 
 function ServerIcon() {
   return (
@@ -26,6 +27,7 @@ function CloudDownloadIcon() {
  * Triggers acquisition via spotDL and provides real-time progress feedback.
  */
 function TrackDownloadButton({ song, className = "", completedPlaceholder = false }) {
+  const { canImport } = usePrivacy();
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
@@ -71,11 +73,13 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
     );
   }
 
+  if (!canImport) return null;
+
   async function handleDownload(event) {
     event.stopPropagation();
     event.preventDefault();
 
-    if (status === "downloading" || status === "queued" || status === "processing") {
+    if (!canImport || status === "downloading" || status === "queued" || status === "processing") {
       return;
     }
 

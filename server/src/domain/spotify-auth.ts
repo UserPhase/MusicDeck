@@ -1,4 +1,5 @@
 import type { Db } from "../db/database.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 /**
  * Shared Spotify Web API client-credentials auth helper. Used by the
@@ -117,7 +118,7 @@ function describeSpotifyErrorBody(body: string): string | undefined {
 export class SpotifyAuthClient {
   private cached: CachedToken | null = null;
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch) { this.fetchImpl = gateFetch(fetchImpl, "imports"); }
 
   /**
    * Requests (or reuses a cached) client-credentials access token. Throws a

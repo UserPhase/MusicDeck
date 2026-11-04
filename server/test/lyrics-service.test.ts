@@ -5,12 +5,12 @@ import { closeTestServer, createFakeBackend, createTestServer, login } from "./h
 const track = { title: "Bohemian Rhapsody", artist: "Queen", album: "A Night at the Opera", durationSeconds: 354.4 };
 
 describe("LyricsService", () => {
-  test("omits album metadata, identifies the client, and coalesces repeat lookups", async () => {
+  test("includes album metadata, identifies the client, and coalesces repeat lookups", async () => {
     const fetchImpl = vi.fn(async (input: URL | string, options?: RequestInit) => {
       const url = new URL(String(input));
       expect(url.hostname).toBe("lrclib.net");
       expect(Object.fromEntries(url.searchParams)).toEqual({
-        track_name: "Bohemian Rhapsody", artist_name: "Queen", duration: "354",
+        track_name: "Bohemian Rhapsody", artist_name: "Queen", album_name: "A Night at the Opera", duration: "354",
       });
       expect(options?.headers).toMatchObject({ "Lrclib-Client": expect.stringContaining("MusicDeck/") });
       return new Response(JSON.stringify({ syncedLyrics: "[00:15.22] Is this the real life?",
@@ -122,6 +122,51 @@ describe("LyricsService", () => {
     expect(parseLrcLines("[00:10.22][00:12.300] Hello\nUntimed"))
       .toEqual([{ time: 10.22, text: "Hello" }, { time: 12.3, text: "Hello" }]);
     expect(parseLrcLines("Plain lyrics only")).toEqual([]);
+    expect(parseLrcLines("[offset:+350]\n[00:01.20] Early")).toEqual([{ time: 0.85, text: "Early" }]);
+  });
+
+  test("preserves version titles and ranks timed results by recording match", async () => {
+    const fetchImpl = vi.fn(async (input: URL | string) => {
+      const url = new URL(String(input));
+      expect(url.searchParams.get("track_name")).toBe("Song (Live Version)");
+      if (url.pathname === "/api/get") return new Response("", { status: 404 });
+      return Response.json([
+        { trackName: "Song", duration: 200, syncedLyrics: "[00:05.00] Studio" },
+        { albumName: "Live album", duration: 204, syncedLyrics: "[00:08.00] Different recording" },
+        { albumName: "Compilation", duration: 200, syncedLyrics: "[00:10.00] Compilation" },
+        { albumName: "Live album", duration: 201, syncedLyrics: "[00:12.00] Live album" },
+      ]);
+    });
+    const service = new LyricsService(fetchImpl as typeof fetch);
+    expect((await service.get("live", { ...track, title: "Song (Live Version)",
+      album: "Live album", durationSeconds: 200 })).syncedLyrics).toEqual([{ time: 12, text: "Live album" }]);
+  });
+
+  test("shows plain text when only a loose recording match is available", async () => {
+    const fetchImpl = vi.fn(async (input: URL | string) => new URL(String(input)).pathname === "/api/get"
+      ? new Response("", { status: 404 })
+      : Response.json([{ duration: 206, syncedLyrics: "[00:10.00] Hello", plainLyrics: "Hello" }]));
+    const service = new LyricsService(fetchImpl as typeof fetch);
+    expect(await service.get("loose", { ...track, durationSeconds: 200 }))
+      .toMatchObject({ syncedLyrics: null, isSynced: false, plainLyrics: "Hello" });
+  });
+
+  test("prefers lyrics timed for the library track over an online match", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const backend = createFakeBackend({ getLyrics: async () => "[00:11.25] Local lyrics" });
+    const server = await createTestServer(backend, {}, undefined, fetchImpl);
+    try {
+      const { cookie } = await login(server.app);
+      const catalog = await server.app.inject({ method: "GET", url: "/api/tracks", headers: { cookie } });
+      const trackId = catalog.json().tracks[0].id;
+      const response = await server.app.inject({ method: "GET",
+        url: `/api/tracks/${trackId}/lyrics?track_name=Hello&artist_name=Artist&duration=180`, headers: { cookie } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().syncedLyrics).toEqual([{ time: 11.25, text: "Local lyrics" }]);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      await closeTestServer(server.app, server.db);
+    }
   });
 
   test("the authenticated route accepts lyrics metadata without an album", async () => {

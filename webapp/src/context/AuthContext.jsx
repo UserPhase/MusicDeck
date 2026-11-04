@@ -1,3 +1,4 @@
+import { tasteProfileStore } from '../services/TasteProfileStore';
 import {
   createContext,
   useContext,
@@ -14,10 +15,16 @@ import {
   getAuthSession,
 } from "../api/session";
 import { artistOverviewQueryClient } from "../api/artistOverviewQuery";
+import { offlineDownloadEngine } from "../services/storage/OfflineDownloadEngine";
+import { offlineAuditor } from "../services/storage/OfflineAuditor";
+import { rememberedDownloadOwner, rememberDownloadOwner } from "../services/storage/offlineIdentity";
+import { playlistCommands } from "../services/playlists/PlaylistCommandStore";
 
 
+/** @typedef {{ id: string, username?: string, role: "admin" | "user", externalSearchEnabled?: boolean, acquisitionEnabled?: boolean, [key: string]: unknown }} AuthSession */
+/** @typedef {{ session: AuthSession | null, isAuthenticated: boolean, isLoading: boolean, signIn(username: string, password: string): Promise<void>, signOut(): Promise<void>, updateSession(user: AuthSession): void }} AuthState */
 const AuthContext =
-  createContext(null);
+  createContext(/** @type {AuthState | null} */ (null));
 
 
 export function AuthProvider({
@@ -32,16 +39,24 @@ export function AuthProvider({
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
 
     async function loadSession() {
       try {
         const currentSession =
-          await getAuthSession();
+          await getAuthSession(controller.signal);
 
         if (cancelled) {
           return;
         }
 
+        if (currentSession) await rememberDownloadOwner(String(currentSession.id));
+        await offlineDownloadEngine.activate(currentSession ? String(currentSession.id) : await rememberedDownloadOwner(), Boolean(currentSession));
+        offlineAuditor.reset();
+        if (cancelled) return;
+
+        playlistCommands.activate(currentSession ? String(currentSession.id) : null); tasteProfileStore.activate(currentSession ? String(currentSession.id) : null);
         setSession(currentSession);
         setStatus(
           currentSession
@@ -50,28 +65,45 @@ export function AuthProvider({
         );
       } catch {
         if (!cancelled) {
+          await offlineDownloadEngine.activate(await rememberedDownloadOwner(), false);
+          offlineAuditor.reset();
+          if (cancelled) return;
+          playlistCommands.activate(null); tasteProfileStore.activate(null);
           setSession(null);
           setStatus("unauthenticated");
         }
-      }
+      } finally { clearTimeout(timeout); }
     }
 
     loadSession();
+    const invalidated = () => { cancelled = true; controller.abort(); offlineAuditor.reset(); playlistCommands.activate(null); tasteProfileStore.activate(null); setSession(null); setStatus("unauthenticated"); };
+    window.addEventListener("musicdeck:downloads-account-invalidated", invalidated);
 
     return () => {
       cancelled = true;
+      clearTimeout(timeout); controller.abort();
+      tasteProfileStore.activate(null);
+      window.removeEventListener("musicdeck:downloads-account-invalidated", invalidated);
     };
   }, []);
 
 
   async function signIn(username, password) {
     const user = await authenticate(username, password);
+    await rememberDownloadOwner(String(user.id));
+    await offlineDownloadEngine.activate(String(user.id));
+    offlineAuditor.reset();
+    playlistCommands.activate(String(user.id)); tasteProfileStore.activate(String(user.id));
     setSession(user);
     setStatus("authenticated");
   }
 
 
   async function signOut() {
+    playlistCommands.activate(null); tasteProfileStore.activate(null);
+    await rememberDownloadOwner(null);
+    await offlineDownloadEngine.activate(null, false);
+    offlineAuditor.reset();
     artistOverviewQueryClient.clear();
     setSession(null);
     setStatus("unauthenticated");
@@ -85,6 +117,7 @@ export function AuthProvider({
 
 
   function updateSession(user) {
+    playlistCommands.activate(user ? String(user.id) : null); tasteProfileStore.activate(user ? String(user.id) : null);
     setSession(user);
   }
 
@@ -110,4 +143,3 @@ export function AuthProvider({
 export function useAuth() {
   return useContext(AuthContext);
 }
-

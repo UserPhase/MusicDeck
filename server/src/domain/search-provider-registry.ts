@@ -4,6 +4,7 @@ import type { PlaylistService } from "./playlist-service.js";
 import { SpotifyAuthClient, SpotifyAuthError, describeSpotifyErrorBody, hasSpotifyCredentials, resolveSpotifyCredentials } from "./spotify-auth.js";
 import { ExternalArtworkTokenStore } from "./external-catalog.js";
 import { classifyPluginError } from "../plugins/plugin-errors.js";
+import { redactConfig } from "../utils/config-redaction.js";
 import { SubsonicAdapter } from "../services/adapters/SubsonicAdapter.js";
 import { DeezerAdapter } from "../services/adapters/DeezerAdapter.js";
 import { iTunesAdapter } from "../services/adapters/iTunesAdapter.js";
@@ -16,6 +17,7 @@ import {
   type SearchProviderResult,
   type UnifiedSearchResult,
 } from "./search.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 export type SearchProviderStatus = "enabled" | "disabled" | "error";
 
@@ -53,9 +55,7 @@ function readConfig(json: string): Record<string, unknown> {
 }
 
 function publicConfig(config: Record<string, unknown>) {
-  return Object.fromEntries(
-    Object.entries(config).filter(([key]) => !/(key|token|secret|password)/i.test(key))
-  );
+  return redactConfig(config, "omit");
 }
 
 function isIncluded(item: UnifiedSearchResult, types?: SearchOptions["types"]) {
@@ -134,7 +134,7 @@ class PlaylistSearchProvider implements SearchProvider {
       return [];
     }
 
-    const playlists = await this.playlists.search(query, options.limit || 20);
+    const playlists = await this.playlists.search(query, options.limit || 20, options.user);
     return playlists.map(toPlaylistSearchResult);
   }
 }
@@ -430,6 +430,7 @@ export class SearchProviderRegistry {
     artworkTokens?: ExternalArtworkTokenStore
   ) {
     this.db = db;
+    const network = gateFetch(fetchImpl);
     this.definitions = [
       {
         id: "library",
@@ -450,14 +451,14 @@ export class SearchProviderRegistry {
         name: "Deezer",
         kind: "external",
         defaultEnabled: true,
-        create: () => new DeezerSearchProvider(fetchImpl, artworkTokens),
+        create: () => new DeezerSearchProvider(network, artworkTokens),
       },
       {
         id: "spotify",
         name: "Spotify",
         kind: "external",
         defaultEnabled: false,
-        create: (config) => new SpotifySearchProvider(config, fetchImpl, db),
+        create: (config) => new SpotifySearchProvider(config, network, db),
       },
     ];
   }

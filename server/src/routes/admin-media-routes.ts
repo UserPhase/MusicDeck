@@ -2,8 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { Db } from "../db/database.js";
-import type { MusicBackend } from "../backends/music-backend.js";
 import type { CatalogService } from "../domain/catalog.js";
+import { isSupportedAudioFile, SUPPORTED_AUDIO_EXTENSIONS } from "../domain/audio-containers.js";
 import { requireAdmin } from "../auth/authorization.js";
 import { sendError } from "../utils/http.js";
 
@@ -16,8 +16,8 @@ export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
 async function verifiedAudioPath(metadataPath: string, rootDir: string): Promise<string> {
   const candidate = path.resolve(rootDir, metadataPath);
   if (!isPathWithinRoot(candidate, rootDir)) throw new MediaPathError(400, "Track path is outside the music library");
-  if (![".mp3", ".flac"].includes(path.extname(candidate).toLowerCase())) {
-    throw new MediaPathError(400, "Only MP3 and FLAC files can be deleted from the server");
+  if (!isSupportedAudioFile(candidate)) {
+    throw new MediaPathError(400, "Unsupported audio container for server deletion");
   }
   try {
     const [realRoot, realFile, stat] = await Promise.all([fs.realpath(rootDir), fs.realpath(candidate), fs.lstat(candidate)]);
@@ -57,7 +57,7 @@ async function removeAlbumDirectoryIfSafe(filePaths: string[], rootDir: string):
     const stat = await fs.lstat(albumDir);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return;
     const entries = await fs.readdir(albumDir, { withFileTypes: true });
-    const audioExtensions = new Set([".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma", ".aiff", ".ape"]);
+    const audioExtensions = new Set([...SUPPORTED_AUDIO_EXTENSIONS, ".aac", ".wma", ".aiff", ".alac", ".ape"]);
     if (entries.some((entry) => !entry.isFile() || audioExtensions.has(path.extname(entry.name).toLowerCase()))) return;
     for (const entry of entries) await fs.unlink(path.join(albumDir, entry.name));
     await fs.rmdir(albumDir);
@@ -66,12 +66,10 @@ async function removeAlbumDirectoryIfSafe(filePaths: string[], rootDir: string):
   }
 }
 
-export async function registerAdminMediaRoutes(app: FastifyInstance, db: Db, musicRoot: string, backend: MusicBackend, catalog: CatalogService) {
-  const scan = async () => {
-    if (!backend.requestLibraryRescan && !backend.scanLibrary) return "Library rescan is not supported by this backend";
+export async function registerAdminMediaRoutes(app: FastifyInstance, db: Db, musicRoot: string, catalog: CatalogService) {
+  const scan = async (connectionId: string) => {
     try {
-      if (backend.requestLibraryRescan) await backend.requestLibraryRescan();
-      else await backend.scanLibrary?.();
+      await catalog.requestLibraryRescan(connectionId);
       return null;
     }
     catch { return "File deleted, but the library rescan could not be started"; }
@@ -82,13 +80,13 @@ export async function registerAdminMediaRoutes(app: FastifyInstance, db: Db, mus
     const { trackId } = request.params as { trackId: string };
     const track = await catalog.getTrack(trackId);
     if (!track) return sendError(reply, 404, "Track not found");
-    const metadataPath = await catalog.getTrackFilePath(trackId);
-    if (!metadataPath) return sendError(reply, 409, "The media provider did not report a real file path. In Navidrome, enable Report Real Path for the MusicDeck File Management player in Settings > Players.");
+    const source = await catalog.resolveTrackFile(trackId);
+    if (!source?.filePath) return sendError(reply, 409, "The media provider did not report a real file path. In Navidrome, enable Report Real Path for the MusicDeck File Management player in Settings > Players.");
     try {
-      const filePath = await verifiedAudioPath(metadataPath, musicRoot);
+      const filePath = await verifiedAudioPath(source.filePath, musicRoot);
       await fs.unlink(filePath);
       await removeEmptyParents(filePath, musicRoot);
-      const warning = await scan();
+      const warning = await scan(source.connectionId);
       return { success: true, message: "Track deleted from disk", trackId, ...(warning ? { warning } : {}) };
     } catch (error) {
       if (error instanceof MediaPathError) return sendError(reply, error.status, error.message);
@@ -101,20 +99,28 @@ export async function registerAdminMediaRoutes(app: FastifyInstance, db: Db, mus
     const { albumId } = request.params as { albumId: string };
     const album = await catalog.getAlbum(albumId);
     if (!album) return sendError(reply, 404, "Album not found");
+    const connectionId = catalog.getSourceConnectionId(albumId);
+    if (!connectionId) return sendError(reply, 409, "The album's library source is unavailable");
     const tracks = await catalog.getAlbumTracks(albumId);
     if (!tracks.length) return sendError(reply, 409, "Album has no server tracks to delete");
     try {
       const paths = [];
       for (const track of tracks) {
-        const metadataPath = await catalog.getTrackFilePath(track.id);
-        if (!metadataPath) return sendError(reply, 409, "The media provider did not report a real file path for an album track. In Navidrome, enable Report Real Path for the MusicDeck File Management player in Settings > Players.");
-        paths.push(await verifiedAudioPath(metadataPath, musicRoot));
+        const source = await catalog.resolveTrackFile(track.id, connectionId);
+        if (!source?.filePath) return sendError(reply, 409, "The media provider did not report a real file path for an album track. In Navidrome, enable Report Real Path for the MusicDeck File Management player in Settings > Players.");
+        paths.push(await verifiedAudioPath(source.filePath, musicRoot));
       }
       const uniquePaths = [...new Set(paths)];
-      for (const filePath of uniquePaths) await fs.unlink(filePath);
+      let deleted = 0;
+      let warning: string | null = null;
+      try {
+        for (const filePath of uniquePaths) { await fs.unlink(filePath); deleted++; }
+      } finally {
+        // A later filesystem failure must not leave earlier deletions unscanned.
+        if (deleted) warning = await scan(connectionId);
+      }
       await removeAlbumDirectoryIfSafe(uniquePaths, musicRoot);
       for (const filePath of uniquePaths) await removeEmptyParents(filePath, musicRoot);
-      const warning = await scan();
       return { success: true, message: "Album deleted from disk", albumId, trackIds: tracks.map((track) => track.id), ...(warning ? { warning } : {}) };
     } catch (error) {
       if (error instanceof MediaPathError) return sendError(reply, error.status, error.message);

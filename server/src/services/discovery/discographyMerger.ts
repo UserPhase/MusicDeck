@@ -1,3 +1,5 @@
+import { normalizeMusicText, versionSignature } from "../../domain/music-identity.js";
+
 export type DiscographySource = "local" | "external";
 
 export type DiscographyAlbum = {
@@ -76,7 +78,10 @@ function sameArtist(left: string | null | undefined, right: string | null | unde
 }
 
 function duplicateAlbum(candidate: DiscographyAlbum, existing: DiscographyAlbum[]) {
-  return existing.some((item) => sameArtist(item.artist, candidate.artist) && similarDiscographyTitle(item.title, candidate.title));
+  const title = normalizeMusicText(candidate.title);
+  const version = versionSignature(candidate.title);
+  return existing.some((item) => item.id === candidate.id || (title && sameArtist(item.artist, candidate.artist)
+    && normalizeMusicText(item.title) === title && versionSignature(item.title) === version));
 }
 
 export function discographyTracksMatch(candidate: DiscographyTrack, existing: DiscographyTrack) {

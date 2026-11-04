@@ -1,5 +1,11 @@
 import { activeLrcIndex, parseLrc } from "./lrc";
 
+test("applies file timing corrections to the active line", () => {
+  const lines = parseLrc("[00:10.00] First\n[00:20.00] Second\n[offset:-500]");
+  expect(activeLrcIndex(lines, 20)).toBe(0);
+  expect(activeLrcIndex(lines, 20.5)).toBe(1);
+});
+
 test("parses centiseconds, milliseconds, repeated timestamps, and instrumental markers", () => {
   expect(parseLrc("[ar:Queen]\n[00:00.00] ♪\n[00:15.22] Caught in a landslide\n[00:17.203][00:18.203] Again"))
     .toEqual([

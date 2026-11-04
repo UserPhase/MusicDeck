@@ -1,7 +1,11 @@
 import { usePlayer } from "../../../context/PlayerContext";
 import { useAlbumArtwork } from "../../../hooks/useAlbumArtwork";
 import { usePreviewImport } from "../../../hooks/usePreviewImport";
+import { usePrivacy } from "../../../context/PrivacyContext";
 import { formatTime } from "../../Player";
+import AudioQualityBadge from "../../player/AudioQualityBadge";
+import PlayerAudioTools from "../../player/PlayerAudioTools";
+import DeviceSelectorButton from "../../player/DeviceSelectorButton";
 
 
 function TransportIcon({ name }) {
@@ -64,6 +68,8 @@ function AppleHeaderPlayer() {
   const {
     currentSong,
     isPlaying,
+    isRemotePlayback,
+    isCasting,
     currentTime,
     duration,
     togglePlay,
@@ -81,11 +87,13 @@ function AppleHeaderPlayer() {
     isPreview,
     playbackUnavailable,
     playbackMessage,
+    isPreparingPlayback,
     activeSidebar,
     setActiveSidebar,
   } = usePlayer();
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 48);
   const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(currentSong);
+  const { canImport } = usePrivacy();
 
   const hasSong = Boolean(currentSong);
   const progress = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
@@ -102,7 +110,7 @@ function AppleHeaderPlayer() {
           type="button"
           className={`header-player-button header-player-mode${isShuffleEnabled ? " active" : ""}`}
           onClick={toggleShuffle}
-          disabled={!hasSong}
+          disabled={!hasSong || isRemotePlayback}
           aria-label={isShuffleEnabled ? "Turn off shuffle" : "Turn on shuffle"}
           aria-pressed={isShuffleEnabled}
         >
@@ -116,9 +124,10 @@ function AppleHeaderPlayer() {
           className="header-player-button header-player-play"
           onClick={togglePlay}
           disabled={!hasSong}
-          aria-label={isPlaying ? "Pause" : "Play"}
+          aria-label={isPreparingPlayback ? "Cancel preparation" : isPlaying ? "Pause" : "Play"}
+          aria-busy={isPreparingPlayback || undefined}
         >
-          <TransportIcon name={isPlaying ? "pause" : "play"} />
+          {isPreparingPlayback ? <span aria-hidden="true">…</span> : <TransportIcon name={isPlaying ? "pause" : "play"} />}
         </button>
         <button type="button" className="header-player-button" onClick={nextSong} disabled={!hasSong} aria-label="Next song">
           <TransportIcon name="next" />
@@ -127,7 +136,7 @@ function AppleHeaderPlayer() {
           type="button"
           className={`header-player-button header-player-mode${isLooping ? " active" : ""}`}
           onClick={toggleLoop}
-          disabled={!hasSong}
+          disabled={!hasSong || isRemotePlayback}
           aria-label={isLooping ? "Turn off repeat" : "Turn on repeat"}
           aria-pressed={isLooping}
         >
@@ -142,7 +151,9 @@ function AppleHeaderPlayer() {
         <div className="header-player-meta">
           <div className="header-player-title-row">
             <span className="header-player-title">{hasSong ? currentSong.title || "Unknown title" : "Nothing playing"}</span>
-            {isPreview && hasSong && (
+            {isPreview && hasSong && <span className="audio-badge audio-badge-preview now-audio-badge">PREVIEW</span>}
+            {hasSong && !isPreview && !isRemotePlayback && !isCasting && <AudioQualityBadge />}
+            {isPreview && hasSong && canImport && (
               <button type="button" className="now-preview-import" onClick={importPreviewTrack} disabled={isImportDisabled}>
                 {importLabel}
               </button>
@@ -213,6 +224,8 @@ function AppleHeaderPlayer() {
         >
           <TransportIcon name="queue" />
         </button>
+        <DeviceSelectorButton compact />
+        <PlayerAudioTools />
       </div>
 
       {playbackMessage && (

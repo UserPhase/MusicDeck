@@ -1,4 +1,6 @@
-import { Link } from "react-router-dom";
+import { useLayoutEffect, useRef } from "react";
+import PlayerAudioTools from "./player/PlayerAudioTools";
+import TrackArtistLinks from "./TrackArtistLinks";
 
 import {
   usePlayer,
@@ -6,8 +8,10 @@ import {
 
 import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
 import { usePreviewImport } from "../hooks/usePreviewImport";
+import { usePrivacy } from "../context/PrivacyContext";
 
-import AudioBadge from "./AudioBadge";
+import AudioQualityBadge from "./player/AudioQualityBadge";
+import DeviceSelectorButton from "./player/DeviceSelectorButton";
 
 
 export function formatTime(seconds) {
@@ -39,6 +43,15 @@ export function formatTime(seconds) {
 }
 
 
+function paintProgress(input, percent) {
+  input.value = String(percent);
+  input.style.setProperty("--range-progress", `${percent}%`);
+}
+
+function progressPercent(position, duration) {
+  return duration > 0 && Number.isFinite(position) ? Math.min(100, Math.max(0, position / duration * 100)) : 0;
+}
+
 /**
  * Docked player bar. `variant="drawer"` restyles it as the floating,
  * expandable bar used by the YouTube Music layout; `actions` renders extra
@@ -54,7 +67,11 @@ function Player({
   const {
     currentSong,
     isPlaying,
+    isRemotePlayback,
+    isCasting,
+    isBuffering,
     currentTime,
+    readPlaybackPosition,
     duration,
 
     togglePlay,
@@ -74,28 +91,48 @@ function Player({
     isCurrentSongLiked,
 
     isPreview,
-    previewDurationSeconds,
     playbackUnavailable,
     playbackMessage,
-
-    streamQuality,
+    isPreparingPlayback,
 
   } = usePlayer();
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
   const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(currentSong);
+  const { canImport } = usePrivacy();
 
 
   /*
    * PROGRESS
    */
 
-  const progress =
-    duration > 0
-      ? Math.min(
-          100,
-          (currentTime / duration) * 100
-        )
-      : 0;
+  const progressInput = useRef(null);
+  const lastAudibleVolume = useRef(0.5);
+  const isMuted = volume === 0;
+  const muteLabel = isMuted ? "Unmute" : "Mute";
+  const animateProgress = Boolean(currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
+
+  useLayoutEffect(() => {
+    if (volume > 0) lastAudibleVolume.current = volume;
+  }, [volume]);
+
+  useLayoutEffect(() => {
+    const position = currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
+    paintProgress(progressInput.current, progressPercent(position, duration));
+  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition]);
+
+  // Repaint only the scrubber between media events so the rest of the UI stays idle.
+  useLayoutEffect(() => {
+    if (!animateProgress) return;
+    const input = progressInput.current;
+    let frame;
+    const draw = () => {
+      const percent = progressPercent(readPlaybackPosition(), duration);
+      if (input.valueAsNumber !== percent) paintProgress(input, percent);
+      frame = requestAnimationFrame(draw);
+    };
+    frame = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(frame);
+  }, [animateProgress, duration, readPlaybackPosition]);
 
 
   return (
@@ -148,31 +185,10 @@ function Player({
             </span>
 
 
-            {currentSong && (
-              <AudioBadge
-                type={
-                  isPreview
-                    ? "preview"
-                    : currentSong.audioType ||
-                      currentSong.metadata?.codec ||
-                      currentSong.source?.quality?.codec
-                }
-                bitrate={
-                  currentSong.bitrate ||
-                  currentSong.metadata?.bitrate ||
-                  currentSong.source?.quality?.bitrate ||
-                  (streamQuality === "original" ? undefined : streamQuality)
-                }
-                className="now-audio-badge"
-                title={
-                  isPreview && previewDurationSeconds
-                    ? `Preview only (${Math.round(previewDurationSeconds)}s), not the full track`
-                    : undefined
-                }
-              />
-            )}
+            {isPreview && currentSong && <span className="audio-badge audio-badge-preview now-audio-badge">PREVIEW</span>}
+            {currentSong && !isPreview && !isRemotePlayback && !isCasting && <AudioQualityBadge />}
 
-            {isPreview && currentSong && (
+            {isPreview && currentSong && canImport && (
               <button
                 type="button"
                 className="now-preview-import"
@@ -200,26 +216,7 @@ function Player({
 
           {currentSong ? (
 
-            currentSong.artistId ? (
-
-              <Link
-                to={
-                  `/artist/${currentSong.artistId}`
-                }
-                className="now-artist"
-              >
-                {currentSong.artist ||
-                  "Unknown artist"}
-              </Link>
-
-            ) : (
-
-              <div className="now-artist">
-                {currentSong.artist ||
-                  "Unknown artist"}
-              </div>
-
-            )
+            <TrackArtistLinks song={currentSong} className="now-artist" />
 
           ) : (
 
@@ -263,6 +260,8 @@ function Player({
           </button>
 
         )}
+        <div className="player-audio-tools-mobile"><PlayerAudioTools /></div>
+
 
       </div>
 
@@ -293,7 +292,7 @@ function Player({
             }
 
             disabled={
-              !currentSong
+              !currentSong || isRemotePlayback
             }
 
             aria-label={
@@ -351,13 +350,14 @@ function Player({
             }
 
             aria-label={
-              isPlaying
+              isPreparingPlayback ? "Cancel preparation" : isPlaying
                 ? "Pause"
                 : "Play"
             }
+            aria-busy={isPreparingPlayback || undefined}
           >
 
-            {isPlaying
+            {isPreparingPlayback ? "…" : isPlaying
               ? "❚❚"
               : "▶"}
 
@@ -399,7 +399,7 @@ function Player({
             }
 
             disabled={
-              !currentSong
+              !currentSong || isRemotePlayback
             }
 
             aria-label={
@@ -438,29 +438,19 @@ function Player({
 
 
           <input
+            ref={progressInput}
             type="range"
-
             min="0"
             max="100"
-
-            value={progress}
-
-            onChange={(event) =>
-              seek(
-                Number(
-                  event.target.value
-                )
-              )
-            }
-
-            disabled={
-              !currentSong
-            }
-
+            step="any"
+            defaultValue={0}
+            onChange={(event) => {
+              const percent = event.currentTarget.valueAsNumber;
+              paintProgress(event.currentTarget, percent);
+              seek(percent);
+            }}
+            disabled={!currentSong || !(duration > 0)}
             className="progress tactile-slider"
-
-            style={{ "--range-progress": `${Math.min(100, Math.max(0, Number(progress) || 0))}%` }}
-
             aria-label="Song progress"
           />
 
@@ -505,17 +495,24 @@ function Player({
         </div>
 
 
+        <div className="player-streaming-controls" role="group" aria-label="Playback devices">
+          <PlayerAudioTools />
+          <DeviceSelectorButton compact />
+        </div>
+
         {/* =============================== */}
         {/* VOLUME */}
         {/* =============================== */}
 
         <div className="volume">
 
-          <span
-            aria-hidden="true"
-          >
-            🔊
-          </span>
+          <button type="button" className="player-mute-button" aria-label={muteLabel} title={muteLabel}
+            onClick={() => changeVolume(isMuted ? lastAudibleVolume.current : 0)}>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+              {isMuted ? <path d="m16 9 5 6m0-6-5 6" /> : <path d="M15 9a4 4 0 0 1 0 6m2.5-8.5a8 8 0 0 1 0 11" />}
+            </svg>
+          </button>
 
 
           <input

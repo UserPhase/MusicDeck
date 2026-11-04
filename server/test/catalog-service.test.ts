@@ -48,7 +48,60 @@ function artist(id: string, name: string): Artist {
   };
 }
 
+test("track snapshots share slow reads and retry after a failed enumeration", async () => {
+  let rejectRead!: (error: Error) => void;
+  const promise = new Promise<Track[]>((_, reject) => { rejectRead = reject; });
+  const listTracks = vi.fn(async () => [track("recovered", "Recovered")]).mockReturnValueOnce(promise);
+  const catalog = makeService(createFakeBackend({ listTracks }));
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+  try {
+    const first = catalog.tracksForWindow();
+    clock.mockReturnValue(32_000);
+    const second = catalog.tracksForWindow();
+    const settled = Promise.allSettled([first, second]);
+    rejectRead(new Error("Offline"));
+    expect((await settled).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    expect(listTracks).toHaveBeenCalledTimes(1);
+
+    const recovered = await catalog.tracksForWindow();
+    expect(recovered.items[0].title).toBe("Recovered");
+    expect(await catalog.tracksForWindow()).toBe(recovered);
+    expect(listTracks).toHaveBeenCalledTimes(2);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("live reads update the cached window when provider availability changes", async () => {
+  const primary = createFakeBackend();
+  const secondary = createFakeBackend();
+  const catalog = makeService(primary, secondary);
+  const healthy = await catalog.tracksForWindow();
+  vi.mocked(secondary.listTracks).mockRejectedValueOnce(new Error("Offline"));
+  expect((await catalog.listTracks()).degraded).toBe(true);
+  const degraded = await catalog.tracksForWindow();
+  expect(degraded).toMatchObject({ degraded: true, items: [expect.any(Object)] });
+  expect(degraded.revision).not.toBe(healthy.revision);
+
+  expect((await catalog.listTracks()).degraded).toBe(false);
+  expect((await catalog.tracksForWindow()).items).toHaveLength(2);
+  expect(primary.listTracks).toHaveBeenCalledTimes(3);
+});
+
 describe("CatalogService single-provider behavior", () => {
+  test("includes import-measured gain in list, detail and search results", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const measured = vi.fn(() => -6);
+    const service = new CatalogService(makeRegistry(createFakeBackend()), new LibraryService(db), undefined, measured);
+    try {
+      const { items } = await service.listTracks();
+      expect(items[0].normalizationGainDb).toBe(-6);
+      expect((await service.getTrack(items[0].id))?.normalizationGainDb).toBe(-6);
+      expect((await service.search("love")).tracks[0].normalizationGainDb).toBe(-6);
+      expect(measured).toHaveBeenCalled();
+    } finally { db.close(); }
+  });
   test("list/search/random reads come from the primary provider without a degraded flag", async () => {
     const backend = createFakeBackend();
     const service = makeService(backend);
@@ -437,6 +490,37 @@ function trackWithRelations(id: string, albumId: string | null, artistId: string
 }
 
 describe("CatalogService nested ID normalization", () => {
+  test("all detail methods query the mapped secondary connection even when provider IDs collide", async () => {
+    const db = new Database(":memory:"); runMigrations(db);
+    const library = new LibraryService(db);
+    const a = createFakeBackend();
+    const b = createFakeBackend({
+      getAlbum: vi.fn(async () => ({ ...album("shared", "Secondary album"), artistId: "shared" })),
+      getArtist: vi.fn(async () => artist("shared", "Secondary artist")),
+      getArtistAlbums: vi.fn(async () => [album("shared", "Secondary album")]),
+      getTrack: vi.fn(async () => ({ ...track("shared", "Secondary song"), artistId: "shared" })),
+      getAlbumTracks: vi.fn(async () => [track("shared", "Secondary song")]),
+      getArtistTracks: vi.fn(async () => [{ ...track("shared", "Secondary song"), artistId: "shared" }]),
+      getArtistTopTracks: vi.fn(async () => [{ ...track("shared", "Secondary song"), artistId: "shared" }]),
+    });
+    const catalog = new CatalogService(makeRegistry(a, b), library);
+    try {
+      const ids = Object.fromEntries((["album", "artist", "track"] as const).map(type =>
+        [type, library.ensureId(type, { connectionId: "conn-2", providerItemId: "shared" })]));
+      expect(await catalog.getAlbum(ids.album)).toMatchObject({ name: "Secondary album" });
+      expect(await catalog.getArtist(ids.artist)).toMatchObject({ name: "Secondary artist" });
+      expect(await catalog.getTrack(ids.track)).toMatchObject({ title: "Secondary song" });
+      expect(await catalog.getAlbumTracks(ids.album)).toHaveLength(1);
+      expect(await catalog.getArtistAlbums(ids.artist)).toHaveLength(1);
+      expect(await catalog.getArtistTracks(ids.artist)).toHaveLength(1);
+      expect(await catalog.getArtistTopTracks(ids.artist)).toHaveLength(1);
+      for (const method of ["getAlbum", "getArtist", "getTrack", "getAlbumTracks", "getArtistAlbums", "getArtistTracks"] as const) {
+        expect(a[method]).not.toHaveBeenCalled();
+        if (method === "getArtist") expect(b[method]).toHaveBeenCalledWith("shared", undefined);
+        else expect(b[method]).toHaveBeenCalledWith("shared");
+      }
+    } finally { db.close(); }
+  });
   test("tracks expose stable MusicDeck albumId and artistId, not provider IDs", async () => {
     const backend = createFakeBackend({
       listTracks: vi.fn(async () => [trackWithRelations("prov-track-1", "prov-album-9", "prov-artist-7")]),

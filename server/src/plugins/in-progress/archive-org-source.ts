@@ -13,6 +13,7 @@ import {
   normalizeMusicText,
 } from "../../domain/music-identity.js";
 import { validatedPlayableUrl } from "../../domain/source-discovery.js";
+import { privacyFetch as fetch } from "../../services/PrivacyManager.js";
 
 export const AUDIO_EXTENSIONS = new Set(["flac", "mp3", "m4a", "aac", "ogg", "opus", "wav", "alac"]);
 export const BLOCKED_EXTENSIONS = new Set([

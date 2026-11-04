@@ -4,6 +4,8 @@ import { z } from "zod";
 import type { Db } from "../db/database.js";
 import type { MusicBackend } from "../backends/music-backend.js";
 import { requireUser } from "../auth/authorization.js";
+import { LoginRateLimiter, DEFAULT_LOGIN_RATE_LIMIT } from "../auth/login-rate-limiter.js";
+import { SessionStreamGuard } from "../auth/session-stream.js";
 import type { CatalogService } from "../domain/catalog.js";
 import type { LibraryService } from "../domain/library.js";
 import { SourceResolver, SourceUnavailableError } from "../domain/source-resolver.js";
@@ -21,23 +23,51 @@ import type { SourceProviderRegistry } from "../domain/source-provider-registry.
 import type { ExternalCatalogRegistry } from "../domain/external-catalog.js";
 import type { RecommendationRegistry, RecommendationKind } from "../domain/recommendations.js";
 import type { LibraryInsightsService, LibraryFilter } from "../domain/library-insights.js";
-import type { AcquisitionService } from "../domain/acquisition.js";
+import { AcquisitionJobError, type AcquisitionService } from "../domain/acquisition.js";
+import { acquisitionRequestSchema } from "../domain/acquisition-input.js";
+import { AcquisitionValidationError } from "../domain/acquisition-url-policy.js";
+import { AcquisitionCapacityError, DEFAULT_ACQUISITION_LIMITS, type AcquisitionLimits } from "../domain/acquisition-limits.js";
 import type { SilenceAnalysisService } from "../domain/silence-analysis.js";
+import { silenceAnalysisRequestSchema } from "./silence-scan-routes.js";
 import type { Album, Artist, Track } from "../types.js";
 import { DeezerDiscoveryService } from "../domain/deezer-discovery.js";
+import { ExploreDiscoveryService } from "../domain/explore-discovery.js";
+import { PlaylistRecommendationService } from "../domain/playlist-recommendations.js";
+import { DeezerDiscoveryCatalog } from "../services/discovery/deezerDiscoveryCatalog.js";
 import { ItunesArtistCatalog, itunesReleaseKey, sameItunesRecording } from "../domain/itunes-artist-catalog.js";
 import { ArtistImageResolver, isNativeArtistPicture } from "../domain/artist-image.js";
 import { MusicBrainzAvatarWorker } from "../domain/musicbrainz-avatar-worker.js";
 import { LyricsService, parseLrcLines, type LyricsTrack } from "../domain/lyrics-service.js";
 import { MediaMetadataFallback } from "../domain/media-metadata-fallback.js";
 import { AlbumArtworkService } from "../services/media/albumService.js";
+import { ARTWORK_VERDICT_HEADER } from "../services/media/navidromeArtwork.js";
+import { isSpotifyArtworkUrl } from "../utils/spotifyArtworkUrl.js";
 import { SqliteImportedArtworkRepository } from "../infrastructure/persistence/sqliteImportedArtworkRepository.js";
-import { discographyTracksMatch, mergeDiscography, normalizeDiscographyText, type DiscographyAlbum, type DiscographyTrack } from "../services/discovery/discographyMerger.js";
+import { mergeDiscography, type DiscographyAlbum, type DiscographyTrack } from "../services/discovery/discographyMerger.js";
+import { normalizeMusicText } from "../domain/music-identity.js";
 import {
   findMatchingExternalAlbum,
   findMatchingExternalArtist,
   mergeAlbumTracks,
+  recordingsMatch,
 } from "../domain/catalog-merge.js";
+import { addRecentlyPlayed } from "../domain/recently-played.js";
+import { activityRecent, playbackEventSchema, recordPlayback } from "../domain/listening-activity.js";
+import { listFavoriteTracks, setTrackFavorite } from "../domain/favorites.js";
+import { listUserSettings } from "../domain/settings.js";
+import { sendError } from "../utils/http.js";
+import { AudioMetadataInspector } from "../services/AudioMetadataInspector.js";
+import { currentPrivacyManager } from "../services/PrivacyManager.js";
+import { SseConnectionLimiter, SseEventWriter } from "../utils/sse.js";
+import type { TaskManager } from "../services/TaskManager.js";
+import { RecommendationSeedNotFoundError } from "../services/RecommendationEngine.js";
+import { tasteProfile, tasteTarget, tasteArtistId } from "../services/TasteProfileManager.js";
+import { hydrateMissingPreviews, normalizeExternalTrack } from "../services/discovery/externalTrackNormalizer.js";
+
+const libraryPageQuerySchema = z.object({
+  offset: z.coerce.number().int().min(0),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+});
 
 const sourceRequestSchema = z.object({
   preference: z.enum(["library", "external", "manual", "best", "lossless", "highest-bitrate", "preferred"]).optional(),
@@ -58,13 +88,6 @@ const sourceRequestSchema = z.object({
     metadata: z.record(z.string(), z.unknown()).optional(),
   }),
 });
-import { addRecentlyPlayed } from "../domain/recently-played.js";
-import { activityRecent, playbackEventSchema, recordPlayback } from "../domain/listening-activity.js";
-import { listFavoriteTracks, setTrackFavorite } from "../domain/favorites.js";
-import { listUserSettings } from "../domain/settings.js";
-import { sendError } from "../utils/http.js";
-import { SseEventWriter } from "../utils/sse.js";
-import { hydrateMissingPreviews, normalizeExternalTrack } from "../services/discovery/externalTrackNormalizer.js";
 
 const trackIdPattern = /^[^/]+$/;
 const lyricsQuerySchema = z.object({
@@ -142,22 +165,51 @@ export async function registerMusicRoutes(
   recommendations: RecommendationRegistry,
   libraryInsights: LibraryInsightsService,
   acquisition?: AcquisitionService,
-  silenceAnalysis?: SilenceAnalysisService
+  silenceAnalysis?: SilenceAnalysisService,
+  acquisitionLimits: AcquisitionLimits = DEFAULT_ACQUISITION_LIMITS,
+  taskManager?: TaskManager,
+  scrobbleQueue?: import("../services/scrobble/ScrobbleQueueService.js").ScrobbleQueueService
 ) {
+  const audioInspector = new AudioMetadataInspector(
+    (trackId, connectionId) => sourceResolver.audioMetadata(trackId, connectionId),
+    (error, message) => app.log.warn({ err: error }, message),
+  );
+  const inspectionQuery = z.object({ inspectionId: z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/) }).strict();
+  app.get("/api/v1/stream/inspect/:trackId", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const query = inspectionQuery.safeParse(request.query);
+    if (!query.success) return sendError(reply, 400, query.error.message);
+    const { trackId } = request.params as { trackId: string };
+    if (!library.exists(trackId)) return sendError(reply, 404, "Track not found");
+    reply.header("Cache-Control", "private, no-store");
+    return audioInspector.inspect(user.id, trackId, query.data.inspectionId);
+  });
+  const acquisitionStreams = new SseConnectionLimiter(acquisitionLimits.ssePerUser, acquisitionLimits.sseGlobal);
+  const streamCleanups = new Set<() => void>();
+  app.addHook("preClose", async () => {
+    for (const cleanup of streamCleanups) cleanup();
+  });
   const deezerDiscovery = new DeezerDiscoveryService();
+  const discoveryCatalog = new DeezerDiscoveryCatalog(externalCatalog.fetchImpl, deezerDiscovery);
+  const exploreDiscovery = new ExploreDiscoveryService(db, catalog, recommendations.local,
+    discoveryCatalog);
+  const playlistRecommendations = new PlaylistRecommendationService(db, catalog, discoveryCatalog);
   const itunesArtistCatalog = new ItunesArtistCatalog(externalCatalog.fetchImpl, externalCatalog.artwork);
   const artistImages = new ArtistImageResolver(externalCatalog.fetchImpl);
   const musicBrainzAvatars = new MusicBrainzAvatarWorker(db, externalCatalog.fetchImpl);
   const lyricsService = new LyricsService(externalCatalog.fetchImpl);
+  const lyricReports = new LoginRateLimiter({ ...DEFAULT_LOGIN_RATE_LIMIT, accountMax: 5, windowMs: 60_000 });
   const mediaMetadata = new MediaMetadataFallback(externalCatalog.fetchImpl);
   const albumArtwork = new AlbumArtworkService(async (id) => {
     const result = id.startsWith("mdart_")
       ? await sourceResolver.fetchArtwork(id)
       : await backend.fetchArtwork(id);
     await result.body?.cancel();
-    if (result.status === 404) return false;
+    if (result.status === 404) return "placeholder";
     if (result.status !== 200) throw new Error(`Album artwork validation returned ${result.status}`);
-    return /^image\//i.test(result.headers.get("content-type") || "");
+    if (!/^image\//i.test(result.headers.get("content-type") || "")) return "placeholder";
+    return result.headers.get(ARTWORK_VERDICT_HEADER) === "uncertain" ? "uncertain" : "genuine";
   }, (artist, album) => mediaMetadata.getAlbumCover(artist, album),
   (error) => app.log.warn({ err: error }, "Album artwork resolution failed"),
   new SqliteImportedArtworkRepository(db));
@@ -203,6 +255,53 @@ export async function registerMusicRoutes(
     } catch {
       return sendError(reply, 502, "External charts are temporarily unavailable", "EXTERNAL_DISCOVERY_UNAVAILABLE");
     }
+  });
+
+  app.get("/api/discovery/personalized", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    currentPrivacyManager()?.assertExternalAllowed("metadata");
+    const result = await exploreDiscovery.get(user.id);
+    currentPrivacyManager()?.assertExternalAllowed("metadata");
+    reply.header("Cache-Control", "private, no-store");
+    return result;
+  });
+
+  app.get("/api/v1/playlists/:playlistId/recommendations", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const { playlistId } = request.params as { playlistId: string };
+    const parsed = z.object({ source: z.enum(["library", "external"]).default("library") }).strict().safeParse(request.query);
+    if (!parsed.success) return sendError(reply, 400, "Invalid recommendation source", "VALIDATION_ERROR");
+    if (!playlists.canRead(playlistId, user)) return sendError(reply, 404, "Playlist not found");
+    reply.header("Cache-Control", "private, no-store");
+    const canModify = playlists.canModify(playlistId, user);
+    const external = parsed.data.source === "external";
+    if (external && ((user.role !== "admin" && !user.externalSearchEnabled) ||
+        currentPrivacyManager()?.isExternalAllowed("metadata") === false)) {
+      return { items: [], message: "External suggestions are disabled. Library suggestions are still available.", canModify };
+    }
+    const playlist = await playlists.get(playlistId, user);
+    if (!playlist) return sendError(reply, 404, "Playlist not found");
+    try {
+      const result = await playlistRecommendations.get(user.id, playlist, external);
+      return { ...result, canModify };
+    } catch (error) {
+      request.log.warn({ err: error }, "Could not load playlist recommendations");
+      return sendError(reply, 503, "Playlist recommendations are temporarily unavailable. Try again shortly.", "RECOMMENDATIONS_UNAVAILABLE");
+    }
+  });
+
+  app.get("/api/discovery/itunes-preview", async (request, reply) => {
+    if (!requireUser(db, request, reply)) return reply;
+    const parsed = z.object({ term: z.string().trim().min(1).max(300), entity: z.literal("song"), limit: z.literal("1") }).strict().safeParse(request.query);
+    if (!parsed.success) return sendError(reply, 400, "Invalid preview lookup", "VALIDATION_ERROR");
+    const url = new URL("https://itunes.apple.com/search");
+    url.search = new URLSearchParams(parsed.data).toString();
+    const response = await externalCatalog.fetchImpl(url, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) return sendError(reply, 502, "iTunes preview lookup unavailable");
+    reply.header("Cache-Control", "private, no-store");
+    return response.json();
   });
 
   app.post("/api/discovery/external/previews", async (request, reply) => {
@@ -258,6 +357,7 @@ export async function registerMusicRoutes(
         value: z.unknown(),
       })).default([]),
       limit: z.number().int().min(1).max(500).optional(),
+      offset: z.number().int().min(0).optional(),
     }).safeParse(request.body);
 
     if (!parsed.success) {
@@ -268,6 +368,7 @@ export async function registerMusicRoutes(
       userId: user.id,
       filters: parsed.data.filters as LibraryFilter[],
       limit: parsed.data.limit,
+      offset: parsed.data.offset,
     });
   });
 
@@ -287,6 +388,7 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
     const { kind } = request.params as { kind: string };
+    if (kind === "highest-rated") return sendError(reply, 404, "Library collection not found");
     const query = request.query as { limit?: string };
     return libraryInsights.collection(user.id, kind, Number(query.limit || 50));
   });
@@ -319,26 +421,16 @@ export async function registerMusicRoutes(
     });
   });
 
-  app.put("/api/library/:itemType/:itemId/rating", async (request, reply) => {
+  app.get("/api/library/collector", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
-
-    const { itemType, itemId } = request.params as { itemType: string; itemId: string };
-    if (!["track", "album", "artist"].includes(itemType)) {
-      return sendError(reply, 400, "Invalid rating item type", "VALIDATION_ERROR");
-    }
-
-    const parsed = z.object({ rating: z.number().int().min(1).max(5).nullable() }).safeParse(request.body);
-    if (!parsed.success) {
-      return sendError(reply, 400, "Invalid rating", "VALIDATION_ERROR");
-    }
-
-    try {
-      libraryInsights.setRating(user.id, itemType as "track" | "album" | "artist", itemId, parsed.data.rating);
-      return { ok: true };
-    } catch {
-      return sendError(reply, 400, "Invalid rating", "VALIDATION_ERROR");
-    }
+    reply.header("Cache-Control", "private, no-store");
+    const includeAlbums = (request.query as { albums?: string }).albums === "1";
+    const [tracks, albums] = await Promise.all([
+      libraryInsights.collectorTracks(user.id),
+      includeAlbums ? catalog.albumsForWindow() : null,
+    ]);
+    return { ...tracks, ownerId: user.id, albums: albums?.items ?? [], degraded: tracks.degraded || albums?.degraded || false };
   });
 
   app.put("/api/library/:itemType/:itemId/favorite", async (request, reply) => {
@@ -350,13 +442,45 @@ export async function registerMusicRoutes(
       return sendError(reply, 400, "Invalid favorite item type", "VALIDATION_ERROR");
     }
 
-    const parsed = z.object({ favorite: z.boolean() }).safeParse(request.body);
+    const parsed = z.object({
+      favorite: z.boolean(),
+      album: z.object({
+        name: z.string().trim().min(1).max(500),
+        artist: z.string().trim().max(500),
+        coverUrl: z.string().max(2048).refine((value) => {
+          if (value.startsWith("/api/") && !value.includes("\\")) return true;
+          try { return ["https:", "http:"].includes(new URL(value).protocol); }
+          catch { return false; }
+        }).nullable(),
+      }).optional(),
+    }).safeParse(request.body);
     if (!parsed.success) {
       return sendError(reply, 400, "Invalid favorite request", "VALIDATION_ERROR");
     }
 
-    libraryInsights.setFavorite(user.id, itemType as "track" | "album" | "artist" | "playlist", itemId, parsed.data.favorite);
+    libraryInsights.setFavorite(user.id, itemType as "track" | "album" | "artist" | "playlist", itemId, parsed.data.favorite,
+      itemType === "album" ? parsed.data.album : undefined);
     return { ok: true };
+  });
+
+  app.get("/api/favorites/albums", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    reply.header("cache-control", "private, no-store");
+    const rows = db.prepare(`SELECT item_id, metadata_json FROM media_favorites
+      WHERE user_id = ? AND item_type = 'album' ORDER BY created_at DESC, item_id`)
+      .all(user.id) as Array<{ item_id: string; metadata_json: string | null }>;
+    const albums = await Promise.all(rows.map(async (row) => {
+      if (row.metadata_json) return { ...JSON.parse(row.metadata_json), id: row.item_id };
+      // Favorites saved before metadata snapshots were introduced still work.
+      try {
+        const album = await catalog.getAlbum(row.item_id);
+        if (album) return { id: album.id, name: album.name, artist: album.artistName,
+          coverUrl: album.artworkUrl, coverArt: album.artworkId };
+      } catch { /* Keep an unavailable favorite visible so it can be removed. */ }
+      return { id: row.item_id, name: "Saved album", artist: "", coverUrl: null };
+    }));
+    return { albums };
   });
 
   app.get("/api/recommendations", async (request, reply) => {
@@ -402,8 +526,13 @@ export async function registerMusicRoutes(
       return sendError(reply, 400, "Invalid radio request", "VALIDATION_ERROR");
     }
 
-    const tracks = await recommendations.local.radio(parsed.data, user.id, parsed.data.limit || 20);
-    return { tracks, degraded: false };
+    try {
+      const tracks = await recommendations.local.radio(parsed.data, user.id, parsed.data.limit || 20);
+      return { tracks, degraded: false };
+    } catch (error) {
+      if (error instanceof RecommendationSeedNotFoundError) return sendError(reply, 404, error.message, "TRACK_NOT_FOUND");
+      throw error;
+    }
   });
 
   app.post("/api/recommendations/feedback", async (request, reply) => {
@@ -413,15 +542,46 @@ export async function registerMusicRoutes(
     const parsed = z.object({
       action: z.enum(["hide", "not-interested", "more-like-this", "less-like-this", "block-artist", "block-album"]),
       itemType: z.enum(["track", "artist", "album"]),
-      itemId: z.string().min(1),
-    }).safeParse(request.body);
+        itemId: z.string().min(1).max(256).optional(),
+        title: z.string().trim().min(1).max(500).optional(),
+        artist: z.string().trim().min(1).max(500).optional(),
+        album: z.string().trim().max(500).optional(),
+    }).refine((value) =>
+      (value.action !== "block-artist" || value.itemType === "artist") &&
+      (value.action !== "block-album" || value.itemType === "album")
+    ).safeParse(request.body);
 
     if (!parsed.success) {
       return sendError(reply, 400, "Invalid recommendation feedback", "VALIDATION_ERROR");
     }
 
-    recommendations.local.setFeedback(user.id, parsed.data.action, parsed.data.itemType, parsed.data.itemId);
+    const feedbackId = parsed.data.itemId ?? (parsed.data.itemType === "artist" && parsed.data.artist ? tasteArtistId(parsed.data.artist) : null);
+    if (!feedbackId) return sendError(reply, 400, "An item ID or artist name is required.", "VALIDATION_ERROR");
+    recommendations.local.setFeedback(user.id, parsed.data.action, parsed.data.itemType, feedbackId, parsed.data);
     return { ok: true };
+  });
+
+  app.post("/api/recommendations/autoplay", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    if (tasteProfile(db).state(user.id).privateListening) return { tracks: [], degraded: false };
+    const parsed = z.object({
+      seedId: z.string().min(1).max(256),
+      limit: z.number().int().min(1).max(50).default(10),
+      excludeIds: z.array(z.string().min(1).max(256)).max(500).default([]),
+      playlistId: z.string().min(1).max(300).optional(), excludeFromTaste: z.boolean().optional(),
+    }).safeParse(request.body);
+    if (!parsed.success) return sendError(reply, 400, "Invalid autoplay request", "VALIDATION_ERROR");
+    const metadata = tasteProfile(db).resolve({ id: parsed.data.seedId });
+    if (tasteProfile(db).decision(user.id, { trackId: parsed.data.seedId, startedAt: new Date().toISOString(), playlistId: parsed.data.playlistId,
+      excludeFromTaste: parsed.data.excludeFromTaste, track: { title: metadata.title, artist: metadata.artist } }).excluded) return { tracks: [], degraded: false };
+    try {
+      const tracks = await recommendations.local.autoplay(user.id, parsed.data.seedId, parsed.data.limit, parsed.data.excludeIds);
+      return { tracks, degraded: false };
+    } catch (error) {
+      if (error instanceof RecommendationSeedNotFoundError) return sendError(reply, 404, error.message, "TRACK_NOT_FOUND");
+      throw error;
+    }
   });
 
   app.post("/api/listening-events", async (request, reply) => {
@@ -436,16 +596,18 @@ export async function registerMusicRoutes(
       }
       let result: ReturnType<typeof recordPlayback>;
       try {
-        result = recordPlayback(db, user.id, parsed.data);
+        result = recordPlayback(db, user.id, parsed.data, Date.now(), (id, seconds, duration) =>
+          scrobbleQueue?.enqueuePlayback(user.id, id, parsed.data, seconds, duration));
       } catch (error) {
         if (error instanceof Error && (error.message.startsWith("Playback session") || error.message.startsWith("Playback start"))) {
           return sendError(reply, 400, error.message, "VALIDATION_ERROR");
         }
         throw error;
       }
-      if (result.newlyCounted || parsed.data.finished) recommendations.local.invalidateListeningTaste(user.id);
-      if (result.newlyCounted) {
-        addRecentlyPlayed(db, user.id, parsed.data.trackId, parsed.data.startedAt);
+      scrobbleQueue?.kick();
+        if (result.tasteChanged || (!result.tasteExcluded && (result.newlyCounted || parsed.data.finished))) recommendations.local.invalidateListeningTaste(user.id);
+        if (result.newlyCounted) addRecentlyPlayed(db, user.id, parsed.data.trackId, parsed.data.startedAt, { excluded: result.tasteExcluded, sessionId: parsed.data.playbackSessionId, recordingKey: result.recordingKey });
+      if (result.scrobbleDue) {
         // Provider scrobbling is secondary; commit the local event first and
         // never make the player wait for the upstream provider.
         sourceResolver.scrobbleTrack(parsed.data.trackId).catch((error) =>
@@ -458,16 +620,17 @@ export async function registerMusicRoutes(
       trackId: z.string().min(1),
       eventType: z.enum(["play", "skip", "complete"]),
       completionRatio: z.number().min(0).max(1).optional(),
+      privateListening: z.boolean().optional(), excludeFromTaste: z.boolean().optional(), playlistId: z.string().min(1).max(300).nullable().optional(),
     }).safeParse(request.body);
 
     if (!parsed.success) {
       return sendError(reply, 400, "Invalid listening event", "VALIDATION_ERROR");
     }
 
-    recommendations.local.recordListeningEvent(user.id, parsed.data.trackId, parsed.data.eventType, parsed.data.completionRatio);
+    const tasteResult = recommendations.local.recordListeningEvent(user.id, parsed.data.trackId, parsed.data.eventType, parsed.data.completionRatio, parsed.data);
     if (parsed.data.eventType !== "complete") return reply.code(201).send({ ok: true });
 
-    addRecentlyPlayed(db, user.id, parsed.data.trackId);
+    addRecentlyPlayed(db, user.id, parsed.data.trackId, undefined, { excluded: tasteResult.excluded, recordingKey: tasteResult.recordingKey });
     // A local provider outage must not discard the listening event or break playback.
     try {
       const scrobbled = await sourceResolver.scrobbleTrack(parsed.data.trackId);
@@ -482,7 +645,14 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
-    const query = request.query as { limit?: string };
+    const query = request.query as { limit?: string; offset?: string };
+    if (query.offset !== undefined) {
+      const page = libraryPageQuerySchema.safeParse(query);
+      if (!page.success) return sendError(reply, 400, "Invalid library page", "VALIDATION_ERROR");
+      const result = await catalog.albumsForWindow();
+      return { albums: result.items.slice(page.data.offset, page.data.offset + page.data.limit),
+        total: result.items.length, revision: result.revision, degraded: result.degraded };
+    }
     const result = await catalog.listAlbums(Number(query.limit || 500));
     return { albums: result.items, degraded: result.degraded };
   });
@@ -511,8 +681,9 @@ export async function registerMusicRoutes(
       })
     );
 
-    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
-    if (!externalCatalog.isEnabled() || !externalAllowed) {
+    const externalAllowed = (user.role === "admin" || user.externalSearchEnabled) &&
+      currentPrivacyManager()?.isExternalAllowed("metadata") !== false;
+    if (!externalCatalog.isEnabled() || !externalAllowed || currentPrivacyManager()?.isExternalAllowed("metadata") === false) {
       return { tracks: stampedLocal, localCount: stampedLocal.length };
     }
 
@@ -642,6 +813,28 @@ export async function registerMusicRoutes(
     return { album: { ...await albumArtwork.resolve(album, tracks), trackCount: tracks.length, localTrackCount: localCount } };
   });
 
+  app.get<{ Params: { albumId: string }; Querystring: { size?: string } }>("/api/albums/:albumId/artwork", async (request, reply) => {
+    if (!requireUser(db, request, reply)) return reply;
+    const { albumId } = request.params;
+    const album = await catalog.getAlbum(albumId);
+    if (!album) return sendError(reply, 404, "Album not found");
+    const resolved = await albumArtwork.resolve(album, () => catalog.getAlbumTracks(albumId));
+    const target = resolved.coverUrl;
+    if (target && isSpotifyArtworkUrl(target) && currentPrivacyManager()?.isExternalAllowed("artwork")) {
+      return reply.header("Cache-Control", "private, no-store").redirect(target);
+    }
+    if (!target || !/^\/api\/(?:artwork\/[^/]|metadata\/album-artwork\?)/.test(target)) {
+      return sendError(reply, 404, "Artwork not found");
+    }
+    const [pathname, query] = target.split("?", 2);
+    const params = new URLSearchParams(query);
+    if (pathname.startsWith("/api/artwork/") && request.query.size !== undefined) {
+      params.set("size", String(resolveArtworkSize(request.query.size)));
+    }
+    reply.header("Cache-Control", resolved.artworkResolutionFailed ? "private, no-store" : "private, max-age=300");
+    return reply.redirect(params.size ? `${pathname}?${params}` : pathname);
+  });
+
   app.get("/api/albums/:albumId/tracks", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
@@ -680,13 +873,49 @@ export async function registerMusicRoutes(
     return { artists: result.items, degraded: result.degraded };
   });
 
+  async function resolvePopularTracks(candidates: UnifiedSearchResult[], localTracks: Track[] = []) {
+    const local = localTracks.map(toTrackSearchResult);
+    const ranked: UnifiedSearchResult[] = [];
+    for (const track of candidates) {
+      if (ranked.some((item) => item.id === track.id || recordingsMatch(item, track))) continue;
+      ranked.push(track);
+      if (ranked.length === 10) break;
+    }
+
+    // Artist albums can omit local singles and tracks filed under compilations.
+    // Search only the unresolved titles in the ranked list, without a library scan.
+    const searches = new Map<string, Promise<UnifiedSearchResult[]>>();
+    const resolved = await Promise.all(ranked.map(async (track) => {
+      const owned = local.find((item) => recordingsMatch(item, track));
+      if (owned) return owned;
+      const key = normalizeMusicText(track.title);
+      if (!key) return track;
+      let lookup = searches.get(key);
+      if (!lookup) {
+        lookup = catalog.search(track.title, ["tracks"])
+          .then((result) => result.tracks.map(toTrackSearchResult)).catch(() => []);
+        searches.set(key, lookup);
+      }
+      return (await lookup).find((item) => recordingsMatch(item, track)) ?? track;
+    }));
+
+    const top: UnifiedSearchResult[] = [];
+    for (const track of [...resolved, ...local]) {
+      if (top.some((item) => item.id === track.id || recordingsMatch(item, track))) continue;
+      top.push(track);
+      if (top.length === 10) break;
+    }
+    return top;
+  }
+
   app.get("/api/artists/:artistId/overview", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
     const { artistId } = request.params as { artistId: string };
     const { scope } = request.query as { scope?: string };
-    const externalAllowed = user.role === "admin" || user.externalSearchEnabled;
+    const externalAllowed = (user.role === "admin" || user.externalSearchEnabled) &&
+      currentPrivacyManager()?.isExternalAllowed("metadata") !== false;
     const keylessExternalArtist = /^external_(deezer|itunes)_artist_/.test(artistId);
     if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) {
       // Deezer and iTunes detail metadata is keyless. Users who can see a
@@ -702,7 +931,7 @@ export async function registerMusicRoutes(
         artist,
         albums: artist.albums,
         tracks: artist.tracks.slice(0, 10),
-        topTracks: artist.tracks.slice(0, 10),
+        topTracks: await resolvePopularTracks(artist.tracks),
         localAlbumCount: 0,
         localSongCount: 0,
       } : sendError(reply, 404, "Artist not found");
@@ -762,6 +991,23 @@ export async function registerMusicRoutes(
     };
   });
 
+  async function deezerArtistForName(name: string, localAlbums: Album[]) {
+    const nameKey = normalizeMusicText(name);
+    if (!nameKey) return null;
+    const candidates = await externalCatalog.deezerProvider.searchArtists(name, 8).catch(() => []);
+    const matches = [...new Set(candidates.filter((candidate) => normalizeMusicText(candidate.title) === nameKey)
+      .map((candidate) => candidate.id))];
+    if (!matches.length || matches.length > 3) return null;
+    const details = await Promise.all(matches.map((id) => externalCatalog.deezerProvider.getArtist(id).catch(() => null)));
+    if (matches.length === 1) return details[0];
+
+    const localReleases = new Set(localAlbums.map((album) => itunesReleaseKey(album.name)));
+    const ranked = details.flatMap((detail) => detail ? [{ detail, score: new Set(detail.albums
+      .map((album) => itunesReleaseKey(album.title)).filter((key) => localReleases.has(key))).size }] : [])
+      .sort((left, right) => right.score - left.score);
+    return ranked[0]?.score && ranked[0].score !== ranked[1]?.score ? ranked[0].detail : null;
+  }
+
   /**
    * Slow, optional artist enrichment. The Artist page requests this only
    * after its local overview has rendered, so a provider timeout never delays
@@ -770,7 +1016,8 @@ export async function registerMusicRoutes(
   app.get("/api/artists/:artistId/discography", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
-    if (user.role !== "admin" && !user.externalSearchEnabled) {
+    if ((user.role !== "admin" && !user.externalSearchEnabled)
+      || currentPrivacyManager()?.isExternalAllowed("metadata") === false) {
       return sendError(reply, 403, "External catalog is not available for this user");
     }
 
@@ -779,25 +1026,18 @@ export async function registerMusicRoutes(
       return sendError(reply, 400, "Complete discography requires a local artist");
     }
 
-    const { artist, localAlbums } = await localArtistSnapshot(artistId);
+    const { artist, localAlbums, localTracks: snapshotTracks } = await localArtistSnapshot(artistId);
     if (!artist) return sendError(reply, 404, "Artist not found");
-    const localTracks = await catalog.getArtistTracks(artistId);
+    const localTracks = await catalog.getArtistTracks(artistId).catch(() => snapshotTracks);
 
-    const [itunesResult, deezerArtistsResult] = await Promise.allSettled([
+    const [itunes, deezerDetail] = await Promise.all([
       itunesArtistCatalog.resolve(artist, localAlbums, localTracks),
-      externalCatalog.deezerProvider.searchArtists(artist.name, 8),
+      deezerArtistForName(artist.name, localAlbums),
     ]);
-    const deezerArtist = deezerArtistsResult.status === "fulfilled"
-      ? deezerArtistsResult.value.find((candidate) => normalizeDiscographyText(candidate.title) === normalizeDiscographyText(artist.name))
-      : null;
-    const deezerDetail = deezerArtist
-      ? await externalCatalog.deezerProvider.getArtist(deezerArtist.id).catch(() => null)
-      : null;
-    const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : null;
 
     const local = {
       albums: localAlbums.map((album): DiscographyAlbum => ({
-        id: album.id, title: album.name, artist: album.artistName, year: album.year,
+        id: album.id, title: album.name, artist: artist.name, year: album.year,
         artworkId: album.artworkId, source: "local",
       })),
       tracks: localTracks.map((track): DiscographyTrack => ({
@@ -851,65 +1091,29 @@ export async function registerMusicRoutes(
   app.get("/api/artists/:artistId/top-tracks", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
-    if (user.role !== "admin" && !user.externalSearchEnabled) {
+    const externalAllowed = currentPrivacyManager()?.isExternalAllowed("metadata") !== false;
+    if (externalAllowed && user.role !== "admin" && !user.externalSearchEnabled) {
       return sendError(reply, 403, "External catalog is not available for this user");
     }
     const { artistId } = request.params as { artistId: string };
-    const { artist, localAlbums } = await localArtistSnapshot(artistId);
+    const { artist, localAlbums, localTracks: snapshotTracks } = await localArtistSnapshot(artistId);
     if (!artist) return sendError(reply, 404, "Artist not found");
-    const localTracks = await catalog.getArtistTracks(artistId);
-    const [itunesResult, deezerArtistsResult] = await Promise.allSettled([
-      itunesArtistCatalog.resolve(artist, localAlbums, localTracks),
-      externalCatalog.deezerProvider.searchArtists(artist.name, 8),
+    const artistTracks = await catalog.getArtistTracks(artistId).catch(() => []);
+    const localTracks = [...new Map([...snapshotTracks, ...artistTracks].map((track) => [track.id, track])).values()];
+    const [itunes, deezer] = await Promise.all([
+      externalAllowed ? itunesArtistCatalog.resolve(artist, localAlbums, localTracks) : Promise.resolve(null),
+      externalAllowed ? deezerArtistForName(artist.name, localAlbums) : Promise.resolve(null),
     ]);
-    const deezerArtist = deezerArtistsResult.status === "fulfilled"
-      ? deezerArtistsResult.value.find((candidate) => normalizeDiscographyText(candidate.title) === normalizeDiscographyText(artist.name))
-      : null;
-    const deezer = deezerArtist
-      ? await externalCatalog.deezerProvider.getArtist(deezerArtist.id).catch(() => null)
-      : null;
-    const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : null;
-    const candidates: DiscographyTrack[] = [
-      ...(deezer?.tracks || []).map((track): DiscographyTrack => ({
-        id: track.id, title: track.title, artist: track.artist, album: track.album,
-        durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
-        artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
-        source: "external", provider: "deezer", metadata: track.metadata,
-      })),
-      ...(itunes?.tracks || []).map((track): DiscographyTrack => ({
-        id: track.id, title: track.title, artist: track.artist, album: track.album,
-        durationSeconds: typeof track.metadata.durationSeconds === "number" ? track.metadata.durationSeconds : null,
-        artworkId: track.artwork?.id || null, previewUrl: track.previewUrl || null,
-        source: "external", provider: "itunes", metadata: track.metadata,
-      })),
-    ];
-    const knownLocal = localTracks.map((track): DiscographyTrack => ({
-      id: track.id, title: track.title, artist: track.artistName, album: track.albumName,
-      durationSeconds: track.durationSeconds, artworkId: track.artworkId, source: "local",
-    }));
-    const top: Array<DiscographyTrack & { localId?: string }> = [];
-    for (const candidate of candidates) {
-      if (top.some((item) => discographyTracksMatch(candidate, item))) continue;
-      const local = knownLocal.find((item) => discographyTracksMatch(candidate, item));
-      top.push(local ? { ...local, localId: local.id } : candidate);
-      if (top.length === 10) break;
-    }
-    // Keyless providers may be unavailable. Keep a useful local fallback.
-    for (const local of knownLocal) {
-      if (top.length === 10) break;
-      if (!top.some((item) => discographyTracksMatch(local, item))) top.push({ ...local, localId: local.id });
-    }
+    const top = await resolvePopularTracks([...(deezer?.tracks || []), ...(itunes?.tracks || [])], localTracks);
     reply.header("Cache-Control", "private, max-age=300");
     return {
       tracks: top.map((track) => ({
         ...track,
-        coverArt: track.artworkId,
-        duration: track.durationSeconds,
-        isDownloaded: track.source === "local",
-        discographySource: track.source,
-        source: track.source === "local"
-          ? { kind: "library", count: 1 }
-          : { kind: "external", count: 0, externalAvailable: true },
+        coverArt: track.artwork?.id ?? null,
+        duration: track.metadata.durationSeconds ?? null,
+        isDownloaded: track.source.kind === "library",
+        discographySource: track.source.kind === "library" ? "local" : "external",
+        ...(track.localTrackId ? { localId: track.localTrackId } : {}),
       })),
     };
   });
@@ -928,13 +1132,16 @@ export async function registerMusicRoutes(
     const { artist, localAlbums, localTracks } = await localArtistSnapshot(artistId);
     if (!artist) return sendError(reply, 404, "Artist not found");
     if (skipNative !== "1") {
+      if (artist.imageUrl === artist.artworkUrl && artist.imageUrl?.startsWith("/api/artwork/mdart_")) {
+        return { imageUrl: artist.imageUrl, imageSource: "native", imageKind: "artist" };
+      }
       const native = isNativeArtistPicture(artist.imageUrl || null, localAlbums)
         ? artist.imageUrl : (await catalog.getArtist(artistId, { includeArtistInfo: true }).catch(() => null))?.imageUrl;
       if (isNativeArtistPicture(native || null, localAlbums)) {
         return { imageUrl: native, imageSource: "native", imageKind: "artist" };
       }
     }
-    if (user.role !== "admin" && !user.externalSearchEnabled) return { imageUrl: null };
+    if ((user.role !== "admin" && !user.externalSearchEnabled) || currentPrivacyManager()?.isExternalAllowed("artwork") === false) return { imageUrl: null };
     const verified = await artistImages.resolve({ artist, albums: localAlbums, tracks: localTracks },
       { skipDeezer: skipDeezer === "1" });
     const artworkId = verified
@@ -954,7 +1161,7 @@ export async function registerMusicRoutes(
     const { artistId } = request.params as { artistId: string };
     reply.header("Cache-Control", "no-store");
     if (artistId.startsWith("external_") || artistId.startsWith("extdetail_")) return { imageUrl: null };
-    if (user.role !== "admin" && !user.externalSearchEnabled) return { imageUrl: null };
+    if ((user.role !== "admin" && !user.externalSearchEnabled) || currentPrivacyManager()?.isExternalAllowed("artwork") === false) return { imageUrl: null };
     const { artist } = await localArtistSnapshot(artistId);
     if (!artist) return sendError(reply, 404, "Artist not found");
     const imageUrl = await musicBrainzAvatars.resolve(artist);
@@ -1039,6 +1246,14 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
+    const query = request.query as { offset?: string; limit?: string };
+    if (query.offset !== undefined) {
+      const page = libraryPageQuerySchema.safeParse(query);
+      if (!page.success) return sendError(reply, 400, "Invalid library page", "VALIDATION_ERROR");
+      const result = await catalog.tracksForWindow();
+      return { tracks: result.items.slice(page.data.offset, page.data.offset + page.data.limit),
+        total: result.items.length, revision: result.revision, degraded: result.degraded };
+    }
     const result = await catalog.listTracks();
     return { tracks: result.items, degraded: result.degraded };
   });
@@ -1084,20 +1299,45 @@ export async function registerMusicRoutes(
           album: track.albumName || undefined, durationSeconds: track.durationSeconds };
       }
     }
+    const local = await catalog.getTrackLyrics(trackId).catch(() => null);
+    const localLines = typeof local === "string" ? parseLrcLines(local) : [];
+    if (localLines.length) {
+      return { syncedLyrics: localLines, plainLyrics: null, isSynced: true,
+        provider: "none", instrumental: false, lyrics: local };
+    }
     const external = metadata ? await lyricsService.get(trackId, metadata) : null;
     if (external?.syncedLyrics || external?.plainLyrics) {
       return { ...external, lyrics: external.syncedLyrics || external.plainLyrics };
     }
-    const local = await catalog.getTrackLyrics(trackId).catch(() => null);
-    const localLines = typeof local === "string" ? parseLrcLines(local) : [];
     return {
-      syncedLyrics: localLines.length ? localLines : null,
-      plainLyrics: localLines.length ? null : local,
-      isSynced: localLines.length > 0,
+      syncedLyrics: null,
+      plainLyrics: local,
+      isSynced: false,
       provider: "none",
       instrumental: external?.instrumental || false,
       lyrics: local,
     };
+  });
+
+  app.post("/api/tracks/:trackId/lyrics/report", async (request, reply) => {
+    const user = requireUser(db, request, reply);
+    if (!user) return reply;
+    const params = z.object({ trackId: z.string().min(1).max(300).regex(/^[\w.:-]+$/) }).safeParse(request.params);
+    const body = z.object({ reason: z.enum(["wrong-lyrics", "wrong-timing"]), ownerId: z.string().min(1) })
+      .strict().safeParse(request.body);
+    if (!params.success || !body.success) return sendError(reply, 400, "Invalid lyrics report");
+    if (body.data.ownerId !== user.id) return sendError(reply, 409, "The signed-in account changed");
+    const admission = lyricReports.admit(request.ip, user.id);
+    if (!admission.allowed) {
+      reply.header("Retry-After", admission.retryAfter);
+      return sendError(reply, 429, "Too many lyrics reports. Try again shortly.");
+    }
+    try {
+      request.log.warn({ trackId: params.data.trackId, userId: user.id, reason: body.data.reason }, "Lyrics issue reported");
+      return reply.code(204).send();
+    } finally {
+      admission.release();
+    }
   });
 
   const artistMetadataQuery = z.object({ artist: z.string().trim().min(1).max(300) });
@@ -1181,12 +1421,11 @@ export async function registerMusicRoutes(
     }
 
     const { trackId } = request.params as { trackId: string };
-    return { analysis: silenceAnalysis.getAnalysis(trackId) };
-  });
-
-  const silenceAnalysisRequestSchema = z.object({
-    thresholdDb: z.number().optional(),
-    minSilenceSeconds: z.number().positive().optional(),
+    const parsed = z.object({ thresholdDb: z.coerce.number().min(-100).max(0).optional(),
+      minSilenceSeconds: z.coerce.number().positive().max(30).optional() }).strict().safeParse(request.query);
+    if (!parsed.success) return sendError(reply, 400, "Invalid silence analysis settings", "VALIDATION_ERROR");
+    await sourceResolver.refreshContentRevision(trackId);
+    return { analysis: silenceAnalysis.getAnalysis(trackId, Object.keys(parsed.data).length ? parsed.data : undefined) };
   });
 
   // Manual (re-)analysis. Always resolves with a result (completed or
@@ -1218,6 +1457,11 @@ export async function registerMusicRoutes(
   app.get("/api/search", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
+    const personalize = (groups: Parameters<typeof deduplicateSearchGroups>[0], all = false) => {
+      const allows = tasteProfile(db).feedbackFilter(user.id);
+      return Object.fromEntries(Object.entries(groups).map(([type, items]) => [type, items.filter(item =>
+        item.type === "playlist" || (!all && item.source?.kind === "library") || allows(tasteTarget(item)))])) as typeof groups;
+    };
 
     const query = request.query as { q?: string; types?: string; mode?: string; phase?: string };
     const types = parseTypes(query.types)?.flatMap((type) => {
@@ -1230,7 +1474,8 @@ export async function registerMusicRoutes(
     const requestedMode = query.mode === "library" || query.mode === "external" || query.mode === "hybrid"
       ? query.mode
       : "hybrid";
-    const canSearchExternal = user.role === "admin" || user.externalSearchEnabled;
+    const canSearchExternal = (user.role === "admin" || user.externalSearchEnabled) &&
+      currentPrivacyManager()?.isExternalAllowed("metadata") !== false;
 
     if (requestedMode === "external" && !canSearchExternal) {
       return sendError(reply, 403, "External search is not available for this user");
@@ -1238,7 +1483,7 @@ export async function registerMusicRoutes(
 
     const mode = canSearchExternal ? requestedMode : "library";
     if (query.phase === "local") {
-      const local = await searchProviders.search(query.q || "", { types, mode: "library" });
+      const local = await searchProviders.search(query.q || "", { types, mode: "library", user });
       const groups = deduplicateSearchGroups(local.groups);
       return { ...toLegacySearchResponse(local.groups), results: groups, degraded: local.degraded };
     }
@@ -1261,16 +1506,16 @@ export async function registerMusicRoutes(
         }
       }
       return {
-        results: deduplicateSearchGroups({
+          results: personalize(deduplicateSearchGroups({
           ...external.groups,
           track: [...external.groups.track, ...extra.filter((item) => item.type === "track")],
           album: [...external.groups.album, ...extra.filter((item) => item.type === "album")],
           artist: [...external.groups.artist, ...extra.filter((item) => item.type === "artist")],
-        }),
+          }), true),
         degraded: external.degraded,
       };
     }
-    const result = await searchProviders.search(query.q || "", { types, mode });
+    const result = await searchProviders.search(query.q || "", { types, mode, user });
     const shouldSearchExternal = canSearchExternal
       && externalCatalog.isEnabled()
       && (mode === "hybrid" || mode === "external")
@@ -1279,21 +1524,21 @@ export async function registerMusicRoutes(
     if (shouldSearchExternal) {
       try {
         const external = await externalCatalog.search(query.q || "", { limit: 12 });
-        const groups = deduplicateSearchGroups({
+        const groups = personalize(deduplicateSearchGroups({
           ...result.groups,
           track: [...result.groups.track, ...external.filter((item) => item.type === "track")],
           album: [...result.groups.album, ...external.filter((item) => item.type === "album")],
           artist: [...result.groups.artist, ...external.filter((item) => item.type === "artist")],
-        });
-        const legacy = toLegacySearchResponse(result.groups);
+        }), mode === "external");
+        const legacy = toLegacySearchResponse(groups);
         return { ...legacy, results: groups, degraded: result.degraded };
       } catch {
         // Keep library results available when external discovery degrades.
       }
     }
 
-    const legacy = toLegacySearchResponse(result.groups);
-    const normalized = deduplicateSearchGroups(result.groups);
+    const normalized = personalize(deduplicateSearchGroups(result.groups), mode === "external");
+    const legacy = toLegacySearchResponse(normalized);
     return {
       ...legacy,
       results: normalized,
@@ -1349,6 +1594,7 @@ export async function registerMusicRoutes(
     }
 
     await setTrackFavorite(db, user.id, trackId, true);
+    recommendations.local.invalidateListeningTaste(user.id);
     return { ok: true };
   });
 
@@ -1363,6 +1609,7 @@ export async function registerMusicRoutes(
     }
 
     await setTrackFavorite(db, user.id, trackId, false);
+    recommendations.local.invalidateListeningTaste(user.id);
     return { ok: true };
   });
 
@@ -1370,7 +1617,7 @@ export async function registerMusicRoutes(
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
-    return { tracks: await activityRecent(db, catalog, user.id) };
+    return { tracks: await activityRecent(db, catalog, user.id, (request.query as { tasteOnly?: string }).tasteOnly === "1") };
   });
 
   app.post("/api/recently-played", async (request, reply) => {
@@ -1443,7 +1690,11 @@ export async function registerMusicRoutes(
     if (!user) return reply;
 
     const { trackId } = request.params as { trackId: string };
-    const query = request.query as { source?: string; playableSource?: string; maxBitRate?: string };
+    const query = request.query as { source?: string; playableSource?: string; maxBitRate?: string; inspectionId?: string };
+    const inspectionId = query.inspectionId;
+    if (inspectionId !== undefined && !inspectionQuery.safeParse({ inspectionId }).success) {
+      return sendError(reply, 400, "Invalid audio inspection identifier");
+    }
     const preferredSource = typeof query.source === "string" && query.source ? query.source : undefined;
     const playableSource = typeof query.playableSource === "string" && query.playableSource ? query.playableSource : undefined;
     const requestedBitRate = Number(query.maxBitRate);
@@ -1458,9 +1709,17 @@ export async function registerMusicRoutes(
         return sendError(reply, 403, "External playback is not available for this user");
       }
 
+      const release = taskManager?.acquireMediaStream();
+      if (release) {
+        reply.raw.once("finish", release);
+        reply.raw.once("close", release);
+        reply.raw.once("error", release);
+      }
       try {
-        return await sendProxyResponse(reply, await sourceProviders.fetchStream(trackId, playableSource, request.headers.range));
+        const result = await sourceProviders.fetchStream(trackId, playableSource, request.headers.range);
+        return await sendProxyResponse(reply, result);
       } catch {
+        release?.();
         return sendError(reply, 502, "Playback unavailable");
       }
     }
@@ -1469,9 +1728,18 @@ export async function registerMusicRoutes(
       return sendError(reply, 404, "Track not found");
     }
 
+    const release = taskManager?.acquireMediaStream();
+    if (release) {
+      reply.raw.once("finish", release);
+      reply.raw.once("close", release);
+      reply.raw.once("error", release);
+    }
     try {
-      return await sendProxyResponse(reply, await sourceResolver.fetchStream(trackId, request.headers.range, preferredSource, maxBitRate));
+      let result = await sourceResolver.fetchStream(trackId, request.headers.range, preferredSource, maxBitRate);
+      if (inspectionId) result = audioInspector.observe(user.id, trackId, inspectionId, result, request.headers.range);
+      return await sendProxyResponse(reply, result);
     } catch (error) {
+      release?.();
       if (error instanceof SourceUnavailableError) {
         return sendError(reply, 502, "Playback unavailable");
       }
@@ -1523,6 +1791,7 @@ export async function registerMusicRoutes(
     if (playlistArtwork) {
       const rendered = await playlists.renderArtwork(
         playlistArtwork.playlistId,
+        user,
         resolveArtworkSize(size)
       );
 
@@ -1531,7 +1800,7 @@ export async function registerMusicRoutes(
       }
 
       reply.header("content-type", rendered.contentType);
-      reply.header("cache-control", "private, max-age=300");
+      reply.header("cache-control", "private, no-store");
       reply.header("x-content-type-options", "nosniff");
       reply.header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'");
       return reply.send(rendered.body);
@@ -1574,7 +1843,7 @@ export async function registerMusicRoutes(
     }
   });
 
-  app.post("/api/acquisitions", async (request, reply) => {
+  app.post("/api/acquisitions", { bodyLimit: 65_536 }, async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
@@ -1586,10 +1855,11 @@ export async function registerMusicRoutes(
       return sendError(reply, 503, "Acquisition service is not available");
     }
 
-    const body = request.body as any;
-    if (!body || (!body.candidate && !body.candidateId && !body.result && !body.trackId && !body.albumId)) {
+    const parsed = acquisitionRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
       return sendError(reply, 400, "Invalid acquisition request payload", "VALIDATION_ERROR");
     }
+    const body = parsed.data;
 
     try {
       const job = await acquisition.createJob({
@@ -1597,11 +1867,12 @@ export async function registerMusicRoutes(
         candidate: body.candidate,
         candidateId: body.candidateId,
         result: body.result,
-        sourceProvider: body.sourceProvider || body.providerId,
+        sourceProvider: body.sourceProvider,
         containerId: body.containerId,
         trackId: body.trackId,
         albumId: body.albumId,
-        spotifyTrackUrl: body.spotifyTrackUrl || body.spotifyUrl,
+        spotifyTrackUrl: body.spotifyTrackUrl,
+        spotifyUrl: body.spotifyUrl,
         autoPlay: Boolean(body.autoPlay),
       });
 
@@ -1612,8 +1883,15 @@ export async function registerMusicRoutes(
         job,
       });
     } catch (error) {
-      app.log.error(error);
-      return sendError(reply, 500, error instanceof Error ? error.message : "Failed to create acquisition job");
+      if (error instanceof AcquisitionCapacityError) {
+        reply.header("Retry-After", error.retryAfter);
+        return sendError(reply, 429, error.message, "ACQUISITION_CAPACITY");
+      }
+      if (error instanceof AcquisitionValidationError) {
+        return sendError(reply, 400, error.message, "VALIDATION_ERROR");
+      }
+      request.log.error({ err: error, operation: "acquisition.create" }, "Failed to create acquisition job");
+      return sendError(reply, 500, "Failed to create acquisition job", "ACQUISITION_CREATE_FAILED");
     }
   });
 
@@ -1625,28 +1903,60 @@ export async function registerMusicRoutes(
       return sendError(reply, 503, "Acquisition service is not available");
     }
 
-    reply.hijack();
-    reply.raw.setHeader("Content-Type", "text/event-stream");
-    reply.raw.setHeader("Cache-Control", "no-cache");
-    reply.raw.setHeader("Connection", "keep-alive");
-    reply.raw.flushHeaders?.();
-    const eventWriter = new SseEventWriter(reply.raw);
-    eventWriter.push("connected", { connected: true });
+    const release = acquisitionStreams.reserve(user.id);
+    if (!release) {
+      reply.header("Retry-After", 30);
+      return sendError(reply, 429, "Acquisition event connection limit reached", "ACQUISITION_CAPACITY");
+    }
+    let eventWriter: SseEventWriter | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let guard: SessionStreamGuard | undefined;
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      release();
+      guard?.close();
+      unsubscribe?.();
+      streamCleanups.delete(cleanup);
+      request.raw.removeListener("aborted", cleanup);
+      reply.raw.removeListener("close", cleanup);
+      reply.raw.removeListener("error", cleanup);
+      reply.raw.removeListener("finish", cleanup);
+      eventWriter?.close();
+    };
+    streamCleanups.add(cleanup);
+    request.raw.once("aborted", cleanup);
+    reply.raw.once("close", cleanup);
+    reply.raw.once("error", cleanup);
+    reply.raw.once("finish", cleanup);
+    try {
+      guard = new SessionStreamGuard(db, request, user.role === "admin", cleanup, (error) => app.log.error(error));
+      reply.hijack();
+      reply.raw.setHeader("Content-Type", "text/event-stream");
+      reply.raw.setHeader("Cache-Control", "no-cache");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.flushHeaders?.();
+      eventWriter = new SseEventWriter(reply.raw, undefined, undefined, (event, payload) => {
+        const current = guard?.currentUser();
+        return Boolean(current && (event === "connected" || current.role === "admin" || payload.userId === current.id));
+      });
+      guard.start();
+      eventWriter.push("connected", { connected: true });
 
-    const unsubscribe = acquisition.subscribe((event, payload) => {
-      if (user.role !== "admin" && payload.userId !== user.id) {
-        return;
+      if (!closed) {
+        unsubscribe = acquisition.subscribe((event, payload) => {
+          eventWriter?.push(event, payload);
+        });
       }
-      eventWriter.push(event, payload);
-    });
-
-    request.raw.on("close", () => {
-      unsubscribe();
-    });
-    reply.raw.on("close", unsubscribe);
+    } catch (error) {
+      cleanup();
+      app.log.error(error);
+      reply.raw.destroy();
+    }
   });
 
-  app.get("/api/acquisitions", async (request, reply) => {
+  app.get<{ Querystring: { scope?: string } }>("/api/acquisitions", async (request, reply) => {
     const user = requireUser(db, request, reply);
     if (!user) return reply;
 
@@ -1654,7 +1964,8 @@ export async function registerMusicRoutes(
       return { jobs: [] };
     }
 
-    const jobs = acquisition.listJobs(user.id, user.role === "admin");
+    const jobs = acquisition.listJobs(user.id, user.role === "admin" && request.query.scope !== "mine");
+    reply.header("Cache-Control", "private, no-store");
     return { jobs };
   });
 
@@ -1706,7 +2017,18 @@ export async function registerMusicRoutes(
       const job = await acquisition.retryJob(id, user.id, user.role === "admin");
       return { ok: true, job };
     } catch (error) {
-      return sendError(reply, 400, error instanceof Error ? error.message : "Could not retry job");
+      if (error instanceof AcquisitionCapacityError) {
+        reply.header("Retry-After", error.retryAfter);
+        return sendError(reply, 429, error.message, "ACQUISITION_CAPACITY");
+      }
+      if (error instanceof AcquisitionJobError) {
+        return sendError(reply, error.code === "ACQUISITION_NOT_FOUND" ? 404 : 409, error.message, error.code);
+      }
+      if (error instanceof AcquisitionValidationError) {
+        return sendError(reply, 400, error.message, "VALIDATION_ERROR");
+      }
+      request.log.error({ err: error, operation: "acquisition.retry" }, "Failed to retry acquisition job");
+      return sendError(reply, 500, "Failed to retry acquisition job", "ACQUISITION_RETRY_FAILED");
     }
   });
 }

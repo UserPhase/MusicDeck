@@ -1,0 +1,26 @@
+.extension-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.extension-eyebrow { font-size: 9px; letter-spacing: .14em; color: var(--text-muted); margin: 0 0 8px; }
+.extension-heading h2 { margin: 0; }
+.extension-count { color: var(--text-muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.extension-trust { color: var(--text-secondary); line-height: 1.7; font-size: 12px; max-width: 78ch; border-left: 2px solid var(--accent); padding-left: 14px; margin: 20px 0; }
+.extension-list { list-style: none; padding: 0; margin: 22px 0 0; }
+.extension-card { display: flex; align-items: flex-start; gap: 15px; padding: 20px 0; border-top: 1px solid var(--panel-border); }
+.extension-mark { flex-shrink: 0; display: grid; place-items: center; width: 38px; height: 38px; border: 1px solid var(--panel-border); border-radius: 7px; font-size: 11px; letter-spacing: .08em; color: var(--text-muted); }
+.extension-card--enabled .extension-mark { border-color: var(--accent); color: var(--accent-text); }
+.extension-detail { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.extension-detail h3 { margin: 0 0 5px; font-size: 13px; color: var(--text); }
+.extension-detail h3 span { font-size: 10px; color: var(--text-muted); font-weight: 400; margin-left: 7px; }
+.extension-detail code { font-size: 10px; color: var(--text-muted); }
+.extension-detail p { margin: 8px 0 0; font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+.extension-control { display: grid; justify-items: end; gap: 9px; font-size: 11px; }
+.extension-state { text-transform: uppercase; font-size: 9px; letter-spacing: .12em; color: var(--text-muted); }
+.extension-card--enabled .extension-state { color: var(--accent-text); }
+.extension-control input { accent-color: var(--accent); }
+.extension-settings :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.extension-issues { border: 1px solid var(--panel-border); padding: 14px; font-size: 12px; line-height: 1.7; color: var(--text-secondary); overflow-wrap: anywhere; }
+.extension-empty { padding: 20px 0; color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+@media (max-width: 560px) {
+  .extension-card { flex-wrap: wrap; gap: 10px; }
+  .extension-control { flex-basis: 100%; justify-items: start; padding-left: 48px; }
+  .extension-heading { align-items: flex-start; }
+}

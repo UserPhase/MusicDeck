@@ -156,7 +156,7 @@ export async function createTestServer(
   externalFetchImpl?: typeof fetch,
   pluginFetchImpl?: typeof fetch,
   spotifyImportFactory?: (backend: MusicBackend, playlists: PlaylistService, musicRoot: string) => SpotifyPlaylistImportService,
-  serverOptions: Pick<Parameters<typeof buildServer>[0], "logger" | "logBuffer"> = {},
+  serverOptions: Pick<Parameters<typeof buildServer>[0], "logger" | "logBuffer" | "taskDefinitions" | "scrobbleFetch"> = {},
 ) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "musicdeck-test-"));
   const config = loadConfig({
@@ -175,6 +175,8 @@ export async function createTestServer(
   });
 
   const db = await openDatabase(config);
+  db.prepare(`UPDATE backend_connections SET id = 'test-connection'
+    WHERE id = (SELECT id FROM backend_connections WHERE enabled = 1 ORDER BY created_at LIMIT 1)`).run();
   const registry = new ProviderRegistry([{
     connectionId: "test-connection",
     type: "navidrome",
@@ -225,6 +227,7 @@ export async function createTestServer(
       downloadDir: path.join(directory, "music"),
       tmpDir: path.join(directory, "acquisitions", "tmp"),
       maxConcurrentDownloads: 3,
+      limits: config.acquisitionLimits,
       autoScan: true,
       sourcePipeline,
     }

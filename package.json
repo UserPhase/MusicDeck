@@ -8,9 +8,12 @@
     "dev": "npm run start",
     "install:all": "npm install --prefix server && npm install --prefix webapp",
     "build": "npm run build --prefix server && npm run build --prefix webapp",
-    "test": "npm test --prefix server && npm test --prefix webapp"
+    "test": "npm test --prefix server && npm test --prefix webapp",
+    "test:acceptance": "playwright test",
+    "test:acceptance:types": "node server/node_modules/typescript/bin/tsc -p tests/acceptance/tsconfig.json"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "@playwright/test": "^1.64.1",
+    "concurrently": "^10.0.6"
   }
 }

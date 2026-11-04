@@ -12,9 +12,32 @@ import {
 } from "../api/playlists";
 
 import PlaylistCover from "../components/PlaylistCover";
+import LibraryBrowseControls from "../components/LibraryBrowseControls";
+import { normalizePlaylistSearch } from "../utils/playlistSearch";
+import LikedAlbumsSection from "../components/LikedAlbumsSection";
+import SmartPlaylistShelf from "../components/SmartPlaylistShelf";
+import { useSmartPlaylists } from "../hooks/useSmartPlaylists";
 
 
-function Playlists() {
+const playlistFilters = { all: "All playlists", regular: "Regular playlists", smart: "Smart playlists" };
+const playlistSorts = { az: "A–Z", za: "Z–A", newest: "Newest", oldest: "Oldest" };
+const compareNames = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
+
+function comparePlaylists(left, right, sort) {
+  const byName = compareNames(left.name, right.name);
+  if (sort === "az") return byName;
+  if (sort === "za") return -byName;
+  const leftDate = Date.parse(left.createdAt);
+  const rightDate = Date.parse(right.createdAt);
+  if (Number.isFinite(leftDate) !== Number.isFinite(rightDate)) return Number.isFinite(leftDate) ? -1 : 1;
+  return (sort === "newest" ? rightDate - leftDate : leftDate - rightDate) || byName;
+}
+
+function PlaylistGrid() {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [sort, setSort] = useState("az");
+  const smart = useSmartPlaylists();
 
   const [playlists, setPlaylists] =
     useState([]);
@@ -24,6 +47,12 @@ function Playlists() {
 
   const [error, setError] =
     useState(null);
+  const search = normalizePlaylistSearch(query.trim());
+  const matches = playlist => normalizePlaylistSearch(playlist.name).includes(search);
+  const ordered = items => items.filter(matches).sort((left, right) => comparePlaylists(left, right, sort));
+  const visible = filter === "smart" ? [] : ordered(playlists);
+  const smartItems = filter === "regular" ? [] : ordered(smart.items);
+  const total = visible.length + smartItems.length;
 
 
   /*
@@ -31,12 +60,14 @@ function Playlists() {
    */
 
   useEffect(() => {
+    let mounted = true, sequence = 0;
 
-    async function loadPlaylists() {
+    async function loadPlaylists(quiet = false) {
+      const request = ++sequence;
 
       try {
 
-        setLoading(true);
+        if (!quiet) setLoading(true);
 
         setError(null);
 
@@ -45,7 +76,7 @@ function Playlists() {
           await getPlaylists();
 
 
-        setPlaylists(data);
+        if (mounted && request === sequence) setPlaylists(data);
 
       } catch (err) {
 
@@ -55,14 +86,14 @@ function Playlists() {
         );
 
 
-        setError(
+        if (mounted && request === sequence) setError(
           err.message ||
           "Could not load playlists."
         );
 
       } finally {
 
-        setLoading(false);
+        if (mounted && request === sequence) setLoading(false);
 
       }
 
@@ -70,7 +101,9 @@ function Playlists() {
 
 
     loadPlaylists();
-
+    const changed = () => { void loadPlaylists(true); };
+    window.addEventListener("playlistsChanged", changed);
+    return () => { mounted = false; window.removeEventListener("playlistsChanged", changed); };
   }, []);
 
 
@@ -149,8 +182,10 @@ function Playlists() {
 
 
         <span>
-          {playlists.length} playlists
+          {total} playlists
         </span>
+        <LibraryBrowseControls label="playlists" query={query} onQueryChange={setQuery} filter={filter}
+          onFilterChange={setFilter} choices={playlistFilters} sort={sort} onSortChange={setSort} sortChoices={playlistSorts} />
 
       </div>
 
@@ -159,7 +194,7 @@ function Playlists() {
 
       <div className="playlist-grid">
 
-        {playlists.map(
+        {visible.map(
           (playlist) => (
 
           <Link
@@ -202,17 +237,18 @@ function Playlists() {
 
         {/* EMPTY */}
 
-        {playlists.length === 0 && (
+        {total === 0 && (filter === "regular" || (!smart.loading && !smart.error)) && (
 
           <div className="playlist-empty">
 
-            No playlists yet.
+            {search || filter !== "all" ? "No playlists match these filters." : "No playlists yet."}
 
           </div>
 
         )}
 
       </div>
+      {filter !== "regular" && <SmartPlaylistShelf {...smart} items={smartItems} />}
 
     </section>
 
@@ -221,4 +257,6 @@ function Playlists() {
 }
 
 
-export default Playlists;
+export default function Playlists() {
+  return <><PlaylistGrid /><LikedAlbumsSection /></>;
+}

@@ -37,6 +37,12 @@ export class SourceResolver {
     private readonly library: LibraryService
   ) {}
 
+  /** Catalog reads register file hints; analysis checks only local file
+   * metadata here, without downloading audio or adding a provider request. */
+  refreshContentRevision(libraryItemId: string): Promise<string | null> {
+    return this.library.refreshContentRevision(libraryItemId);
+  }
+
   /**
    * Map a MusicDeck ID to its candidate sources in deterministic registry
    * connection order. Sources whose connection is not currently enabled are
@@ -95,11 +101,13 @@ export class SourceResolver {
       try {
         const result = await operation(provider.provider, source);
 
-        if (result.body || result.status < 500) {
+        if (result.body && (result.status === 200 || result.status === 206)) {
+          if (result.audioStream) result.audioStream.sourceConnectionId = source.connectionId;
           return result;
         }
 
         lastError = new Error(`source returned status ${result.status}`);
+        try { await result.body?.cancel(); } catch { /* A failed source must not block another source. */ }
       } catch (error) {
         lastError = error;
       }
@@ -120,22 +128,43 @@ export class SourceResolver {
     preferredConnectionId?: string,
     maxBitRate?: number
   ): Promise<StreamResult> {
-    return this.resolveWithFallback(libraryItemId, (provider, source) =>
-      maxBitRate === undefined
+    return this.resolveWithFallback(libraryItemId, async (provider, source) => {
+      const result = await (maxBitRate === undefined
         ? provider.fetchStream(source.providerItemId, range)
-        : provider.fetchStream(source.providerItemId, range, maxBitRate)
-    , preferredConnectionId);
+        : provider.fetchStream(source.providerItemId, range, maxBitRate));
+      return { ...result, audioStream: result.audioStream ?? { direct: false, requestedBitrateKbps: maxBitRate ?? null } };
+    }, preferredConnectionId);
   }
 
   /** Resolve a stable artwork/library ID to artwork, with source fallback. */
-  fetchArtwork(libraryItemId: string, size?: number): Promise<StreamResult> {
-    return this.resolveWithFallback(libraryItemId, (provider, source) =>
-      // Omitted rather than passed as undefined so providers without
-      // thumbnail support see an unchanged call.
-      size === undefined
-        ? provider.fetchArtwork(source.providerItemId)
-        : provider.fetchArtwork(source.providerItemId, size)
-    );
+  async fetchArtwork(libraryItemId: string, size?: number): Promise<StreamResult> {
+    let attempts = 0;
+    let missing = 0;
+    try {
+      return await this.resolveWithFallback(libraryItemId, async (provider, source) => {
+        attempts++;
+        const result = await (size === undefined
+          ? provider.fetchArtwork(source.providerItemId)
+          : provider.fetchArtwork(source.providerItemId, size));
+        if (result.status === 404) missing++;
+        return result;
+      });
+    } catch (error) {
+      // A genuine absence is the artwork API's ordinary empty state, after
+      // every mapped source has been tried and its error body cancelled.
+      if (error instanceof SourceUnavailableError && attempts > 0 && attempts === missing) {
+        return { status: 404, body: null, headers: new Headers() };
+      }
+      throw error;
+    }
+  }
+
+  async audioMetadata(libraryItemId: string, connectionId?: string) {
+    const candidates = this.candidateSources(libraryItemId);
+    const selected = connectionId ? candidates.find((item) => item.source.connectionId === connectionId) : candidates[0];
+    if (!selected) throw new SourceUnavailableError();
+    const track = await selected.provider.provider.getTrack(selected.source.providerItemId);
+    return track?.audioMetadata ?? null;
   }
 
   /** Whether any enabled source exists for the item (used to distinguish

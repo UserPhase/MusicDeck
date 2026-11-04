@@ -17,6 +17,68 @@ afterEach(async () => {
 });
 
 describe("profile, settings, authorization, and errors", () => {
+  test("persists direct and 256 kbps preferences through user and admin settings", async () => {
+    const { app, db } = await setup();
+    const admin = await login(app);
+    const id = (db.prepare("SELECT id FROM users WHERE username='admin'").get() as { id: string }).id;
+    for (const quality of ["256", "direct", "original"]) {
+      for (const url of ["/api/settings/user", `/api/admin/users/${id}/settings`]) {
+        const saved = await app.inject({
+          method: "PATCH", url, headers: { cookie: admin.cookie },
+          payload: { settings: { "playback.streamQuality": quality } },
+        });
+        expect(saved.statusCode).toBe(200);
+        expect(saved.json().settings).toContainEqual(expect.objectContaining({ key: "playback.streamQuality", value: JSON.stringify(quality) }));
+      }
+    }
+  });
+  test("album-aware playback is a validated per-user boolean preference", async () => {
+    const { app, db } = await setup();
+    const admin = await login(app);
+    await createUser(db, { username: "album-listener", password: "listener-password", role: "user" });
+    const listener = await login(app, "album-listener", "listener-password");
+    for (const enabled of [true, false]) {
+      const saved = await app.inject({
+        method: "PATCH", url: "/api/settings/user", headers: { cookie: listener.cookie },
+        payload: { settings: { "playback.albumAware": enabled } },
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json().settings).toContainEqual(expect.objectContaining({ key: "playback.albumAware", value: JSON.stringify(enabled) }));
+    }
+    const invalid = await app.inject({
+      method: "PATCH", url: "/api/settings/user", headers: { cookie: listener.cookie },
+      payload: { settings: { "playback.albumAware": "true" } },
+    });
+    expect(invalid.statusCode).toBe(400);
+    const other = await app.inject({ method: "GET", url: "/api/settings/user", headers: { cookie: admin.cookie } });
+    expect(other.json().settings.some((row: { key: string }) => row.key === "playback.albumAware")).toBe(false);
+  });
+
+  test("shuffle mode is validated, persisted and scoped to the signed-in user", async () => {
+    const { app, db } = await setup();
+    const admin = await login(app);
+    await createUser(db, { username: "shuffle-listener", password: "listener-password", role: "user" });
+    const listener = await login(app, "shuffle-listener", "listener-password");
+    for (const mode of ["standard", "smart"]) {
+      const saved = await app.inject({
+        method: "PATCH", url: "/api/settings/user", headers: { cookie: listener.cookie },
+        payload: { settings: { "playback.shuffleMode": mode } },
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json().settings).toContainEqual(expect.objectContaining({ key: "playback.shuffleMode", value: JSON.stringify(mode) }));
+    }
+    const invalid = await app.inject({
+      method: "PATCH", url: "/api/settings/user", headers: { cookie: listener.cookie },
+      payload: { settings: { "playback.shuffleMode": "random-sort" } },
+    });
+    expect(invalid.statusCode).toBe(400);
+    const other = await app.inject({ method: "GET", url: "/api/settings/user", headers: { cookie: admin.cookie } });
+    expect(other.json().settings.some((row: { key: string }) => row.key === "playback.shuffleMode")).toBe(false);
+    expect((await app.inject({
+      method: "PATCH", url: "/api/settings/user", payload: { settings: { "playback.shuffleMode": "smart" } },
+    })).statusCode).toBe(401);
+  });
+
   test("users can update safe profile fields but cannot escalate role", async () => {
     const { app } = await setup();
     const { cookie } = await login(app);

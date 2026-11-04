@@ -8,6 +8,7 @@ import RequireAdmin from "./admin/RequireAdmin";
 import Sidebar from "./Sidebar";
 import { ImportProvider } from "../context/ImportContext";
 import Player from "./Player";
+import { prepareNormalizedPlayback } from "../api/musicdeck";
 
 
 jest.mock("../context/AuthContext", () => ({
@@ -16,6 +17,7 @@ jest.mock("../context/AuthContext", () => ({
 
 jest.mock("../api/musicdeck", () => ({
   getStreamUrl: jest.fn(() => "http://example.test/stream"),
+  prepareNormalizedPlayback: jest.fn(async () => ({ status: "unavailable" })),
   getRecentlyPlayed: jest.fn(() => Promise.resolve([])),
   getStarred: jest.fn(() => Promise.resolve([])),
   recordRecentlyPlayed: jest.fn(),
@@ -88,6 +90,7 @@ function renderApp({ route = "/", user = ADMIN_USER } = {}) {
 
 
 beforeEach(() => {
+  prepareNormalizedPlayback.mockResolvedValue({ status: "unavailable" });
   jest.clearAllMocks();
   localStorage.clear();
 });

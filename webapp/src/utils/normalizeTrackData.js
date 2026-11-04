@@ -5,6 +5,7 @@
  * @property {string} title
  * @property {string|null} artistId
  * @property {string} artist
+ * @property {{ id: string|null, name: string }[]} [artistCredits]
  * @property {string|null} albumId
  * @property {string} album
  * @property {number|null} duration
@@ -24,6 +25,8 @@
  * @property {string} origin
  */
 
+import { validLoudness } from "./loudness";
+
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value
@@ -32,6 +35,20 @@ function object(value) {
 
 function first(...values) {
   return values.find((value) => value !== undefined && value !== null) ?? null;
+}
+
+export function normalizeArtistCredits(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.flatMap((credit) => {
+    if (typeof credit?.name !== "string" || !credit.name.trim()) return [];
+    const name = credit.name.trim();
+    const id = typeof credit.id === "string" ? credit.id.trim() || null : null;
+    const key = id ? `id:${id}` : `name:${name}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ id, name }];
+  });
 }
 
 function number(value) {
@@ -71,7 +88,16 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
   const metadata = {
     ...(object(wrapper.metadata) || {}),
     ...(object(track.metadata) || {}),
+    ...(track.year != null ? { year: track.year } : {}),
+    ...(track.genres ? { genres: track.genres } : {}),
+    ...(track.audioMetadata ? { audioMetadata: track.audioMetadata } : {}),
+    ...(track.sourceServer ? { sourceServer: track.sourceServer } : {}),
   };
+  const measuredGain = first(track.normalizationGainDb, wrapper.normalizationGainDb, metadata.normalizationGainDb);
+  const normalizationGainDb = Number.isFinite(measuredGain) && measuredGain >= -60 && measuredGain <= 12 ? measuredGain : undefined;
+  if (normalizationGainDb !== undefined) metadata.normalizationGainDb = normalizationGainDb;
+  const loudness = validLoudness(first(track.loudness, wrapper.loudness, metadata.loudness));
+  if (loudness) metadata.loudness = loudness;
   const availability =
     object(track.availability) ||
     object(wrapper.availability) ||
@@ -150,6 +176,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     object(wrapper.replayGain) ||
     object(metadata.replayGain) ||
     null;
+  const artistCredits = normalizeArtistCredits(track.artistCredits ?? wrapper.artistCredits);
 
   return {
     id: id === null ? null : String(id),
@@ -162,6 +189,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
       wrapper.artistId,
       wrapper.ArtistItems?.[0]?.Id
     ),
+    ...(artistCredits.length ? { artistCredits } : {}),
     artist: String(first(
       typeof track.artist === "string" ? track.artist : null,
       deezerArtist,
@@ -222,6 +250,8 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     provider,
     metadata,
     replayGain,
+    ...(normalizationGainDb !== undefined ? { normalizationGainDb } : {}),
+    ...(loudness ? { loudness } : {}),
     sources: Array.isArray(track.sources)
       ? track.sources
       : Array.isArray(wrapper.sources)

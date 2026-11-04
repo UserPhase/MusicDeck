@@ -1,4 +1,5 @@
 import { loadConfig, validateConfig } from "./config.js";
+import { createPrivacyManager, setRuntimePrivacyManager } from "./services/PrivacyManager.js";
 import { createProviderRegistry } from "./backends/factory.js";
 import { type MusicBackend } from "./backends/music-backend.js";
 import { withLocalUserDataSync } from "./backends/local-user-data-sync.js";
@@ -20,9 +21,12 @@ import { SilenceAnalysisService } from "./domain/silence-analysis.js";
 import { DownloaderAdapterRegistry } from "./domain/downloader-adapter.js";
 import { SpotDLDownloaderAdapter } from "./domain/spotdl-downloader-adapter.js";
 import { AudioTaggerService } from "./services/media/audioTaggerService.js";
+import path from "node:path";
+import { LoudnessService } from "./services/media/loudnessService.js";
+import { LoudnessScanService } from "./services/media/loudnessScanService.js";
+import { SilenceScanService } from "./services/media/silenceScanService.js";
 import { SqliteImportJobRepository } from "./infrastructure/persistence/sqliteImportJobRepository.js";
 import { SqliteImportedArtworkRepository } from "./infrastructure/persistence/sqliteImportedArtworkRepository.js";
-import { getUserById } from "./users/users.js";
 import { PluginRegistry } from "./plugins/plugin-registry.js";
 import {
   createExternalArtworkPlugin,
@@ -32,18 +36,48 @@ import {
   createSpotDLDownloaderPlugin,
 } from "./plugins/first-party.js";
 import { installLogCapture, registerLogSecret, serverLogs } from "./utils/logger.js";
+import type { FastifyInstance } from "fastify";
+import type { Db } from "./db/database.js";
+import { recoverInterruptedRestore } from "./services/BackupRestoreService.js";
+import { applySystemConfiguration } from "./services/systemConfiguration.js";
 
 // Capture console output and process-level failures for the Admin log viewer
 // before anything else can log.
 installLogCapture();
 
-async function start() {
-  const config = loadConfig();
+let currentApp: FastifyInstance | null = null;
+let currentDb: Db | null = null;
+async function quiesceRuntime() {
+  const app = currentApp;
+  if (!app) return;
+  const force = setTimeout(() => app.server.closeAllConnections(), 2000); force.unref();
+  try { await app.close(); currentApp = null; } finally { clearTimeout(force); }
+}
+function closeRuntimeDatabase() {
+  if (!currentDb?.open) { currentDb = null; return; }
+  const checkpoint = currentDb.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+  if (checkpoint.some((row) => row.busy)) throw new Error("Another SQLite connection prevented the recovery checkpoint. Stop other MusicDeck instances before restoring.");
+  currentDb.close(); currentDb = null;
+}
+async function start(options: { skipRecovery?: boolean } = {}) {
+  const deployment = loadConfig();
+  if (!options.skipRecovery) recoverInterruptedRestore(deployment);
+  const config = applySystemConfiguration(deployment);
   for (const secret of [config.sessionSecret, config.navidrome.password, config.jellyfin.apiKey, config.firstAdmin.password]) {
     registerLogSecret(secret);
   }
-  validateConfig(config);
+  let setupRequired = false;
+  try { validateConfig(config); }
+  catch {
+    validateConfig({ ...config, navidrome: { url: "http://navidrome:4533", username: "setup", password: "setup" }, jellyfin: { url: "http://jellyfin:8096", apiKey: "setup" } });
+    setupRequired = true;
+  }
   const db = await openDatabase(config);
+  currentDb = db;
+  try {
+  if (!(db.prepare("SELECT COUNT(*) AS count FROM users WHERE role='admin' AND disabled=0").get() as { count: number }).count) throw new Error("Set MUSICDECK_ADMIN_PASSWORD to bootstrap the first administrator before opening the setup wizard.");
+  const privacy = createPrivacyManager(db, config);
+  setRuntimePrivacyManager(privacy);
   const registry = createProviderRegistry(db, config);
   const primaryProvider = registry.getPrimary().provider;
 
@@ -52,9 +86,20 @@ async function start() {
   // playlists stay in MusicDeck's own database instead of blocking startup.
   const backend: MusicBackend = withLocalUserDataSync(primaryProvider);
 
-  const library = new LibraryService(db);
-  const catalog = new CatalogService(registry, library, serverLogs);
+  const library = new LibraryService(db, { musicRoot: config.musicRoot });
+  const spotdlAdapter = new SpotDLDownloaderAdapter({});
+  const loudness = new LoudnessService(db, {
+    cacheDir: path.join(path.dirname(path.resolve(config.databasePath)), "playback-cache"),
+    getFFmpegPath: () => spotdlAdapter.getMediaToolPaths().ffmpegPath,
+    refreshContentRevision: trackId => library.refreshContentRevision(trackId),
+  });
+  const catalog = new CatalogService(registry, library, serverLogs, track => loudness.trackLoudness(track));
   const sourceResolver = new SourceResolver(registry, library);
+  const loudnessScan = new LoudnessScanService(db, catalog, sourceResolver, loudness);
+  const silenceAnalysis = new SilenceAnalysisService(db, sourceResolver, {
+    getFFmpegPath: () => spotdlAdapter.getMediaToolPaths().ffmpegPath,
+  });
+  const silenceScan = new SilenceScanService(db, catalog, silenceAnalysis);
   const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
   const externalCatalog = new ExternalCatalogRegistry(undefined, db);
   const searchProviders = new SearchProviderRegistry(db, catalog, playlists, undefined, externalCatalog.artwork);
@@ -79,7 +124,6 @@ async function start() {
       addTrack: (playlistId, trackId) => playlists.addTrack(playlistId, trackId),
     },
   });
-  const spotdlAdapter = new SpotDLDownloaderAdapter({});
   const downloaderRegistry = new DownloaderAdapterRegistry();
   downloaderRegistry.register(spotdlAdapter);
   const acquisition = new AcquisitionService(
@@ -91,10 +135,14 @@ async function start() {
     {
       musicRoot: config.musicRoot,
       tmpDir: config.acquisitionTmpDir,
+      limits: config.acquisitionLimits,
       maxConcurrentDownloads: 1,
       autoScan: true,
       sourcePipeline,
       downloaderRegistry,
+      analyzeImportedFile: file => loudness.analyzeImportedFile(file.path, config.musicRoot, {
+        title: file.title || "", artist: file.artist || "", album: file.album || "", durationSeconds: file.durationSeconds,
+      }),
     }
   );
   // Active, supported first-party plugins. In-progress plugins live under
@@ -109,9 +157,10 @@ async function start() {
     backend, playlists, spotdlAdapter, config.musicRoot, undefined, config.spotifyImportSubdir,
     new AudioTaggerService({ getTools: () => spotdlAdapter.getMediaToolPaths() }),
     new SqliteImportJobRepository(db),
-    new SqliteImportedArtworkRepository(db)
+    new SqliteImportedArtworkRepository(db),
+    undefined,
+    (filePath, metadata) => loudness.analyzeImportedFile(filePath, config.musicRoot, metadata),
   );
-  spotifyPlaylistImport.resumeInterrupted((userId) => getUserById(db, userId));
   for (const manifest of plugins.loadInstalledCustomPlugins()) {
     try {
       await plugins.register({ manifest }, "third-party");
@@ -119,12 +168,23 @@ async function start() {
       console.error(`Failed to rehydrate custom plugin ${manifest.id}`, error);
     }
   }
-  const app = await buildServer({ config, db, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, silenceAnalysis: new SilenceAnalysisService(db, sourceResolver) });
+  const app = await buildServer({ config, db, privacy, backend, catalog, playlists, spotifyPlaylistImport, library, sourceResolver, searchProviders, sourceProviders, externalCatalog, recommendations, libraryInsights, plugins, acquisition, loudness, loudnessScan, silenceAnalysis, silenceScan, setupRequired,
+    recoveryLifecycle: { quiesce: quiesceRuntime, closeDatabase: closeRuntimeDatabase, restart: () => start({ skipRecovery: true }) },
+  });
+  currentApp = app;
 
   await app.listen({
     host: config.host,
     port: config.port,
   });
+  loudnessScan.resume();
+  silenceScan.resume();
+  } catch (error) {
+    await quiesceRuntime();
+    if (db.open) db.close();
+    currentDb = null;
+    throw error;
+  }
 }
 
 try {

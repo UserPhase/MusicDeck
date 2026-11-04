@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { SearchProviderRegistry, searchIdentity } from "../src/domain/search-provider-registry.js";
 import { closeTestServer, createTestServer } from "./helpers.js";
+import { getUserById } from "../src/users/users.js";
 
 let current: Awaited<ReturnType<typeof createTestServer>> | null = null;
 
@@ -100,9 +101,10 @@ describe("SearchProviderRegistry", () => {
 
     registry.configure("spotify", { enabled: true, config: { clientId: "id", clientSecret: "secret" } });
     const user = db.prepare("SELECT id, role FROM users LIMIT 1").get() as { id: string; role: "admin" };
-    await playlists.create("Road Trip", user as any);
+    const sessionUser = getUserById(db, user.id)!;
+    await playlists.create("Road Trip", sessionUser);
 
-    const result = await registry.search("road");
+    const result = await registry.search("road", { user: sessionUser });
 
     expect(result.degraded).toBe(false);
     expect(result.groups.track).toEqual(expect.arrayContaining([

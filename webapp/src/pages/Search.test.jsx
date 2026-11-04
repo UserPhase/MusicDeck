@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Search from "./Search";
@@ -112,9 +112,10 @@ test("renders external results without provider-specific UI and disables unavail
         provider: "external",
         source: { kind: "external", count: 0 },
         availability: null,
-        metadata: { durationSeconds: 180 },
+        metadata: { durationSeconds: 180, artistId: "external_itunes_artist_2", albumId: "external_itunes_album_3" },
       }],
-      album: [],
+      album: [{ id: "external_itunes_album_3", title: "Album", artist: "Artist",
+        provider: "external", metadata: { artistId: "external_itunes_artist_2" } }],
       artist: [],
       playlist: [],
     },
@@ -125,6 +126,12 @@ test("renders external results without provider-specific UI and disables unavail
   expect(await screen.findByLabelText("Available externally")).toHaveTextContent("External");
   expect(screen.queryByText("Available externally")).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Play preview of External Song" })).toBeEnabled();
+  const tracks = within(screen.getByRole("table", { name: "Search tracks" }));
+  const albums = within(screen.getByRole("heading", { name: "Albums" }).closest("section"));
+  expect(tracks.getByRole("link", { name: "Artist" })).toHaveAttribute("href", "/artist/ext%3Aitunes%3A2");
+  expect(tracks.getByRole("link", { name: "Album" })).toHaveAttribute("href", "/album/external_itunes_album_3");
+  expect(albums.getByRole("link", { name: "Album" })).toHaveAttribute("href", "/album/external_itunes_album_3");
+  expect(albums.getByRole("link", { name: "Artist" })).toHaveAttribute("href", "/artist/ext%3Aitunes%3A2");
   expect(screen.queryByText(/itunes|navidrome|jellyfin/i)).toBeNull();
 });
 
@@ -147,7 +154,7 @@ test("starts track radio from the existing track menu", async () => {
   renderSearch();
 
   fireEvent.click(await screen.findByRole("button", { name: /more options for digital love/i }));
-  fireEvent.click(screen.getByRole("button", { name: /start radio/i }));
+  fireEvent.click(screen.getByRole("menuitem", { name: /start radio/i }));
 
   await waitFor(() => {
     expect(startRadio).toHaveBeenCalledWith(expect.objectContaining({ type: "track", id: "md_track_1" }));

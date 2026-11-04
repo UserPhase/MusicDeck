@@ -3,10 +3,12 @@ import {
   Routes,
   Route,
   Navigate,
+  Outlet,
   useLocation,
 } from "react-router-dom";
 
 import {
+  lazy,
   useEffect,
   useRef,
   useState,
@@ -26,14 +28,13 @@ import {
   readStoredLayoutPreset,
 } from "./utils/layoutPreset";
 
-import AdminTopBar from "./components/admin/AdminTopBar";
 import { ImportProvider } from "./context/ImportContext";
 import { ServerDeletionProvider } from "./context/ServerDeletionContext";
 import CommandPalette from "./components/CommandPalette";
 import AmbientBackground from "./components/AmbientBackground";
 import Player from "./components/Player";
 import AppLayout from "./components/Layout/AppLayout";
-import AdminSidebar from "./components/admin/AdminSidebar";
+import RouteBoundary from "./components/RouteBoundary";
 import RequireAdmin from "./components/admin/RequireAdmin";
 import CustomCssStyle, {
   CustomCssResetButton,
@@ -41,44 +42,7 @@ import CustomCssStyle, {
 
 import Home from "./pages/Home";
 import Library from "./pages/Library";
-
-import Tracks from "./pages/Tracks";
-import Albums from "./pages/Albums";
-import Artists from "./pages/Artists";
-import Playlists from "./pages/Playlists";
-import LibraryHealth from "./pages/LibraryHealth";
-
-import Album from "./pages/Album";
-import Playlist from "./pages/Playlist";
-import Artist from "./pages/Artist";
-import ArtistExternalAlbum from "./pages/ArtistExternalAlbum";
-
-import Liked from "./pages/Liked.jsx";
-import ListeningActivity from "./pages/ListeningActivity";
 import Login from "./pages/Login.jsx";
-import Search from "./pages/Search";
-import Explore from "./pages/Explore";
-import Profile from "./pages/Profile";
-import Settings from "./pages/Settings";
-
-import AdminDashboard from "./pages/admin/AdminDashboard";
-import AdminUsers from "./pages/admin/AdminUsers";
-import AdminUserDetail from "./pages/admin/AdminUserDetail";
-import AdminLibrary from "./pages/admin/AdminLibrary";
-import AdminLibraryHealth from "./pages/admin/AdminLibraryHealth";
-import AdminLibraryDuplicates from "./pages/admin/AdminLibraryDuplicates";
-import AdminLibraryMetadata from "./pages/admin/AdminLibraryMetadata";
-import AdminLibraryScan from "./pages/admin/AdminLibraryScan";
-import {
-  AdminLibraryAlbums,
-  AdminLibraryArtists,
-  AdminLibraryTracks,
-} from "./pages/admin/AdminLibraryBrowse";
-import AdminSources from "./pages/admin/AdminSources";
-import AdminPlugins from "./pages/admin/AdminPlugins";
-import AdminPluginDetail from "./pages/admin/AdminPluginDetail";
-import AdminAppearance from "./pages/admin/AdminAppearance";
-import AdminServer from "./pages/admin/AdminServer";
 
 import {
   PlayerProvider,
@@ -91,21 +55,75 @@ import {
 } from "./context/AuthContext";
 
 import { BrandingProvider } from "./context/BrandingContext";
+import { PrivacyProvider } from "./context/PrivacyContext";
+import OfflineStatusBanner from "./components/OfflineStatusBanner";
+import DownloadsView from "./views/DownloadsView";
+import NewReleasesView from "./views/NewReleasesView";
+import { PartyHostBridge } from "./components/playlists/PlaylistPartyPanel";
+import { QueueResumePrompt } from "./components/queues/QueueManager";
+import PlaylistUndoShortcuts from "./components/playlists/PlaylistUndoShortcuts";
+import useAutoDownloadSync from "./hooks/useAutoDownloadSync";
+import { offlineDownloadEngine } from "./services/storage/OfflineDownloadEngine";
 import useGlobalHotkeys from "./hooks/useGlobalHotkeys";
+
+const AdminTopBar = lazy(() => import("./components/admin/AdminTopBar"));
+const AdminSidebar = lazy(() => import("./components/admin/AdminSidebar"));
+const Tracks = lazy(() => import("./pages/Tracks"));
+const Albums = lazy(() => import("./pages/Albums"));
+const Artists = lazy(() => import("./pages/Artists"));
+const Playlists = lazy(() => import("./pages/Playlists"));
+const SmartPlaylists = lazy(() => import("./pages/SmartPlaylists"));
+const LibraryHealth = lazy(() => import("./pages/LibraryHealth"));
+const Album = lazy(() => import("./pages/Album"));
+const Playlist = lazy(() => import("./pages/Playlist"));
+const Artist = lazy(() => import("./pages/Artist"));
+const ArtistExternalAlbum = lazy(() => import("./pages/ArtistExternalAlbum"));
+const Liked = lazy(() => import("./pages/Liked.jsx"));
+const ListeningActivity = lazy(() => import("./pages/ListeningActivity"));
+const Search = lazy(() => import("./pages/Search"));
+const Explore = lazy(() => import("./pages/Explore"));
+const SavedDiscoveriesView = lazy(() => import("./components/SavedDiscoveriesView"));
+const Profile = lazy(() => import("./pages/Profile"));
+const Settings = lazy(() => import("./pages/Settings"));
+const TasteProfileView = lazy(() => import("./views/settings/TasteProfileView"));
+const AdminDashboard = lazy(() => import("./pages/admin/AdminDashboard"));
+const AdminUsers = lazy(() => import("./pages/admin/AdminUsers"));
+const AdminUserDetail = lazy(() => import("./pages/admin/AdminUserDetail"));
+const AdminLibrary = lazy(() => import("./pages/admin/AdminLibrary"));
+const AdminLibraryHealth = lazy(() => import("./pages/admin/AdminLibraryHealth"));
+const AdminLibraryDuplicates = lazy(() => import("./pages/admin/AdminLibraryDuplicates"));
+const AdminLibraryMetadata = lazy(() => import("./pages/admin/AdminLibraryMetadata"));
+const AdminLibraryScan = lazy(() => import("./pages/admin/AdminLibraryScan"));
+const AdminSources = lazy(() => import("./pages/admin/AdminSources"));
+const AdminPlugins = lazy(() => import("./pages/admin/AdminPlugins"));
+const SonicExtensionView = lazy(() => import("./views/admin/SonicExtensionView"));
+const AdminPluginDetail = lazy(() => import("./pages/admin/AdminPluginDetail"));
+const AdminAppearance = lazy(() => import("./pages/admin/AdminAppearance"));
+const AdminServer = lazy(() => import("./pages/admin/AdminServer"));
+const SetupRecoveryView = lazy(() => import("./views/admin/SetupRecoveryView"));
+const ActivityCenter = lazy(() => import("./views/ActivityCenter"));
+const PlaylistInvitationView = lazy(() => import("./views/PlaylistInvitationView"));
+const AdminLibraryAlbums = lazy(() => import("./pages/admin/AdminLibraryBrowse").then((module) => ({ default: module.AdminLibraryAlbums })));
+const AdminLibraryArtists = lazy(() => import("./pages/admin/AdminLibraryBrowse").then((module) => ({ default: module.AdminLibraryArtists })));
+const AdminLibraryTracks = lazy(() => import("./pages/admin/AdminLibraryBrowse").then((module) => ({ default: module.AdminLibraryTracks })));
 
 function AdminLayout() {
   return (
-    <div className="admin-shell">
-      <AdminSidebar />
-      <div className="admin-content">
-        <RequireAdmin />
+    <RouteBoundary>
+      <AdminTopBar />
+      <div className="admin-shell">
+        <AdminSidebar />
+        <div className="admin-content">
+          <RouteBoundary><Outlet /></RouteBoundary>
+        </div>
       </div>
-    </div>
+    </RouteBoundary>
   );
 }
 
 
 function AuthenticatedApp() {
+  const downloadSync = useAutoDownloadSync(true);
   const location = useLocation();
   const {
     activeSidebar,
@@ -231,55 +249,71 @@ function AuthenticatedApp() {
   return (
     <>
       {!isAdminRoute && <AmbientBackground />}
-      {isAdminRoute && <AdminTopBar />}
+      <PartyHostBridge />
+      <QueueResumePrompt />
       <CustomCssStyle />
       <CustomCssResetButton />
+      {downloadSync.error && <p className="downloads-notice" role="status">{downloadSync.error}</p>}
       <Routes>
-        <Route path="/admin" element={<AdminLayout />}>
-          <Route index element={<AdminDashboard />} />
-          <Route path="users" element={<AdminUsers />} />
-          <Route path="users/:userId" element={<AdminUserDetail />} />
-          <Route path="library" element={<AdminLibrary />} />
-          <Route path="library/tracks" element={<AdminLibraryTracks />} />
-          <Route path="library/albums" element={<AdminLibraryAlbums />} />
-          <Route path="library/artists" element={<AdminLibraryArtists />} />
-          <Route path="library/health" element={<AdminLibraryHealth />} />
-          <Route path="library/duplicates" element={<AdminLibraryDuplicates />} />
-          <Route path="library/metadata" element={<AdminLibraryMetadata />} />
-          <Route path="library/scan" element={<AdminLibraryScan />} />
-          <Route path="sources" element={<AdminSources />} />
-          <Route path="plugins" element={<AdminPlugins />} />
-          <Route path="plugins/:pluginId" element={<AdminPluginDetail />} />
-          <Route path="appearance/*" element={<AdminAppearance />} />
-          <Route path="server/*" element={<AdminServer />} />
+        <Route path="/admin" element={<RequireAdmin />}>
+          <Route element={<AdminLayout />}>
+            <Route index element={<AdminDashboard />} />
+            <Route path="activity" element={<ActivityCenter />} />
+            <Route path="users" element={<AdminUsers />} />
+            <Route path="users/:userId" element={<AdminUserDetail />} />
+            <Route path="library" element={<AdminLibrary />} />
+            <Route path="library/tracks" element={<AdminLibraryTracks />} />
+            <Route path="library/albums" element={<AdminLibraryAlbums />} />
+            <Route path="library/artists" element={<AdminLibraryArtists />} />
+            <Route path="library/health" element={<AdminLibraryHealth />} />
+            <Route path="library/duplicates" element={<AdminLibraryDuplicates />} />
+            <Route path="library/metadata" element={<AdminLibraryMetadata />} />
+            <Route path="library/scan" element={<AdminLibraryScan />} />
+            <Route path="sources" element={<AdminSources />} />
+            <Route path="plugins" element={<AdminPlugins />} />
+            <Route path="sonic" element={<SonicExtensionView />} />
+            <Route path="plugins/:pluginId" element={<AdminPluginDetail />} />
+            <Route path="appearance/*" element={<AdminAppearance />} />
+            <Route path="server/*" element={<AdminServer />} />
+            <Route path="setup-recovery" element={<SetupRecoveryView />} />
+          </Route>
         </Route>
         <Route
           path="*"
           element={
             <AppLayout preset={layoutPreset}>
-              <Routes>
-                <Route path="/" element={<Home />} />
-                <Route path="/login" element={<Navigate to="/" replace />} />
-                <Route path="/library" element={<Library />}>
-                  <Route index element={<Navigate to="playlists" replace />} />
-                  <Route path="tracks" element={<Tracks />} />
-                  <Route path="albums" element={<Albums />} />
-                  <Route path="artists" element={<Artists />} />
-                  <Route path="playlists" element={<Playlists />} />
-                  <Route path="health" element={<LibraryHealth />} />
-                </Route>
-                <Route path="/album/:id" element={<Album />} />
-                <Route path="/artist/:id/album/:albumId" element={<ArtistExternalAlbum />} />
-                <Route path="/artist/:id" element={<Artist />} />
-                <Route path="/playlist/:id" element={<Playlist />} />
-                <Route path="/liked" element={<Liked />} />
-                <Route path="/listening-activity" element={<ListeningActivity />} />
-                <Route path="/search" element={<Search />} />
-                <Route path="/explore" element={<Explore />} />
-                <Route path="/profile" element={<Profile />} />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
+              <RouteBoundary>
+                <Routes>
+                  <Route path="/" element={<Home />} />
+                  <Route path="/login" element={<Navigate to="/" replace />} />
+                  <Route path="/library" element={<Library />}>
+                    <Route index element={<Navigate to="playlists" replace />} />
+                    <Route path="tracks" element={<Tracks />} />
+                    <Route path="albums" element={<Albums />} />
+                    <Route path="artists" element={<Artists />} />
+                    <Route path="playlists" element={<Playlists />} />
+                    <Route path="smart-playlists" element={<Navigate to="/library/playlists" replace />} />
+                    <Route path="health" element={<LibraryHealth />} />
+                  </Route>
+                  <Route path="/album/:id" element={<Album />} />
+                  <Route path="/artist/:id/album/:albumId" element={<ArtistExternalAlbum />} />
+                  <Route path="/artist/:id" element={<Artist />} />
+                  <Route path="/playlist/:id" element={<Playlist />} />
+                  <Route path="/smart-playlist/:id" element={<SmartPlaylists />} />
+                  <Route path="/liked" element={<Liked />} />
+                  <Route path="/downloads" element={<DownloadsView />} />
+                  <Route path="/new-releases" element={<NewReleasesView />} />
+                  <Route path="/playlist-share" element={<PlaylistInvitationView />} />
+                  <Route path="/listening-activity" element={<ListeningActivity />} />
+                  <Route path="/search" element={<Search />} />
+                  <Route path="/explore" element={<Explore />} />
+                  <Route path="/saved-discoveries" element={<SavedDiscoveriesView />} />
+                  <Route path="/profile" element={<Profile />} />
+                  <Route path="/settings" element={<Settings />} />
+                  <Route path="/settings/taste" element={<TasteProfileView />} />
+                  <Route path="*" element={<Navigate to="/" replace />} />
+                </Routes>
+              </RouteBoundary>
             </AppLayout>
           }
         />
@@ -310,7 +344,9 @@ function AppContent() {
     return (
       <Routes>
         <Route path="/login" element={<Login />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
+        <Route path="/playlist-share" element={<Login redirectTo="/playlist-share" />} />
+        <Route path="/downloads" element={<><DownloadsView /><Player /></>} />
+        <Route path="*" element={<Navigate to={navigator.onLine === false || offlineDownloadEngine.getOwner() ? "/downloads" : "/login"} replace />} />
       </Routes>
     );
   }
@@ -323,11 +359,15 @@ function App() {
   return (
     <QueryClientProvider client={artistOverviewQueryClient}>
       <BrowserRouter>
+        <OfflineStatusBanner />
         <BrandingProvider>
           <AuthProvider>
+            <PrivacyProvider>
             <PlayerProvider>
+              <PlaylistUndoShortcuts />
               <AppContent />
             </PlayerProvider>
+            </PrivacyProvider>
           </AuthProvider>
         </BrandingProvider>
       </BrowserRouter>

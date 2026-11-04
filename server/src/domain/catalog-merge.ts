@@ -37,12 +37,17 @@ export function recordingsMatch(
 
   const localStrongIds = strongRecordingIds(localTrack);
   const catalogStrongIds = strongRecordingIds(catalogTrack);
-  if (localStrongIds.size > 0 && catalogStrongIds.size > 0) {
-    return [...localStrongIds].some((id) => catalogStrongIds.has(id));
-  }
+  if ([...localStrongIds].some((id) => catalogStrongIds.has(id))) return true;
+  if (["isrc", "musicbrainz"].some((scheme) => [...localStrongIds].some((id) => id.startsWith(`${scheme}:`))
+    && [...catalogStrongIds].some((id) => id.startsWith(`${scheme}:`)))) return false;
 
   if (titleKey(localTrack.title) !== titleKey(catalogTrack.title)) return false;
-  if (normalizeMusicText(localTrack.artist) !== normalizeMusicText(catalogTrack.artist)) return false;
+  const localArtist = normalizeMusicText(localTrack.artist);
+  const catalogArtist = normalizeMusicText(catalogTrack.artist);
+  if (!localArtist || !catalogArtist) return false;
+  if (localArtist !== catalogArtist
+    && !localTrack.artistCredits?.some(({ name }) => normalizeMusicText(name) === catalogArtist)
+    && !catalogTrack.artistCredits?.some(({ name }) => normalizeMusicText(name) === localArtist)) return false;
 
   const localDuration = Number(localTrack.metadata.durationSeconds || 0);
   const catalogDuration = Number(catalogTrack.metadata.durationSeconds || 0);

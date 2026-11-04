@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler",
+    "jsx": "react-jsx", "strict": true, "esModuleInterop": true,
+    "skipLibCheck": true, "allowJs": true, "resolveJsonModule": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"], "types": ["node"],
+    "typeRoots": ["../../server/node_modules/@types", "../../webapp/node_modules/@types"],
+    "paths": {
+      "react": ["../../webapp/node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": ["../../webapp/node_modules/@types/react/jsx-runtime.d.ts"],
+      "react-dom/*": ["../../webapp/node_modules/@types/react-dom/*"]
+    },
+    "noEmit": true
+  },
+  "include": ["./**/*.ts", "./**/*.tsx", "../../playwright.config.ts"]
+}

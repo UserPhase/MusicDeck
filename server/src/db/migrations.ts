@@ -4,7 +4,60 @@ import type { AppConfig } from "../config.js";
 import { hashPassword } from "../auth/passwords.js";
 import { createId } from "../utils/ids.js";
 
-const migrations = [
+function smartActivityRefresh(table: "listening_events" | "recently_played", row: "NEW" | "OLD", taste = false) {
+  const events = table === "listening_events";
+  const columns = events ? "plays,skips,last_played" : "recent_plays,recent_last_played";
+  const at = events ? "created_at" : "played_at";
+  const aggregate = events
+    ? `COUNT(CASE WHEN event_type IN ('play','complete') THEN 1 END),
+       COALESCE(SUM(CASE WHEN event_type='skip' OR
+         (event_type='progress' AND finished=1 AND listened_seconds>0) THEN 1 ELSE 0 END),0),
+       MAX(CASE WHEN event_type IN ('play','complete','skip') OR listened_seconds>0
+         THEN CAST(ROUND((julianday(${at})-2440587.5)*86400000) AS INTEGER) END)`
+    : `COUNT(*),MAX(CAST(ROUND((julianday(${at})-2440587.5)*86400000) AS INTEGER))`;
+  const updates = columns.split(",").map((column) => `${column}=excluded.${column}`).join(",");
+  // During cascading user deletion the parent is already absent: don't recreate its summary.
+  return `INSERT INTO smart_playlist_activity(user_id,track_id,${columns})
+    SELECT ${row}.user_id,${row}.track_id,${aggregate} FROM ${taste ? `taste_${table}` : table}
+    WHERE user_id=${row}.user_id AND track_id=${row}.track_id
+    HAVING EXISTS(SELECT 1 FROM users WHERE id=${row}.user_id)
+    ON CONFLICT(user_id,track_id) DO UPDATE SET ${updates};`;
+}
+
+function smartPlaylistActivitySchema(taste = false) {
+  return `    CREATE TABLE IF NOT EXISTS smart_playlist_activity (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, track_id TEXT NOT NULL,
+      plays INTEGER NOT NULL DEFAULT 0, skips INTEGER NOT NULL DEFAULT 0, last_played INTEGER,
+      recent_plays INTEGER NOT NULL DEFAULT 0, recent_last_played INTEGER,
+      PRIMARY KEY(user_id,track_id)
+    ) WITHOUT ROWID;
+    INSERT INTO smart_playlist_activity(user_id,track_id,plays,skips,last_played)
+      SELECT user_id,track_id,COUNT(CASE WHEN event_type IN ('play','complete') THEN 1 END),
+        COALESCE(SUM(CASE WHEN event_type='skip' OR
+          (event_type='progress' AND finished=1 AND listened_seconds>0) THEN 1 ELSE 0 END),0),
+        MAX(CASE WHEN event_type IN ('play','complete','skip') OR listened_seconds>0
+          THEN CAST(ROUND((julianday(created_at)-2440587.5)*86400000) AS INTEGER) END)
+      FROM ${taste ? "taste_listening_events" : "listening_events"} GROUP BY user_id,track_id
+      ON CONFLICT(user_id,track_id) DO UPDATE SET plays=excluded.plays,skips=excluded.skips,last_played=excluded.last_played;
+    INSERT INTO smart_playlist_activity(user_id,track_id,recent_plays,recent_last_played)
+      SELECT user_id,track_id,COUNT(*),MAX(CAST(ROUND((julianday(played_at)-2440587.5)*86400000) AS INTEGER))
+      FROM ${taste ? "taste_recently_played" : "recently_played"} GROUP BY user_id,track_id
+      ON CONFLICT(user_id,track_id) DO UPDATE SET recent_plays=excluded.recent_plays,recent_last_played=excluded.recent_last_played;
+    ${(["listening_events", "recently_played"] as const).map((table) =>
+      (["INSERT", "UPDATE", "DELETE"] as const).map((operation) => `
+        CREATE TRIGGER IF NOT EXISTS smart_${table}_${operation.toLowerCase()} AFTER ${operation} ON ${table} BEGIN
+          ${operation !== "INSERT" ? smartActivityRefresh(table, "OLD", taste) : ""}
+          ${operation !== "DELETE" ? smartActivityRefresh(table, "NEW", taste) : ""}
+        END;`).join("")).join("")}`;
+}
+
+type Migration = {
+  id: number;
+  name: string;
+  sql: string | ((db: Database.Database) => void);
+};
+
+const migrations: Migration[] = [
   {
     id: 1,
     name: "initial-auth-and-backend-config",
@@ -575,9 +628,522 @@ const migrations = [
         WHERE counted = 1;
     `,
   },
+  {
+    id: 26,
+    name: "cached-playback-loudness",
+    sql: `CREATE TABLE playback_loudness_cache (
+      cache_key TEXT PRIMARY KEY,
+      external INTEGER NOT NULL,
+      format TEXT NOT NULL CHECK (format IN ('flac', 'mp3')),
+      integrated_lufs REAL NOT NULL,
+      true_peak_db REAL NOT NULL,
+      bytes INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      accessed_at INTEGER NOT NULL
+    );`,
+  },
+  {
+    id: 27,
+    name: "bounded-acquisition-retry-inputs",
+    sql: `CREATE TABLE acquisition_job_inputs (
+      job_id TEXT PRIMARY KEY REFERENCES acquisition_jobs(id) ON DELETE CASCADE,
+      input_json TEXT NOT NULL
+    );
+    CREATE INDEX acquisition_jobs_retention_idx ON acquisition_jobs(status, updated_at);`,
+  },
+  {
+    id: 28,
+    name: "live-playback-loudness-measurements",
+    sql: `CREATE TABLE playback_loudness_measurements (
+      cache_key TEXT PRIMARY KEY,
+      measurement_json TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );`,
+  },
+  {
+    id: 29,
+    name: "imported-audio-loudness",
+    sql: `CREATE TABLE imported_audio_loudness (
+      file_path TEXT PRIMARY KEY, music_root TEXT NOT NULL,
+      file_size INTEGER NOT NULL, mtime_ms REAL NOT NULL,
+      title_key TEXT NOT NULL, artist_key TEXT NOT NULL, album_key TEXT NOT NULL,
+      duration_seconds REAL NOT NULL, measurement_json TEXT NOT NULL
+    );
+    CREATE INDEX imported_audio_loudness_match ON imported_audio_loudness(title_key, artist_key, album_key);`,
+  },
+  {
+    id: 30,
+    name: "persistent-loudness-library-scans",
+    sql: `CREATE TABLE loudness_scan_jobs (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL, total_tracks INTEGER NOT NULL DEFAULT 0,
+      completed_tracks INTEGER NOT NULL DEFAULT 0, skipped_tracks INTEGER NOT NULL DEFAULT 0,
+      failed_tracks INTEGER NOT NULL DEFAULT 0, current_track TEXT, warning TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX loudness_scan_active ON loudness_scan_jobs((1)) WHERE status IN ('discovering', 'running');
+    CREATE TABLE loudness_scan_tracks (
+      job_id TEXT NOT NULL REFERENCES loudness_scan_jobs(id) ON DELETE CASCADE,
+      track_id TEXT NOT NULL, title TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 2,
+      status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(job_id, track_id)
+    );
+    CREATE INDEX loudness_scan_next ON loudness_scan_tracks(job_id, status, priority);`,
+  },
+  {
+    id: 31,
+    name: "persistent-silence-library-scans",
+    sql: `ALTER TABLE loudness_scan_jobs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+    CREATE TABLE silence_scan_jobs (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL, options_json TEXT NOT NULL DEFAULT '{}', total_tracks INTEGER NOT NULL DEFAULT 0,
+      completed_tracks INTEGER NOT NULL DEFAULT 0, skipped_tracks INTEGER NOT NULL DEFAULT 0,
+      failed_tracks INTEGER NOT NULL DEFAULT 0, current_track TEXT, warning TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX silence_scan_active ON silence_scan_jobs((1)) WHERE status IN ('discovering', 'running');
+    CREATE TABLE silence_scan_tracks (
+      job_id TEXT NOT NULL REFERENCES silence_scan_jobs(id) ON DELETE CASCADE,
+      track_id TEXT NOT NULL, title TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 2,
+      status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(job_id, track_id)
+    );
+    CREATE INDEX silence_scan_next ON silence_scan_tracks(job_id, status, priority);
+    CREATE TABLE track_silence_analysis_profiles (
+      track_id TEXT NOT NULL, threshold_db REAL NOT NULL, min_silence_seconds REAL NOT NULL,
+      revision TEXT NOT NULL, analysis_json TEXT NOT NULL,
+      PRIMARY KEY(track_id, threshold_db, min_silence_seconds)
+    );
+    INSERT INTO track_silence_analysis_profiles
+      SELECT s.track_id, s.threshold_db, s.min_silence_seconds, COALESCE(i.updated_at, ''),
+        json_object('trackId', s.track_id, 'status', s.status,
+          'leadingSilenceSeconds', s.leading_silence_seconds, 'trailingSilenceSeconds', s.trailing_silence_seconds,
+          'durationSeconds', s.duration_seconds, 'thresholdDb', s.threshold_db, 'minSilenceSeconds', s.min_silence_seconds,
+          'errorMessage', s.error_message, 'analyzedAt', s.analyzed_at, 'updatedAt', s.updated_at)
+      FROM track_silence_analysis s LEFT JOIN library_items i ON i.id = s.track_id;`,
+  },
+  {
+    id: 32,
+    name: "saved-external-discoveries",
+    sql: `CREATE TABLE saved_discoveries (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK(provider IN ('deezer', 'itunes')),
+      external_id TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('track', 'album')),
+      title TEXT NOT NULL,
+      artist TEXT NOT NULL,
+      cover_url TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, provider, type, external_id)
+    );
+    CREATE INDEX saved_discoveries_user_created ON saved_discoveries(user_id, created_at DESC);`,
+  },
+  {
+    id: 33,
+    name: "smart-playlists-and-catalog-projection",
+    sql: `CREATE TABLE smart_playlists (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      rules_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX smart_playlists_owner ON smart_playlists(user_id, updated_at DESC);
+    CREATE TABLE smart_playlist_tracks (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL,
+      genre TEXT, year INTEGER, bpm REAL, revision TEXT NOT NULL
+    ) WITHOUT ROWID;
+    CREATE TABLE smart_playlist_track_payloads (
+      track_id TEXT PRIMARY KEY REFERENCES smart_playlist_tracks(id) ON DELETE CASCADE,
+      track_json TEXT NOT NULL
+    ) WITHOUT ROWID;
+    CREATE INDEX smart_tracks_title ON smart_playlist_tracks(title COLLATE NOCASE, id);
+    CREATE INDEX smart_tracks_year ON smart_playlist_tracks(year,genre,id);
+    CREATE INDEX smart_tracks_bpm ON smart_playlist_tracks(bpm);
+    CREATE TABLE smart_playlist_genres (
+      track_id TEXT NOT NULL REFERENCES smart_playlist_tracks(id) ON DELETE CASCADE,
+      genre TEXT NOT NULL,
+      PRIMARY KEY(track_id,genre)
+    ) WITHOUT ROWID;
+    CREATE INDEX smart_recent_user_track ON recently_played(user_id, track_id, played_at);
+    CREATE TABLE smart_playlist_catalog_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1), refreshed_at TEXT NOT NULL, degraded INTEGER NOT NULL
+    );
+    ${smartPlaylistActivitySchema()}`,
+  },
+  {
+    id: 34,
+    name: "listening-export-client",
+    sql: "ALTER TABLE listening_events ADD COLUMN client_name TEXT;",
+  },
+  {
+    id: 35,
+    name: "resumable-media",
+    sql: `CREATE TABLE media_sessions (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      media_type TEXT NOT NULL CHECK(media_type IN ('album','playlist')),
+      media_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      track_id TEXT NOT NULL,
+      occurrence_id TEXT,
+      track_index INTEGER NOT NULL,
+      track_count INTEGER NOT NULL,
+      position_seconds REAL NOT NULL,
+      duration_seconds REAL,
+      progress REAL NOT NULL,
+      captured_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id,media_type,media_id)
+    );
+    CREATE INDEX media_sessions_expiry ON media_sessions(updated_at);
+    CREATE TABLE media_session_completions (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      media_type TEXT NOT NULL,
+      media_id TEXT NOT NULL,
+      captured_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id,media_type,media_id)
+    );
+    CREATE INDEX media_session_completions_expiry ON media_session_completions(updated_at);`,
+  },
+  {
+    id: 36,
+    name: "album-favorite-metadata",
+    sql: "ALTER TABLE media_favorites ADD COLUMN metadata_json TEXT;",
+  },
+  {
+    id: 37,
+    name: "guided-playlist-mixes",
+    sql: `ALTER TABLE smart_playlists ADD COLUMN options_json TEXT;
+      ALTER TABLE smart_playlist_tracks ADD COLUMN original_year INTEGER;`,
+  },
+  {
+    id: 38,
+    name: "track-content-revisions",
+    sql: `ALTER TABLE library_items ADD COLUMN content_revision TEXT NOT NULL DEFAULT '';
+      UPDATE library_items SET content_revision = lower(hex(randomblob(16))) WHERE type = 'track';
+      ALTER TABLE library_item_sources ADD COLUMN content_fingerprint TEXT;
+      ALTER TABLE library_item_sources ADD COLUMN content_metadata_json TEXT;
+      ALTER TABLE library_item_sources ADD COLUMN file_fingerprint TEXT;
+      ALTER TABLE library_item_sources ADD COLUMN file_path TEXT;
+      DELETE FROM track_silence_analysis;
+      DELETE FROM track_silence_analysis_profiles;`,
+  },
+  {
+    id: 39,
+    name: "upgrade-legacy-smart-playlist-projection",
+    sql: (db) => {
+      // Early installations applied migration 33 before payloads, normalized
+      // genres and activity summaries were added. An applied migration never
+      // runs again, so upgrade those databases explicitly without losing mixes.
+      db.exec(`CREATE TABLE IF NOT EXISTS smart_playlist_track_payloads (
+        track_id TEXT PRIMARY KEY REFERENCES smart_playlist_tracks(id) ON DELETE CASCADE,
+        track_json TEXT NOT NULL
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS smart_playlist_genres (
+        track_id TEXT NOT NULL REFERENCES smart_playlist_tracks(id) ON DELETE CASCADE,
+        genre TEXT NOT NULL, PRIMARY KEY(track_id,genre)
+      ) WITHOUT ROWID;`);
+      const legacyPayloads = db.prepare("PRAGMA table_info(smart_playlist_tracks)").all()
+        .some((column: any) => column.name === "track_json");
+      if (legacyPayloads) {
+        db.exec(`INSERT INTO smart_playlist_track_payloads(track_id,track_json)
+          SELECT id,track_json FROM smart_playlist_tracks WHERE 1
+          ON CONFLICT(track_id) DO NOTHING;
+          ALTER TABLE smart_playlist_tracks DROP COLUMN track_json;`);
+      }
+
+      // Restore exact multi-genre matching from the cached provider payloads.
+      // Keep cached tracks usable even while a library source is offline.
+      const rows = db.prepare(`SELECT t.id,t.genre,p.track_json FROM smart_playlist_tracks t
+        LEFT JOIN smart_playlist_track_payloads p ON p.track_id=t.id`).all() as
+        Array<{ id: string; genre: string | null; track_json: string | null }>;
+      const insertGenre = db.prepare("INSERT OR IGNORE INTO smart_playlist_genres(track_id,genre) VALUES (?,?)");
+      const updateGenres = db.prepare("UPDATE smart_playlist_tracks SET genre=? WHERE id=?");
+      for (const row of rows) {
+        let genres = row.genre?.split("\u001f") ?? [];
+        if (row.track_json) {
+          try {
+            const payload: unknown = JSON.parse(row.track_json);
+            if (payload && typeof payload === "object" && "genres" in payload && Array.isArray(payload.genres)) {
+              genres = payload.genres.filter((genre): genre is string => typeof genre === "string");
+            }
+          } catch { /* Preserve the existing genre when an old cache payload is malformed. */ }
+        }
+        for (const genre of genres) insertGenre.run(row.id, genre);
+        updateGenres.run(genres.length ? genres.join("\u001f") : null, row.id);
+      }
+      db.exec(`DROP INDEX IF EXISTS smart_tracks_year;
+        CREATE INDEX smart_tracks_year ON smart_playlist_tracks(year,genre,id);
+        ${smartPlaylistActivitySchema()}`);
+    },
+  },
+  {
+    id: 40,
+    name: "per-user-durable-scrobble-outbox",
+    sql: `
+    -- An enabled legacy Last.fm plugin has no shared secret. Disable it before
+    -- plugin rehydration so the new required field cannot prevent server startup.
+    UPDATE plugin_configs SET enabled=0 WHERE plugin_id='lastfm' AND
+      CASE WHEN json_valid(config_json) THEN COALESCE(
+        json_type(config_json,'$.apiSecret')='text' AND length(json_extract(config_json,'$.apiSecret'))>0,0)
+        ELSE 0 END = 0;
+    CREATE TABLE scrobble_connections (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK(provider IN ('lastfm','listenbrainz')),
+      enabled INTEGER NOT NULL DEFAULT 1, credentials_json TEXT NOT NULL,
+      username TEXT NOT NULL, account_key TEXT NOT NULL, generation TEXT NOT NULL, connected_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'connected', last_success_at INTEGER, last_listened_at INTEGER,
+      last_error_code TEXT, last_error_message TEXT, last_http_status INTEGER,
+      last_checked_at INTEGER, pause_until INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id,provider)
+    );
+    CREATE TABLE scrobble_queue (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK(provider IN ('lastfm','listenbrainz')),
+      listening_event_id TEXT NOT NULL REFERENCES listening_events(id) ON DELETE CASCADE,
+      dedupe_key TEXT NOT NULL, account_name TEXT NOT NULL, payload_json TEXT NOT NULL,
+      listened_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','sending','blocked','failed','sent','ignored','cancelled')),
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+      lease_token TEXT, lease_until INTEGER, created_at INTEGER NOT NULL, delivered_at INTEGER,
+      error_code TEXT, error_message TEXT, http_status INTEGER,
+      UNIQUE(user_id,provider,dedupe_key), UNIQUE(user_id,provider,listening_event_id)
+    );
+    CREATE INDEX scrobble_due ON scrobble_queue(state,next_attempt_at,listened_at);
+    CREATE INDEX scrobble_stream ON scrobble_queue(user_id,provider,account_name,state,listened_at,created_at,id);
+    CREATE TABLE scrobble_auth_states (
+      state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL, expires_at INTEGER NOT NULL
+    );`,
+  },
+  {
+    id: 41,
+    name: "playlist-folders-trash-and-reversible-commands",
+    sql: `ALTER TABLE playlists ADD COLUMN deleted_at TEXT;
+      ALTER TABLE playlists ADD COLUMN edit_revision INTEGER NOT NULL DEFAULT 0;
+      CREATE INDEX playlists_trash_expiry ON playlists(deleted_at) WHERE deleted_at IS NOT NULL;
+      CREATE TABLE playlist_folders (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 200),
+        parent_folder_id TEXT, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0,1)), position INTEGER NOT NULL DEFAULT 0 CHECK(position>=0),
+        UNIQUE(id,user_id),
+        FOREIGN KEY(parent_folder_id,user_id) REFERENCES playlist_folders(id,user_id) DEFERRABLE INITIALLY DEFERRED
+      );
+      CREATE INDEX playlist_folders_children ON playlist_folders(user_id,parent_folder_id,position,id);
+      CREATE TRIGGER playlist_folder_cycle BEFORE UPDATE OF parent_folder_id ON playlist_folders
+      WHEN NEW.parent_folder_id IS NOT NULL BEGIN
+        SELECT RAISE(ABORT,'Playlist folders cannot contain cycles') WHERE NEW.id IN (
+          WITH RECURSIVE ancestors(id) AS (SELECT NEW.parent_folder_id UNION
+            SELECT f.parent_folder_id FROM playlist_folders f JOIN ancestors a ON f.id=a.id WHERE f.parent_folder_id IS NOT NULL)
+          SELECT id FROM ancestors);
+      END;
+      CREATE TABLE playlist_placements (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+        folder_id TEXT, pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0,1)),
+        position INTEGER NOT NULL DEFAULT 0 CHECK(position>=0), PRIMARY KEY(user_id,playlist_id),
+        FOREIGN KEY(folder_id,user_id) REFERENCES playlist_folders(id,user_id) DEFERRABLE INITIALLY DEFERRED
+      );
+      CREATE INDEX playlist_placements_folder ON playlist_placements(user_id,folder_id,position);
+      CREATE TABLE playlist_organization_state (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, revision INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE playlist_edit_commands (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+        label TEXT NOT NULL, before_hash TEXT NOT NULL, after_hash TEXT NOT NULL,
+        forward_json TEXT NOT NULL, inverse_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('done','undone')), created_at TEXT NOT NULL
+      );
+      CREATE INDEX playlist_commands_user ON playlist_edit_commands(user_id,created_at DESC,id);
+      CREATE TABLE playlist_provider_tombstones (
+        connection_id TEXT NOT NULL, provider_playlist_id TEXT NOT NULL, PRIMARY KEY(connection_id,provider_playlist_id)
+      );
+      CREATE TRIGGER playlist_trash_tombstone AFTER UPDATE OF deleted_at ON playlists
+      WHEN NEW.deleted_at IS NOT NULL AND NEW.source_connection_id IS NOT NULL AND NEW.source_playlist_id IS NOT NULL BEGIN
+        INSERT OR IGNORE INTO playlist_provider_tombstones VALUES(NEW.source_connection_id,NEW.source_playlist_id);
+      END;
+      CREATE TRIGGER playlist_metadata_revision AFTER UPDATE OF name,description,deleted_at ON playlists BEGIN
+        UPDATE playlists SET edit_revision=edit_revision+1 WHERE id=NEW.id;
+      END;
+      CREATE TRIGGER playlist_insert_revision AFTER INSERT ON playlist_items BEGIN
+        UPDATE playlists SET edit_revision=edit_revision+1 WHERE id=NEW.playlist_id;
+      END;
+      CREATE TRIGGER playlist_update_revision AFTER UPDATE ON playlist_items BEGIN
+        UPDATE playlists SET edit_revision=edit_revision+1 WHERE id=NEW.playlist_id;
+        UPDATE playlists SET edit_revision=edit_revision+1 WHERE id=OLD.playlist_id AND OLD.playlist_id<>NEW.playlist_id;
+      END;
+      CREATE TRIGGER playlist_remove_revision AFTER DELETE ON playlist_items BEGIN
+        UPDATE playlists SET edit_revision=edit_revision+1 WHERE id=OLD.playlist_id;
+      END;`,
+  },
 ];
 
-export function runMigrations(db: Database.Database) {
+migrations.push({
+  id: 42,
+  name: "similar-song-mixes-and-discovery-playlist-entries",
+  sql: `CREATE TABLE similar_mix_vectors (
+    seed_key TEXT PRIMARY KEY, payload_json TEXT, expires_at INTEGER NOT NULL DEFAULT 0,
+    retry_at INTEGER NOT NULL DEFAULT 0, touched_at INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  CREATE INDEX similar_mix_vectors_expiry ON similar_mix_vectors(touched_at);
+  CREATE TABLE similar_mix_external_tracks (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL, mbid TEXT, preview_url TEXT, preview_checked_at INTEGER,
+    touched_at INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE similar_mix_previews (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    candidate_ids_json TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL
+  );
+  CREATE INDEX similar_mix_previews_owner ON similar_mix_previews(user_id,created_at);
+  ALTER TABLE playlist_items ADD COLUMN external_track_json TEXT;
+  ALTER TABLE smart_playlist_catalog_state ADD COLUMN mix_revision INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE recommendation_feedback ADD COLUMN identity_title TEXT;
+  ALTER TABLE recommendation_feedback ADD COLUMN identity_artist TEXT;`,
+});
+
+migrations.push({ id: 43, name: "private-listening-and-taste-controls", sql: `
+  CREATE TABLE taste_settings(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    private_listening INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, reset_before TEXT,
+    provider_history_disabled INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE taste_private_periods(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    started_at TEXT NOT NULL,ended_at TEXT);
+  CREATE INDEX taste_private_periods_owner ON taste_private_periods(user_id,started_at,ended_at);
+  CREATE TABLE taste_track_exclusions(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,track_id TEXT NOT NULL,
+    recording_key TEXT NOT NULL,title TEXT NOT NULL,artist TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(user_id,track_id));
+  CREATE INDEX taste_track_recording ON taste_track_exclusions(user_id,recording_key);
+  ALTER TABLE playlists ADD COLUMN exclude_from_taste INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE listening_events ADD COLUMN taste_excluded INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE listening_events ADD COLUMN context_playlist_id TEXT;
+  ALTER TABLE listening_events ADD COLUMN taste_recording_key TEXT;
+  ALTER TABLE recently_played ADD COLUMN taste_excluded INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE recently_played ADD COLUMN playback_session_id TEXT;
+  ALTER TABLE recently_played ADD COLUMN taste_recording_key TEXT;
+  ALTER TABLE recommendation_feedback ADD COLUMN identity_album TEXT;
+  CREATE VIEW taste_listening_events AS SELECT e.* FROM listening_events e LEFT JOIN taste_settings s ON s.user_id=e.user_id
+    WHERE e.taste_excluded=0 AND e.created_at>COALESCE(s.reset_before,'0000') AND NOT EXISTS (
+      SELECT 1 FROM taste_track_exclusions x WHERE x.user_id=e.user_id AND (x.track_id=e.track_id OR x.recording_key=e.taste_recording_key));
+  CREATE VIEW taste_recently_played AS SELECT e.* FROM recently_played e LEFT JOIN taste_settings s ON s.user_id=e.user_id
+    WHERE e.taste_excluded=0 AND e.played_at>COALESCE(s.reset_before,'0000') AND NOT EXISTS (
+      SELECT 1 FROM taste_track_exclusions x WHERE x.user_id=e.user_id AND (x.track_id=e.track_id OR x.recording_key=e.taste_recording_key));
+  ${(["listening_events", "recently_played"] as const).flatMap(table => ["insert", "update", "delete"].map(op => `DROP TRIGGER IF EXISTS smart_${table}_${op};`)).join("\n")}
+  DELETE FROM smart_playlist_activity;
+  ${smartPlaylistActivitySchema(true)}
+  ${["INSERT", "UPDATE", "DELETE"].map(op => `CREATE TRIGGER taste_feedback_${op.toLowerCase()} AFTER ${op} ON recommendation_feedback BEGIN
+    INSERT OR IGNORE INTO taste_settings(user_id) SELECT ${op === "DELETE" ? "OLD" : "NEW"}.user_id WHERE EXISTS(SELECT 1 FROM users WHERE id=${op === "DELETE" ? "OLD" : "NEW"}.user_id);
+    UPDATE taste_settings SET revision=revision+1 WHERE user_id=${op === "DELETE" ? "OLD" : "NEW"}.user_id;
+  END;`).join("\n")}
+` });
+
+migrations.push({ id: 44, name: "explicit-artist-follows-and-new-releases", sql: `
+  CREATE TABLE followed_artist_catalog (
+    artist_key TEXT PRIMARY KEY, artist_id TEXT NOT NULL, artist_name TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK(provider IN ('library','deezer','itunes')),
+    resolved_id TEXT, next_scan_at INTEGER NOT NULL DEFAULT 0, checked_at INTEGER,
+    failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, lease_until INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE followed_artists (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    artist_key TEXT NOT NULL REFERENCES followed_artist_catalog(artist_key) ON DELETE CASCADE,
+    followed_at TEXT NOT NULL, PRIMARY KEY(user_id,artist_key)
+  );
+  CREATE INDEX followed_artists_catalog ON followed_artists(artist_key);
+  CREATE TABLE new_release_cache (
+    artist_key TEXT NOT NULL REFERENCES followed_artist_catalog(artist_key) ON DELETE CASCADE,
+    release_id TEXT NOT NULL, canonical_key TEXT NOT NULL, release_date TEXT NOT NULL,
+    data_json TEXT NOT NULL, cached_at INTEGER NOT NULL, PRIMARY KEY(artist_key,release_id)
+  );
+  CREATE INDEX new_release_dates ON new_release_cache(release_date DESC,canonical_key);
+  CREATE TABLE release_provider_throttle(provider TEXT PRIMARY KEY,next_request_at INTEGER NOT NULL);
+` });
+
+migrations.push({ id: 45, name: "playlist-collaboration-and-party-requests", sql: `
+  ALTER TABLE playlists ADD COLUMN sharing_mode TEXT NOT NULL DEFAULT 'PRIVATE'
+    CHECK(sharing_mode IN ('PRIVATE','SHARED_READ','COLLABORATIVE','PUBLIC_SERVER'));
+  ALTER TABLE playlists ADD COLUMN sharing_revision INTEGER NOT NULL DEFAULT 0;
+  UPDATE playlists SET sharing_mode='PUBLIC_SERVER' WHERE owner_user_id IS NULL;
+  CREATE TABLE playlist_permissions (
+    playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('VIEWER','COLLABORATOR')),
+    granted_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL, granted_at TEXT NOT NULL,
+    PRIMARY KEY(playlist_id,user_id)
+  );
+  CREATE INDEX playlist_permissions_user ON playlist_permissions(user_id,playlist_id);
+  ALTER TABLE playlist_items ADD COLUMN added_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
+  UPDATE playlist_items SET added_by_user_id=(SELECT owner_user_id FROM playlists p WHERE p.id=playlist_items.playlist_id);
+  CREATE TABLE playlist_share_links (
+    id TEXT PRIMARY KEY, playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    recipient_user_id TEXT REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE,
+    created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER
+  );
+  CREATE INDEX playlist_share_links_playlist ON playlist_share_links(playlist_id,expires_at);
+  CREATE TABLE playlist_party_sessions (
+    id TEXT PRIMARY KEY, playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    host_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    host_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, host_device_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, closed_at INTEGER
+  );
+  CREATE UNIQUE INDEX playlist_party_one_active ON playlist_party_sessions(playlist_id) WHERE closed_at IS NULL;
+  CREATE TABLE playlist_party_requests (
+    id TEXT PRIMARY KEY, party_id TEXT NOT NULL REFERENCES playlist_party_sessions(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL, requested_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    idempotency_key TEXT NOT NULL, created_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','QUEUED','DISMISSED')),
+    UNIQUE(party_id,requested_by_user_id,idempotency_key)
+  );
+  CREATE INDEX playlist_party_pending ON playlist_party_requests(party_id,state,created_at);
+` });
+
+migrations.push({ id: 46, name: "durable-queue-sessions-and-named-queues", sql: `
+  CREATE TABLE queue_contents(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,content_id TEXT NOT NULL,
+    compressed BLOB NOT NULL,raw_bytes INTEGER NOT NULL,track_count INTEGER NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(user_id,content_id));
+  CREATE TABLE queue_sessions(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,device_id TEXT NOT NULL,device_name TEXT NOT NULL,
+    content_id TEXT NOT NULL,checkpoint_json TEXT NOT NULL,sequence INTEGER NOT NULL,updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id,device_id),FOREIGN KEY(user_id,content_id) REFERENCES queue_contents(user_id,content_id));
+  CREATE INDEX queue_sessions_latest ON queue_sessions(user_id,updated_at DESC);
+  CREATE TABLE named_queues(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT NOT NULL,
+    content_id TEXT NOT NULL,checkpoint_json TEXT NOT NULL,operation_id TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(user_id,operation_id),
+    FOREIGN KEY(user_id,content_id) REFERENCES queue_contents(user_id,content_id));
+  CREATE INDEX named_queues_owner ON named_queues(user_id,updated_at DESC);
+  CREATE TABLE queue_playlist_saves(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,operation_id TEXT NOT NULL,
+    playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL,content_id TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(user_id,operation_id));
+` });
+
+migrations.push({ id: 47, name: "sonic-feature-index", sql: `
+  CREATE TABLE sonic_vectors (
+    track_id TEXT PRIMARY KEY REFERENCES library_items(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content_revision TEXT,
+    file_revision TEXT NOT NULL,
+    vector BLOB NOT NULL CHECK(length(vector) = 512),
+    analyzed_at TEXT NOT NULL
+  );
+  CREATE INDEX sonic_vectors_version_track ON sonic_vectors(version, track_id);
+` });
+
+migrations.push({ id: 48, name: "playlist-scoped-audio-scans", sql: `
+  ALTER TABLE loudness_scan_jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'library' CHECK(scope IN ('library','playlists'));
+  ALTER TABLE silence_scan_jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'library' CHECK(scope IN ('library','playlists'));
+` });
+
+migrations.push({ id: 49, name: "playlist-pin-order", sql: `
+  ALTER TABLE playlist_placements ADD COLUMN pin_position INTEGER;
+` });
+
+migrations.push({ id: 50, name: "catalog-and-playlist-query-indexes", sql: `
+  CREATE INDEX playlists_owner_deleted_idx ON playlists(owner_user_id, deleted_at);
+  CREATE INDEX smart_tracks_artist ON smart_playlist_tracks(artist COLLATE NOCASE, title COLLATE NOCASE, id);
+  CREATE INDEX smart_tracks_album ON smart_playlist_tracks(album COLLATE NOCASE, title COLLATE NOCASE, id);
+` });
+
+/** A target version lets acceptance tests construct genuine legacy schemas. */
+export function runMigrations(db: Database.Database, upTo = Number.POSITIVE_INFINITY) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id INTEGER PRIMARY KEY,
@@ -586,23 +1152,20 @@ export function runMigrations(db: Database.Database) {
     );
   `);
 
-  const applied = new Set(
-    db.prepare("SELECT id FROM schema_migrations").all().map((row: any) => row.id)
-  );
+  const applied = new Set(db.prepare<[], { id: number }>("SELECT id FROM schema_migrations").all().map(({ id }) => id));
+  const isApplied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?");
+  const record = db.prepare("INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)");
+  const apply = db.transaction((migration: Migration) => {
+    // Recheck under the write lock in case another process migrated first.
+    if (isApplied.get(migration.id)) return;
+    if (typeof migration.sql === "function") migration.sql(db);
+    else db.exec(migration.sql);
+    record.run(migration.id, migration.name, new Date().toISOString());
+  });
 
   for (const migration of migrations) {
-    if (applied.has(migration.id)) {
-      continue;
-    }
-
-    const apply = db.transaction(() => {
-      db.exec(migration.sql);
-      db.prepare(
-        "INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)"
-      ).run(migration.id, migration.name, new Date().toISOString());
-    });
-
-    apply();
+    if (migration.id > upTo) break;
+    if (!applied.has(migration.id)) apply.immediate(migration);
   }
 }
 
@@ -773,6 +1336,13 @@ export function backfillConnectionScope(db: Database.Database) {
  * is reused, not duplicated.
  */
 export function backfillLibraryIdentities(db: Database.Database) {
+  // Existing playlists can contain thousands of entries. Commit their identity
+  // rewrites together so startup neither fsyncs every row nor leaves half a
+  // playlist upgraded when a write fails.
+  db.transaction(() => backfillLibraryIdentityRows(db))();
+}
+
+function backfillLibraryIdentityRows(db: Database.Database) {
   const hasMigration5 = db.prepare(
     "SELECT id FROM schema_migrations WHERE id = 5"
   ).get();
@@ -845,7 +1415,7 @@ export function backfillLibraryIdentities(db: Database.Database) {
 
   // playlist_items: keep provider mapping, add the stable library_track_id.
   const itemRows = db.prepare(
-    "SELECT id, connection_id, provider_track_id FROM playlist_items WHERE library_track_id IS NULL"
+    "SELECT id, connection_id, provider_track_id FROM playlist_items WHERE library_track_id IS NULL AND external_track_json IS NULL"
   ).all() as Array<{ id: string; connection_id: string; provider_track_id: string }>;
 
   for (const row of itemRows) {

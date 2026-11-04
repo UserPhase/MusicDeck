@@ -97,6 +97,17 @@ describe("auth and health", () => {
     expect(cookie).toContain("SameSite=Lax");
   });
 
+  test("explicit trusted-LAN HTTP mode preserves login and session cookies", async () => {
+    const { app } = await setup({ isProduction: true, secureCookies: false });
+    const { response, cookie } = await login(app);
+    expect(response.statusCode).toBe(200);
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Lax");
+    expect(cookie).not.toContain("Secure");
+    const session = await app.inject({ url: "/api/auth/session", headers: { cookie } });
+    expect(session.json()).toMatchObject({ authenticated: true, user: { username: "admin" } });
+  });
+
   test("password changes are hashed and require the old password", async () => {
     const { app } = await setup();
     const { cookie } = await login(app);

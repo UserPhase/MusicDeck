@@ -49,7 +49,7 @@ describe("first-party plugin suite", () => {
     expect(JSON.stringify(list)).not.toContain("lb-token");
   });
 
-  test("ListenBrainz scrobbles completed tracks only after explicit enablement", async () => {
+  test("ListenBrainz enablement never sends global history to an administrator's account", async () => {
     const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
     const { app, plugins } = await setup(fetchMock as typeof fetch);
 
@@ -62,24 +62,23 @@ describe("first-party plugin suite", () => {
     plugins.emit("track.completed", { title: "Song", artist: "Artist", album: "Album" });
     await new Promise((resolve) => setImmediate(resolve));
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.listenbrainz.org/1/submit-listens",
-      expect.objectContaining({ method: "POST" })
-    );
+    expect(fetchMock).not.toHaveBeenCalled();
     expect(JSON.stringify(plugins.get("listenbrainz", true))).not.toContain("lb-token");
   });
 
   test("Last.fm test connection uses configured credentials without exposing them", async () => {
-    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    const fetchMock = vi.fn(async (_url: string | URL) => new Response('{"user":{"name":"listener"}}', { status: 200 }));
     const { app, plugins } = await setup(fetchMock as typeof fetch);
 
-    await enable(app, "lastfm", { apiKey: "api-key", sessionKey: "session-key" }, ["history.read", "network.request"]);
+    await enable(app, "lastfm", { apiKey: "api-key", apiSecret: "api-secret", sessionKey: "session-key" }, ["history.read", "network.request"]);
     const { cookie } = await login(app);
     const tested = await app.inject({ method: "POST", url: "/api/admin/plugins/lastfm/test", headers: { cookie } });
 
     expect(tested.statusCode).toBe(200);
     expect(tested.json().test.ok).toBe(true);
     expect(JSON.stringify(plugins.get("lastfm", true))).not.toContain("session-key");
+    const requestUrl = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(requestUrl.searchParams.get("api_sig")).toMatch(/^[a-f0-9]{32}$/);
   });
 
   test("MusicBrainz and external artwork plugins expose testable metadata/artwork capabilities", async () => {

@@ -1,0 +1,23 @@
+.offline-status-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; position: sticky; top: 0; z-index: 1000; padding: 12px 20px; border-bottom: 1px solid var(--panel-border); background: var(--panel-chrome); color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.offline-status-banner strong { color: var(--text); white-space: nowrap; }
+.offline-status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.offline-status-banner > span:last-child { flex: 1 1 320px; }
+.offline-storage-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
+.offline-storage-eyebrow { color: var(--text-muted); font-size: 10px; letter-spacing: .15em; }
+.offline-storage-heading h3 { margin: 8px 0 0; color: var(--text); font-size: 20px; font-weight: 600; }
+.offline-storage-connection { border: 1px solid var(--panel-border); border-radius: 4px; padding: 5px 10px; color: var(--text-secondary); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+.offline-storage-detail, .offline-storage-actions p { color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+.offline-storage-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--panel-border); margin-top: 22px; }
+.offline-storage-actions article { display: flex; flex-direction: column; align-items: flex-start; padding: 20px 16px; border-right: 1px solid var(--panel-border); }
+.offline-storage-actions article:first-child { padding-left: 0; }
+.offline-storage-actions article:last-child { border-right: 0; }
+.offline-storage-actions h3 { font-size: 14px; color: var(--text); margin: 0; }
+.offline-storage-actions p { flex: 1; }
+.offline-storage-actions button { white-space: normal; text-align: left; }
+.offline-storage-confirm { border-left: 2px solid var(--accent); padding-left: 12px; }
+.offline-storage-confirm button { margin: 4px 0; }
+@media (max-width: 800px) {
+  .offline-storage-actions { grid-template-columns: 1fr; }
+  .offline-storage-actions article, .offline-storage-actions article:first-child { padding: 18px 0; border-right: 0; border-bottom: 1px solid var(--panel-border); }
+  .offline-status-banner { padding: 10px 14px; }
+}

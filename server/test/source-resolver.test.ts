@@ -40,6 +40,42 @@ function makeSetup(...providers: MusicBackend[]) {
 }
 
 describe("SourceResolver", () => {
+  test.each([400, 401, 403, 404, 416, 500, 503, 302])("cancels a body-bearing HTTP %i before trying the next source", async (status) => {
+    const cancel = vi.fn();
+    const a = createFakeBackend({ fetchStream: vi.fn(async () => ({ status, headers: new Headers(), body: new ReadableStream({ cancel }) })) });
+    const b = createFakeBackend({ fetchStream: vi.fn(async () => streamResult("working")) });
+    const { db, library, resolver } = makeSetup(a, b);
+    try {
+      const id = library.ensureId("track", { connectionId: "conn-1", providerItemId: "missing" });
+      library.addSource(id, { connectionId: "conn-2", providerItemId: "working" });
+      const result = await resolver.fetchStream(id);
+      expect(result.status).toBe(200); expect(cancel).toHaveBeenCalledOnce();
+      expect(b.fetchStream).toHaveBeenCalledWith("working", undefined); await result.body?.cancel();
+    } finally { db.close(); }
+  });
+
+  test.each([200, 206])("accepts HTTP %i audio without trying another source", async status => {
+    const a = createFakeBackend({ fetchStream: vi.fn(async () => ({ ...streamResult("audio"), status })) });
+    const b = createFakeBackend(); const { db, library, resolver } = makeSetup(a, b);
+    try {
+      const id = library.ensureId("track", { connectionId: "conn-1", providerItemId: "audio" });
+      library.addSource(id, { connectionId: "conn-2", providerItemId: "unused" });
+      const result = await resolver.fetchStream(id, "bytes=0-2");
+      expect(result.status).toBe(status); expect(b.fetchStream).not.toHaveBeenCalled(); await result.body?.cancel();
+    } finally { db.close(); }
+  });
+
+  test("tries every missing artwork source and preserves the final empty-artwork response", async () => {
+    const a = createFakeBackend({ fetchArtwork: vi.fn(async () => ({ status: 404, body: null, headers: new Headers() })) });
+    const b = createFakeBackend({ fetchArtwork: vi.fn(async () => ({ status: 404, body: null, headers: new Headers() })) });
+    const { db, library, resolver } = makeSetup(a, b);
+    try {
+      const id = library.ensureId("artwork", { connectionId: "conn-1", providerItemId: "missing-a" });
+      library.addSource(id, { connectionId: "conn-2", providerItemId: "missing-b" });
+      expect(await resolver.fetchArtwork(id)).toMatchObject({ status: 404, body: null });
+      expect(a.fetchArtwork).toHaveBeenCalledOnce(); expect(b.fetchArtwork).toHaveBeenCalledOnce();
+    } finally { db.close(); }
+  });
   test("resolves a single source successfully", async () => {
     const backend = createFakeBackend({
       fetchStream: vi.fn(async () => streamResult("a")),
@@ -120,6 +156,10 @@ describe("SourceResolver", () => {
     expect(result.status).toBe(200);
     expect(failing.fetchStream).toHaveBeenCalled();
     expect(working.fetchStream).toHaveBeenCalledWith("t-2", undefined);
+    expect(result.audioStream).toEqual({ direct: false, requestedBitrateKbps: null, sourceConnectionId: "conn-2" });
+    await resolver.audioMetadata(id, result.audioStream?.sourceConnectionId);
+    expect(working.getTrack).toHaveBeenCalledWith("t-2");
+    expect(failing.getTrack).not.toHaveBeenCalled();
   });
 
   test("throws SourceUnavailableError when every source fails", async () => {

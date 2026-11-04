@@ -33,6 +33,7 @@ WORKDIR /app
 ENV SPOTDL_HOME=/opt/spotdl
 ENV PATH="${SPOTDL_HOME}/bin:${PATH}"
 ENV HOME=/app/home
+ENV MUSICDECK_EXTENSIONS_DIR=/extensions
 COPY requirements.txt ./requirements.txt
 
 RUN apt-get update \
@@ -51,8 +52,10 @@ RUN apt-get update \
 
 RUN groupadd --system musicdeck \
   && useradd --system --gid musicdeck --home-dir /app/home musicdeck \
-  && mkdir -p /app/home /app/data /app/config /app/cache \
+  && mkdir -p /app/home /app/data /app/config /app/cache /extensions \
   && chown -R musicdeck:musicdeck /app
+
+RUN chmod 0700 /app/data
 
 # Install Deno under the same HOME used by the non-root runtime. spotDL finds
 # that local binary and passes its path to yt-dlp; no host installation needed.

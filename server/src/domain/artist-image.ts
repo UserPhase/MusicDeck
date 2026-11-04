@@ -1,6 +1,8 @@
 import type { Album, Artist, Track } from "../types.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 import { upscaleItunesArtwork } from "./itunes-artist-catalog.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
+import { isDefaultPlaceholder } from "../services/media/placeholderDetector.js";
 
 const DEEZER = "https://api.deezer.com";
 const ITUNES = "https://itunes.apple.com";
@@ -58,8 +60,8 @@ export function isDedicatedArtistPicture(value: string | null): value is string 
 }
 
 /** Accept native artist-info portraits, but never local cover-art routes or album CDN images. */
-export function isNativeArtistPicture(value: string | null, albums: Pick<Album, "artworkUrl">[] = []): value is string {
-  if (!value?.trim()) return false;
+export function isNativeArtistPicture(value: unknown, albums: Pick<Album, "artworkUrl">[] = []): value is string {
+  if (typeof value !== "string" || !value.trim() || isDefaultPlaceholder(value)) return false;
   try {
     const url = new URL(value);
     if (url.protocol !== "https:" || url.username || url.password) return false;
@@ -93,7 +95,7 @@ export function verifyArtistImageCandidate(local: LocalArtistCatalog, candidate:
 export class ArtistImageResolver {
   private readonly cache = new Map<string, { expiresAt: number; value: Promise<VerifiedArtistImage | null> }>();
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch) { this.fetchImpl = gateFetch(fetchImpl); }
 
   purgeArtistImageCache(artistId?: string) {
     if (artistId) {

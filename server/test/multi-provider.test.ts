@@ -8,6 +8,7 @@ import { CatalogService } from "../src/domain/catalog.js";
 import { SourceResolver, SourceUnavailableError } from "../src/domain/source-resolver.js";
 import { LibraryService } from "../src/domain/library.js";
 import { runMigrations } from "../src/db/migrations.js";
+import { toTrackSearchResult } from "../src/domain/search.js";
 
 // --- HTTP fixtures -------------------------------------------------------
 
@@ -130,6 +131,52 @@ describe("multi-provider registry", () => {
 });
 
 describe("multi-provider catalog fan-out", () => {
+  test("preserves artist credits and maps them to artist pages on the same provider", async () => {
+    const { db, library, catalog } = makeStack({
+      navidromeFetch: () => jsonResponse({ "subsonic-response": { status: "ok", song: {
+        ...NAVIDROME_TRACK["subsonic-response"].song,
+        artists: [{ id: "primary", name: "Lead" }, { id: "guest", name: "Guest" }],
+      } } }),
+      jellyfinFetch: () => jsonResponse({ Items: [{ ...JELLYFIN_TRACK.Items[0],
+        ArtistItems: [{ Id: "primary", Name: "Lead" }, { Id: "guest", Name: "Guest" }],
+      }] }),
+    });
+    try {
+      for (const [connectionId, providerItemId] of [["conn-nav", "nav-track-1"], ["conn-jf", "jf-track-1"]]) {
+        const track = await catalog.getTrack(library.ensureId("track", { connectionId, providerItemId }));
+        const expected = [
+          { id: library.ensureId("artist", { connectionId, providerItemId: "primary" }), name: "Lead" },
+          { id: library.ensureId("artist", { connectionId, providerItemId: "guest" }), name: "Guest" },
+        ];
+        expect(track?.artistCredits).toEqual(expected);
+        if (!track) throw new Error("Missing test track");
+        expect(toTrackSearchResult({ ...track, availability: {
+          connectionId, state: "available", libraryAvailable: true, sourceCount: 1, availableSourceCount: 1,
+        } }).artistCredits).toEqual(expected);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("routes a Jellyfin artist portrait back to the Jellyfin connection", async () => {
+    const { db, catalog, resolver } = makeStack({
+      jellyfinFetch: (url) => url.pathname.endsWith("/Images/Primary")
+        ? new Response("artist-portrait", { headers: { "content-type": "image/jpeg" } })
+        : jsonResponse({ Items: [{ Id: "jf-artist-1", Name: "JF Artist", ImageTags: { Primary: "t" } }] }),
+    });
+    try {
+      const listing = await catalog.listArtists();
+      const artist = await catalog.getArtist(listing.items[0].id);
+      expect(artist?.artworkId).toMatch(/^mdart_/);
+      expect(artist?.imageUrl).toBe(`/api/artwork/${artist?.artworkId}`);
+      const artwork = await resolver.fetchArtwork(artist!.artworkId!);
+      expect(await new Response(artwork.body).text()).toBe("artist-portrait");
+    } finally {
+      db.close();
+    }
+  });
+
   test("returns results from both providers in deterministic order with distinct stable IDs", async () => {
     const { catalog } = makeStack({
       navidromeFetch: () => jsonResponse(NAVIDROME_ALBUMS),

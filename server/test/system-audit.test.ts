@@ -19,10 +19,13 @@ function listRoutes(app: FastifyInstance): Route[] {
     const depth = Math.round(match[1].length / 4);
     stack.length = depth;
     stack[depth] = match[2];
-    const fullPath = stack.join("");
+    const fullPath = stack.join("").replace(/:[A-Za-z]+/g, "audit-id");
+    // printRoutes collapses static segments that precede a bare wildcard, so a
+    // wildcard URL cannot be reconstructed faithfully; those are listed manually.
+    if (fullPath.includes("*")) continue;
     for (const method of match[3].split(",").map((value) => value.trim())) {
       if (method === "HEAD" || method === "OPTIONS") continue;
-      routes.push({ method, url: fullPath.replace(/:[A-Za-z]+/g, "audit-id") });
+      routes.push({ method, url: fullPath });
     }
   }
   return routes;
@@ -34,6 +37,12 @@ const ADMIN_ONLY_NON_PREFIXED: Route[] = [
   { method: "PATCH", url: "/api/users/audit-id" },
   { method: "DELETE", url: "/api/users/audit-id" },
 ];
+
+// Wildcard routes cannot be reconstructed from printRoutes (see listRoutes), so
+// the extension route gateway is audited explicitly with a concrete path.
+const ADMIN_ONLY_WILDCARD: Route[] = ["GET", "POST", "PUT", "PATCH", "DELETE"].map((method) => ({
+  method, url: "/api/v1/admin/extensions/audit-id/routes/audit-path",
+}));
 
 let current: { app: FastifyInstance; db: Parameters<typeof closeTestServer>[1] } | null = null;
 const tempDirs: string[] = [];
@@ -56,6 +65,7 @@ describe("system audit: admin auth guards", () => {
     const adminRoutes = [
       ...listRoutes(app).filter((route) => /^\/api\/(v1\/)?admin\//.test(route.url)),
       ...ADMIN_ONLY_NON_PREFIXED,
+      ...ADMIN_ONLY_WILDCARD,
     ];
     expect(adminRoutes.length).toBeGreaterThan(25);
 

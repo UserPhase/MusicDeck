@@ -2,10 +2,11 @@ import { Link, useLocation } from "react-router-dom";
 
 const MOBILE_NAV_ITEMS = [
   { to: "/", label: "Home", icon: "⌂", exact: true },
-  { to: "/explore", label: "Explore", icon: "◇" },
+  { to: "/explore", label: "Discover", icon: "◇" },
   { to: "/search", label: "Search", icon: "⌕" },
   { to: "/library/playlists", label: "Library", icon: "♫", match: "/library" },
   { to: "/liked", label: "Liked", icon: "♡" },
+  { to: "/downloads", label: "Downloads", icon: "↓" },
 ];
 
 function isActive(item, pathname) {

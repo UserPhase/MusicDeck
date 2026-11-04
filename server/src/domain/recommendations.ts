@@ -5,6 +5,8 @@ import { toTrackSearchResult, type UnifiedSearchResult } from "./search.js";
 import type { Available } from "./catalog.js";
 import type { Track } from "../types.js";
 import { canUseProviderHistory, listeningWindowStart } from "./recently-played.js";
+import { RecommendationEngine } from "../services/RecommendationEngine.js";
+import { tasteProfile, tasteTarget } from "../services/TasteProfileManager.js";
 
 export type RecommendationKind =
   | "continue-listening"
@@ -55,6 +57,8 @@ type TasteEntry = {
   albumId: string | null;
   albumName: string;
 };
+
+export type DiscoverySeed = { name: string; score: number };
 
 type FeedbackAction =
   | "hide"
@@ -125,37 +129,92 @@ function diversify(items: UnifiedSearchResult[], limit: number, maxPerArtist = 2
 }
 
 export class RecommendationService {
-  private readonly tasteCache = new Map<string, { expiresAt: number; entries: TasteEntry[] }>();
-  private readonly libraryCache = new Map<string, { expiresAt: number; promise: Promise<Array<Available<Track>>> }>();
+  readonly engine: RecommendationEngine;
+  private snapshot: Promise<void> | null = null;
+  private snapshotAt = 0;
+  private refreshTimer: NodeJS.Timeout | null = null;
+  private readonly tasteCache = new Map<string, { version: number; expiresAt: number; entries: TasteEntry[] }>();
+  private readonly libraryCache = new Map<string, { version: number; expiresAt: number; promise: Promise<Array<Available<Track>>> }>();
   constructor(
     private readonly db: Db,
     private readonly catalog: CatalogService
-  ) {}
+  ) {
+    this.engine = new RecommendationEngine(db);
+  }
 
-  recordListeningEvent(userId: string, trackId: string, eventType: "play" | "skip" | "complete", completionRatio?: unknown) {
-    dbInsertEvent(this.db, userId, trackId, eventType, parseRatio(completionRatio));
-    this.invalidateListeningTaste(userId);
+  start(): void {
+    if (this.refreshTimer) return;
+    const refresh = () => {
+      void this.refreshCatalog().catch((error) => console.error("Could not refresh local recommendation catalog", error));
+    };
+    refresh();
+    this.refreshTimer = setInterval(refresh, 5 * 60_000);
+    this.refreshTimer.unref();
+  }
+
+  async close(): Promise<void> {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = null;
+    await this.snapshot;
+  }
+
+  async refreshCatalog(): Promise<void> {
+    if (this.snapshot) return this.snapshot;
+    this.snapshot = this.catalog.tracksForWindow().then(({ items }) => {
+      this.engine.replaceCatalog(items);
+      this.snapshotAt = Date.now();
+    });
+    try {
+      await this.snapshot;
+    } finally {
+      this.snapshot = null;
+    }
+  }
+
+  async autoplay(userId: string, seedId: string, limit = 10, excludeIds: readonly string[] = []) {
+    if (!this.snapshotAt) await this.refreshCatalog();
+    return (await this.engine.selectWithSonic(userId, seedId, limit, excludeIds)).map(({ track, reason }) =>
+      withReason(toTrackSearchResult(track), reason)
+    );
+  }
+
+  recordListeningEvent(userId: string, trackId: string, eventType: "play" | "skip" | "complete", completionRatio?: unknown, context?: { playlistId?: string | null; privateListening?: boolean; excludeFromTaste?: boolean }) {
+    const result = dbInsertEvent(this.db, userId, trackId, eventType, parseRatio(completionRatio), context);
+    if (!result.excluded) { tasteProfile(this.db).bump(userId); this.invalidateListeningTaste(userId); }
+    return result;
   }
 
   invalidateListeningTaste(userId: string) {
+    this.engine.invalidate(userId);
     this.tasteCache.delete(userId);
     this.libraryCache.delete(userId);
   }
 
-  setFeedback(userId: string, action: FeedbackAction, itemType: "track" | "artist" | "album", itemId: string) {
+  setFeedback(userId: string, action: FeedbackAction, itemType: "track" | "artist" | "album", itemId: string, identity?: { title?: string; artist?: string; album?: string }) {
     const weight = action === "more-like-this"
       ? 1
       : action === "less-like-this"
         ? -0.5
         : -1;
 
-    this.db.prepare(`
-      INSERT INTO recommendation_feedback (user_id, item_type, item_id, action, weight, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, item_type, item_id, action) DO UPDATE SET
-        weight = excluded.weight,
-        updated_at = excluded.updated_at
-    `).run(userId, itemType, itemId, action, weight, new Date().toISOString(), new Date().toISOString());
+    this.db.transaction(() => {
+      if (action === "more-like-this" || action === "less-like-this") {
+        this.db.prepare(`DELETE FROM recommendation_feedback
+          WHERE user_id = ? AND item_type = ? AND item_id = ? AND action IN ('more-like-this','less-like-this')`)
+          .run(userId, itemType, itemId);
+      }
+      this.db.prepare(`
+        INSERT INTO recommendation_feedback (user_id, item_type, item_id, action, weight, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, item_type, item_id, action) DO UPDATE SET
+          weight = excluded.weight,
+          updated_at = excluded.updated_at
+      `).run(userId, itemType, itemId, action, weight, new Date().toISOString(), new Date().toISOString());
+      const resolved = tasteProfile(this.db).resolve({ id: itemId, type: itemType, ...identity });
+      this.db.prepare(`UPDATE recommendation_feedback SET identity_title=COALESCE(?,identity_title),identity_artist=COALESCE(?,identity_artist),identity_album=COALESCE(?,identity_album)
+        WHERE user_id=? AND item_type=? AND item_id=? AND action=?`).run(resolved.title ?? null, resolved.artist ?? null, resolved.album ?? null, userId, itemType, itemId, action);
+    })();
+    this.engine.invalidate(userId);
     this.libraryCache.delete(userId);
     this.tasteCache.delete(userId);
   }
@@ -178,8 +237,9 @@ export class RecommendationService {
   }
 
   private taste(userId: string, libraryTracks: Array<Available<Track>>) {
+    const version = tasteProfile(this.db).state(userId).revision;
     const cached = this.tasteCache.get(userId);
-    if (cached && cached.expiresAt > Date.now()) return cached.entries;
+    if (cached && cached.expiresAt > Date.now() && cached.version === version) return cached.entries;
     const cutoff = listeningWindowStart();
     const favoriteRows = this.db.prepare(
       "SELECT track_id FROM favorites WHERE user_id = ?"
@@ -188,7 +248,7 @@ export class RecommendationService {
 
     const recentRows = this.db.prepare(`
       SELECT track_id, COUNT(*) AS playCount, MAX(played_at) AS lastPlayedAt
-      FROM recently_played
+      FROM taste_recently_played
       WHERE user_id = ? AND played_at >= ?
       GROUP BY track_id
     `).all(userId, cutoff) as Array<{ track_id: string; playCount: number; lastPlayedAt: string }>;
@@ -199,7 +259,7 @@ export class RecommendationService {
           WHEN 'skip' THEN -2 ELSE 1 END) AS scoreDelta,
         SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completedCount,
         MAX(CASE WHEN event_type = 'complete' THEN created_at END) AS lastCompletedAt
-      FROM listening_events
+      FROM taste_listening_events
       WHERE user_id = ? AND created_at >= ? AND event_type IN ('play', 'skip', 'complete')
       GROUP BY track_id
     `).all(userId, cutoff) as Array<{
@@ -238,7 +298,7 @@ export class RecommendationService {
     // Subsonic exposes only the last play and all-time count, not a dated
     // scrobble log. Use a recent provider timestamp as a coarse seed for
     // listens made in other clients; local qualified events remain precise.
-    for (const track of canUseProviderHistory(this.db) ? libraryTracks : []) {
+    for (const track of canUseProviderHistory(this.db) && tasteProfile(this.db).canUseProviderHistory(userId) ? libraryTracks : []) {
       if (!track.lastPlayedAt) continue;
       const playedAt = Date.parse(track.lastPlayedAt);
       if (!Number.isFinite(playedAt) || playedAt < Date.parse(cutoff)) continue;
@@ -256,9 +316,10 @@ export class RecommendationService {
 
     const tracks: TasteEntry[] = [];
     const catalogById = new Map(libraryTracks.map((track) => [track.id, track]));
+    const allows = tasteProfile(this.db).feedbackFilter(userId);
     for (const [trackId, stats] of byTrack) {
       const track = catalogById.get(trackId);
-      if (!track) continue;
+      if (!track || !allows(tasteTarget(track))) continue;
       tracks.push({
         trackId,
         score: stats.score,
@@ -271,17 +332,19 @@ export class RecommendationService {
         albumName: track.albumName,
       });
     }
-    this.tasteCache.set(userId, { entries: tracks, expiresAt: Date.now() + 30_000 });
+    this.tasteCache.set(userId, { version, entries: tracks, expiresAt: Date.now() + 30_000 });
     return tracks;
   }
 
   private async libraryTracks(userId: string): Promise<Array<Available<Track>>> {
+    const version = tasteProfile(this.db).state(userId).revision;
     const cached = this.libraryCache.get(userId);
-    if (cached && cached.expiresAt > Date.now()) return cached.promise;
+    if (cached && cached.expiresAt > Date.now() && cached.version === version) return cached.promise;
     const promise = this.catalog.listTracks().then((result) => {
       const feedback = this.feedback(userId);
+      const allows = tasteProfile(this.db).feedbackFilter(userId);
       return result.items.filter((track) =>
-        !feedback.blockedItems.has(track.id)
+        allows(tasteTarget(track)) && !feedback.blockedItems.has(track.id)
         && !(track.artistId && feedback.blockedArtists.has(track.artistId))
         && !(track.albumId && feedback.blockedAlbums.has(track.albumId))
       );
@@ -289,8 +352,63 @@ export class RecommendationService {
       this.libraryCache.delete(userId);
       throw error;
     });
-    this.libraryCache.set(userId, { expiresAt: Date.now() + 30_000, promise });
+    this.libraryCache.set(userId, { version, expiresAt: Date.now() + 30_000, promise });
     return promise;
+  }
+
+  /** Only deliberate account signals seed external discovery, never another
+   * listener's history or an arbitrary sample of the shared library. */
+  discoverySeeds(userId: string, tracks: Array<Available<Track>>, resultLimit = 3): DiscoverySeed[] {
+    const allows = tasteProfile(this.db).feedbackFilter(userId);
+    const artists = new Map<string, DiscoverySeed>();
+    const feedback = this.feedback(userId);
+    const add = (name: string, score: number) => {
+      const primary = name.split(/\s*[;•]\s*|\s+\/\s+/)[0].trim();
+      const key = primary.normalize("NFKC").toLowerCase();
+      if (!key || /unknown artist/i.test(primary) || !allows({ id: `name:${key}`, type: "artist", title: primary, artist: primary })) return;
+      const existing = artists.get(key);
+      artists.set(key, { name: primary, score: (existing?.score || 0) + score });
+    };
+    const allowed = tracks.filter((track) => allows(tasteTarget(track)) && !feedback.blockedItems.has(track.id)
+      && !(track.artistId && feedback.blockedArtists.has(track.artistId))
+      && !(track.albumId && feedback.blockedAlbums.has(track.albumId)));
+    const allowedIds = new Set(allowed.map((track) => track.id));
+    for (const entry of this.taste(userId, allowed)) if (allowedIds.has(entry.trackId)) add(entry.artistName, entry.score);
+    const favorites = new Set((this.db.prepare("SELECT track_id FROM favorites WHERE user_id = ?")
+      .all(userId) as Array<{ track_id: string }>).map((row) => row.track_id));
+    const media = this.db.prepare(`SELECT item_type, item_id, metadata_json FROM media_favorites
+      WHERE user_id = ? AND item_type IN ('artist', 'album')`).all(userId) as
+      Array<{ item_type: string; item_id: string; metadata_json: string | null }>;
+    const represented = new Set<string>();
+    const byArtist = new Map<string, string>();
+    const byAlbum = new Map<string, string>();
+    for (const track of allowed) {
+      if (favorites.has(track.id)) add(track.artistName, 8);
+      if (track.artistId) byArtist.set(track.artistId, track.artistName);
+      if (track.albumId) byAlbum.set(track.albumId, track.artistName);
+    }
+    const artistFeedback = this.db.prepare(`SELECT item_id, SUM(weight) AS weight FROM recommendation_feedback
+      WHERE user_id = ? AND item_type = 'artist' AND action IN ('more-like-this','less-like-this') GROUP BY item_id`)
+      .all(userId) as Array<{ item_id: string; weight: number }>;
+    for (const row of artistFeedback) {
+      const name = byArtist.get(row.item_id);
+      if (name) add(name, row.weight * 8);
+    }
+    for (const entry of media) {
+      const name = (entry.item_type === "artist" ? byArtist : byAlbum).get(entry.item_id);
+      if (name) { add(name, 10); represented.add(entry.item_id); }
+    }
+    for (const entry of media) {
+      if (represented.has(entry.item_id) || !entry.metadata_json || feedback.blockedItems.has(entry.item_id)
+        || feedback.blockedAlbums.has(entry.item_id)) continue;
+      try {
+        const metadata = JSON.parse(entry.metadata_json) as { artist?: unknown };
+        if (typeof metadata.artist === "string") add(metadata.artist, 10);
+      } catch { /* Old favorites need not have a metadata snapshot. */ }
+    }
+    return [...artists.values()].filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
+      .slice(0, Math.max(1, Math.min(resultLimit, 3)));
   }
 
   async recommend(context: RecommendationContext): Promise<UnifiedSearchResult[]> {
@@ -308,10 +426,10 @@ export class RecommendationService {
     const topArtists = ranked("artistId");
     const topAlbums = ranked("albumId");
     const feedback = this.feedback(context.userId);
-    const providerHistoryIsPersonal = canUseProviderHistory(this.db);
+    const providerHistoryIsPersonal = canUseProviderHistory(this.db) && tasteProfile(this.db).canUseProviderHistory(context.userId);
     const lifetimeRows = context.kind === "discover" || context.kind === "forgotten-favorites"
       ? this.db.prepare(`
-          SELECT track_id, COUNT(*) AS playCount FROM listening_events
+          SELECT track_id, COUNT(*) AS playCount FROM taste_listening_events
           WHERE user_id = ? AND event_type = 'complete' GROUP BY track_id
         `).all(context.userId) as Array<{ track_id: string; playCount: number }>
       : [];
@@ -387,6 +505,7 @@ export class RecommendationService {
 
   async radio(seed: RecommendationContext["seed"], userId: string, limit = 20) {
     if (!seed) return [];
+    if (seed.type === "track") return this.autoplay(userId, seed.id, limit);
     const kind: RecommendationKind = seed.type === "artist"
       ? "radio-artist"
       : seed.type === "album"
@@ -402,11 +521,14 @@ export class RecommendationService {
   }
 }
 
-function dbInsertEvent(db: Db, userId: string, trackId: string, eventType: string, completionRatio: number | null) {
+function dbInsertEvent(db: Db, userId: string, trackId: string, eventType: string, completionRatio: number | null, context?: { playlistId?: string | null; privateListening?: boolean; excludeFromTaste?: boolean }) {
+  const manager = tasteProfile(db), metadata = manager.resolve({ id: trackId }), at = new Date().toISOString();
+  const policy = manager.decision(userId, { trackId, startedAt: at, ...context, track: { title: metadata.title, artist: metadata.artist } });
   db.prepare(`
-    INSERT INTO listening_events (id, user_id, track_id, event_type, completion_ratio, created_at, counted, finished)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-  `).run(createId("listen"), userId, trackId, eventType, completionRatio, new Date().toISOString(), Number(eventType === "complete"));
+    INSERT INTO listening_events (id, user_id, track_id, event_type, completion_ratio, created_at, counted, finished,taste_excluded,context_playlist_id,taste_recording_key)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1,?,?,?)
+  `).run(createId("listen"), userId, trackId, eventType, completionRatio, at, Number(eventType === "complete"), Number(policy.excluded), policy.playlistId, policy.recordingKey);
+  return policy;
 }
 
 /**

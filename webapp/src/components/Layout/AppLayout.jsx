@@ -3,6 +3,7 @@ import { useLocation } from "react-router-dom";
 
 import { usePlayer } from "../../context/PlayerContext";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { useRouteScrollRestoration } from "../../hooks/useViewStateStore";
 import {
   DEFAULT_LAYOUT_PRESET,
   MOBILE_LAYOUT_QUERY,
@@ -24,15 +25,16 @@ import MobileNavBar from "./MobileNavBar";
 
 function getContentClassName(pathname) {
   const isDetailPage = pathname === "/liked" || /^\/(?:album|artist|playlist)\/[^/]+/.test(pathname);
-  const isSongPage = isDetailPage || ["/library/tracks", "/liked", "/search"].includes(pathname);
-  const isWideContentPage = isSongPage || ["/", "/explore", "/listening-activity"].includes(pathname) ||
-    /^\/library\/(?:playlists|albums|artists)$/.test(pathname);
+  const isWideContentPage = isDetailPage
+    || ["/", "/search", "/explore", "/saved-discoveries", "/downloads", "/listening-activity", "/new-releases"].includes(pathname)
+    || /^\/smart-playlist\/[^/]+/.test(pathname)
+    || /^\/library(?:\/(?:tracks|playlists|smart-playlists|albums|artists|health))?\/?$/.test(pathname);
   return [
     "main-content",
     isDetailPage && "main-content--detail",
     pathname === "/" && "main-content--home",
     isWideContentPage && "main-content--wide",
-    (pathname === "/explore" || pathname === "/search") && "main-content--full-bleed-hero",
+    ["/explore", "/search", "/saved-discoveries"].includes(pathname) && "main-content--full-bleed-hero",
   ].filter(Boolean).join(" ");
 }
 
@@ -46,6 +48,8 @@ function getContentClassName(pathname) {
  */
 function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
   const location = useLocation();
+  const mainRef = useRef(null);
+  useRouteScrollRestoration(mainRef);
   const {
     currentSong,
     activeSidebar,
@@ -132,7 +136,7 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
         <div key="nav-scrim" className="nav-drawer-scrim" aria-hidden="true" onClick={() => setIsNavDrawerOpen(false)} />
       )}
       <Sidebar key="sidebar" id={NAV_DRAWER_ID} />
-      <main key="main" className={`main${isPanelOpen ? " sidebar-open" : ""}`}>
+      <main ref={mainRef} key="main" className={`main${isPanelOpen ? " sidebar-open" : ""}`}>
         {showPanelToggle && (
           <button
             className="main-now-playing-toggle"

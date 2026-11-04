@@ -1,471 +1,153 @@
-import {
-  useEffect,
-  useState,
-} from "react";
-
-import {
-  usePlayer,
-} from "../context/PlayerContext";
-
-import {
-  filterLibraryTracks,
-  getAllSongs,
-  setMediaRating,
-} from "../api/musicdeck";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePlayerActions } from "../context/PlayerItemState";
+import { getAllSongs, getTrackPage } from "../api/musicdeck";
 
 import TrackListHeader from "../components/TrackListHeader";
-import TrackRow from "../components/TrackRow";
+import VirtualizedTrackList from "../components/VirtualizedTrackList";
+import { usePagedLibrary } from "../hooks/usePagedLibrary";
+import { useCollectorLibrary } from "../hooks/useCollectorLibrary";
+import CollectorFilterBar from "../components/CollectorFilterBar";
+import { useViewStateValue } from "../hooks/useViewStateStore";
 import { useServerDeletion } from "../context/ServerDeletionContext";
-import {
-  EmptyState,
-  ErrorState,
-  LoadingState,
-} from "../components/ui/PageState";
+import { EmptyState, ErrorState, LoadingState } from "../components/ui/PageState";
 
-import {
-  getPlaylists,
-  addSongToPlaylist as addSongToPlaylistRequest,
-} from "../api/playlists";
+const compareText = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
+const sortChoices = {
+  custom: "Library order",
+  "title-asc": "Title (A–Z)", "title-desc": "Title (Z–A)",
+  "album-asc": "Album (A–Z)", "album-desc": "Album (Z–A)",
+  "duration-asc": "Shortest first", "duration-desc": "Longest first",
+};
 
-function Tracks() {
-  const deletion = useServerDeletion();
-
-  const {
-    playContext,
-    playSongFromSource,
-  } = usePlayer();
-
-  function handleTrackPlayback(song, index) {
-    playContext(songs, index, {
-      type: "collection",
-      id: "library-tracks",
-      name: "Library Tracks",
-      coverArt: null,
-    });
+function compareTracks(left, right, field, descending) {
+  if (field === "duration") {
+    const leftKnown = Number.isFinite(left.duration) && left.duration > 0;
+    const rightKnown = Number.isFinite(right.duration) && right.duration > 0;
+    if (leftKnown !== rightKnown) return leftKnown ? -1 : 1;
+    if (!leftKnown) return 0;
+    return descending ? right.duration - left.duration : left.duration - right.duration;
   }
-
-
-  const [allSongs, setSongs] =
-    useState([]);
-  const songs = allSongs.filter((song) => !deletion?.deletedTracks.has(String(song.id)));
-
-  useEffect(() => {
-    const handleDeleted = (event) => {
-      const ids = new Set(event.detail?.trackIds || []);
-      if (ids.size) setSongs((current) => current.filter((song) => !ids.has(song.id)));
-    };
-    window.addEventListener("musicdeck:server-deleted", handleDeleted);
-    return () => window.removeEventListener("musicdeck:server-deleted", handleDeleted);
-  }, []);
-
-  const [loadingSongs, setLoadingSongs] =
-    useState(true);
-
-  const [songError, setSongError] =
-    useState(null);
-
-  const [filters, setFilters] =
-    useState({ favoritesOnly: false, unplayedOnly: false });
-
-
-  const [
-    playlistMenuSong,
-    setPlaylistMenuSong,
-  ] = useState(null);
-
-
-  const [
-    playlists,
-    setPlaylists,
-  ] = useState([]);
-
-  const [
-    playlistsLoading,
-    setPlaylistsLoading,
-  ] = useState(false);
-
-
-  /*
-   * Prevent duplicate playlist additions
-   */
-
-  const [
-    addingToPlaylist,
-    setAddingToPlaylist,
-  ] = useState(false);
-
-useEffect(() => {
-
-  function handleDocumentClick() {
-    setPlaylistMenuSong(null);
-  }
-
-  document.addEventListener(
-    "mousedown",
-    handleDocumentClick
-  );
-
-  return () => {
-
-    document.removeEventListener(
-      "mousedown",
-      handleDocumentClick
-    );
-
-  };
-
-}, []);
-  /*
-   * Load all songs
-   */
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadSongs() {
-
-      try {
-
-        setLoadingSongs(true);
-
-        setSongError(null);
-
-        const activeFilters = [
-          filters.favoritesOnly ? { field: "favorite", op: "boolean", value: true } : null,
-          filters.unplayedOnly ? { field: "played", op: "boolean", value: false } : null,
-        ].filter(Boolean);
-
-        const data = activeFilters.length > 0
-          ? await filterLibraryTracks(activeFilters)
-          : await getAllSongs();
-
-
-        if (!cancelled) {
-          setSongs(data);
-        }
-
-      } catch (error) {
-
-        console.error(
-          "Could not load songs:",
-          error
-        );
-
-        if (!cancelled) {
-          setSongError(
-            "Could not load your songs."
-          );
-        }
-
-      } finally {
-
-        if (!cancelled) {
-          setLoadingSongs(false);
-        }
-
-      }
-
-    }
-
-
-    loadSongs();
-
-    return () => {
-      cancelled = true;
-    };
-
-  }, [filters]);
-
-
-  /*
-   * Load playlists
-   */
-
-  async function loadPlaylists() {
-
-    try {
-
-      setPlaylistsLoading(true);
-
-
-      const data =
-        await getPlaylists();
-
-
-      setPlaylists(data);
-
-    } catch (error) {
-
-      console.error(
-        "Could not load playlists:",
-        error
-      );
-
-    } finally {
-
-      setPlaylistsLoading(false);
-
-    }
-
-  }
-
-
-  /*
-   * Open / close playlist menu
-   */
-
-  async function togglePlaylistMenu(song) {
-
-    if (
-      playlistMenuSong?.id === song.id
-    ) {
-
-      setPlaylistMenuSong(null);
-
-      return;
-
-    }
-
-
-    setPlaylistMenuSong(song);
-
-
-    /*
-     * Only load playlists when
-     * we actually need them.
-     */
-
-    if (playlists.length === 0) {
-
-      await loadPlaylists();
-
-    }
-
-  }
-
-
-  /*
-   * Add ONE song to ONE playlist
-   */
-
-  async function addSongToPlaylist(
-    event,
-    playlist,
-    song
-  ) {
-    event.stopPropagation();
-
-    if (addingToPlaylist) {
-      return;
-    }
-
-    try {
-
-      setAddingToPlaylist(true);
-
-      await addSongToPlaylistRequest(
-        playlist.id,
-        song.id
-      );
-
-      /*
-       * Close the menu.
-       */
-
-      setPlaylistMenuSong(null);
-
-    } catch (error) {
-
-      console.error(
-        "Could not add song to playlist:",
-        error
-      );
-
-    } finally {
-
-      setAddingToPlaylist(false);
-
-    }
-
-  }
-
-
-  return (
-
-    <section className="library-section">
-
-
-      <div className="library-track-toolbar">
-        <div className="search-mode" aria-label="Library filters">
-          <button
-            type="button"
-            className={`search-mode-option ${filters.favoritesOnly ? "active" : ""}`}
-            aria-pressed={filters.favoritesOnly}
-            onClick={() => setFilters((current) => ({ ...current, favoritesOnly: !current.favoritesOnly }))}
-          >
-            Favorites
-          </button>
-          <button
-            type="button"
-            className={`search-mode-option ${filters.unplayedOnly ? "active" : ""}`}
-            aria-pressed={filters.unplayedOnly}
-            onClick={() => setFilters((current) => ({ ...current, unplayedOnly: !current.unplayedOnly }))}
-          >
-            Unplayed
-          </button>
-        </div>
-
-        {!loadingSongs && (
-          <span className="library-track-count">
-            {songs.length} {songs.length === 1 ? "song" : "songs"}
-          </span>
-        )}
-      </div>
-
-
-      {/* LOADING */}
-
-      {loadingSongs && (
-
-        <LoadingState>
-          Loading your songs...
-        </LoadingState>
-
-      )}
-
-
-      {/* ERROR */}
-
-      {songError && (
-
-        <ErrorState>
-          {songError}
-        </ErrorState>
-
-      )}
-
-
-      {/* TRACK LIST */}
-
-      {!loadingSongs &&
-        !songError && (
-
-        <div className="track-list" role="table" aria-label="Tracks">
-
-          <TrackListHeader />
-
-          {songs.length === 0 && (
-
-            <EmptyState>
-              No songs yet.
-            </EmptyState>
-
-          )}
-
-          {songs.map(
-            (song, index) => (
-            <TrackRow
-              key={song.id}
-              song={song}
-              index={index}
-              onPlay={handleTrackPlayback}
-              onSelectSource={playSongFromSource}
-              onToggleMenu={togglePlaylistMenu}
-              menu={playlistMenuSong?.id === song.id ? (
-                <div className="playlist-menu">
-
-                    <div className="playlist-menu-title">
-                      Track actions
-                    </div>
-
-                    <div className="playlist-menu-item" role="group" aria-label={`Rate ${song.title}`}>
-                      {[1, 2, 3, 4, 5].map((rating) => (
-                        <button
-                          key={rating}
-                          type="button"
-                          className="source-menu-retry"
-                          aria-label={`Rate ${song.title} ${rating} stars`}
-                          onClick={() => setMediaRating("track", song.id, rating).catch(() => {})}
-                        >
-                          {rating}★
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        className="source-menu-retry"
-                        onClick={() => setMediaRating("track", song.id, null).catch(() => {})}
-                      >
-                        Clear
-                      </button>
-                    </div>
-
-
-                    {playlistsLoading && (
-
-                      <div className="playlist-menu-item">
-                        Loading...
-                      </div>
-
-                    )}
-
-
-                    {!playlistsLoading &&
-                      playlists.map(
-                        (playlist) => (
-
-                        <button
-                          key={playlist.id}
-                          className="playlist-menu-item"
-
-                          disabled={
-                            addingToPlaylist
-                          }
-
-                          onClick={(event) =>
-                            addSongToPlaylist(
-                              event,
-                              playlist,
-                              song
-                            )
-                          }
-                        >
-
-                          <span>
-                            ♫
-                          </span>
-
-                          <span>
-                            {playlist.name}
-                          </span>
-
-                        </button>
-
-                      ))}
-
-
-                    {!playlistsLoading &&
-                      playlists.length === 0 && (
-
-                      <div className="playlist-menu-empty">
-                        No playlists yet
-                      </div>
-
-                    )}
-                </div>
-              ) : null}
-            />
-
-          ))}
-
-        </div>
-
-      )}
-
-    </section>
-
-  );
-
+  const order = compareText(left[field] || "", right[field] || "");
+  return descending ? -order : order;
 }
 
+function Tracks() {
+  const { playContext } = usePlayerActions();
+  const deletion = useServerDeletion();
+  const deletedTracks = deletion?.deletedTracks;
+  const excludeTrack = useCallback((song) => Boolean(deletedTracks?.has(String(song.id))), [deletedTracks]);
+  const [filters, setFilters] = useViewStateValue("/library/tracks", "filters", { favoritesOnly: false, unplayedOnly: false });
+  const activeFilters = useMemo(() => [
+    filters.favoritesOnly ? { field: "favorite", op: "boolean", value: true } : null,
+    filters.unplayedOnly ? { field: "played", op: "boolean", value: false } : null,
+  ].filter(Boolean), [filters]);
+  const loadPage = useCallback((options) => getTrackPage({ ...options, filters: activeFilters }), [activeFilters]);
+  const library = usePagedLibrary(loadPage, excludeTrack);
+  const [sort, setSort] = useState({ field: "custom", descending: false });
+  const sortActive = sort.field !== "custom";
+  const sortBy = useCallback(field => setSort(current => ({
+    field, descending: field !== "custom" && current.field === field && !current.descending,
+  })), []);
+  const collector = useCollectorLibrary("track", { ...filters, exclude: excludeTrack, sortActive });
+  const collectorActive = collector.showSnapshot;
+  const collectorItems = useMemo(() => sortActive
+    ? [...collector.items].sort((left, right) => compareTracks(left, right, sort.field, sort.descending))
+    : collector.items, [collector.items, sort, sortActive]);
+  const total = collectorActive ? collectorItems.length : library.total;
+  const getCollectorItem = useCallback(index => collectorItems[index], [collectorItems]);
+  const selectionIdentity = useMemo(() => ({ filters: activeFilters, revision: library.collectionRevision, deletedTracks }), [activeFilters, library.collectionRevision, deletedTracks]);
+  const loadRange = library.onRangeChange;
+  const [, setPageIndex] = useViewStateValue("/library/tracks", "pageIndex", 0);
+  const onRangeChange = useCallback((start, end) => {
+    loadRange(start, end);
+    setPageIndex(Math.floor(start / 200));
+  }, [loadRange, setPageIndex]);
+
+
+  const [actionError, setActionError] = useState("");
+  const [preparingQueue, setPreparingQueue] = useState(false);
+  const playbackRequest = useRef(0);
+
+  useEffect(() => {
+    playbackRequest.current += 1;
+
+    setPreparingQueue(false);
+    return () => { playbackRequest.current += 1; };
+  }, [activeFilters, collectorActive, collectorItems]);
+
+  const handleTrackPlayback = useCallback(async (song) => {
+    const request = ++playbackRequest.current;
+    setPreparingQueue(true);
+    setActionError("");
+    try {
+      // Playback still receives the complete filtered collection, not just the
+      // viewport's cached pages. Enumeration happens only on explicit play.
+      let songs;
+      if (collectorActive) {
+        songs = collectorItems;
+      } else if (!activeFilters.length) {
+        songs = await getAllSongs();
+      } else {
+        songs = [];
+        let total;
+        do {
+          const page = await getTrackPage({ filters: activeFilters, offset: songs.length });
+          if (request !== playbackRequest.current) return;
+          songs.push(...page.items);
+          total = page.total;
+          if (!page.items.length && songs.length < total) throw new Error("The library changed. Please try again.");
+        } while (songs.length < total);
+      }
+      if (request !== playbackRequest.current) return;
+      songs = songs.filter((item) => !excludeTrack(item));
+      const index = songs.findIndex((item) => String(item.id) === String(song.id));
+      if (index < 0) throw new Error("This track is no longer in the collection.");
+      await playContext(songs, index, {
+        type: "collection", id: "library-tracks", name: "Library Tracks", coverArt: null,
+      });
+    } catch (error) {
+      console.error("Could not play library tracks:", error);
+      if (request === playbackRequest.current) setActionError(error.message || "Could not play the collection.");
+    } finally {
+      if (request === playbackRequest.current) setPreparingQueue(false);
+    }
+  }, [activeFilters, collectorActive, collectorItems, excludeTrack, playContext]);
+
+
+  return <section className="library-section" data-view-loading={library.loading}>
+    <div className="library-track-toolbar">
+      <div className="search-mode" aria-label="Library filters">
+        {[["favoritesOnly", "Favorites"], ["unplayedOnly", "Unplayed"]].map(([key, label]) =>
+          <button key={key} type="button" className={`search-mode-option ${filters[key] ? "active" : ""}`}
+            aria-pressed={filters[key]} onClick={() => setFilters((current) => ({ ...current, [key]: !current[key] }))}>
+            {label}
+          </button>)}
+      </div>
+      {!library.loading && <span className="library-track-count">{total} {total === 1 ? "song" : "songs"}</span>}
+      <CollectorFilterBar {...collector.bar} sort={{
+        label: "Sort tracks",
+        value: sortActive ? `${sort.field}-${sort.descending ? "desc" : "asc"}` : "custom",
+        choices: sortChoices,
+        onChange: value => {
+          const [field, direction] = value.split("-");
+          setSort({ field, descending: direction === "desc" });
+        },
+      }} />
+    </div>
+    {library.loading && <LoadingState>Loading your songs...</LoadingState>}
+    {preparingQueue && <div role="status">Preparing playback...</div>}
+    {actionError && <ErrorState>{actionError}</ErrorState>}
+    {library.error && <ErrorState>{library.error} <button type="button" onClick={library.retry}>Retry</button></ErrorState>}
+    {!library.loading && <div className="track-list" role="table" aria-label="Tracks" aria-rowcount={total + 1}>
+      <TrackListHeader sort={{ ...sort, onChange: sortBy }} showDateAdded={false} />
+      {!total && !library.error && !collector.bar.busy && <EmptyState>{collectorActive ? "No songs match these filters." : "No songs yet."}</EmptyState>}
+      <VirtualizedTrackList itemCount={total} getItem={collectorActive ? getCollectorItem : library.getItem}
+        searchTokens={collector.searchTokens}
+        loadSelection={collectorActive ? undefined : library.loadSelection}
+        onRangeChange={collectorActive ? undefined : onRangeChange} dataKey={collectorActive ? collectorItems : selectionIdentity} dynamicHeight
+        onPlay={handleTrackPlayback}   />
+    </div>}
+  </section>;
+}
 
 export default Tracks;

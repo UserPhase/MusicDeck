@@ -1,0 +1,14 @@
+.playlist-edit-message { display: flex; gap: 10px; align-items: center; margin: 12px 0; font-size: 12px; color: var(--text-secondary); }
+.playlist-edit-message.is-error { color: var(--danger-text); }
+.playlist-edit-message button { color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 5px 8px; cursor: pointer; }
+.track-selectable { user-select: none; }
+.track-context-menu .playlist-track-remove { color: var(--danger-text); }
+.track.track-selectable.is-selected { background: color-mix(in srgb, var(--accent) 18%, var(--card)); box-shadow: inset 2px 0 var(--accent); }
+.track-reorderable { cursor: grab; }
+.track-reorderable:active { cursor: grabbing; }
+.track-reorderable a, .track-reorderable button { cursor: pointer; }
+.virtual-track-window { position: relative; }
+.track-drop-marker { position: absolute; left: 0; right: 0; height: 2px; background: var(--accent); box-shadow: 0 0 10px var(--accent); pointer-events: none; z-index: 3; }
+.track-drag-image { position: fixed; top: -100px; left: 0; padding: 12px 18px; background: #21152e; color: #eee6ff; border: 1px solid #8b5cf6; border-radius: 8px; }
+.track-drag-feedback { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1201; padding: 10px 16px; background: #21152e; color: #eee6ff; border: 1px solid #8b5cf6; border-radius: 9px; pointer-events: none; font-size: 13px; }
+.track-edit-announcement { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

@@ -15,8 +15,8 @@ import './styles/hero.css';
 import './styles/glassmorphic.css';
 import './styles/tactile.css';
 import './styles/theme.css';
-import './styles/admin-logs.css';
 import App from './App';
+import { registerServiceWorker } from './services/serviceWorkerRegistration';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
@@ -24,3 +24,5 @@ root.render(
     <App />
   </React.StrictMode>
 );
+
+void registerServiceWorker();

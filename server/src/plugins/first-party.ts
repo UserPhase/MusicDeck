@@ -1,5 +1,9 @@
+import { LastFmScrobbler } from "../services/scrobble/LastFmScrobbler.js";
+import { ListenBrainzScrobbler } from "../services/scrobble/ListenBrainzScrobbler.js";
 import type { MusicDeckPlugin, MusicDeckPluginContext } from "./plugin-registry.js";
 import { writeCookiesFile, type SpotDLDownloaderAdapter } from "../domain/spotdl-downloader-adapter.js";
+import { DEFAULT_SPOTDL_FORMAT, parseSpotDLOutputFormat } from "../domain/spotdl-format.js";
+import { ClassifiedPluginError } from "./plugin-errors.js";
 
 function required(context: MusicDeckPluginContext, key: string) {
   const value = context.settings.get<string>(key);
@@ -7,52 +11,21 @@ function required(context: MusicDeckPluginContext, key: string) {
   return value;
 }
 
-function trackPayload(payload: Record<string, unknown>) {
-  return {
-    track: String(payload.title || payload.track || "Unknown title"),
-    artist: String(payload.artist || "Unknown artist"),
-    album: payload.album ? String(payload.album) : undefined,
-  };
-}
-
 export function createListenBrainzPlugin(): MusicDeckPlugin {
   return {
     manifest: {
-      id: "listenbrainz",
-      name: "ListenBrainz",
-      version: "1.0.0",
-      description: "Scrobble completed tracks and contribute recommendations.",
-      capabilities: ["scrobble", "recommendation"],
-      permissions: ["history.read", "network.request"],
-      config: {
-        fields: [
-          { key: "token", label: "ListenBrainz token", secret: true, required: true },
-          { key: "username", label: "ListenBrainz username", required: true },
-        ],
-      },
-    },
-    register(context) {
-      context.events.subscribe("track.completed", async (payload) => {
-        const response = await context.network!.fetch("https://api.listenbrainz.org/1/submit-listens", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Token ${required(context, "token")}`,
-          },
-          body: JSON.stringify({
-            listen_type: "single",
-            payload: [{ listened_at: Math.floor(Date.now() / 1000), track_metadata: trackPayload(payload) }],
-          }),
-        });
-        if (!response.ok) throw new Error("ListenBrainz scrobble failed");
-        context.logging.info("Scrobbled completed track");
-      });
+      id: "listenbrainz", name: "ListenBrainz", version: "2.0.0",
+      description: "Allow users to connect ListenBrainz in Settings. Qualified listens use a durable per-user queue.",
+      capabilities: ["scrobble"], permissions: ["history.read", "network.request"],
+      config: { fields: [
+        { key: "token", label: "Optional administrator test token", secret: true },
+      ] },
     },
     async test(context) {
-      const response = await context.network!.fetch(`https://api.listenbrainz.org/1/user/${encodeURIComponent(required(context, "username"))}/playing-now`, {
-        headers: { authorization: `Token ${required(context, "token")}` },
-      });
-      return { ok: response.ok, message: response.ok ? "ListenBrainz is reachable" : "ListenBrainz authentication failed" };
+      const token = context.settings.get<string>("token");
+      if (!token) return { ok: true, message: "Enabled for per-user connections in Settings. No shared account receives listens." };
+      const username = await new ListenBrainzScrobbler(token, context.network!.fetch).validateToken();
+      return { ok: true, message: `Validated ListenBrainz account ${username}. Users connect their own accounts in Settings.` };
     },
   };
 }
@@ -60,46 +33,20 @@ export function createListenBrainzPlugin(): MusicDeckPlugin {
 export function createLastFmPlugin(): MusicDeckPlugin {
   return {
     manifest: {
-      id: "lastfm",
-      name: "Last.fm",
-      version: "1.0.0",
-      description: "Scrobble tracks and contribute metadata/recommendations.",
-      capabilities: ["scrobble", "recommendation", "metadata"],
-      permissions: ["history.read", "network.request"],
-      config: {
-        fields: [
-          { key: "apiKey", label: "API key", secret: true, required: true },
-          { key: "sessionKey", label: "Session key", secret: true, required: true },
-        ],
-      },
-    },
-    register(context) {
-      context.events.subscribe("track.completed", async (payload) => {
-        const body = new URLSearchParams({
-          method: "track.scrobble",
-          api_key: required(context, "apiKey"),
-          sk: required(context, "sessionKey"),
-          track: trackPayload(payload).track,
-          artist: trackPayload(payload).artist,
-          timestamp: String(Math.floor(Date.now() / 1000)),
-          format: "json",
-        });
-        const response = await context.network!.fetch("https://ws.audioscrobbler.com/2.0/", {
-          method: "POST",
-          headers: { "content-type": "application/x-www-form-urlencoded" },
-          body,
-        });
-        if (!response.ok) throw new Error("Last.fm scrobble failed");
-      });
+      id: "lastfm", name: "Last.fm", version: "2.0.0",
+      description: "Configure application credentials, then let each user authorize Last.fm in Settings.",
+      capabilities: ["scrobble"], permissions: ["history.read", "network.request"],
+      config: { fields: [
+        { key: "apiKey", label: "Application API key", secret: true, required: true },
+        { key: "apiSecret", label: "Application shared secret", secret: true, required: true },
+        { key: "sessionKey", label: "Optional administrator test session", secret: true },
+      ] },
     },
     async test(context) {
-      const url = new URL("https://ws.audioscrobbler.com/2.0/");
-      url.searchParams.set("method", "user.getInfo");
-      url.searchParams.set("api_key", required(context, "apiKey"));
-      url.searchParams.set("sk", required(context, "sessionKey"));
-      url.searchParams.set("format", "json");
-      const response = await context.network!.fetch(url);
-      return { ok: response.ok, message: response.ok ? "Last.fm is reachable" : "Last.fm authentication failed" };
+      const sessionKey = context.settings.get<string>("sessionKey");
+      const client = new LastFmScrobbler({ apiKey: required(context, "apiKey"), apiSecret: required(context, "apiSecret"), sessionKey }, context.network!.fetch);
+      if (sessionKey) await client.validateSession(); else await client.validateApplication();
+      return { ok: true, message: "Last.fm credentials validated. Users authorize their own accounts in Settings." };
     },
   };
 }
@@ -152,11 +99,24 @@ export function createSpotDLDownloaderPlugin(adapter: SpotDLDownloaderAdapter): 
       id: "spotdl-downloader",
       name: "SpotDL Downloader",
       version: "1.0.0",
-      description: "Configures the spotDL downloader used by On-Demand Library acquisitions (Spotify app credentials, optional YouTube cookies, binary paths).",
+      description: "Configures spotDL downloads and Spotify playlist imports: audio format, Spotify credentials, optional YouTube cookies, and binary paths.",
       capabilities: ["acquisition"],
       permissions: ["library.acquire", "network.request"],
       config: {
         fields: [
+          {
+            key: "outputFormat", label: "Audio format", type: "select", default: DEFAULT_SPOTDL_FORMAT,
+            options: [
+              { value: "best", label: "Best source quality (M4A) — recommended" },
+              { value: "m4a", label: "M4A — original bitrate" },
+              { value: "opus", label: "Opus — original bitrate" },
+              { value: "mp3", label: "MP3 — 320 kbps, broad compatibility" },
+              { value: "flac", label: "FLAC — larger files" },
+              { value: "ogg", label: "OGG Vorbis" },
+              { value: "wav", label: "WAV — uncompressed, very large files" },
+            ],
+            description: "Best uses M4A at the source bitrate and avoids re-encoding when available. Source quality depends on the provider and account; FLAC/WAV cannot improve a lossy source. Applies to new individual downloads and playlist imports. Existing files are reused.",
+          },
           { key: "spotdlPath", label: "spotDL executable (leave blank for auto-detect)", required: false },
           { key: "ffmpegPath", label: "FFmpeg executable (leave blank for auto-detect)", required: false },
           {
@@ -177,6 +137,10 @@ export function createSpotDLDownloaderPlugin(adapter: SpotDLDownloaderAdapter): 
         ],
       },
     },
+    validateConfig(config) {
+      try { parseSpotDLOutputFormat(config.outputFormat); }
+      catch { throw new ClassifiedPluginError("not_configured", "Choose a supported spotDL audio format"); }
+    },
     register(context) {
       const spotdlPath = (context.settings.get<string>("spotdlPath") || "").trim();
       const ffmpegPath = (context.settings.get<string>("ffmpegPath") || "").trim();
@@ -194,6 +158,7 @@ export function createSpotDLDownloaderPlugin(adapter: SpotDLDownloaderAdapter): 
       }
 
       adapter.configure({
+        outputFormat: parseSpotDLOutputFormat(context.settings.get("outputFormat")),
         spotdlPath: spotdlPath || undefined,
         ffmpegPath: ffmpegPath || undefined,
         clientId: clientId || undefined,

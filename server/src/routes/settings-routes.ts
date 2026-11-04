@@ -31,7 +31,7 @@ const adminUserSettingsSchema = z.object({
   settings: z.object({
     "ui.theme": themeSchema.optional(),
     "ui.layoutPreset": layoutPresetSchema.optional(),
-    "playback.streamQuality": z.enum(["128", "320", "original"]).optional(),
+    "playback.streamQuality": z.enum(["128", "256", "320", "original", "direct"]).optional(),
     "playback.downloadQuality": z.enum(["lossless", "320kbps", "256kbps", "192kbps", "128kbps"]).optional(),
   }).strict(),
 }).strict();
@@ -61,6 +61,18 @@ export async function registerSettingsRoutes(app: FastifyInstance, db: Db, sched
     }
 
     const theme = parsed.data.settings["ui.theme"];
+    const target = parsed.data.settings["playback.normalization.targetLufs"];
+    const shuffleMode = parsed.data.settings["playback.shuffleMode"];
+    const albumAware = parsed.data.settings["playback.albumAware"];
+    if (albumAware !== undefined && typeof albumAware !== "boolean") {
+      return sendError(reply, 400, "Album-aware playback must be a boolean", "VALIDATION_ERROR");
+    }
+    if (shuffleMode !== undefined && !z.enum(["standard", "smart"]).safeParse(shuffleMode).success) {
+      return sendError(reply, 400, "Shuffle mode must be standard or smart", "VALIDATION_ERROR");
+    }
+    if (target !== undefined && !z.union([z.literal(-18), z.literal(-16), z.literal(-14)]).safeParse(target).success) {
+      return sendError(reply, 400, "Loudness target must be -18, -16 or -14 LUFS", "VALIDATION_ERROR");
+    }
     if (theme !== undefined && !themeSchema.safeParse(theme).success) {
       return sendError(reply, 400, "Theme must be \"dark\" or \"light\"", "VALIDATION_ERROR");
     }

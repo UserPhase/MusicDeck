@@ -3,6 +3,7 @@ import type { CanonicalIdentity, UnifiedSearchResult } from "./search.js";
 import type { PlayableSource, SourceProvider, SourceResolutionOptions } from "./playable-sources.js";
 import { normalizeMusicText, versionSignature } from "./music-identity.js";
 import { classifyPluginError } from "../plugins/plugin-errors.js";
+import { privacyFetch as fetch } from "../services/PrivacyManager.js";
 
 export type SourceCandidateKind =
   | "track"

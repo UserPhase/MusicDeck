@@ -13,7 +13,6 @@ jest.mock("../api/musicdeck", () => ({
   LISTENING_ACTIVITY_CHANGED_EVENT: "musicdeck:listening-activity-changed",
 }));
 jest.mock("../components/TrackRow", () => ({ song, onPlay }) => <button onClick={() => onPlay(song)}>{song.title}</button>);
-jest.mock("../hooks/useTrackPlaylistMenu", () => () => ({ toggleMenu: jest.fn(), isOpen: () => false, renderMenu: () => null }));
 
 const song = { id: "track-1", title: "My Song", artist: "Artist" };
 const historyEvent = (id, date = new Date().toISOString()) => ({ id, playedAt: date, listenedSeconds: 60, track: song });

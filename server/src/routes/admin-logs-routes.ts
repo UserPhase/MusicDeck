@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import type { Db } from "../db/database.js";
 import { requireAdmin } from "../auth/authorization.js";
+import { SessionStreamGuard } from "../auth/session-stream.js";
 import { sendError } from "../utils/http.js";
 import { SseEventWriter } from "../utils/sse.js";
 import { LOG_LEVELS, type LogBuffer, type LogEntry, serverLogs } from "../utils/logger.js";
@@ -24,6 +25,10 @@ const streamQuerySchema = z.object({
 
 export async function registerAdminLogsRoutes(app: FastifyInstance, db: Db, logs: LogBuffer = serverLogs) {
   let openStreams = 0;
+  const streamCleanups = new Set<() => void>();
+  app.addHook("preClose", async () => {
+    for (const cleanup of streamCleanups) cleanup();
+  });
 
   app.get("/api/admin/logs", async (request, reply) => {
     if (!requireAdmin(db, request, reply)) return reply;
@@ -62,58 +67,82 @@ export async function registerAdminLogsRoutes(app: FastifyInstance, db: Db, logs
     const after = Number.isInteger(lastEventId) && lastEventId >= 0 ? lastEventId : parsed.data.after;
 
     openStreams += 1;
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      // no-transform keeps compression middleware (CRA dev proxy) from
-      // buffering the stream; X-Accel-Buffering does the same for nginx.
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    const writer = new SseEventWriter(reply.raw);
-    writer.push("ready", { stats: logs.stats() });
-
-    let pending: LogEntry[] = after === undefined ? [] : logs.list({ after });
+    let writer: SseEventWriter | undefined;
+    let guard: SessionStreamGuard | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let heartbeat: NodeJS.Timeout | undefined;
     let flushTimer: NodeJS.Timeout | undefined;
-    const flush = () => {
-      if (flushTimer) clearTimeout(flushTimer);
-      flushTimer = undefined;
-      // Batches stay well under the writer's pending-frame cap, so a log burst
-      // never trips its slow-client disconnect.
-      while (pending.length) {
-        const batch = pending.slice(0, STREAM_BATCH_MAX);
-        pending = pending.slice(STREAM_BATCH_MAX);
-        writer.push("logs", { entries: batch }, batch[batch.length - 1].id);
-      }
-    };
-    if (pending.length) flush();
-
-    const unsubscribe = logs.subscribe(
-      (entry) => {
-        pending.push(entry);
-        if (pending.length >= STREAM_BATCH_MAX) flush();
-        else if (!flushTimer) flushTimer = setTimeout(flush, STREAM_BATCH_MS);
-      },
-      () => {
-        pending = [];
-        writer.push("cleared", {});
-      },
-    );
-    const heartbeat = setInterval(() => writer.push("ping", { at: Date.now() }), HEARTBEAT_MS);
-    heartbeat.unref?.();
-
+    let pending: LogEntry[] = [];
     let cleanedUp = false;
     const cleanup = () => {
       if (cleanedUp) return;
       cleanedUp = true;
       openStreams -= 1;
-      unsubscribe();
-      clearInterval(heartbeat);
+      guard?.close();
+      unsubscribe?.();
+      if (heartbeat) clearInterval(heartbeat);
       if (flushTimer) clearTimeout(flushTimer);
       pending = [];
+      streamCleanups.delete(cleanup);
+      request.raw.removeListener("aborted", cleanup);
+      reply.raw.removeListener("close", cleanup);
+      reply.raw.removeListener("error", cleanup);
+      reply.raw.removeListener("finish", cleanup);
+      writer?.close();
     };
-    reply.raw.on("close", cleanup);
-    reply.raw.on("error", cleanup);
+    streamCleanups.add(cleanup);
+    request.raw.once("aborted", cleanup);
+    reply.raw.once("close", cleanup);
+    reply.raw.once("error", cleanup);
+    reply.raw.once("finish", cleanup);
+    try {
+      guard = new SessionStreamGuard(db, request, true, cleanup, (error) => app.log.error(error));
+      reply.hijack();
+      reply.raw.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        // no-transform keeps compression middleware (CRA dev proxy) from
+        // buffering the stream; X-Accel-Buffering does the same for nginx.
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      writer = new SseEventWriter(reply.raw, undefined, undefined, () => Boolean(guard?.currentUser()));
+      guard.start();
+      writer.push("ready", { stats: logs.stats() });
+
+      pending = after === undefined ? [] : logs.list({ after });
+      const flush = () => {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = undefined;
+        if (!guard?.currentUser()) return;
+        // Batches stay well under the writer's pending-frame cap, so a log burst
+        // never trips its slow-client disconnect.
+        while (pending.length) {
+          const batch = pending.slice(0, STREAM_BATCH_MAX);
+          pending = pending.slice(STREAM_BATCH_MAX);
+          writer?.push("logs", { entries: batch }, batch[batch.length - 1].id);
+        }
+      };
+      if (pending.length) flush();
+
+      if (cleanedUp) return;
+      unsubscribe = logs.subscribe(
+        (entry) => {
+          pending.push(entry);
+          if (pending.length >= STREAM_BATCH_MAX) flush();
+          else if (!flushTimer) flushTimer = setTimeout(flush, STREAM_BATCH_MS);
+        },
+        () => {
+          pending = [];
+          writer?.push("cleared", {});
+        },
+      );
+      heartbeat = setInterval(() => writer?.push("ping", { at: Date.now() }), HEARTBEAT_MS);
+      heartbeat.unref?.();
+    } catch (error) {
+      cleanup();
+      app.log.error(error);
+      reply.raw.destroy();
+    }
   });
 }

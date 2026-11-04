@@ -1,6 +1,8 @@
 import {
   getAlbum,
   getAlbums,
+  getAlbumPage,
+  getTrackPage,
   getArtist,
   getArtistOverview,
   getArtistPortrait,
@@ -9,6 +11,10 @@ import {
   getRecentlyPlayed,
   getPlayableSources,
   getStreamUrl,
+  prepareNormalizedPlayback,
+  getSilenceAnalysis,
+  getSilenceScan,
+  startSilenceScan,
   getTrackLyrics,
   login,
   matchLibraryItems,
@@ -16,11 +22,148 @@ import {
   reportPlaybackSession,
   LISTENING_ACTIVITY_CHANGED_EVENT,
   searchNavidrome,
+  getAutoplayTracks,
+  sendRecommendationFeedback,
+  RECOMMENDATION_FEEDBACK_CHANGED_EVENT,
+  getPlaylist,
+  reorderPlaylistItems,
+  editPlaylistTracks,
+  removeSongFromPlaylist,
+  getDataExportSummary,
+  downloadUserData,
+  getMediaCheckpoints,
+  saveMediaCheckpoint,
 } from "./musicdeck";
 
 
 beforeEach(() => {
   global.fetch = jest.fn();
+});
+
+test("listening checkpoints use authenticated cancellable requests and keepalive JSON saves", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ items: [] }) });
+  const controller = new AbortController();
+  await getMediaCheckpoints(controller.signal, "playlist", "mix/#1");
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/user/media-sessions?type=playlist&mediaId=mix%2F%231",
+    expect.objectContaining({ credentials: "include", signal: controller.signal }));
+  const input = { type: "album", mediaId: "album-one", positionSeconds: 102.125 };
+  await saveMediaCheckpoint(input, controller.signal);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/user/media-sessions", expect.objectContaining({
+    method: "POST", body: JSON.stringify(input), keepalive: true, signal: controller.signal,
+    credentials: "include", headers: { "Content-Type": "application/json" },
+  }));
+});
+
+test("export estimates use authenticated API requests and native downloads use safe URLs without a Blob", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ counts: { history: 50000 } }) });
+  const controller = new AbortController();
+  expect(await getDataExportSummary(controller.signal)).toEqual({ counts: { history: 50000 } });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/user/export/summary", expect.objectContaining({
+    credentials: "include", signal: controller.signal,
+  }));
+  const click = jest.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function () {
+    expect(this.getAttribute("href")).toBe("/api/v1/user/export/playlists/list%2F%22bad?format=xspf");
+    expect(this.hasAttribute("download")).toBe(true);
+  });
+  downloadUserData("playlists", "xspf", 'list/"bad');
+  expect(click).toHaveBeenCalledTimes(1);
+  expect(document.querySelector("a[download]")).not.toBeInTheDocument();
+  expect(global.fetch).toHaveBeenCalledTimes(1);
+  click.mockRestore();
+});
+
+test("playlist edits retain occurrence identities and send exact compare-and-swap order", async () => {
+  const playlist = { id: "list", name: "List", itemIds: ["first", "missing", "second"],
+    tracks: [{ id: "same", title: "Same", playlistItemId: "first" }, { id: "same", title: "Same", playlistItemId: "second" }] };
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ playlist }) });
+  const detail = await getPlaylist("list");
+  expect(detail.itemIds).toEqual(playlist.itemIds);
+  expect(detail.entry.map((song) => song.playlistItemId)).toEqual(["first", "second"]);
+  await reorderPlaylistItems("list", ["second", "missing", "first"], playlist.itemIds);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/playlists/list/reorder", expect.objectContaining({
+    method: "POST", body: JSON.stringify({ itemIds: ["second", "missing", "first"], expectedItemIds: playlist.itemIds }),
+  }));
+  await editPlaylistTracks("list", { action: "remove", itemIds: ["second"], expectedItemIds: playlist.itemIds });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/playlists/list/tracks/batch", expect.objectContaining({
+    body: JSON.stringify({ action: "remove", itemIds: ["second"], expectedItemIds: playlist.itemIds }),
+  }));
+  await removeSongFromPlaylist("list", 1);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/playlists/list/tracks/second", expect.objectContaining({ method: "DELETE" }));
+});
+
+test("local autoplay forwards the seed and exclusions and preserves explanations", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({
+    tracks: [{ id: "next", type: "track", title: "Next", metadata: { recommendationReason: "Based on synthwave" } }],
+  }) });
+  expect(await getAutoplayTracks("seed", 10, ["queued"])).toEqual([
+    expect.objectContaining({ id: "next", recommendationGenerated: true, autoplayGenerated: true,
+      metadata: { recommendationReason: "Based on synthwave" } }),
+  ]);
+  expect(global.fetch).toHaveBeenCalledWith("/api/recommendations/autoplay", expect.objectContaining({
+    body: JSON.stringify({ seedId: "seed", limit: 10, excludeIds: ["queued"] }),
+  }));
+});
+
+test("broadcasts feedback changes only after persistence succeeds", async () => {
+  const listener = jest.fn();
+  window.addEventListener(RECOMMENDATION_FEEDBACK_CHANGED_EVENT, listener);
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true }) });
+  const feedback = { action: "hide", itemType: "track", itemId: "hidden" };
+  await sendRecommendationFeedback(feedback);
+  expect(listener).toHaveBeenCalledWith(expect.objectContaining({ detail: feedback }));
+  window.removeEventListener(RECOMMENDATION_FEEDBACK_CHANGED_EVENT, listener);
+});
+
+test("library pages preserve totals and revisions, normalize items, and forward cancellation", async () => {
+  const controller = new AbortController();
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({
+    tracks: [{ id: "track-452", title: "Song", artistName: "Artist", durationSeconds: 120 }],
+    total: 10000, revision: "snapshot-a",
+  }) });
+  const tracks = await getTrackPage({ offset: 400, limit: 200, signal: controller.signal });
+  expect(tracks).toMatchObject({
+    total: 10000, revision: "snapshot-a", items: [{ id: "track-452", title: "Song", artist: "Artist", duration: 120 }],
+  });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/tracks?offset=400&limit=200",
+    expect.objectContaining({ credentials: "include", signal: controller.signal }));
+  const filters = [{ field: "favorite", op: "boolean", value: true }];
+  await getTrackPage({ offset: 200, filters, signal: controller.signal });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/library/tracks/filter",
+    expect.objectContaining({ method: "POST", signal: controller.signal,
+      body: JSON.stringify({ filters, offset: 200, limit: 200 }) }));
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({
+    albums: [{ id: "album-1", name: "Album", artistName: "Artist", artworkId: "cover-1" }],
+    total: 2000, revision: "snapshot-b",
+  }) });
+  const albums = await getAlbumPage({ offset: 1000, signal: controller.signal });
+  expect(albums).toMatchObject({ total: 2000, revision: "snapshot-b",
+    items: [{ id: "album-1", artist: "Artist", coverArt: "cover-1" }] });
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/albums?offset=1000&limit=200",
+    expect.objectContaining({ signal: controller.signal }));
+});
+
+test("silence scan uses selected parameters and saved analysis requests the matching profile", async () => {
+  const parameters = { thresholdDb: -28, minSilenceSeconds: 0.8 };
+  const controller = new AbortController();
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ scan: { id: "scan" }, analysis: null }) });
+  await getSilenceScan(controller.signal);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/playback/silence-scan", expect.objectContaining({ signal: controller.signal, credentials: "include" }));
+  await startSilenceScan(parameters);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/playback/silence-scan", expect.objectContaining({ method: "POST", body: JSON.stringify(parameters) }));
+  await getSilenceAnalysis("track", parameters);
+  expect(global.fetch).toHaveBeenLastCalledWith("/api/tracks/track/silence-analysis?thresholdDb=-28&minSilenceSeconds=0.8", expect.anything());
+});
+
+test("normalization sends the selected source, bitrate and cancellation signal", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: "ready" }) });
+  const controller = new AbortController();
+  await prepareNormalizedPlayback("track-1", { id: "playable-1" }, null, controller.signal, "128");
+  expect(global.fetch).toHaveBeenCalledWith("/api/playback/normalize", expect.objectContaining({
+    credentials: "include", method: "POST", signal: controller.signal,
+    body: JSON.stringify({ trackId: "track-1", playableSource: "playable-1", bitRate: 128, background: true, targetLufs: -16 }),
+  }));
+  await prepareNormalizedPlayback("external-1", null, "https://cdns-preview-a.dzcdn.net/audio.mp3", controller.signal);
+  expect(JSON.parse(global.fetch.mock.calls[1][1].body)).toEqual({ trackId: "external-1", previewUrl: "https://cdns-preview-a.dzcdn.net/audio.mp3", background: true, targetLufs: -16 });
 });
 
 test("playback reports only refresh activity for qualification or a final duration update", async () => {

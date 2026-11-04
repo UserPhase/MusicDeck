@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
+import PrivacySettingsPanel from "../../components/settings/PrivacySettingsPanel";
+import ScrobbleSettingsPanel from "../../components/settings/ScrobbleSettingsPanel";
 
 import {
   cleanupAdminAcquisitions,
@@ -271,6 +273,7 @@ function AdminServerGeneral() {
         />
         <LibraryScanControl status={data.scanStatus} onStatus={setScanStatus} />
       </section>
+      <ScrobbleSettingsPanel />
     </>
   );
 }
@@ -655,6 +658,9 @@ function AdminServer() {
         <NavLink to="/admin/server" end className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
           General
         </NavLink>
+        <NavLink to="/admin/server/privacy" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
+          Privacy
+        </NavLink>
         <NavLink to="/admin/server/storage" className={({ isActive }) => `admin-subnav-item${isActive ? " active" : ""}`}>
           Storage
         </NavLink>
@@ -677,6 +683,7 @@ function AdminServer() {
 
       <Routes>
         <Route index element={<AdminServerGeneral />} />
+        <Route path="privacy" element={<PrivacySettingsPanel />} />
         <Route path="storage" element={<AdminServerStorage />} />
         <Route path="tasks" element={<AdminServerTasks />} />
         <Route path="downloads" element={<AdminServerDownloads />} />

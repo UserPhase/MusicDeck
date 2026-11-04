@@ -1,5 +1,6 @@
 import type { ExternalArtworkTokenStore } from "../../domain/external-catalog.js";
 import type { ExternalAlbum, ExternalArtist, ExternalTrack, MetadataAdapter } from "./MetadataAdapter.js";
+import { privacyFetch as fetch, gateFetch } from "../PrivacyManager.js";
 
 type DeezerArtist = { id?: number; name?: string; picture_xl?: string; picture_big?: string };
 type DeezerAlbum = { id?: number; title?: string; cover_xl?: string; cover_big?: string; artist?: DeezerArtist };
@@ -12,7 +13,7 @@ export class DeezerAdapter implements MetadataAdapter {
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly artworkTokens?: ExternalArtworkTokenStore,
     private readonly limit = 12
-  ) {}
+  ) { this.fetchImpl = gateFetch(fetchImpl); }
 
   private artwork(url: string | undefined) {
     const id = this.artworkTokens?.token(url, ["dzcdn.net"]);
@@ -48,7 +49,9 @@ export class DeezerAdapter implements MetadataAdapter {
       artwork: this.artwork(item.album?.cover_xl || item.album?.cover_big),
       previewUrl: item.preview || null, provider: "external",
       source: { kind: "external", count: 0 }, availability: null,
-      metadata: { durationSeconds: item.duration ?? null },
+      metadata: { durationSeconds: item.duration ?? null,
+        artistId: item.artist?.id != null ? `external_deezer_artist_${item.artist.id}` : null,
+        albumId: item.album?.id != null ? `external_deezer_album_${item.album.id}` : null },
       ...(item.isrc ? { identityHints: { isrc: item.isrc } } : {}),
     }]);
   }
@@ -61,7 +64,7 @@ export class DeezerAdapter implements MetadataAdapter {
       artist: item.artist?.name || null, album: null,
       artwork: this.artwork(item.cover_xl || item.cover_big),
       provider: "external", source: { kind: "external", count: 0 },
-      availability: null, metadata: {},
+      availability: null, metadata: { artistId: item.artist?.id != null ? `external_deezer_artist_${item.artist.id}` : null },
     }]);
   }
 

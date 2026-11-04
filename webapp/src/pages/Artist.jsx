@@ -1,10 +1,7 @@
-import {
-  memo,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
+import TrackActionScope from "../components/TrackActionScope";
+import { EditionBadges } from "../components/common/EditionBadges";
+import { usePrivacy } from "../context/PrivacyContext";
+import { memo, useEffect, useState } from "react";
 
 import {
   useParams,
@@ -16,6 +13,7 @@ import {
   createAcquisition,
 } from "../api/musicdeck";
 import ArtistAvatar from "../components/ArtistAvatar";
+import ArtistFollowButton from "../components/ArtistFollowButton";
 import FullHero from "../components/Layout/FullHero";
 import ArtistBiography from "../components/ArtistBiography";
 import InLibraryBadge from "../components/InLibraryBadge";
@@ -28,10 +26,6 @@ import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 
-import {
-  getPlaylists,
-  addSongToPlaylist as addSongToPlaylistRequest,
-} from "../api/playlists";
 
 import {
   usePlayer,
@@ -56,13 +50,14 @@ const ArtistAlbumCard = memo(function ArtistAlbumCard({ album, artistRouteId }) 
         <InLibraryBadge visible={album.source?.kind === "external" && album.inLibrary} />
       </div>
       {album.year && <div className="album-artist">{album.year}</div>}
+      <EditionBadges item={album} />
       {album.source?.kind === "external" && !album.inLibrary && (
         <div className="album-artist album-not-downloaded">Not downloaded</div>
       )}
     </Link>
     </div>
   );
-}, (previous, next) => ["id", "name", "coverArt", "year", "inLibrary"].every(
+}, (previous, next) => ["id", "name", "coverArt", "year", "inLibrary", "localAlbumId", "metadata"].every(
   (field) => previous.album[field] === next.album[field]
 ) && previous.album.source?.kind === next.album.source?.kind);
 
@@ -110,6 +105,7 @@ function Artist() {
   const [error, setError] =
     useState(null);
   const [isImportingArtist, setIsImportingArtist] = useState(false);
+  const { canImport } = usePrivacy();
 
   const {
     playQueue,
@@ -118,63 +114,6 @@ function Artist() {
     isShuffleEnabled,
     toggleShuffle,
   } = usePlayer();
-
-  /*
-   * Playlist menu
-   */
-
-  const [
-    playlistMenuSong,
-    setPlaylistMenuSong,
-  ] = useState(null);
-
-
-  const [
-    playlists,
-    setPlaylists,
-  ] = useState([]);
-
-
-  const [
-    playlistsLoading,
-    setPlaylistsLoading,
-  ] = useState(false);
-  const playlistMenuSongRef = useRef(null);
-  const playlistsRef = useRef([]);
-  playlistMenuSongRef.current = playlistMenuSong;
-  playlistsRef.current = playlists;
-
-
-  /*
-   * Close playlist menu when
-   * clicking anywhere outside it.
-   */
-
-  useEffect(() => {
-
-    function handleDocumentClick() {
-
-      setPlaylistMenuSong(null);
-
-    }
-
-
-    document.addEventListener(
-      "mousedown",
-      handleDocumentClick
-    );
-
-
-    return () => {
-
-      document.removeEventListener(
-        "mousedown",
-        handleDocumentClick
-      );
-
-    };
-
-  }, []);
 
 
   /*
@@ -210,7 +149,7 @@ function Artist() {
   }, [universalArtist.apiId, universalArtist.data, universalArtist.error, universalArtist.isLoading]);
 
   async function importArtistDiscography() {
-    if (!artist) return;
+    if (!canImport || !artist) return;
     setIsImportingArtist(true);
     try {
       await createAcquisition({
@@ -234,119 +173,6 @@ function Artist() {
 
   function handleTopTrack(song) {
     return playSong(song);
-  }
-
-
-  /*
-   * Load playlists
-   */
-
-  const loadPlaylists = useCallback(async () => {
-
-    try {
-
-      setPlaylistsLoading(true);
-
-
-      const data =
-        await getPlaylists();
-
-
-      setPlaylists(
-        data
-      );
-
-    } catch (err) {
-
-      console.error(
-        "Could not load playlists:",
-        err
-      );
-
-    } finally {
-
-      setPlaylistsLoading(false);
-
-    }
-
-  }, []);
-
-
-  /*
-   * Open / close playlist menu
-   */
-
-  const togglePlaylistMenu = useCallback(async (song) => {
-
-    /*
-     * Clicking the same menu closes it.
-     */
-
-    if (
-      playlistMenuSongRef.current?.id === song.id
-    ) {
-
-      setPlaylistMenuSong(null);
-
-      return;
-
-    }
-
-
-    /*
-     * Open this song's menu.
-     */
-
-    setPlaylistMenuSong(song);
-
-
-    /*
-     * Load playlists the first
-     * time the menu is opened.
-     */
-
-    if (
-      playlistsRef.current.length === 0
-    ) {
-
-      await loadPlaylists();
-
-    }
-
-  }, [loadPlaylists]);
-
-
-  /*
-   * Add song to playlist
-   */
-
-  async function addSongToPlaylist(
-    playlist,
-    song
-  ) {
-
-    try {
-
-      await addSongToPlaylistRequest(
-        playlist.id,
-        song.id
-      );
-
-      /*
-       * Close menu.
-       */
-
-      setPlaylistMenuSong(null);
-
-    } catch (err) {
-
-      console.error(
-        "Could not add song to playlist:",
-        err
-      );
-
-    }
-
   }
 
 
@@ -478,7 +304,8 @@ function Artist() {
         }
         actions={
           <>
-            <button
+            <ArtistFollowButton artistId={universalArtist.apiId} artistName={artist.name} />
+            {(!universalArtist.isExternal || canImport) && <button
               className="artist-play"
               onClick={universalArtist.isExternal ? importArtistDiscography : playArtist}
               disabled={universalArtist.isExternal ? isImportingArtist : songs.length === 0}
@@ -487,7 +314,7 @@ function Artist() {
               <span>
                 {universalArtist.isExternal ? (isImportingArtist ? "Adding…" : "Import Discography") : "Play"}
               </span>
-            </button>
+            </button>}
             <button
               type="button"
               className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}
@@ -556,7 +383,8 @@ function Artist() {
 
           )}
 
-          {topTracks.map(
+          <TrackActionScope tracks={topTracks} dataKey={id}>
+                {topTracks.map(
             (song, index) => (
             <TrackRow
               key={`${song.id}-${index}`}
@@ -566,70 +394,12 @@ function Artist() {
               showSourceIndicator
               onPlay={handleTopTrack}
               onSelectSource={playSongFromSource}
-              onToggleMenu={togglePlaylistMenu}
-              menu={playlistMenuSong?.id === song.id ? (
-                <div className="playlist-menu">
-
-                    <div className="playlist-menu-title">
-                      Add to playlist
-                    </div>
 
 
-                    {playlistsLoading && (
-
-                      <div className="playlist-menu-item">
-                        Loading...
-                      </div>
-
-                    )}
-
-
-                    {!playlistsLoading &&
-                      playlists.map(
-                        (playlist) => (
-
-                        <button
-                          key={
-                            playlist.id
-                          }
-
-                          className="playlist-menu-item"
-
-                          onClick={() =>
-                            addSongToPlaylist(
-                              playlist,
-                              song
-                            )
-                          }
-                        >
-
-                          <span>
-                            ♫
-                          </span>
-
-
-                          <span>
-                            {playlist.name}
-                          </span>
-
-                        </button>
-
-                      ))}
-
-
-                    {!playlistsLoading &&
-                      playlists.length === 0 && (
-
-                      <div className="playlist-menu-empty">
-                        No playlists yet
-                      </div>
-
-                    )}
-                </div>
-              ) : null}
             />
 
           ))}
+        </TrackActionScope>
 
         </div>
 

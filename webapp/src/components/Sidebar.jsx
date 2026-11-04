@@ -2,13 +2,103 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
-import PlaylistCover from "./PlaylistCover";
+import PlaylistFolderTree from "./playlists/PlaylistFolderTree";
+import PlaylistSearchHighlight from "./playlists/PlaylistSearchHighlight";
+import MixBuilderModal from "./discovery/MixBuilderModal";
+import { normalizePlaylistSearch } from "../utils/playlistSearch";
 
 import {
   getPlaylists,
   createPlaylist,
 } from "../api/playlists";
+import { useAuth } from "../context/AuthContext";
 import { useImport } from "../context/ImportContext";
+import { usePrivacy } from "../context/PrivacyContext";
+import { useLikedAlbums } from "../hooks/useLikedAlbums";
+import { DiscoveryArtwork } from "./DiscoveryCards";
+import { useSmartPlaylists } from "../hooks/useSmartPlaylists";
+import SmartPlaylistBuilder from "./SmartPlaylistBuilder";
+
+const navigation = [
+  { to: "/explore", label: "Discover", icon: "◇" },
+  { to: "/new-releases", label: "New Releases", icon: "◎" },
+  { to: "/saved-discoveries", label: "Saved Discoveries", icon: "☆" },
+  { to: "/library/playlists", label: "Library", icon: "♫" },
+  { to: "/liked", label: "Liked Songs", icon: "♡" },
+];
+const navigationItems = navigation.map(item => ({ ...item, id: item.to }));
+function useSidebarOrder(items, group, owner) {
+  const key = `musicdeck:sidebar-${group}:${owner}`;
+  const mime = `application/x-musicdeck-sidebar-${group}`;
+  const [preference, setPreference] = useState(null);
+  const [dropMarker, setDropMarker] = useState(null);
+  const dragged = useRef(null);
+  useEffect(() => {
+    let ids = [];
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) || "null");
+      if (Array.isArray(stored)) ids = stored.filter(id => typeof id === "string");
+    } catch { /* Use the default order when browser storage is unavailable. */ }
+    setPreference({ key, ids });
+  }, [key]);
+  const byId = new Map(items.map(item => [String(item.id), item]));
+  const ids = [...new Set([...(preference?.key === key ? preference.ids.filter(id => byId.has(id)) : []), ...byId.keys()])];
+  function move(id, position) {
+    const from = ids.indexOf(id);
+    if (from < 0 || position < 0 || position >= ids.length || position === from) return;
+    const order = [...ids];
+    order.splice(from, 1);
+    order.splice(position, 0, id);
+    setPreference({ key, ids: order });
+    try { localStorage.setItem(key, JSON.stringify(order)); } catch { /* Keep the order for this session. */ }
+  }
+  function dragProps(itemId) {
+    const id = String(itemId);
+    const edge = event => {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      return event.clientY > bounds.top + bounds.height / 2 ? "after" : "before";
+    };
+    return {
+      draggable: true,
+      "data-sidebar-drop": dropMarker?.id === id ? dropMarker.edge : undefined,
+      "aria-keyshortcuts": "Alt+ArrowUp Alt+ArrowDown",
+      onKeyDown: event => {
+        if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        move(id, ids.indexOf(id) + (event.key === "ArrowUp" ? -1 : 1));
+      },
+      onDragStart: event => {
+        dragged.current = id;
+        event.dataTransfer.clearData?.();
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData(mime, id);
+      },
+      onDragOver: event => {
+        if (!event.dataTransfer.types.includes(mime) || !dragged.current || dragged.current === id) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        const side = edge(event);
+        setDropMarker(current => current?.id === id && current.edge === side ? current : { id, edge: side });
+      },
+      onDragLeave: event => {
+        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+        setDropMarker(current => current?.id === id ? null : current);
+      },
+      onDragEnd: () => { dragged.current = null; setDropMarker(null); },
+      onDrop: event => {
+        if (!event.dataTransfer.types.includes(mime)) return;
+        event.preventDefault();
+        setDropMarker(null);
+        const source = event.dataTransfer.getData(mime);
+        const from = ids.indexOf(source), to = ids.indexOf(id);
+        if (from < 0 || from === to) return;
+        const after = edge(event) === "after";
+        move(source, to + Number(after) - Number(from < to));
+      },
+    };
+  }
+  return { items: ids.map(id => byId.get(id)), dragProps };
+}
 
 export function isSpotifyPlaylistUrl(value) {
   try {
@@ -21,8 +111,16 @@ export function isSpotifyPlaylistUrl(value) {
 }
 
 function Sidebar({ id }) {
+  const { canImport } = usePrivacy();
+  const likedAlbums = useLikedAlbums();
+  const smartPlaylists = useSmartPlaylists();
 
   const location = useLocation();
+  const owner = useAuth()?.session?.id ?? "anonymous";
+  const orderedNavigation = useSidebarOrder(navigationItems, "navigation", owner);
+  const orderedSmart = useSidebarOrder(smartPlaylists.items, "smart-playlists", owner);
+  const orderedAlbums = useSidebarOrder(likedAlbums.albums, "liked-albums", owner);
+
   const navigate = useNavigate();
   const { job: importJob, openProgressToken, startImport, minimize } = useImport();
 
@@ -56,19 +154,19 @@ function Sidebar({ id }) {
   }, [notice]);
 
   useEffect(() => {
-    if (!modalStep) return undefined;
+    if (!modalStep || modalStep === "advanced-mix") return undefined;
     modalRef.current?.focus();
   }, [modalStep]);
 
   useEffect(() => {
-    if (!modalStep) return undefined;
+    if (!modalStep || modalStep === "advanced-mix") return undefined;
     const closeOnEscape = (event) => {
       if (event.key === "Escape" && !busy) {
         if (modalStep === "progress" && importJob && (importJob.status === "queued" || importJob.status === "running")) minimize();
         setModalStep(null);
         triggerRef.current?.focus();
       } else if (event.key === "Tab") {
-        const focusable = [...(modalRef.current?.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled])') || [])];
+        const focusable = [...(modalRef.current?.querySelectorAll('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]') || [])];
         if (!focusable.length) {
           event.preventDefault();
           return;
@@ -175,8 +273,8 @@ function Sidebar({ id }) {
    * Create playlist
    */
 
-  function handleAddPlaylist(event) {
-    triggerRef.current = event.currentTarget;
+  function handleAddPlaylist(trigger) {
+    triggerRef.current = trigger;
     setModalStep(importJob && (importJob.status === "queued" || importJob.status === "running") ? "progress" : "choose");
     setPlaylistName("");
     setDescription("");
@@ -242,105 +340,62 @@ function Sidebar({ id }) {
       <section className="nav-section" aria-labelledby="library-navigation">
         <h2 className="nav-title" id="library-navigation">Your Library</h2>
 
-        <Link
-          to="/explore"
-          className={`nav-item ${location.pathname === "/explore" ? "active" : ""}`}
-          aria-current={location.pathname === "/explore" ? "page" : undefined}
-        >
-          <span className="nav-icon" aria-hidden="true">◇</span>
-          <span className="nav-label">Explore</span>
-        </Link>
-
-        <Link
-          to="/library/playlists"
-          className={`nav-item ${location.pathname.startsWith("/library") ? "active" : ""}`}
-          aria-current={location.pathname.startsWith("/library") ? "page" : undefined}
-        >
-          <span className="nav-icon" aria-hidden="true">♫</span>
-          <span className="nav-label">Library</span>
-        </Link>
-
-        <Link
-          to="/liked"
-          className={`nav-item ${location.pathname === "/liked" ? "active" : ""}`}
-          aria-current={location.pathname === "/liked" ? "page" : undefined}
-        >
-          <span className="nav-icon" aria-hidden="true">♡</span>
-          <span className="nav-label">Liked Songs</span>
-        </Link>
-        <Link
-          to="/listening-activity"
-          className={`nav-item ${location.pathname === "/listening-activity" ? "active" : ""}`}
-          aria-current={location.pathname === "/listening-activity" ? "page" : undefined}
-        >
-          <span className="nav-icon" aria-hidden="true">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-              <circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" />
-            </svg>
-          </span>
-          <span className="nav-label">Listening Activity</span>
-        </Link>
+        {orderedNavigation.items.map(({ to: path, label, icon }) => {
+          const active = path === "/library/playlists" ? location.pathname.startsWith("/library") : location.pathname === path;
+          return <Link key={path} to={path} className={`nav-item sidebar-reorderable${active ? " active" : ""}`}
+            aria-current={active ? "page" : undefined} {...orderedNavigation.dragProps(path)}>
+            <span className="nav-icon" aria-hidden="true">{icon}</span>
+            <span className="nav-label">{label}</span>
+          </Link>;
+        })}
       </section>
 
-      <section className="nav-section playlists-section" aria-labelledby="playlist-navigation">
-        <div className="nav-section-heading">
-          <h2 className="nav-title" id="playlist-navigation">Playlists</h2>
-          <button
-            className="add-playlist-icon"
-            type="button"
-            onClick={handleAddPlaylist}
-            aria-label="Add playlist"
-            title="Add playlist"
-          >
-            <span aria-hidden="true">+</span>
-          </button>
-        </div>
-
+      <section className="nav-section playlists-section" aria-label="Playlists">
         <div className="playlist-list">
-          {loading && <div className="nav-loading">Loading playlists…</div>}
-
-          {!loading && playlists.map((playlist) => {
-            const isActive = location.pathname === `/playlist/${playlist.id}`;
-
-            return (
-              <Link
-                key={playlist.id}
-                to={`/playlist/${playlist.id}`}
-                className={`nav-item playlist-nav-item ${isActive ? "active" : ""}`}
-                aria-current={isActive ? "page" : undefined}
-                title={playlist.name}
-              >
-                <span className="nav-icon nav-icon-playlist" aria-hidden="true">
-                  <PlaylistCover
-                    playlist={playlist}
-                    size={64}
-                    placeholderClassName="nav-icon-playlist-placeholder"
-                  />
-                </span>
-                <span className="nav-label">{playlist.name}</span>
-              </Link>
-            );
-          })}
+          <PlaylistFolderTree
+            loading={loading}
+            playlists={playlists}
+            onAddPlaylist={handleAddPlaylist}
+            extraItems={tokens => {
+              const matches = item => {
+                const name = normalizePlaylistSearch(item.name || "");
+                return tokens.every(token => name.includes(token));
+              };
+              return [
+                ...(smartPlaylists.error ? [<div key="smart-error" className="nav-loading" role="status">Could not load smart playlists.
+                  <button type="button" onClick={() => { void smartPlaylists.refresh(); }}>Retry</button>
+                </div>] : []),
+                ...orderedSmart.items.filter(matches).map(playlist => {
+                  const href = `/smart-playlist/${encodeURIComponent(playlist.id)}`;
+                  return <Link key={playlist.id} to={href} className={`nav-item playlist-nav-item sidebar-reorderable ${location.pathname === href ? "active" : ""}`}
+                    aria-current={location.pathname === href ? "page" : undefined} title={`${playlist.name} · Smart playlist`} {...orderedSmart.dragProps(playlist.id)}>
+                    <span className="nav-icon nav-icon-playlist smart-playlist-mark" aria-hidden="true">✦</span>
+                    <span className="nav-label"><PlaylistSearchHighlight text={playlist.name} tokens={tokens} /></span>
+                  </Link>;
+                }),
+                ...orderedAlbums.items.filter(matches).map(album => {
+                  const href = `/album/${encodeURIComponent(album.id)}`;
+                  return <Link key={`album:${album.id}`} to={href} className={`nav-item playlist-nav-item sidebar-reorderable ${location.pathname === href ? "active" : ""}`}
+                    aria-current={location.pathname === href ? "page" : undefined} title={`${album.name} · Album`} {...orderedAlbums.dragProps(album.id)}>
+                    <span className="nav-icon nav-icon-playlist" aria-hidden="true"><DiscoveryArtwork item={album} /></span>
+                    <span className="nav-label"><PlaylistSearchHighlight text={album.name} tokens={tokens} /></span>
+                  </Link>;
+                }),
+              ];
+            }}
+          />
         </div>
-
-        <button
-          className="nav-item add-playlist"
-          type="button"
-          onClick={handleAddPlaylist}
-        >
-          <span className="nav-icon add-icon" aria-hidden="true">+</span>
-          <span className="nav-label">Add playlist</span>
-        </button>
       </section>
-      {modalStep && createPortal(
+      {modalStep === "advanced-mix" && <MixBuilderModal open onClose={closeModal} />}
+      {modalStep && modalStep !== "advanced-mix" && createPortal(
         <div className="playlist-modal-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) closeModal();
         }}>
-          <section className="playlist-modal" role="dialog" aria-modal="true" aria-labelledby="playlist-modal-title" ref={modalRef} tabIndex={-1}>
+          <section className={`playlist-modal${modalStep === "smart" ? " playlist-modal--smart" : ""}`} role="dialog" aria-modal="true" aria-labelledby="playlist-modal-title" ref={modalRef} tabIndex={-1}>
             <div className="playlist-modal-heading">
               <div>
                 <span className="playlist-modal-eyebrow">YOUR LIBRARY / PLAYLISTS</span>
-                <h2 id="playlist-modal-title">{modalStep === "choose" ? "Create New Playlist" : modalStep === "blank" ? "Blank Playlist" : modalStep === "progress" ? "Importing Playlist..." : "Import Spotify Playlist"}</h2>
+                <h2 id="playlist-modal-title">{modalStep === "choose" ? "Create New Playlist" : modalStep === "blank" ? "Blank Playlist" : modalStep === "smart" ? "Make a mix" : modalStep === "progress" ? "Importing Playlist..." : "Import Spotify Playlist"}</h2>
               </div>
               <button className="playlist-modal-close" type="button" onClick={closeModal} disabled={busy} aria-label="Close playlist dialog">×</button>
             </div>
@@ -355,14 +410,28 @@ function Sidebar({ id }) {
                     <span>Create from scratch</span>
                     <span className="playlist-modal-option-arrow" aria-hidden="true">↗</span>
                   </button>
-                  <button type="button" className="playlist-modal-option" onClick={() => setModalStep("import")}>
+                  <button type="button" className="playlist-modal-option" onClick={() => setModalStep("smart")}>
+                    <span className="playlist-modal-option-icon" aria-hidden="true">✦</span>
+                    <strong>Make a mix</strong><span>Find the right songs, automatically</span>
+                    <span className="playlist-modal-option-arrow" aria-hidden="true">↗</span>
+                  </button>
+                  {canImport && <button type="button" className="playlist-modal-option" onClick={() => setModalStep("import")}>
                     <span className="playlist-modal-option-icon" aria-hidden="true">♫</span>
                     <strong>Import Spotify Playlist</strong>
                     <span>Import via URL</span>
                     <span className="playlist-modal-option-arrow" aria-hidden="true">↗</span>
-                  </button>
+                  </button>}
                 </div>
               </>
+            ) : modalStep === "smart" ? <>
+              <button type="button" className="playlist-modal-back" disabled={busy} onClick={() => setModalStep("choose")}>Back</button>
+              <button type="button" className="playlist-modal-back" disabled={busy} onClick={() => setModalStep("advanced-mix")}>Advanced mix</button>
+              <SmartPlaylistBuilder onBusyChange={setBusy} onSaved={(playlist, kind) => {
+                setModalStep(null); setBusy(false); triggerRef.current?.focus();
+                navigate(`/${kind === "playlist" ? "playlist" : "smart-playlist"}/${encodeURIComponent(playlist.id)}`);
+              }} />
+            </> : modalStep === "import" && !canImport ? (
+              <p className="playlist-modal-intro" role="status">Spotify imports are disabled by server privacy policy.</p>
             ) : modalStep === "blank" ? (
               <form className="playlist-modal-form" onSubmit={handleCreatePlaylist}>
                 <label htmlFor="new-playlist-name">Playlist name <span aria-hidden="true">*</span></label>

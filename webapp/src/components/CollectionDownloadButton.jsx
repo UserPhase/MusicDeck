@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { downloadToDevice } from "../utils/downloadManager";
+import { offlineDownloadEngine } from "../services/storage/OfflineDownloadEngine";
 
 function isAvailableOnServer(track) {
   return Boolean(
@@ -10,7 +11,7 @@ function isAvailableOnServer(track) {
   );
 }
 
-function CollectionDownloadButton({ tracks = [], quality = "320kbps", label = "collection" }) {
+function CollectionDownloadButton({ tracks = [], quality = "320kbps", label = "collection", collectionId, collectionName }) {
   const eligibleTracks = useMemo(
     () => tracks.filter((track) => track?.id && isAvailableOnServer(track)),
     [tracks]
@@ -23,11 +24,25 @@ function CollectionDownloadButton({ tracks = [], quality = "320kbps", label = "c
     if (isDownloading || eligibleTracks.length === 0) return;
 
     setBatch({ status: "downloading", completed: 0, total: eligibleTracks.length });
+    const batchOwner = offlineDownloadEngine.getOwner();
     let failed = 0;
+    if (collectionId && offlineDownloadEngine.getOwner()) {
+      try {
+        await offlineDownloadEngine.enqueueCollection({ id: String(collectionId), kind: label === "album" ? "album" : "playlist", name: collectionName || label, trackIds: tracks.filter((track) => track?.id != null).map((track) => String(track.id)) }, eligibleTracks, quality);
+      } catch (error) {
+        console.error("Could not save offline collection:", error);
+        setBatch({ status: "failed", completed: 0, total: eligibleTracks.length });
+        return;
+      }
+    }
 
     for (let index = 0; index < eligibleTracks.length; index += 1) {
+      if (offlineDownloadEngine.getOwner() !== batchOwner) {
+        setBatch({ status: "failed", completed: index, total: eligibleTracks.length });
+        return;
+      }
       try {
-        await downloadToDevice(eligibleTracks[index].id, quality);
+        await downloadToDevice(eligibleTracks[index].id, quality, eligibleTracks[index]);
       } catch (error) {
         failed += 1;
         console.error("Could not download collection track:", error);

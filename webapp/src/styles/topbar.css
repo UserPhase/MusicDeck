@@ -2,35 +2,24 @@
 .logo { justify-self: start; min-width: 0; max-width: 100%; overflow: hidden; font-size: 24px; font-weight: 800; letter-spacing: -1px; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-center { display: flex; align-items: center; gap: 12px; }
 .homebutton { width: 44px; height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: center; background: var(--control-surface); border-radius: 50%; color: var(--text-secondary); text-decoration: none; transition: background 0.15s ease, border-color 0.15s ease; }
-.homebutton:hover { background: var(--card); border-color: var(--border-hover); }
+.homebutton:hover { border-color: var(--border-hover); }
 .profile { position: relative; justify-self: end; display: flex; align-items: center; gap: 10px; padding: 5px 12px 5px 6px; background: var(--control-surface); border: 1px solid transparent; border-radius: 22px; color: var(--text-secondary); }
 .topbar-import-status { display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .6rem; border: 1px solid rgb(168 85 247 / 25%); border-radius: 1rem; background: rgb(168 85 247 / 9%); color: var(--text-secondary); font-size: .72rem; white-space: nowrap; cursor: pointer; }
-.topbar-import-status:hover { color: var(--text); background: rgb(168 85 247 / 16%); }
+.topbar-import-status:hover:not(:disabled) { color: var(--text); }
 .topbar-import-status:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
-.downloads-menu-toggle { position: relative; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: 50%; color: var(--text-secondary); cursor: pointer; transition: background 0.15s ease; }
-.downloads-menu-toggle:hover { background: var(--card-hover); }
-.downloads-menu-toggle:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
-.downloads-menu-badge { position: absolute; top: 1px; right: 1px; min-width: 15px; height: 15px; padding: 0 3px; display: flex; align-items: center; justify-content: center; border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent-hover); font-size: 10px; font-weight: 800; line-height: 1; border-radius: 8px; }
-.downloads-menu-popover { min-width: 280px; max-width: 340px; max-height: 400px; overflow-y: auto; }
-.downloads-menu-list { display: flex; flex-direction: column; gap: 4px; }
-.downloads-menu-empty { padding: 16px 10px; color: var(--text-muted); font-size: 13px; text-align: center; }
-.downloads-menu-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: var(--radius-sm); }
-.downloads-menu-item:hover { background: var(--card-hover); }
-.downloads-menu-item-info { min-width: 0; flex: 1; }
-.downloads-menu-item-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.downloads-menu-item-status { margin-top: 2px; font-size: 11px; color: var(--text-muted); }
-.downloads-menu-item.status-failed .downloads-menu-item-status { color: var(--status-failed); }
-.downloads-menu-item.status-completed .downloads-menu-item-status { color: var(--accent-text); }
-.downloads-menu-progress { margin-top: 6px; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
-.downloads-menu-progress-bar { height: 100%; background: var(--accent); transition: width 0.3s ease; }
-.downloads-menu-action { flex-shrink: 0; padding: 5px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: transparent; color: var(--text-secondary); font-size: 11px; cursor: pointer; }
-.downloads-menu-action:hover { background: var(--card-hover); color: var(--text); }
+.topbar-page-icon { position: relative; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: 50%; color: var(--text-secondary); cursor: pointer; transition: background 0.15s ease; }
+.topbar-page-icon[aria-current="page"] { color: var(--accent-text); }
+.topbar-page-icon:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
 .profile-button { display: flex; align-items: center; gap: 10px; background: transparent; color: inherit; }
-.profile-button:focus-visible, .account-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(.topbar, .account-menu, .search-dropdown) :is(button, input, select, a):focus-visible,
+.account-menu.glass-dropdown :is(button, input, select, a):focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+:is(.account-menu.glass-dropdown, .search-dropdown) :is(button, a):focus-visible { outline-offset: -2px; }
 .avatar { width: 30px; height: 30px; display: grid; place-items: center; flex-shrink: 0; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 12px; font-weight: 800; }
 .account-menu { position: absolute; right: 0; top: calc(100% + 8px); min-width: 190px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4); z-index: 1100; }
 .account-menu-item { width: 100%; display: block; padding: 10px 12px; border-radius: 7px; background: transparent; color: var(--text); font-size: 13px; text-align: left; text-decoration: none; }
-.account-menu-item:hover { background: var(--card-hover); }
 .search-wrapper { position: relative; width: 100%; max-width: 600px; }
 .search { position: relative; width: min(420px, 50vw); }
 .search input { width: 100%; padding: 11px 18px 11px 15px; background: var(--control-surface); border: 1px solid transparent; border-radius: 22px; color: var(--text); outline: none; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
@@ -38,21 +27,26 @@
 .search-dropdown { position: absolute; top: calc(100% + 8px); left: 0; right: 0; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4); z-index: 1000; }
 .search-dropdown-label { padding: 10px 14px 7px; color: var(--text-muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
 .search-dropdown-song { width: 100%; display: flex; align-items: center; gap: 11px; padding: 9px 12px; border: none; background: transparent; color: var(--text); text-align: left; cursor: pointer; box-sizing: border-box; }
-.search-dropdown-song:hover { background: var(--card-hover); }
+.search-dropdown-song:is(:hover, :focus-within) { background: var(--card-hover); }
 .search-dropdown-cover { width: 42px; height: 42px; flex-shrink: 0; border-radius: 5px; overflow: hidden; background: var(--background); }
 .search-dropdown-cover img { width: 100%; height: 100%; object-fit: cover; }
 .search-dropdown-cover-empty { width: 100%; height: 100%; display: grid; place-items: center; color: var(--text-muted); font-size: 18px; }
 .search-dropdown-info { min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .search-dropdown-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 600; }
 .search-dropdown-play-action { display: block; width: 100%; padding: 0; border: none; background: transparent; color: inherit; text-align: left; cursor: pointer; }
-.search-dropdown-play-action:focus-visible, .search-dropdown-play:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.search-dropdown-play:focus-visible { opacity: 1; }
 .search-dropdown-artist { margin-top: 3px; color: var(--text-secondary); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; background: transparent; }
-.search-dropdown-artist:hover { color: var(--text); text-decoration: underline; }
 .search-dropdown-play { flex-shrink: 0; padding: 4px; border: none; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); font-size: 12px; opacity: 0; cursor: pointer; }
 .search-dropdown-song:hover .search-dropdown-play { opacity: 1; }
 .search-dropdown-status { padding: 18px; color: var(--text-muted); font-size: 13px; text-align: center; }
 .search-dropdown-more { width: 100%; padding: 12px 14px; border: none; border-top: 1px solid var(--border); background: transparent; color: var(--accent-text); font-size: 12px; text-align: left; cursor: pointer; }
-.search-dropdown-more:hover { background: var(--card-hover); }
+:is(.homebutton, .topbar-import-status, .topbar-page-icon, .profile-button, .account-menu-item, .search-dropdown-play-action, .search-dropdown-play, .search-dropdown-more):is(:hover, :active):not(:disabled):not([aria-disabled="true"]) {
+  background: var(--card-hover);
+}
+:is(.topbar, .account-menu, .search-dropdown) :is(button, input, select, a):is(:disabled, [aria-disabled="true"]) {
+  opacity: .5;
+  cursor: default;
+}
 
 @media (max-width: 700px) {
 	.topbar { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; padding: 0 12px; }

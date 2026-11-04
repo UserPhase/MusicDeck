@@ -80,6 +80,20 @@ test("shows only tracks after the active queue item", () => {
   expect(screen.getByText("Actually Next")).toBeInTheDocument();
 });
 
+test("explains auto-generated tracks without labeling manually queued songs", () => {
+  usePlayer.mockReturnValue({
+    queueIndex: -1, playHistory: [],
+    queue: [
+      { id: "auto", title: "Autoplay Song", recommendationGenerated: true, autoplayGenerated: true,
+        metadata: { recommendationReason: "Based on synthwave & artists you play and favorite" } },
+      { id: "manual", title: "Manual Song", metadata: { recommendationReason: "Not an automatic item" } },
+    ],
+  });
+  render(<QueueSidebar isOpen onClose={jest.fn()} />);
+  expect(screen.getByText("Autoplay: Based on synthwave & artists you play and favorite")).toBeInTheDocument();
+  expect(screen.queryByText("Not an automatic item")).not.toBeInTheDocument();
+});
+
 const makeSongs = (count, prefix) =>
   Array.from({ length: count }, (_, index) => ({ id: `${prefix}-${index}`, title: `${prefix} song ${index}`, artist: "Artist" }));
 

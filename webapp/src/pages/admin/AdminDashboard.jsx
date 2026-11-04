@@ -9,6 +9,7 @@ import {
 } from "../../api/musicdeck";
 import { useAuth } from "../../context/AuthContext";
 import { useAdminData } from "./useAdminData";
+import FirstRunSetupNotice from "../../components/admin/FirstRunSetupNotice";
 
 
 function formatBytes(bytes) {
@@ -59,6 +60,7 @@ function AdminDashboard() {
       </div>
 
       {error && <div className="error">{error}</div>}
+      <FirstRunSetupNotice />
 
       <section className="admin-section">
         <h2>Overview</h2>

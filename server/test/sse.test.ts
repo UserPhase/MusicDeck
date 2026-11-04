@@ -49,4 +49,18 @@ describe("SseEventWriter", () => {
     writer.push("acquisition.failed", { jobId: "overflow" });
     expect(response.end).toHaveBeenCalledOnce();
   });
+
+  test("authorization is checked again before draining buffered sensitive frames", () => {
+    const response = new SlowResponse();
+    let authorized = true;
+    const writer = new SseEventWriter(response as never, 4, 10_000, () => authorized);
+    writer.push("connected", {});
+    writer.push("logs", { entries: [{ message: "buffered-sensitive-data" }] });
+    authorized = false;
+    response.write.mockImplementation((frame) => { response.writes.push(frame); return true; });
+    response.emit("drain");
+    expect(response.writes.join("")).not.toContain("buffered-sensitive-data");
+    writer.close();
+    expect(response.listenerCount("drain")).toBe(0);
+  });
 });

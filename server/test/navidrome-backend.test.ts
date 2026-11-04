@@ -9,6 +9,40 @@ function jsonResponse(body: unknown) {
 }
 
 describe("NavidromeBackend", () => {
+  test("enumerates all album pages and rejects non-advancing providers", async () => {
+    const albums = Array.from({ length: 2001 }, (_, index) => ({ id: String(index), name: "Album" }));
+    const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = new URL(String(input));
+      const offset = Number(url.searchParams.get("offset"));
+      return jsonResponse({ "subsonic-response": { status: "ok", albumList2: {
+        album: albums.slice(offset, offset + 500),
+      } } });
+    });
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test", username: "listener", password: "test-password",
+    }, fetchImpl);
+    expect(await backend.listAllAlbums()).toHaveLength(2001);
+    expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).searchParams.get("offset")))
+      .toEqual(["0", "500", "1000", "1500", "2000"]);
+    fetchImpl.mockImplementation(async () => jsonResponse({ "subsonic-response": {
+      status: "ok", albumList2: { album: albums.slice(0, 500) },
+    } }));
+    await expect(backend.listAllAlbums()).rejects.toThrow("did not advance");
+  });
+  test("lists tracks beyond the first 500 albums with bounded album requests", async () => {
+    const albums = Array.from({ length: 501 }, (_, i) => ({ id: String(i) }));
+    const fetchImpl = vi.fn(async (url: URL) => {
+      if (url.pathname.endsWith("/getAlbumList2.view")) {
+        const offset = Number(url.searchParams.get("offset"));
+        return jsonResponse({ "subsonic-response": { status: "ok", albumList2: { album: albums.slice(offset, offset + 500) } } });
+      }
+      return jsonResponse({ "subsonic-response": { status: "ok", album: { song: [{ id: `song-${url.searchParams.get("id")}`, title: "Song" }] } } });
+    });
+    const backend = new NavidromeBackend({ url: "http://navidrome.test", username: "listener", password: "secret" }, fetchImpl as any);
+    expect(await backend.listTracks()).toHaveLength(501);
+    const pages = fetchImpl.mock.calls.map(([url]) => url).filter(url => url.pathname.endsWith("/getAlbumList2.view"));
+    expect(pages.map(url => url.searchParams.get("offset"))).toEqual(["0", "500"]);
+  });
   test("passes playlist matching pagination through to Subsonic search", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({ "subsonic-response": { status: "ok", searchResult3: { song: [] } } }));
     const backend = new NavidromeBackend({ url: "http://navidrome.test", username: "listener", password: "secret" }, fetchImpl as any);
@@ -73,6 +107,7 @@ describe("NavidromeBackend", () => {
       if (endpoint.endsWith("/getArtist.view")) {
         return jsonResponse({ "subsonic-response": { status: "ok", artist: {
           id: "queen-id", name: "Queen", coverArt: "album-cover",
+          artistImageUrl: "https://images.example.test/default-avatar.jpg",
           album: [{ id: "queen-album", name: "Queen Album", artistId: "queen-id" }],
         } } });
       }
@@ -213,6 +248,20 @@ describe("NavidromeBackend", () => {
     expect(updateUrl).not.toContain("songIdToAdd=track-1");
   });
 
+  test("reorder replaces the provider playlist including duplicate occurrences", async () => {
+    const fetchImpl = vi.fn(async (_input: Parameters<typeof fetch>[0]) => jsonResponse({
+      "subsonic-response": { status: "ok", playlist: { id: "list", name: "List", entry: [] } },
+    }));
+    const backend = new NavidromeBackend({
+      url: "http://navidrome.test", username: "user", password: "password",
+    }, fetchImpl);
+    await backend.reorderPlaylistTracks("list", ["same", "other", "same"]);
+    const url = new URL(String(fetchImpl.mock.calls[0]?.[0]));
+    expect(url.pathname).toContain("createPlaylist.view");
+    expect(url.searchParams.get("playlistId")).toBe("list");
+    expect(url.searchParams.getAll("songId")).toEqual(["same", "other", "same"]);
+  });
+
   test("reads structured lyrics and artist biography from Subsonic metadata endpoints", async () => {
     const fetchImpl = vi.fn(async (url: URL) => {
       const requestUrl = String(url);
@@ -220,7 +269,10 @@ describe("NavidromeBackend", () => {
         return jsonResponse({
           "subsonic-response": {
             status: "ok",
-            lyricsList: { structuredLyrics: [{ line: [{ value: "First line" }, { value: "Second line" }] }] },
+            lyricsList: { structuredLyrics: [
+              { line: [{ value: "Untimed version" }] },
+              { synced: true, offset: 250, line: [{ start: 1000, value: "First line" }, { start: 2250, value: "Second line" }] },
+            ] },
           },
         });
       }
@@ -240,7 +292,7 @@ describe("NavidromeBackend", () => {
       password: "navidrome-password",
     }, fetchImpl as any);
 
-    await expect(backend.getLyrics("track-1")).resolves.toBe("First line\nSecond line");
+    await expect(backend.getLyrics("track-1")).resolves.toBe("[offset:250]\n[0:01.000]First line\n[0:02.250]Second line");
     await expect(backend.getArtistBiographyForTrack("track-1")).resolves.toBe("An artist story.");
   });
 

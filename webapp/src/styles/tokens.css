@@ -28,9 +28,15 @@
   --sidebar-width: 280px; --right-sidebar-width: 300px; --frame: 8px; --panel-radius: 12px; --player-height: 90px;
 
   --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px; --space-6: 24px;
+  --font-family-ui: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-library-heading: clamp(1.75rem, 3vw, 2.25rem);
+  --font-detail-heading: 38px;
   --font-xs: 11px; --font-sm: 12px; --font-md: 13px; --font-base: 14px; --font-lg: 16px; --font-title: 21px;
   --weight-semibold: 600; --weight-bold: 700;
   --radius-sm: 6px; --radius-md: 8px; --radius-lg: 12px; --radius-pill: 999px;
+  --radius-sidebar: 16px;
+  --radius-panel: var(--radius-lg);
+  --blur-shell: 24px;
   --control-sm: 32px; --control-md: 40px;
   --content-max: 1100px; --content-wide: 1200px;
   --focus-ring: 2px solid var(--accent);
@@ -45,7 +51,8 @@
   --accent-text: var(--accent);
   --text-soft: #d4d4d8;
   --panel-chrome: rgb(12 12 14 / 90%);
-  --panel-shadow: 0 25px 50px rgb(0 0 0 / 80%);
+  --shadow-panel: 0 25px 50px rgb(0 0 0 / 80%);
+  --panel-shadow: var(--shadow-panel);
   --player-bg: #09090b;
   --card-solid: rgb(24 24 27 / 80%);
   --card-raised: rgb(24 24 27 / 86%);
@@ -71,12 +78,14 @@
   --sidebar-surface: var(--panel-chrome);
   --aside-surface: var(--panel-chrome);
   --main-surface: var(--bg-chrome);
+  --main-surface-solid: #09090b;
   --panel-border: rgb(var(--tint-rgb) / 10%);
 
   --glass-menu-bg: rgba(20, 20, 24, 0.88);
   --glass-menu-solid: rgb(20, 20, 24);
   --glass-menu-border: rgba(255, 255, 255, 0.1);
-  --glass-menu-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  --shadow-menu: 0 10px 30px rgba(0, 0, 0, 0.5);
+  --glass-menu-shadow: var(--shadow-menu);
   --glass-menu-text: #fff;
   --glass-menu-text-secondary: #d4d4dd;
   --glass-menu-text-muted: #b9b9c4;
@@ -114,7 +123,7 @@
   --accent-text: color-mix(in srgb, var(--accent) 70%, #000);
   --text-soft: #374151;
   --panel-chrome: rgb(255 255 255 / 92%);
-  --panel-shadow: 0 18px 40px rgb(15 23 42 / 8%), 0 1px 2px rgb(15 23 42 / 6%);
+  --shadow-panel: 0 18px 40px rgb(15 23 42 / 8%), 0 1px 2px rgb(15 23 42 / 6%);
   --player-bg: #ffffff;
   --card-solid: rgb(255 255 255 / 90%);
   --card-raised: #ffffff;
@@ -138,12 +147,13 @@
   --sidebar-surface: #f3f4f6;
   --aside-surface: #f8f9fa;
   --main-surface: #ffffff;
+  --main-surface-solid: #ffffff;
   --panel-border: rgb(226 232 240 / 80%);
 
   --glass-menu-bg: rgb(255 255 255 / 80%);
   --glass-menu-solid: #ffffff;
   --glass-menu-border: rgb(229 231 235 / 50%);
-  --glass-menu-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+  --shadow-menu: 0 10px 30px rgba(0, 0, 0, 0.1);
   --glass-menu-text: #111827;
   --glass-menu-text-secondary: #374151;
   --glass-menu-text-muted: #6b7280;

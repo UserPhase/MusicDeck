@@ -42,7 +42,12 @@ export default function FloatingPanel({
 
   useEffect(() => {
     const anchor = anchorRef.current;
-    if (role === "menu") panelRef.current?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
+    const menuItems = () => [...(panelRef.current?.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]') || [])]
+      .filter((item) => !item.disabled && item.getAttribute("aria-disabled") !== "true");
+    if (role === "menu") {
+      const items = menuItems();
+      (items.find((item) => item.getAttribute("role") === "menuitemradio" && item.getAttribute("aria-checked") === "true") || items[0])?.focus();
+    }
     function dismiss(event) {
       if (!panelRef.current?.contains(event.target) && !anchor?.contains(event.target)) closeRef.current?.();
     }
@@ -52,8 +57,7 @@ export default function FloatingPanel({
         closeRef.current?.();
         anchor?.focus();
       } else if (role === "menu" && panelRef.current?.contains(event.target)) {
-        const items = [...panelRef.current.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"]')]
-          .filter((item) => !item.disabled && item.getAttribute("aria-disabled") !== "true");
+        const items = menuItems();
         const index = items.indexOf(document.activeElement);
         if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
           event.preventDefault();

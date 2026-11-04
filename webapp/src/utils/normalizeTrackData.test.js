@@ -2,6 +2,14 @@ import {
   normalizeTrackData,
 } from "./normalizeTrackData";
 
+test("preserves measured gain through API normalization, including nested playlist tracks", () => {
+  const song = { id: "measured", title: "Song", normalizationGainDb: -6 };
+  const normalized = normalizeTrackData({ id: "playlist-entry", track: song });
+  expect(normalized.normalizationGainDb).toBe(-6);
+  expect(normalized.metadata.normalizationGainDb).toBe(-6);
+  expect(normalizeTrackData(normalized).normalizationGainDb).toBe(-6);
+});
+
 test("normalizes a library track and derives its downloaded state", () => {
   expect(normalizeTrackData({
     id: "md_track-1",

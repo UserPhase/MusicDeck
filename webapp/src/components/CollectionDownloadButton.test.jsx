@@ -29,8 +29,8 @@ test("downloads every server-available track at the selected quality", async () 
   fireEvent.click(screen.getByRole("button", { name: "Download playlist to this device" }));
 
   await waitFor(() => {
-    expect(mockDownloadToDevice).toHaveBeenNthCalledWith(1, "one", "lossless");
-    expect(mockDownloadToDevice).toHaveBeenNthCalledWith(2, "two", "lossless");
+    expect(mockDownloadToDevice).toHaveBeenNthCalledWith(1, "one", "lossless", { id: "one", isDownloaded: true });
+    expect(mockDownloadToDevice).toHaveBeenNthCalledWith(2, "two", "lossless", { id: "two", availability: { libraryAvailable: true } });
     expect(screen.getByRole("button", { name: "playlist downloaded to this device" }))
       .toBeInTheDocument();
   });

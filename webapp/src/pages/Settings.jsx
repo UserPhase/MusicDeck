@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 
 import {
   analyzeSilence,
@@ -6,12 +6,15 @@ import {
   updateUserSettings,
   USER_SETTINGS_CHANGED_EVENT,
 } from "../api/musicdeck";
-import { usePlayer } from "../context/PlayerContext";
-import {
-  clearLocalBrowserCache,
-  formatStorageSize,
-  getBrowserStorageUsage,
-} from "../utils/browserCache";
+import { DEFAULT_CROSSFADE_SECONDS, clampCrossfadeDuration, isTransitionMode, usePlayer } from "../context/PlayerContext";
+import LoudnessScanControl from "../components/LoudnessScanControl";
+import PlayerSettings from "../components/PlayerSettings";
+import DataExportPanel from "../components/settings/DataExportPanel";
+import OfflineStoragePanel from "../components/settings/OfflineStoragePanel";
+import TasteProfileView from "../views/settings/TasteProfileView";
+import { isShuffleMode } from "../utils/shuffle";
+import SilenceScanControl from "../components/SilenceScanControl";
+import { DEFAULT_LOUDNESS_TARGET, LOUDNESS_TARGETS } from "../utils/loudness";
 import {
   applySettingsBackup,
   createSettingsBackup,
@@ -34,6 +37,8 @@ import {
   saveLayoutPresetPreference,
 } from "../utils/layoutPreset";
 
+const EqualizerSettings = lazy(() => import("../components/settings/EqualizerSettings"));
+
 function parseSettingValue(value) {
   try {
     return JSON.parse(value);
@@ -51,14 +56,22 @@ function Settings() {
   const player = usePlayer() || {};
   const {
     currentSong = null,
-    crossfadeDuration: globalCrossfadeDuration = 0,
+    crossfadeDuration: globalCrossfadeDuration = DEFAULT_CROSSFADE_SECONDS,
     changeCrossfadeDuration,
+    transitionMode: globalTransitionMode = "gapless",
+    changeTransitionMode,
+    shuffleMode: globalShuffleMode = "standard",
+    changeShuffleMode,
+    isAlbumAware: globalAlbumAware = false,
+    changeAlbumAware,
     streamQuality: globalStreamQuality = "original",
     changeStreamQuality,
     downloadQuality: globalDownloadQuality = "320kbps",
     changeDownloadQuality,
-    isReplayGainEnabled: globalReplayGainEnabled = false,
+    isReplayGainEnabled: globalReplayGainEnabled = true,
     changeReplayGainEnabled,
+    normalizationTarget: globalNormalizationTarget = DEFAULT_LOUDNESS_TARGET,
+    changeNormalizationTarget,
     layoutDensity: globalLayoutDensity = "comfortable",
     changeLayoutDensity,
     accentColor: globalAccentColor = DEFAULT_ACCENT_COLOR,
@@ -71,15 +84,23 @@ function Settings() {
   const [silenceTrimEnabled, setSilenceTrimEnabled] = useState(false);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState(-35);
   const [silenceMinSeconds, setSilenceMinSeconds] = useState(0.5);
-  const [crossfadeDuration, setCrossfadeDuration] = useState(
-    globalCrossfadeDuration,
+  const [crossfadeDuration, setCrossfadeDuration] = useState(() =>
+    clampCrossfadeDuration(globalCrossfadeDuration),
   );
+  const [transitionMode, setTransitionMode] = useState(globalTransitionMode);
+  const [shuffleMode, setShuffleMode] = useState(globalShuffleMode);
+  const [isAlbumAware, setIsAlbumAware] = useState(globalAlbumAware);
+  const initialAlbumAware = useRef(globalAlbumAware);
+  useEffect(() => setIsAlbumAware(globalAlbumAware), [globalAlbumAware]);
+  const initialShuffleMode = useRef(globalShuffleMode);
+  useEffect(() => setShuffleMode(globalShuffleMode), [globalShuffleMode]);
   const [streamQuality, setStreamQuality] = useState(globalStreamQuality);
   const [downloadQuality, setDownloadQuality] = useState(globalDownloadQuality);
   const [isReplayGainEnabled, setIsReplayGainEnabled] = useState(
     globalReplayGainEnabled,
   );
   const [layoutDensity, setLayoutDensity] = useState(globalLayoutDensity);
+  const [normalizationTarget, setNormalizationTarget] = useState(globalNormalizationTarget);
   const [theme, setTheme] = useState(getActiveTheme);
   const [themeError, setThemeError] = useState(null);
   const themeTouchedRef = useRef(false);
@@ -95,16 +116,12 @@ function Settings() {
   const [message, setMessage] = useState("");
   const [reanalyzing, setReanalyzing] = useState(false);
   const [reanalyzeMessage, setReanalyzeMessage] = useState("");
-  const [storageUsage, setStorageUsage] = useState({
-    supported: false,
-    usage: null,
-    quota: null,
-  });
-  const [isClearingCache, setIsClearingCache] = useState(false);
   const [cacheMessage, setCacheMessage] = useState("");
   const initialCrossfadePreference = useRef({
     duration: globalCrossfadeDuration,
     change: changeCrossfadeDuration,
+    mode: globalTransitionMode,
+    changeMode: changeTransitionMode,
   });
   const initialAudioPreferences = useRef({
     streamQuality: globalStreamQuality,
@@ -113,6 +130,8 @@ function Settings() {
     changeDownloadQuality,
     replayGainEnabled: globalReplayGainEnabled,
     changeReplayGainEnabled,
+    normalizationTarget: globalNormalizationTarget,
+    changeNormalizationTarget,
   });
   const initialLayoutPreference = useRef({
     density: globalLayoutDensity,
@@ -126,19 +145,6 @@ function Settings() {
     autoplayEnabled: globalAutoplayEnabled,
     changeAutoplayEnabled,
   });
-
-  const refreshStorageUsage = useCallback(async () => {
-    const estimate = await getBrowserStorageUsage();
-    setStorageUsage(estimate || {
-      supported: false,
-      usage: null,
-      quota: null,
-    });
-  }, []);
-
-  useEffect(() => {
-    refreshStorageUsage();
-  }, [refreshStorageUsage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -162,24 +168,30 @@ function Settings() {
             ),
           );
 
-          const nextCrossfadeDuration = Math.max(
-            0,
-            Math.min(
-              12,
-              Number(
-                getSetting(
-                  settings,
-                  "playback.crossfadeDuration",
-                  initialCrossfadePreference.current.duration,
-                ),
-              ) || 0,
-            ),
+          const savedCrossfadeDuration = Number(
+            getSetting(settings, "playback.crossfadeDuration", Number.NaN),
           );
+          const savedTransitionMode = getSetting(settings, "playback.transitionMode", null);
+          const hasSavedCrossfade = Number.isFinite(savedCrossfadeDuration) && savedCrossfadeDuration > 0;
+          const nextCrossfadeDuration = hasSavedCrossfade
+            ? clampCrossfadeDuration(savedCrossfadeDuration)
+            : clampCrossfadeDuration(initialCrossfadePreference.current.duration);
+          // Accounts saved before transition modes existed used a positive duration to mean crossfade.
+          const nextTransitionMode = isTransitionMode(savedTransitionMode)
+            ? savedTransitionMode
+            : hasSavedCrossfade
+              ? "crossfade"
+              : initialCrossfadePreference.current.mode;
 
           setCrossfadeDuration(nextCrossfadeDuration);
-          initialCrossfadePreference.current.change?.(nextCrossfadeDuration);
+          setTransitionMode(nextTransitionMode);
+          const storedShuffleMode = getSetting(settings, "playback.shuffleMode", initialShuffleMode.current);
+          setShuffleMode(isShuffleMode(storedShuffleMode) ? storedShuffleMode : "standard");
+          setIsAlbumAware(getSetting(settings, "playback.albumAware", initialAlbumAware.current) === true);
+          if (hasSavedCrossfade) initialCrossfadePreference.current.change?.(nextCrossfadeDuration);
+          initialCrossfadePreference.current.changeMode?.(nextTransitionMode);
 
-          const nextStreamQuality = ["128", "320", "original"].includes(
+          const nextStreamQuality = ["128", "256", "320", "original", "direct"].includes(
             getSetting(
               settings,
               "playback.streamQuality",
@@ -220,12 +232,16 @@ function Settings() {
           const nextReplayGainEnabled = Boolean(
             getSetting(
               settings,
-              "playback.replayGain.enabled",
+              "playback.normalization.enabled",
               initialAudioPreferences.current.replayGainEnabled,
             ),
           );
 
           setIsReplayGainEnabled(nextReplayGainEnabled);
+          const storedTarget = getSetting(settings, "playback.normalization.targetLufs", initialAudioPreferences.current.normalizationTarget);
+          const target = LOUDNESS_TARGETS.includes(storedTarget) ? storedTarget : DEFAULT_LOUDNESS_TARGET;
+          setNormalizationTarget(target);
+          initialAudioPreferences.current.changeNormalizationTarget?.(target);
           initialAudioPreferences.current.changeReplayGainEnabled?.(
             nextReplayGainEnabled,
           );
@@ -297,9 +313,13 @@ function Settings() {
         "playback.silenceTrim.thresholdDb": Number(silenceThresholdDb),
         "playback.silenceTrim.minSilenceSeconds": Number(silenceMinSeconds),
         "playback.crossfadeDuration": Number(crossfadeDuration),
+        "playback.transitionMode": transitionMode,
+        "playback.shuffleMode": shuffleMode,
+        "playback.albumAware": isAlbumAware,
         "playback.streamQuality": streamQuality,
         "playback.downloadQuality": downloadQuality,
-        "playback.replayGain.enabled": isReplayGainEnabled,
+        "playback.normalization.enabled": isReplayGainEnabled,
+        "playback.normalization.targetLufs": normalizationTarget,
         "ui.layoutDensity": layoutDensity,
         "ui.accentColor": accentColor,
         "ui.autoOpenSidebar": autoOpenSidebar,
@@ -313,22 +333,24 @@ function Settings() {
     }
   }
 
-  function handleCrossfadeChange(event) {
-    const nextDuration = Number(event.target.value);
-
-    setCrossfadeDuration(nextDuration);
-    changeCrossfadeDuration?.(nextDuration);
-
-    if (!changeCrossfadeDuration) {
-      try {
-        localStorage.setItem(
-          "playerCrossfadeDuration",
-          String(nextDuration),
-        );
-      } catch {
-        // The server save remains available if browser storage is blocked.
-      }
+  function storeLocally(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      // The server save remains available if browser storage is blocked.
     }
+  }
+
+  function handleCrossfadeChange(nextDuration) {
+    setCrossfadeDuration(nextDuration);
+    if (changeCrossfadeDuration) changeCrossfadeDuration(nextDuration);
+    else storeLocally("playerCrossfadeDuration", String(nextDuration));
+  }
+
+  function handleTransitionModeChange(nextMode) {
+    setTransitionMode(nextMode);
+    if (changeTransitionMode) changeTransitionMode(nextMode);
+    else storeLocally("playerTransitionMode", nextMode);
   }
 
   function handleStreamQualityChange(event) {
@@ -366,7 +388,7 @@ function Settings() {
 
     if (!changeReplayGainEnabled) {
       try {
-        localStorage.setItem("playerReplayGainEnabled", String(nextEnabled));
+        localStorage.setItem("playerNormalizationEnabled", String(nextEnabled));
       } catch {
         // Saving to the backend remains available if browser storage is blocked.
       }
@@ -375,6 +397,9 @@ function Settings() {
 
   useEffect(() => {
     function handleUserSettingsChanged(event) {
+      if (typeof event.detail?.["playback.albumAware"] === "boolean") setIsAlbumAware(event.detail["playback.albumAware"]);
+      const nextShuffleMode = event.detail?.["playback.shuffleMode"];
+      if (isShuffleMode(nextShuffleMode)) setShuffleMode(nextShuffleMode);
       const nextTheme = normalizeTheme(event.detail?.[THEME_SETTING_KEY]);
       if (nextTheme) setTheme(nextTheme);
       const nextLayoutPreset = normalizeLayoutPreset(event.detail?.[LAYOUT_PRESET_SETTING_KEY]);
@@ -454,20 +479,6 @@ function Settings() {
     }
   }
 
-  async function handleClearCache() {
-    try {
-      setIsClearingCache(true);
-      setCacheMessage("");
-      await clearLocalBrowserCache();
-      await refreshStorageUsage();
-      setCacheMessage("Local cache cleared. Your preferences and session are still intact.");
-    } catch {
-      setCacheMessage("Could not clear the local cache. Please try again.");
-    } finally {
-      setIsClearingCache(false);
-    }
-  }
-
   function handleExportBackup() {
     downloadSettingsBackup(createSettingsBackup());
     setCacheMessage("Preferences exported successfully.");
@@ -496,11 +507,11 @@ function Settings() {
     try {
       setReanalyzing(true);
       setReanalyzeMessage("");
-      await analyzeSilence(currentSong.id, {
+      const analysis = await analyzeSilence(currentSong.id, {
         thresholdDb: Number(silenceThresholdDb),
         minSilenceSeconds: Number(silenceMinSeconds),
       });
-      setReanalyzeMessage("Re-analysis complete for the current track.");
+      setReanalyzeMessage(analysis?.status === "completed" ? "Re-analysis complete for the current track." : "Could not analyze this track. Please try again.");
     } catch (err) {
       setReanalyzeMessage(
         err.message || "Could not re-analyze the current track.",
@@ -509,10 +520,6 @@ function Settings() {
       setReanalyzing(false);
     }
   }
-
-  const storagePercent = storageUsage.supported && storageUsage.quota > 0
-    ? Math.min(100, Math.max(0, (storageUsage.usage / storageUsage.quota) * 100))
-    : 0;
 
   if (loading) return <div className="loading">Loading settings...</div>;
 
@@ -532,6 +539,10 @@ function Settings() {
             <span>01</span>
             <h2 id="audio-playback-title">Audio &amp; Playback</h2>
           </div>
+
+          {player.audioEngine && <Suspense fallback={<p role="status">Loading equalizer…</p>}>
+            <EqualizerSettings engine={player.audioEngine} local={!player.isCasting && !player.isRemotePlayback} />
+          </Suspense>}
 
           <article className="settings-row settings-row-featured">
             <div className="settings-row-copy">
@@ -559,6 +570,8 @@ function Settings() {
               <span>Silence threshold (dB)</span>
               <input
                 type="number"
+                min="-100"
+                max="0"
                 step="1"
                 value={silenceThresholdDb}
                 onChange={(event) => setSilenceThresholdDb(event.target.value)}
@@ -569,7 +582,8 @@ function Settings() {
               <span>Minimum silence duration (seconds)</span>
               <input
                 type="number"
-                min="0"
+                min="0.1"
+                max="30"
                 step="0.1"
                 value={silenceMinSeconds}
                 onChange={(event) => setSilenceMinSeconds(event.target.value)}
@@ -578,43 +592,38 @@ function Settings() {
             </label>
           </div>
 
-          <div className="settings-row-actions">
+          <SilenceScanControl disabled={!silenceTrimEnabled} thresholdDb={silenceThresholdDb} minSilenceSeconds={silenceMinSeconds}>
             <button
               type="button"
               className="account-secondary"
               onClick={handleReanalyze}
-              disabled={!currentSong || reanalyzing}
+              disabled={!silenceTrimEnabled || !currentSong || reanalyzing}
             >
               {reanalyzing ? "Analyzing..." : "Re-analyze current track"}
             </button>
-            {reanalyzeMessage && (
-              <span className="settings-inline-message">{reanalyzeMessage}</span>
-            )}
-          </div>
+          </SilenceScanControl>
+          {reanalyzeMessage && (
+            <span className="settings-inline-message">{reanalyzeMessage}</span>
+          )}
 
-          <article className="settings-row settings-crossfade-row">
-            <div className="settings-row-copy">
-              <h3>Crossfade</h3>
-              <p>Blend the end of one track into the beginning of the next.</p>
-            </div>
-
-            <div className="settings-range-control">
-              <label htmlFor="crossfade-duration">Crossfade duration</label>
-              <input
-                id="crossfade-duration"
-                type="range"
-                min="0"
-                max="12"
-                step="1"
-                value={crossfadeDuration}
-                onChange={handleCrossfadeChange}
-                style={{ "--range-progress": `${(crossfadeDuration / 12) * 100}%` }}
-              />
-              <output htmlFor="crossfade-duration">
-                {crossfadeDuration} s
-              </output>
-            </div>
-          </article>
+          <PlayerSettings
+            isAlbumAware={isAlbumAware}
+            onAlbumAwareChange={(enabled) => {
+              setIsAlbumAware(enabled);
+              if (changeAlbumAware) changeAlbumAware(enabled);
+              else storeLocally("playerAlbumAware", String(enabled));
+            }}
+            shuffleMode={shuffleMode}
+            onShuffleModeChange={(mode) => {
+              setShuffleMode(mode);
+              if (changeShuffleMode) changeShuffleMode(mode);
+              else storeLocally("playerShuffleMode", mode);
+            }}
+            transitionMode={transitionMode}
+            crossfadeDuration={crossfadeDuration}
+            onTransitionModeChange={handleTransitionModeChange}
+            onCrossfadeDurationChange={handleCrossfadeChange}
+          />
 
           <article className="settings-row">
             <div className="settings-row-copy">
@@ -625,7 +634,9 @@ function Settings() {
               <span>Streaming quality</span>
               <select value={streamQuality} onChange={handleStreamQualityChange}>
                 <option value="128">128 kbps</option>
+                <option value="256">256 kbps</option>
                 <option value="320">320 kbps</option>
+                <option value="direct">Direct passthrough (no server normalization)</option>
                 <option value="original">Original/Lossless</option>
               </select>
             </label>
@@ -650,12 +661,12 @@ function Settings() {
 
           <article className="settings-row">
             <div className="settings-row-copy">
-              <h3>Volume Normalization (ReplayGain)</h3>
-              <p>Use track ReplayGain metadata to keep playback levels more consistent.</p>
+              <h3>Volume Normalization</h3>
+              <p>Songs start immediately. Volume adjusts smoothly as tracks are measured, and upcoming songs prepare in the background. Your original files stay unchanged.</p>
             </div>
             <label
               className="settings-switch"
-              aria-label="Volume Normalization (ReplayGain)"
+              aria-label="Volume Normalization"
             >
               <input
                 type="checkbox"
@@ -665,6 +676,30 @@ function Settings() {
               <span aria-hidden="true" />
             </label>
           </article>
+          <div className={`settings-normalization-options${!isReplayGainEnabled ? " is-disabled" : ""}`}
+            role="group" aria-label="Volume normalization options" aria-disabled={!isReplayGainEnabled}
+            aria-describedby={!isReplayGainEnabled ? "normalization-options-hint" : undefined}>
+            {!isReplayGainEnabled && <p id="normalization-options-hint" className="settings-normalization-hint">Enable Volume Normalization to change the loudness target or scan your library.</p>}
+            <article className="settings-row settings-normalization-target">
+              <div className="settings-row-copy">
+                <h3>Loudness target</h3>
+                <p>Applies only to your account. Peak protection stays on, so very dynamic songs may play a little quieter.</p>
+              </div>
+              <label className="settings-select-control">
+                <span>Loudness target</span>
+                <select value={normalizationTarget} disabled={!isReplayGainEnabled} onChange={event => {
+                  const target = Number(event.target.value);
+                  setNormalizationTarget(target);
+                  changeNormalizationTarget?.(target);
+                }}>
+                  <option value={-18}>−18 LUFS · More headroom</option>
+                  <option value={-16}>−16 LUFS · Balanced</option>
+                  <option value={-14}>−14 LUFS · Louder</option>
+                </select>
+              </label>
+            </article>
+            <LoudnessScanControl disabled={!isReplayGainEnabled} />
+          </div>
         </section>
 
         <section className="settings-section" aria-labelledby="interface-layout-title">
@@ -857,63 +892,6 @@ function Settings() {
             <h2 id="data-storage-title">Data &amp; Storage</h2>
           </div>
 
-          <div className="settings-storage-card">
-            <div className="settings-storage-card-header">
-              <div>
-                <h3>Local browser storage</h3>
-                <p>Artwork, track metadata, and offline cache stored on this device.</p>
-              </div>
-              <button
-                className="settings-storage-refresh"
-                type="button"
-                onClick={refreshStorageUsage}
-              >
-                Refresh
-              </button>
-            </div>
-
-            {storageUsage.supported ? (
-              <>
-                <div className="settings-storage-amount">
-                  <strong>{formatStorageSize(storageUsage.usage)}</strong>
-                  <span>of {formatStorageSize(storageUsage.quota)} used</span>
-                </div>
-                <div
-                  className="settings-storage-meter"
-                  role="progressbar"
-                  aria-label="Local browser storage usage"
-                  aria-valuemin="0"
-                  aria-valuemax="100"
-                  aria-valuenow={Math.round(storagePercent)}
-                >
-                  <span
-                    style={{
-                      width: `${storagePercent}%`,
-                    }}
-                  />
-                </div>
-              </>
-            ) : (
-              <p className="settings-storage-unavailable">
-                Storage usage is unavailable in this browser.
-              </p>
-            )}
-          </div>
-
-          <article className="settings-row settings-cache-row">
-            <div className="settings-row-copy">
-              <h3>Clear Local Cache</h3>
-              <p>Deletes cached album art and normalized track metadata. Your preferences and login session will not be deleted.</p>
-            </div>
-            <button
-              className="settings-cache-button"
-              type="button"
-              onClick={handleClearCache}
-              disabled={isClearingCache}
-            >
-              {isClearingCache ? "Clearing..." : "Clear Cache"}
-            </button>
-          </article>
           <article className="settings-row settings-backup-row">
             <div className="settings-row-copy">
               <h3>Backup &amp; Restore Preferences</h3>
@@ -930,6 +908,9 @@ function Settings() {
           {cacheMessage && <p className="settings-cache-message" role="status">{cacheMessage}</p>}
         </section>
 
+        <OfflineStoragePanel />
+        <DataExportPanel />
+
         <div className="settings-submit-row">
           {message && <span className="success">{message}</span>}
           <button type="submit" className="account-primary" disabled={saving}>
@@ -937,6 +918,7 @@ function Settings() {
           </button>
         </div>
       </form>
+      <TasteProfileView embedded />
     </div>
   );
 }

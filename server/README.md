@@ -1,6 +1,77 @@
 # MusicDeck Server
 
+## Acquisition security limits
+
+Acquisition create/retry failures use stable API error codes; unexpected
+exceptions return generic HTTP 500 messages. Known invalid input remains 400,
+missing retry jobs return 404, non-retryable states return 409, and capacity
+limits retain 429 plus `Retry-After`. Detailed exception diagnostics are
+redacted in administrator logs and the Fastify terminal/Docker log destination.
+Persisted acquisition failures are also normalized when returned to clients.
+
+Acquisition requests use bounded schemas (64 KiB maximum body). SpotDL validates
+all download URL fields at admission and again before process execution, without
+trusting a candidate's claimed provider. Manual sources must use HTTPS with the
+default HTTPS port, no credentials, and supported YouTube, SoundCloud, or artist
+Bandcamp track/album URLs. Spotify identities use canonical `open.spotify.com`
+URLs. Arbitrary direct-file sources belong to separately registered providers
+with their own configured source policy, not to SpotDL.
+
+Queue, submission, terminal-history and event-stream limits are documented in
+[Self-hosting](../docs/SELF_HOSTING.md#acquisition-resource-limits). Limits and
+input persistence cover the on-demand acquisition service, not the separate
+Spotify playlist-import job system. Existing Spotify import downloads still use
+the validated SpotDL adapter.
+
+## Sessions, streams, and database files
+
+Administrative password resets and account disabling revoke all sessions in the
+same SQLite transaction. Self-service password changes keep the current session.
+Log and acquisition SSE streams validate their original session before sending
+frames (including buffered frames), on in-process authorization notifications,
+and every five seconds while idle. Demoted administrator streams are closed.
+
+SQLite creation requests private directory/file modes and inspects existing
+database and sidecar modes without changing ownership or recursively modifying
+host permissions. Nested provider/plugin credentials are redacted in API
+responses without altering stored values. See
+[database protections](../docs/SELF_HOSTING.md#database-and-credential-file-protections)
+and [backup guidance](../docs/SELF_HOSTING.md#backup-basics), especially for
+Windows ACLs, bind mounts, and existing Docker volumes. POSIX modes cannot prove
+effective isolation on every host filesystem.
+
 MusicDeck Server is the API boundary between the React web client, future Android clients, and the music providers (Navidrome, Jellyfin).
+
+## Automatic playback volume
+
+Volume Normalization is enabled by default and does not require ReplayGain tags
+or manual analysis. Playback starts immediately while the server measures the
+audio with FFmpeg in the background. Once measured, the browser smoothly applies
+peak-limited gain without changing the source, seeking, or restarting playback.
+The server also prepares a stream targeting **−16 LUFS** with a **−1 dB true-peak
+ceiling**, and verifies it for subsequent plays. LUFS matches average
+perceived loudness; quiet passages and musical dynamics still vary naturally.
+
+The player prepares the next two queued tracks ahead of time. Cached results and
+measurements survive restarts. The cache sits in `playback-cache` beside the
+SQLite database, expires after seven days, and is capped at 1 GiB (plus temporary
+work for at most two active preparations). Originals and their tags are never
+modified. Original-quality playback uses a lossless FLAC derivative; selected
+128/192/256/320 kbps modes use MP3 derivatives with decoded peak verification.
+
+The FFmpeg executable comes from the downloader plugin's configured tool path.
+If it is unavailable, the source cannot be measured, or preparation exceeds its
+limits, the original audio continues without interruption and a short retry
+cooldown applies. A previously unmeasured first listen begins at its existing
+level; measured gain settles smoothly during playback. Peak headroom takes
+priority over boosting on this first listen. Prepared upcoming tracks start
+normalized. Browsers without Web Audio use the native volume range.
+External provider previews use the same process and retain their preview limits
+and playback permissions. Seek requests use authenticated byte-range streaming.
+
+The new user preference `playback.normalization.enabled` controls this behavior
+under **Settings → Volume Normalization**. Previous ReplayGain preferences remain
+stored for compatibility; they do not disable the new automatic feature.
 
 For setup, startup, environment, and deployment, see the authoritative root [README](../README.md). For Docker/self-hosting detail, see [Self-Hosting Guide](../docs/SELF_HOSTING.md).
 
@@ -124,7 +195,26 @@ Recently played is stored per authenticated MusicDeck user and trimmed to preven
 
 Favorites are stored per authenticated MusicDeck user and synchronized to the current backend.
 
-Playlist ownership is tracked in MusicDeck. Legacy/unowned playlists remain accessible for compatibility, while owned playlists can only be modified by their owner or an admin.
+Playlist ownership is tracked in MusicDeck. User-created playlists are private:
+list, detail, search, artwork, and modification access is restricted to the
+owner or an administrator. Legacy/unowned playlists remain readable and
+modifiable by authenticated users for compatibility.
+
+### Login throttling
+
+Login uses bounded, process-local fixed-window budgets per client IP and
+normalized username, plus a global concurrent-login cap. All admitted attempts
+count (including successful logins); success does not reset a failed-attempt
+budget. Throttled requests receive generic `429` responses with `Retry-After`.
+Expired entries are removed periodically and on admission; storage exhaustion
+fails closed without evicting live limits. See the [Self-Hosting Guide](../docs/SELF_HOSTING.md#login-limits-and-trusted-proxies)
+for defaults, tuning, and proxy/multiple-instance limitations.
+
+`test/compose-security.test.ts` renders both Compose stacks with Docker Compose
+when available (no daemon or containers are needed). Alternatively, set
+`MUSICDECK_TEST_COMPOSE_BINARY` to a standalone Compose executable. Render tests
+are explicitly skipped if Docker Compose is unavailable; static port-binding
+assertions still run.
 
 ## Profile and Settings Foundation
 

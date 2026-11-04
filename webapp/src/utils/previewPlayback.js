@@ -1,3 +1,5 @@
+import { isBrowserIntegrationAllowed } from "../services/privacyPolicy";
+
 function normalized(value) {
   return String(value || "")
     .normalize("NFKD")
@@ -30,10 +32,11 @@ export async function findItunesPreview(
     : null,
   timeoutMs = ITUNES_PREVIEW_TIMEOUT_MS,
 ) {
+  if (!isBrowserIntegrationAllowed("metadata")) return null;
   const term = `${track?.artist || ""} ${track?.title || ""}`.trim();
   if (!term) return null;
 
-  const url = new URL("https://itunes.apple.com/search");
+  const url = new URL("/api/discovery/itunes-preview", window.location.origin);
   url.searchParams.set("term", term);
   url.searchParams.set("entity", "song");
   url.searchParams.set("limit", "1");
@@ -92,4 +95,22 @@ export async function findItunesPreview(
 
 export function trustedPreviewUrl(value) {
   return isTrustedPreviewUrl(value) ? value : null;
+}
+
+export async function canStreamPreview(value) {
+  if (!trustedPreviewUrl(value)) return false;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(`/api/playback/preview?url=${encodeURIComponent(value)}`, {
+      headers: { Range: "bytes=0-0" },
+      signal: controller.signal,
+    });
+    void response.body?.cancel().catch(() => {});
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }

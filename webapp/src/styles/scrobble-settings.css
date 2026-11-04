@@ -1,0 +1,33 @@
+.scrobble-panel { margin-top: 32px; }
+.scrobble-intro { max-width: 68ch; color: var(--text-primary, #ececec); line-height: 1.65; }
+.scrobble-note, .scrobble-account { color: var(--text-secondary, #aaa); font-size: .875rem; line-height: 1.6; }
+.scrobble-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-top: 24px; }
+.scrobble-card { border: 1px solid var(--border-color, #333); border-top: 3px solid #d34a43; border-radius: 10px; padding: 24px; background: var(--surface-secondary, #191919); min-width: 0; }
+.scrobble-card-listenbrainz { border-top-color: #dba345; }
+.scrobble-card-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
+.scrobble-card h3 { margin: 0; font-size: 1.3rem; letter-spacing: -.025em; }
+.scrobble-status { border: 1px solid currentColor; padding: 4px 8px; border-radius: 4px; font-size: .72rem; color: #c9b27c; }
+.scrobble-status.is-connected { color: #8dd2a0; }
+.scrobble-metrics { margin: 20px 0; border-top: 1px solid var(--border-color, #333); }
+.scrobble-metrics > div { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-color, #333); font-size: .8rem; }
+.scrobble-metrics dt { color: var(--text-secondary, #aaa); }
+.scrobble-metrics dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.scrobble-warning, .scrobble-notice { padding: 12px; border-left: 2px solid #e5af5c; background: #b67b1912; line-height: 1.55; font-size: .85rem; overflow-wrap: anywhere; }
+.scrobble-notice { border-color: #8dd2a0; }
+.scrobble-warning code { display: block; margin-top: 6px; font-size: .75rem; }
+.scrobble-credential { display: grid; gap: 10px; margin-top: 16px; }
+.scrobble-credential label, .scrobble-credential a { font-size: .8rem; }
+.scrobble-credential a { color: #e8bf7c; text-underline-offset: 3px; }
+.scrobble-credential input { min-width: 0; width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid var(--border-color, #555); border-radius: 6px; background: var(--bg-primary, #121212); color: inherit; }
+.scrobble-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.scrobble-actions button, .scrobble-text-button { padding: 9px 11px; border: 1px solid var(--border-color, #555); border-radius: 5px; background: transparent; color: inherit; font-size: .78rem; cursor: pointer; }
+.scrobble-text-button { display: block; margin-top: 12px; border-color: transparent; text-decoration: underline; text-underline-offset: 3px; padding-left: 0; }
+.scrobble-panel button:disabled { opacity: .45; cursor: default; }
+.scrobble-panel :is(button, input, summary, a):focus-visible { outline: 2px solid #e8bf7c; outline-offset: 4px; }
+.scrobble-diagnostics { margin-top: 20px; border-top: 1px solid var(--border-color, #333); padding-top: 16px; font-size: .8rem; }
+.scrobble-diagnostics summary { cursor: pointer; }
+.scrobble-diagnostics ul { list-style: none; padding: 0; margin-bottom: 0; }
+.scrobble-diagnostics li { padding: 12px 0; border-bottom: 1px solid var(--border-color, #333); overflow-wrap: anywhere; }
+.scrobble-diagnostics span { display: block; margin-top: 7px; color: var(--text-secondary, #aaa); }
+.scrobble-diagnostics p { margin: 8px 0; }
+@media (max-width: 800px) { .scrobble-grid { grid-template-columns: 1fr; } .scrobble-card { padding: 18px; } }

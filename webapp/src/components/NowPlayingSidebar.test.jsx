@@ -1,9 +1,12 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render as renderWithOptions, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 
 import NowPlayingSidebar from "./NowPlayingSidebar";
 import { getTrackArtistBiography, getTrackLyrics } from "../api/musicdeck";
 import { getWikipediaBiography } from "../services/biographyFallback";
 import { usePlayer } from "../context/PlayerContext";
+
+const render = (element) => renderWithOptions(element, { wrapper: MemoryRouter });
 
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(() => "/cover.jpg"),
@@ -90,26 +93,29 @@ test("keeps the next queue preview visible and hands off to the queue sidebar", 
 });
 
 test("highlights and centers timed lyrics as playback advances or scrubs", async () => {
-  const scrollIntoView = jest.fn();
-  const previous = Element.prototype.scrollIntoView;
-  Element.prototype.scrollIntoView = scrollIntoView;
+  const scrollTo = jest.fn();
+  const previous = Element.prototype.scrollTo;
+  Element.prototype.scrollTo = scrollTo;
+  const seekToSeconds = jest.fn();
   getTrackLyrics.mockResolvedValue({ syncedLyrics: "[00:00.00] ♪\n[00:15.22] First line\n[00:30.00] Second line", plainLyrics: null });
   const song = { id: "queen-track", title: "Queen Track", artist: "Queen", album: "Queen Album", duration: 180 };
-  usePlayer.mockReturnValue({ currentSong: song, currentTime: 0, queue: [] });
+  usePlayer.mockReturnValue({ currentSong: song, currentTime: 0, queue: [], seekToSeconds });
   const { rerender } = render(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
   expect(await screen.findByText("First line")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "First line" }));
+  expect(seekToSeconds).toHaveBeenCalledWith(15.22);
   expect(document.querySelector(".right-sidebar-lyric-line")).toHaveAttribute("aria-current", "true");
 
   usePlayer.mockReturnValue({ currentSong: song, currentTime: 16, queue: [] });
   rerender(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
   expect(screen.getByText("First line")).toHaveAttribute("aria-current", "true");
-  await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" }));
+  await waitFor(() => expect(scrollTo).toHaveBeenCalledWith({ behavior: expect.any(String), top: expect.any(Number) }));
 
   usePlayer.mockReturnValue({ currentSong: song, currentTime: 31, queue: [] });
   rerender(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
   expect(screen.getByText("Second line")).toHaveAttribute("aria-current", "true");
   expect(getTrackLyrics).toHaveBeenCalledTimes(1);
-  Element.prototype.scrollIntoView = previous;
+  Element.prototype.scrollTo = previous;
 });
 
 test("renders plain lyrics without parsing or auto-scrolling on time updates", async () => {

@@ -1,6 +1,7 @@
 import type { Db } from "../db/database.js";
 import type { Artist } from "../types.js";
 import { normalizeMusicText } from "./music-identity.js";
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 
 const MUSICBRAINZ = "https://musicbrainz.org/ws/2/artist/";
 const WIKIDATA = "https://www.wikidata.org/w/api.php";
@@ -82,7 +83,7 @@ export class MusicBrainzAvatarWorker {
   private readonly negativeUntil = new Map<string, number>();
 
   constructor(private readonly db: Db, private readonly fetchImpl: typeof fetch = fetch,
-    private readonly intervalMs = 1_100) {}
+    private readonly intervalMs = 1_100) { this.fetchImpl = gateFetch(fetchImpl, "artwork"); }
 
   cached(artist: Pick<Artist, "id" | "name">): string | null {
     const row = this.db.prepare("SELECT value FROM settings WHERE key = ?")

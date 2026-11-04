@@ -1,3 +1,4 @@
+import { privacyFetch as fetch, gateFetch } from "../services/PrivacyManager.js";
 export type LyricsTrack = {
   title: string;
   artist: string;
@@ -20,6 +21,9 @@ type LrclibPayload = {
   syncedLyrics?: unknown;
   instrumental?: unknown;
   duration?: unknown;
+  trackName?: unknown;
+  artistName?: unknown;
+  albumName?: unknown;
 };
 
 const FOUND_TTL = 24 * 60 * 60_000;
@@ -27,16 +31,23 @@ const MISSING_TTL = 10 * 60_000;
 const ERROR_TTL = 30_000;
 const LRCLIB_CLIENT = "MusicDeck/0.1.0 (https://github.com/UserPhase/MusicDeck)";
 const LRCLIB_HEADERS = { "Lrclib-Client": LRCLIB_CLIENT, "User-Agent": LRCLIB_CLIENT };
+const SYNC_DURATION_TOLERANCE = 2;
+
+function metadataKey(value: unknown): string {
+  return typeof value === "string" ? value.normalize("NFC").trim().toLowerCase().replace(/\s+/g, " ") : "";
+}
 
 export function parseLrcLines(value: string): ParsedLrcLine[] {
   const lines: ParsedLrcLine[] = [];
+  const offsetMs = Number(value.match(/^\s*\[offset:\s*([+-]?\d+)\s*\]/im)?.[1] ?? 0);
   for (const raw of value.split(/\r?\n/)) {
     const stamps = [...raw.matchAll(/\[(\d{1,3}):([0-5]\d)\.(\d{2,3})\]/g)];
     if (!stamps.length) continue;
     const text = raw.slice(stamps[stamps.length - 1].index! + stamps[stamps.length - 1][0].length).trim();
     for (const stamp of stamps) {
-      lines.push({ time: Number(stamp[1]) * 60 + Number(stamp[2])
-        + Number(stamp[3]) / (stamp[3].length === 2 ? 100 : 1000), text });
+      const timeMs = Number(stamp[1]) * 60_000 + Number(stamp[2]) * 1000
+        + Number(stamp[3].padEnd(3, "0"));
+      lines.push({ time: Math.max(0, timeMs - (Number.isSafeInteger(offsetMs) ? offsetMs : 0)) / 1000, text });
     }
   }
   return lines.sort((left, right) => left.time - right.time);
@@ -49,7 +60,7 @@ function noneResult(instrumental = false): LyricsResult {
 export function sanitizeTrackTitle(title: string): string {
   return title
     .replace(/\s*[([]\s*(?:feat(?:uring)?\.?|ft\.?)\s+[^)\]]+[)\]]/gi, "")
-    .replace(/\s*[([]\s*(?:(?:\d{4}\s*)?remaster(?:ed)?|deluxe(?:\s+edition)?|single|[^)\]]*\bversion)\b[^)\]]*[)\]]/gi, "")
+    .replace(/\s*[([]\s*(?:(?:\d{4}\s*)?remaster(?:ed)?|deluxe(?:\s+edition)?|single)\b[^)\]]*[)\]]/gi, "")
     .replace(/\s*-\s*(?:single|ep|remaster(?:ed)?)\b.*$/gi, "")
     .trim();
 }
@@ -74,7 +85,7 @@ function hasLyrics(data: LrclibPayload): boolean {
 export class LyricsService {
   private readonly cache = new Map<string, { expiresAt: number; value: Promise<LyricsResult> }>();
 
-  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+  constructor(private readonly fetchImpl: typeof fetch = fetch) { this.fetchImpl = gateFetch(fetchImpl); }
 
   private async request(track: LyricsTrack): Promise<LyricsResult> {
     const title = sanitizeTrackTitle(track.title) || track.title.trim();
@@ -96,12 +107,16 @@ export class LyricsService {
     const url = new URL("https://lrclib.net/api/get");
     url.searchParams.set("track_name", title);
     url.searchParams.set("artist_name", artist);
+    if (track.album?.trim()) url.searchParams.set("album_name", track.album.trim());
     url.searchParams.set("duration", String(Math.round(track.durationSeconds)));
     const response = await this.fetchImpl(url, { headers: LRCLIB_HEADERS, signal: AbortSignal.timeout(4_000) });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`LRCLIB returned ${response.status}`);
     const data = await response.json() as LrclibPayload;
-    return hasLyrics(data) || data.instrumental === true ? lyricsFrom(data) : null;
+    if (!hasLyrics(data) && data.instrumental !== true) return null;
+    return lyricsFrom(typeof data.duration === "number"
+      && Math.abs(data.duration - track.durationSeconds) > SYNC_DURATION_TOLERANCE
+      ? { ...data, syncedLyrics: null } : data);
   }
 
   private async search(track: LyricsTrack, title: string, artist: string): Promise<LyricsResult | null> {
@@ -114,14 +129,24 @@ export class LyricsService {
       if (!response.ok) throw new Error(`LRCLIB search returned ${response.status}`);
       const candidates = await response.json() as unknown;
       if (!Array.isArray(candidates)) return null;
-      const best = (candidates as LrclibPayload[])
+      const album = metadataKey(track.album);
+      const durationDifference = (candidate: LrclibPayload) => Math.abs((candidate.duration as number) - track.durationSeconds);
+      const matchesAlbum = (candidate: LrclibPayload) => !!album && metadataKey(candidate.albumName) === album;
+      const results = (candidates as LrclibPayload[])
         .filter((candidate) => candidate && hasLyrics(candidate)
-          && typeof candidate.duration === "number" && Number.isFinite(candidate.duration))
-        .sort((left, right) => Math.abs((left.duration as number) - track.durationSeconds)
-          - Math.abs((right.duration as number) - track.durationSeconds))[0];
-      if (!best || Math.abs((best.duration as number) - track.durationSeconds) > 8) return null;
-      const result = lyricsFrom(best);
-      return result.isSynced || result.plainLyrics ? result : null;
+          && (!candidate.trackName || metadataKey(candidate.trackName) === metadataKey(title))
+          && (!candidate.artistName || metadataKey(candidate.artistName) === metadataKey(name))
+          && typeof candidate.duration === "number" && durationDifference(candidate) <= 8)
+        .map(candidate => ({
+          candidate,
+          result: lyricsFrom(durationDifference(candidate) <= SYNC_DURATION_TOLERANCE
+            ? candidate : { ...candidate, syncedLyrics: null }),
+        }))
+        .filter(({ result }) => result.isSynced || result.plainLyrics)
+        .sort((left, right) => Number(right.result.isSynced) - Number(left.result.isSynced)
+          || Number(matchesAlbum(right.candidate)) - Number(matchesAlbum(left.candidate))
+          || durationDifference(left.candidate) - durationDifference(right.candidate));
+      return results[0]?.result ?? null;
     };
 
     const result = await searchArtist(artist);
@@ -143,7 +168,7 @@ export class LyricsService {
   }
 
   get(trackId: string, track: LyricsTrack): Promise<LyricsResult> {
-    const key = `${trackId}\0${track.title}\0${track.artist}\0${Math.round(track.durationSeconds)}`;
+    const key = `${trackId}\0${track.title}\0${track.artist}\0${metadataKey(track.album)}\0${track.durationSeconds}`;
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
     const entry = {

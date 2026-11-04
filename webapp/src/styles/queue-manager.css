@@ -1,0 +1,24 @@
+.queue-manager { padding: 14px 0; margin: 0 18px; border-bottom: 1px solid #ffffff15; font-size: 12px; }
+.queue-manager[open] { max-height: min(48vh, 420px); overflow-y: auto; flex-shrink: 0; }
+.queue-manager summary { cursor: pointer; font-weight: 600; }
+.queue-manager > label { display: block; margin-top: 16px; color: var(--text-secondary, #aaa); }
+.queue-manager input { width: 100%; box-sizing: border-box; margin: 7px 0; padding: 9px; border: 1px solid #ffffff25; border-radius: 5px; background: #ffffff06; color: inherit; font: inherit; }
+.queue-manager button, .queue-resume-prompt button { cursor: pointer; background: #ffffff08; color: inherit; border: 1px solid #ffffff24; border-radius: 5px; padding: 7px 9px; font: inherit; font-size: 11px; }
+.queue-manager button:disabled, .queue-resume-prompt button:disabled { opacity: .45; cursor: default; }
+.queue-manager button:hover:not(:disabled), .queue-resume-prompt button:hover:not(:disabled) { border-color: var(--accent, #b48afa); background: #b48afa12; }
+.queue-manager-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 5px 0 12px; }
+.queue-manager h4 { font-size: 11px; margin: 18px 0 8px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary, #aaa); }
+.queue-manager ul { list-style: none; padding: 0; }
+.queue-manager li { display: flex; align-items: center; gap: 5px; border-top: 1px solid #ffffff0b; padding: 10px 0; }
+.queue-manager li > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.queue-manager small { display: block; font-size: 10px; color: var(--text-secondary, #aaa); line-height: 1.5; margin-top: 4px; }
+.queue-manager p { font-size: 11px; line-height: 1.5; color: var(--text-secondary, #aaa); }
+.queue-manager .queue-manager-error { color: #f1a5ac; }
+.queue-manager a { color: var(--accent, #b48afa); text-decoration: none; }
+.queue-resume-prompt { position: fixed; z-index: 500; bottom: 108px; left: 50%; transform: translateX(-50%); width: min(620px, calc(100vw - 36px)); box-sizing: border-box; padding: 16px; background: #211b2c; border: 1px solid #b48afa60; border-radius: 10px; box-shadow: 0 12px 48px #0007; display: flex; align-items: center; gap: 12px; color: #f5f2fa; }
+.queue-resume-prompt > div { flex: 1; }
+.queue-resume-prompt strong { font-size: 13px; }
+.queue-resume-prompt p { font-size: 11px; color: #bfb7cd; line-height: 1.5; margin: 6px 0 0; }
+.queue-resume-prompt [role=alert] { color: #f1a5ac; }
+.queue-manager :focus-visible, .queue-resume-prompt :focus-visible { outline: 2px solid var(--accent, #b48afa); outline-offset: 3px; }
+@media(max-width:767px) { .queue-resume-prompt { bottom: 158px; flex-wrap: wrap; } .queue-resume-prompt > div { flex-basis: 100%; } }

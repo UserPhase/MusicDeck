@@ -5,12 +5,15 @@ import { useBranding } from "../../context/BrandingContext";
 
 const ADMIN_NAV_ITEMS = [
   { to: "/admin", label: "Dashboard", icon: "▦", end: true },
+  { to: "/admin/activity", label: "Activity Center", icon: "◷" },
   { to: "/admin/users", label: "Users", icon: "◉" },
   { to: "/admin/library", label: "Library", icon: "♫" },
   { to: "/admin/sources", label: "Sources & Providers", icon: "⇄" },
   { to: "/admin/plugins", label: "Plugins", icon: "🧩" },
+  { to: "/admin/sonic", label: "Sonic analysis", icon: "≋" },
   { to: "/admin/appearance", label: "Appearance", icon: "🎨" },
   { to: "/admin/server", label: "Server", icon: "🖥" },
+  { to: "/admin/setup-recovery", label: "Setup & Recovery", icon: "↺" },
 ];
 
 

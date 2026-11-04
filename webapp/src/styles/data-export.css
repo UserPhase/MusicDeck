@@ -1,0 +1,29 @@
+.data-export-panel { margin-top: 24px; }
+.data-export-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+.data-export-heading h2 { margin: 5px 0 8px; }
+.data-export-heading p, .data-export-card > p { color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.data-export-eyebrow, .data-export-index { color: var(--accent-text, var(--accent)); font-size: 10px; font-weight: 700; letter-spacing: .14em; }
+.data-export-heading > button { flex: none; }
+.data-export-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.data-export-card { display: flex; flex-direction: column; align-items: stretch; min-width: 0; gap: 12px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.data-export-card h3 { font-size: 18px; letter-spacing: -.025em; margin: 0; }
+.data-export-card > small { color: var(--text-muted); font-size: 11px; }
+.data-export-card label { display: flex; flex-direction: column; min-width: 0; gap: 6px; color: var(--text-secondary); font-size: 12px; }
+.data-export-selects { display: grid; grid-template-columns: minmax(0, 2fr) minmax(85px, 1fr); gap: 10px; }
+.data-export-card select { width: 100%; max-width: 100%; min-width: 0; padding: 10px; background: var(--bg-app); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.data-export-card .data-export-metric { display: flex; align-items: baseline; gap: 6px; color: var(--text-muted); margin-top: auto; padding-top: 12px; font-size: 12px; }
+.data-export-metric strong { font-size: 24px; letter-spacing: -.04em; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); }
+.data-export-metric span { margin-left: auto; font-variant-numeric: tabular-nums; }
+.data-export-card .data-export-download { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--card-hover); color: var(--text); text-align: left; }
+.data-export-card .data-export-download:hover:not(:disabled) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.data-export-bundle .data-export-download { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); color: var(--accent-text, var(--text)); }
+.data-export-bundle { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); box-shadow: inset 2px 0 0 var(--accent); }
+.data-export-settings-link { padding: 3px 0; background: transparent; color: var(--text-secondary); border: 0; text-decoration: underline; font: inherit; font-size: 11px; cursor: pointer; }
+.data-export-error { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 0; color: var(--danger-text, #fda4af); font-size: 13px; }
+.data-export-message { margin-top: 16px; color: var(--accent-text, var(--text)); font-size: 13px; }
+.data-export-notes { margin-top: 18px; font-size: 12px; line-height: 1.7; color: var(--text-muted); }
+.data-export-notes summary { cursor: pointer; color: var(--text-secondary); }
+.data-export-notes ul { margin: 12px 0; padding-left: 20px; }
+.data-export-panel button:focus-visible, .data-export-panel select:focus-visible, .data-export-notes summary:focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
+.data-export-panel button:disabled { opacity: .5; cursor: not-allowed; }
+@media (max-width: 700px) { .data-export-grid { grid-template-columns: minmax(0, 1fr); } .data-export-heading { align-items: flex-start; flex-direction: column; gap: 12px; } .data-export-card { padding: 16px; } }

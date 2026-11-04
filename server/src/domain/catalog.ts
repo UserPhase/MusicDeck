@@ -1,8 +1,12 @@
 import type { Album, Artist, Track } from "../types.js";
+import { randomUUID } from "node:crypto";
 import type { CatalogProvider } from "../backends/catalog-provider.js";
 import type { ProviderRegistry, RegisteredProvider } from "../backends/registry.js";
 import { LibraryService, type LibraryItemType } from "./library.js";
 import { redactText, serverLogs, type LogBuffer } from "../utils/logger.js";
+import type { TaskManager, TaskRunContext } from "../services/TaskManager.js";
+import { trackContentHint } from "../services/media/contentRevision.js";
+import { isTrackCreditedTo } from "../utils/artistMetadata.js";
 
 /**
  * MusicDeck-owned availability summary attached to catalog read-model items.
@@ -46,6 +50,8 @@ export type CatalogListResult<T> = {
   items: Array<Available<T>>;
   degraded: boolean;
 };
+type WindowSnapshot<T> = CatalogListResult<T> & { revision: string };
+const WINDOW_TTL_MS = 30_000;
 
 export type CatalogSearchResult = {
   artists: Array<Available<Artist>>;
@@ -105,18 +111,64 @@ function availabilityFor(connectionId: string, totalSources: number, availableSo
  * preserved as-is until the stable-ID phase.
  */
 export class CatalogService {
+  private readonly trackSnapshotListeners = new Set<(snapshot: CatalogListResult<Track>) => void>();
+
+  subscribeTrackSnapshots(listener: (snapshot: CatalogListResult<Track>) => void): () => void {
+    this.trackSnapshotListeners.add(listener);
+    return () => { this.trackSnapshotListeners.delete(listener); };
+  }
+
+  private taskManager?: TaskManager;
+  private readonly scanOutcomes = new Map<string, { attempted: number; failures: unknown[] }>();
+
+  bindTaskManager(manager: TaskManager): void {
+    this.taskManager = manager;
+  }
+
+  async refreshIndex(task: TaskRunContext, batchSize = 50): Promise<void> {
+    let processed = 0;
+    const snapshot: Array<Available<Track>> = [];
+    for (const entry of this.connections()) {
+      await task.checkpoint();
+      const tracks = await entry.provider.listTracks();
+      for (let offset = 0; offset < tracks.length; offset += batchSize) {
+        await task.checkpoint();
+        for (const track of tracks.slice(offset, offset + batchSize)) {
+          snapshot.push({ ...this.stamp(track, "track", entry.connectionId),
+            availability: availabilityFor(entry.connectionId, 1, 1) });
+          processed++;
+        }
+        task.report({
+          itemsProcessed: processed,
+          totalItems: null,
+          message: "Refreshing library track identities",
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    this.trackWindow = null;
+    this.albumWindow = null;
+    this.trackSnapshotListeners.forEach((listener) => listener({ items: snapshot, degraded: false }));
+  }
+  private trackWindow: { expires: number; value: Promise<WindowSnapshot<Track>>; degraded?: boolean } | null = null;
+  private albumWindow: { expires: number; value: Promise<WindowSnapshot<Album>> } | null = null;
   constructor(
     private readonly registry: ProviderRegistry,
     private readonly library: LibraryService,
     private readonly logger: Pick<LogBuffer, "push"> = serverLogs,
+    private readonly importedGain?: (track: Track) => number | { gainDb: number; integratedLufs: number; truePeakDb: number } | undefined,
   ) {}
 
   private connections(): RegisteredProvider[] {
     return this.registry.list();
   }
 
-  private primary(): CatalogProvider {
-    return this.registry.getPrimary().provider;
+  private mappedSource(libraryItemId: string) {
+    for (const source of this.library.getSources(libraryItemId)) {
+      const entry = this.registry.getByConnectionId(source.connectionId);
+      if (entry?.enabled) return { ...source, provider: entry.provider };
+    }
+    return null;
   }
 
   /**
@@ -173,8 +225,11 @@ export class CatalogService {
     type: LibraryItemType,
     connectionId: string
   ): T {
-    const mdId = this.library.ensureId(type, { connectionId, providerItemId: item.id });
-    return { ...item, id: mdId };
+    const mdId = this.library.ensureId(type, { connectionId, providerItemId: item.id }, type === "track" ? trackContentHint(item) : undefined);
+    const measured = type === "track" ? this.importedGain?.({ ...item, id: mdId } as T & Track) : undefined;
+    const gain = typeof measured === "object" ? measured.gainDb : measured;
+    return { ...item, id: mdId, ...(Number.isFinite(gain) ? { normalizationGainDb: gain } : {}),
+      ...(typeof measured === "object" ? { loudness: { integratedLufs: measured.integratedLufs, truePeakDb: measured.truePeakDb } } : {}) };
   }
 
   /**
@@ -209,7 +264,7 @@ export class CatalogService {
    * same connection's library mappings. A relationship the provider does not
    * expose (null/empty) is preserved as null — no ID is fabricated.
    */
-  private withStableTrackId<T extends { id: string; albumId: string | null; artistId: string | null }>(
+  private withStableTrackId<T extends Pick<Track, "id" | "albumId" | "artistId" | "artistCredits">>(
     track: T,
     connectionId: string
   ): T {
@@ -223,6 +278,10 @@ export class CatalogService {
       artistId: track.artistId
         ? this.library.ensureId("artist", { connectionId, providerItemId: track.artistId })
         : null,
+      ...(track.artistCredits?.length ? { artistCredits: track.artistCredits.map((credit) => ({
+        ...credit,
+        id: credit.id ? this.library.ensureId("artist", { connectionId, providerItemId: credit.id }) : null,
+      })) } : {}),
     };
   }
 
@@ -252,7 +311,8 @@ export class CatalogService {
     type: LibraryItemType,
     connectionId: string
   ): T {
-    const withArtwork = this.withStableArtwork(item, connectionId);
+    const connection = this.registry.getByConnectionId(connectionId);
+    const withArtwork: T = { ...this.withStableArtwork(item, connectionId), sourceServer: connection?.type };
 
     if (type === "track") {
       return this.withStableTrackId(withArtwork as T & { albumId: string | null; artistId: string | null }, connectionId) as T;
@@ -264,14 +324,6 @@ export class CatalogService {
     }
 
     return this.withStableId(withArtwork, type, connectionId);
-  }
-
-  /**
-   * Resolve a public MusicDeck ID back to the provider-native ID for its
-   * primary source. Returns null when the ID is not a known library item.
-   */
-  private toProviderId(libraryItemId: string): string | null {
-    return this.library.getPrimarySource(libraryItemId)?.providerItemId ?? null;
   }
 
   /**
@@ -358,8 +410,80 @@ export class CatalogService {
     return this.aggregate(await this.runReads("listArtists", (provider) => provider.listArtists()), "artist");
   }
 
-  async listTracks(): Promise<CatalogListResult<Track>> {
+  private async readTracks(): Promise<CatalogListResult<Track>> {
     return this.aggregate(await this.runReads("listTracks", (provider) => provider.listTracks()), "track");
+  }
+
+  async listTracks(): Promise<CatalogListResult<Track>> {
+    const window = this.trackWindow;
+    const result = await this.readTracks();
+    // A live read can observe an outage or recovery before the snapshot expires.
+    if (window && this.trackWindow === window && window.degraded !== undefined && window.degraded !== result.degraded) {
+      this.trackWindow = {
+        expires: Date.now() + WINDOW_TTL_MS,
+        value: Promise.resolve({ ...result, revision: randomUUID() }),
+        degraded: result.degraded,
+      };
+    }
+    return result;
+  }
+
+  /**
+   * Full, uncached listings for diagnostics. `listedConnectionIds` names the
+   * connections whose track listing succeeded, so callers only judge items
+   * missing from a source that actually answered.
+   */
+  async auditSnapshot(): Promise<{
+    tracks: CatalogListResult<Track>;
+    albums: CatalogListResult<Album>;
+    artists: CatalogListResult<Artist>;
+    listedConnectionIds: string[];
+    albumsComplete: boolean;
+  }> {
+    const [trackReads, albumReads, artistReads] = await Promise.all([
+      this.runReads("listTracks", (provider) => provider.listTracks()),
+      this.runReads("listAllAlbums", (provider) =>
+        provider.listAllAlbums ? provider.listAllAlbums() : provider.listAlbums()),
+      this.runReads("listArtists", (provider) => provider.listArtists()),
+    ]);
+    return {
+      tracks: this.aggregate(trackReads, "track"),
+      albums: this.aggregate(albumReads, "album"),
+      artists: this.aggregate(artistReads, "artist"),
+      listedConnectionIds: trackReads.filter((read) => read.ok).map((read) => read.entry.connectionId),
+      albumsComplete: albumReads.every((read) => read.ok && typeof read.entry.provider.listAllAlbums === "function"),
+    };
+  }
+
+  /** Share full track enumeration across viewport reads and background indexes. */
+  async tracksForWindow(): Promise<WindowSnapshot<Track>> {
+    if (!this.trackWindow || this.trackWindow.expires <= Date.now()) {
+      const revision = randomUUID();
+      const value = this.readTracks().then((result) => {
+        if (this.trackWindow === entry) {
+          this.trackWindow = { ...entry, expires: Date.now() + WINDOW_TTL_MS, degraded: result.degraded };
+        }
+        return { ...result, revision };
+      });
+      // Even a slow provider read stays shared until it settles.
+      const entry = { expires: Infinity, value };
+      this.trackWindow = entry;
+      value.catch(() => { if (this.trackWindow === entry) this.trackWindow = null; });
+    }
+    return this.trackWindow.value;
+  }
+
+  async albumsForWindow(): Promise<WindowSnapshot<Album>> {
+    if (!this.albumWindow || this.albumWindow.expires < Date.now()) {
+      const revision = randomUUID();
+      const value = this.runReads("listAllAlbums", (provider) =>
+        provider.listAllAlbums ? provider.listAllAlbums() : provider.listAlbums())
+        .then((results) => ({ ...this.aggregate(results, "album"), revision }));
+      const entry = { expires: Date.now() + WINDOW_TTL_MS, value };
+      this.albumWindow = entry;
+      value.catch(() => { if (this.albumWindow === entry) this.albumWindow = null; });
+    }
+    return this.albumWindow.value;
   }
 
   async getRandomAlbums(limit?: number): Promise<CatalogListResult<Album>> {
@@ -412,29 +536,25 @@ export class CatalogService {
     return { artists, albums, tracks, degraded: availableSources < totalSources };
   }
 
-  // Detail endpoints accept a stable MusicDeck ID, resolve it to the primary
-  // source's provider-native ID, and fetch from the primary provider. An
-  // unknown MusicDeck ID resolves to null -> clean not-found. Source failover
-  // across multiple sources is intentionally not implemented yet.
-  // Availability is not stamped on detail results in this phase.
+  // Provider IDs are scoped to their mapped connection; never send one
+  // connection's native ID to another server.
 
   async getAlbum(albumId: string): Promise<Album | null> {
-    const providerId = this.toProviderId(albumId);
-    if (!providerId) {
+    const source = this.mappedSource(albumId);
+    if (!source) {
       return null;
     }
-    const album = await this.primary().getAlbum(providerId);
+    const album = await source.provider.getAlbum(source.providerItemId);
     if (!album) return null;
-    const connectionId = this.library.getPrimarySource(albumId)!.connectionId;
-    return this.stamp(album, "album", connectionId);
+    return this.withDetailAvailability(this.stamp(album, "album", source.connectionId), source.connectionId);
   }
 
   async getAlbumTracks(albumId: string): Promise<Track[]> {
-    const source = this.library.getPrimarySource(albumId);
+    const source = this.mappedSource(albumId);
     if (!source) {
       return [];
     }
-    const tracks = await this.primary().getAlbumTracks(source.providerItemId);
+    const tracks = await source.provider.getAlbumTracks(source.providerItemId);
     return tracks.map((track) =>
       this.withDetailAvailability(
         this.stamp(track, "track", source.connectionId),
@@ -444,32 +564,38 @@ export class CatalogService {
   }
 
   async getArtist(artistId: string, options?: { includeArtistInfo?: boolean }): Promise<Artist | null> {
-    const source = this.library.getPrimarySource(artistId);
+    const source = this.mappedSource(artistId);
     if (!source) {
       return null;
     }
-    const artist = await this.primary().getArtist(source.providerItemId, options);
+    const artist = await source.provider.getArtist(source.providerItemId, options);
+    if (artist?.imageUrl && artist.imageUrl === artist.artworkUrl
+      && this.registry.getByConnectionId(source.connectionId)?.type === "jellyfin") {
+      const stamped = this.stamp(artist, "artist", source.connectionId);
+      return { ...stamped, imageUrl: stamped.artworkUrl };
+    }
     return artist ? this.withStableId(artist, "artist", source.connectionId) : null;
   }
 
   async getArtistAlbums(artistId: string): Promise<Album[]> {
-    const source = this.library.getPrimarySource(artistId);
+    const source = this.mappedSource(artistId);
     if (!source) {
       return [];
     }
-    const albums = await this.primary().getArtistAlbums(source.providerItemId);
+    const albums = await source.provider.getArtistAlbums(source.providerItemId);
+    const sourceServer = this.registry.getByConnectionId(source.connectionId)?.type;
     return albums.filter((album) => !album.artistId || album.artistId === source.providerItemId).map((album) =>
-      ({ ...this.withStableId(album, "album", source.connectionId), artistId })
+      ({ ...this.withStableId(album, "album", source.connectionId), artistId, sourceServer })
     );
   }
 
   async getArtistTracks(artistId: string): Promise<Track[]> {
-    const source = this.library.getPrimarySource(artistId);
+    const source = this.mappedSource(artistId);
     if (!source) {
       return [];
     }
-    const tracks = await this.primary().getArtistTracks(source.providerItemId);
-    return tracks.filter((track) => track.artistId === source.providerItemId).map((track) =>
+    const tracks = await source.provider.getArtistTracks(source.providerItemId);
+    return tracks.filter((track) => isTrackCreditedTo(track, source.providerItemId)).map((track) =>
       this.withDetailAvailability(
         this.stamp(track, "track", source.connectionId),
         source.connectionId
@@ -478,11 +604,15 @@ export class CatalogService {
   }
 
   async getTrack(trackId: string): Promise<Track | null> {
-    const source = this.library.getPrimarySource(trackId);
+    const source = this.mappedSource(trackId);
     if (!source) {
       return null;
     }
-    const track = await this.primary().getTrack(source.providerItemId);
+    const track = await source.provider.getTrack(source.providerItemId);
+    if (track) {
+      this.library.ensureId("track", { connectionId: source.connectionId, providerItemId: source.providerItemId }, trackContentHint(track));
+      await this.library.refreshContentRevision(trackId, source.connectionId);
+    }
     return track
       ? this.withDetailAvailability(
           this.stamp(track, "track", source.connectionId),
@@ -492,23 +622,49 @@ export class CatalogService {
   }
 
   async getTrackFilePath(trackId: string): Promise<string | null> {
-    const source = this.library.getPrimarySource(trackId);
+    return (await this.resolveTrackFile(trackId))?.filePath ?? null;
+  }
+
+  getSourceConnectionId(itemId: string): string | null {
+    return this.mappedSource(itemId)?.connectionId ?? null;
+  }
+
+  /** Keep the path and owning connection together. An explicit album source
+   * must never fall back to deleting another provider's copy of a track. */
+  async resolveTrackFile(trackId: string, connectionId?: string): Promise<{ connectionId: string; filePath: string | null } | null> {
+    const source = connectionId
+      ? this.library.getSources(trackId).find(candidate => candidate.connectionId === connectionId)
+      : this.mappedSource(trackId);
     if (!source) return null;
     const entry = this.registry.getByConnectionId(source.connectionId);
-    if (!entry?.enabled || !entry.provider.getTrackFilePath) return null;
-    return entry.provider.getTrackFilePath(source.providerItemId);
+    if (!entry?.enabled) return null;
+    const filePath = await entry.provider.getTrackFilePath?.(source.providerItemId) ?? null;
+    return { connectionId: source.connectionId, filePath };
+  }
+
+  /** Administrative file operations request a scan on the owning source.
+   * Prefer the nonblocking scan trigger when that provider supports it. */
+  async requestLibraryRescan(connectionId: string): Promise<void> {
+    const entry = this.registry.getByConnectionId(connectionId);
+    if (!entry?.enabled) throw new Error("The owning library source is unavailable");
+    this.library.invalidateConnectionContent(connectionId);
+    this.trackWindow = null;
+    this.albumWindow = null;
+    if (entry.provider.requestLibraryRescan) await entry.provider.requestLibraryRescan();
+    else if (entry.provider.scanLibrary) await entry.provider.scanLibrary();
+    else throw new Error("The owning library source does not support rescanning");
   }
 
   async getArtistTopTracks(artistId: string, limit = 10): Promise<Track[]> {
-    const source = this.library.getPrimarySource(artistId);
+    const source = this.mappedSource(artistId);
     if (!source) return [];
-    const provider = this.primary();
+    const provider = source.provider;
     const tracks = provider.getArtistTopTracks
       ? await provider.getArtistTopTracks(source.providerItemId, limit)
       : (await provider.getArtistTracks(source.providerItemId))
           .sort((left, right) => (right.playCount || 0) - (left.playCount || 0))
           .slice(0, limit);
-    return tracks.filter((track) => track.artistId === source.providerItemId)
+    return tracks.filter((track) => isTrackCreditedTo(track, source.providerItemId))
       .slice(0, limit)
       .map((track) => this.withDetailAvailability(
         this.stamp(track, "track", source.connectionId), source.connectionId
@@ -519,13 +675,9 @@ export class CatalogService {
     provider: CatalogProvider;
     providerTrackId: string;
   } | null {
-    const source = this.library.getPrimarySource(trackId);
+    const source = this.mappedSource(trackId);
     if (!source) return null;
-
-    const entry = this.registry.getByConnectionId(source.connectionId);
-    if (!entry?.enabled) return null;
-
-    return { provider: entry.provider, providerTrackId: source.providerItemId };
+    return { provider: source.provider, providerTrackId: source.providerItemId };
   }
 
   async getTrackLyrics(trackId: string): Promise<string | null> {
@@ -547,12 +699,38 @@ export class CatalogService {
    * collected rather than thrown so one broken connection cannot block the
    * rest; callers that care (the scan scheduler) inspect the summary.
    */
-  async scanLibrary(): Promise<{ attempted: number; failures: unknown[] }> {
+  async scanLibrary(task?: TaskRunContext): Promise<{ attempted: number; failures: unknown[] }> {
+    if (this.taskManager && !task) {
+      const queued = this.taskManager.enqueue("LIBRARY_SCAN", {}, "system");
+      this.scanOutcomes.set(queued.id, { attempted: 0, failures: [] });
+      try {
+        const settled = await this.taskManager.waitForSettlement(queued.id);
+        const result = this.scanOutcomes.get(queued.id)!;
+        if (settled.state !== "FINISHED" && !result.failures.length) {
+          throw new Error(settled.error ?? "Library scan cancelled");
+        }
+        return result;
+      } finally {
+        this.scanOutcomes.delete(queued.id);
+      }
+    }
     const scanners = this.connections().filter((entry) => typeof entry.provider.scanLibrary === "function");
-    const results = await Promise.allSettled(scanners.map((entry) => entry.provider.scanLibrary!()));
-    return {
-      attempted: scanners.length,
-      failures: results.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
-    };
+    const failures: unknown[] = [];
+    for (const [index, entry] of scanners.entries()) {
+      await task?.checkpoint();
+      try {
+        await entry.provider.scanLibrary!();
+        this.library.invalidateConnectionContent(entry.connectionId);
+        this.trackWindow = null;
+      } catch (error) {
+        task?.throwIfCancelled();
+        failures.push(error);
+      }
+      task?.report({ percent: (index + 1) / scanners.length * 100, message: "Requesting provider library scans" });
+    }
+    task?.throwIfCancelled();
+    const result = { attempted: scanners.length, failures };
+    if (task && this.scanOutcomes.has(task.taskId)) this.scanOutcomes.set(task.taskId, result);
+    return result;
   }
 }

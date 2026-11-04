@@ -14,6 +14,56 @@ function tempDbPath() {
 }
 
 describe("migrations", () => {
+  test("opens a legacy file in WAL mode and applies the catalog indexes once", async () => {
+    const databasePath = tempDbPath();
+    const legacy = new Database(databasePath);
+    try {
+      legacy.pragma("journal_mode = DELETE");
+      runMigrations(legacy, 49);
+      legacy.prepare("INSERT INTO settings VALUES (?, ?, CURRENT_TIMESTAMP)").run("fixture", "before");
+    } finally { legacy.close(); }
+
+    const config = loadConfig({ databasePath });
+    const db = await openDatabase(config);
+    let applied: unknown;
+    try {
+      expect(db.pragma("journal_mode", { simple: true })).toBe("wal");
+      expect(db.pragma("busy_timeout", { simple: true })).toBe(5000);
+      expect(db.pragma("synchronous", { simple: true })).toBe(2);
+      applied = db.prepare("SELECT * FROM schema_migrations WHERE id = 50").get();
+      expect(applied).toMatchObject({ name: "catalog-and-playlist-query-indexes" });
+
+      const plans = [
+        ["SELECT id FROM playlists WHERE owner_user_id = 'user' AND deleted_at IS NULL", "playlists_owner_deleted_idx"],
+        ["SELECT id FROM smart_playlist_tracks WHERE artist COLLATE NOCASE = 'Artist' ORDER BY title COLLATE NOCASE, id", "smart_tracks_artist"],
+        ["SELECT id FROM smart_playlist_tracks WHERE album COLLATE NOCASE = 'Album' ORDER BY title COLLATE NOCASE, id", "smart_tracks_album"],
+        ["SELECT id FROM smart_playlist_tracks WHERE title COLLATE NOCASE = 'Song'", "smart_tracks_title"],
+        ["SELECT id FROM listening_events WHERE user_id = 'user' AND counted = 1 AND created_at >= '2026' ORDER BY created_at DESC, id DESC", "listening_activity_history_idx"],
+      ];
+      for (const [query, index] of plans) {
+        const plan = db.prepare<[], { detail: string }>(`EXPLAIN QUERY PLAN ${query}`).all();
+        expect(plan.some(({ detail }) => detail.includes(`SEARCH`) && detail.includes(index))).toBe(true);
+      }
+
+      const reader = new Database(databasePath, { readonly: true, fileMustExist: true });
+      try {
+        const read = reader.prepare("SELECT value FROM settings WHERE key = 'fixture'").pluck();
+        db.transaction(() => {
+          db.prepare("UPDATE settings SET value = 'after' WHERE key = 'fixture'").run();
+          expect(read.get()).toBe("before");
+        }).immediate();
+        expect(read.get()).toBe("after");
+      } finally { reader.close(); }
+    } finally { db.close(); }
+
+    const reopened = await openDatabase(config);
+    try {
+      expect(reopened.prepare("SELECT * FROM schema_migrations WHERE id = 50").get()).toEqual(applied);
+      expect(reopened.prepare("SELECT value FROM settings WHERE key = 'fixture'").pluck().get()).toBe("after");
+      expect(reopened.pragma("busy_timeout", { simple: true })).toBe(5000);
+    } finally { reopened.close(); }
+  });
+
   test("removes saved Lidarr credentials without touching other plugins", async () => {
     const db = await openDatabase(loadConfig({ databasePath: tempDbPath() }));
     const insert = db.prepare(`

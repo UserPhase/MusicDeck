@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
@@ -30,10 +31,10 @@ usermod --non-unique --uid "$PUID" --gid "$PGID" musicdeck
 mkdir -p /app/home /app/data /app/config /app/cache
 chown -R "$PUID:$PGID" /app/home /app/data /app/config /app/cache
 
-# YouTube extractors change frequently. Refresh at most once per day on
-# container startup; keep the image's working packages if the update service
-# is offline or slow. Set SPOTDL_AUTO_UPDATE=0 for fully fixed deployments.
-if [ "${SPOTDL_AUTO_UPDATE:-1}" = "1" ]; then
+# YouTube extractors change frequently. Refresh at most once per day only when
+# explicitly enabled by setting SPOTDL_AUTO_UPDATE=1. Default startup behavior
+# keeps image-pinned dependencies unchanged.
+if [ "${SPOTDL_AUTO_UPDATE:-0}" = "1" ]; then
   update_stamp=/app/cache/spotdl-last-update
   now="$(date +%s)"
   last_update=0

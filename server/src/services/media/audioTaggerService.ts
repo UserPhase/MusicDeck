@@ -5,6 +5,9 @@ import path from "node:path";
 import { DefaultProcessRunner, type ProcessRunner } from "../../domain/process-runner.js";
 import { autoDetectFFmpegPath } from "../../domain/spotdl-downloader-adapter.js";
 import { flushFile, flushDirectory, safeMusicPath } from "./safeMusicPath.js";
+import { privacyArtworkFetch as fetch, gateFetch } from "../PrivacyManager.js";
+import { isPlaceholderArtist, isPlaceholderAlbumArtist } from "../../utils/artistMetadata.js";
+import { isSupportedAudioFile } from "../../domain/audio-containers.js";
 
 export type CanonicalAudioMetadata = {
   title: string; artists: string[]; album: string; albumArtist?: string | null;
@@ -25,7 +28,7 @@ const clean = (value: unknown): string | null => typeof value === "string" && va
 const normalized = (value: string) => value.normalize("NFKC").trim().toLowerCase();
 const year = (value: unknown): string | null => String(value ?? "").match(/\b\d{4}\b/)?.[0] || null;
 export function isInvalidArtist(value: string | null | undefined): boolean {
-  return !value?.trim() || /unknown/i.test(value) || /^various\s+artists?$/i.test(value.trim());
+  return isPlaceholderArtist(value);
 }
 function matches(actual: string | null, expected: string | null): boolean {
   return !expected || (Boolean(actual?.trim()) && normalized(actual!) === normalized(expected));
@@ -38,7 +41,7 @@ export function needsMetadataRepair(tags: AudioTagInspection, expected: Canonica
     || artists.some((artist) => !actualArtists.includes(normalized(artist)))
     || !matches(tags.title, clean(expected.title)) || !matches(tags.album, clean(expected.album))
     || !matches(tags.albumArtist, clean(expected.albumArtist) || artists[0] || null)
-    || /unknown/i.test(tags.albumArtist || "")
+    || isPlaceholderAlbumArtist(tags.albumArtist)
     || (expectedYear !== null && !matches(year(tags.year), expectedYear))
     || (Boolean(clean(expected.isrc)) && !matches(tags.isrc, clean(expected.isrc)))
     || (Boolean(clean(expected.artworkUrl)) && !tags.hasArtwork);
@@ -46,10 +49,11 @@ export function needsMetadataRepair(tags: AudioTagInspection, expected: Canonica
 
 /** spotDL installs Mutagen already; inspection must not require a separate ffprobe install. */
 export const NATIVE_TAG_INSPECT = String.raw`
-import sys, json
+import sys, json, base64
 import hashlib
 from mutagen import File
 from mutagen.id3 import ID3
+from mutagen.flac import Picture
 filename = sys.argv[1]
 audio = File(filename)
 if audio is None: raise RuntimeError('Unsupported or invalid audio file')
@@ -73,6 +77,11 @@ elif getattr(audio, 'pictures', None):
     image_data = [picture.data for picture in audio.pictures]
 elif tags.get('covr'):
     image_data = [bytes(image) for image in tags.get('covr')]
+elif tags.get('metadata_block_picture'):
+    image_data = []
+    for encoded in tags.get('metadata_block_picture'):
+        try: image_data.append(Picture(base64.b64decode(encoded)).data)
+        except (ValueError, TypeError): pass
 else:
     image_data = []
 artwork = [hashlib.sha256(data).hexdigest() for data in image_data if data]
@@ -94,7 +103,7 @@ print(json.dumps({
  * Untouched fields and pictures are compared after saving before publication.
  */
 export const NATIVE_TAG_MERGE = String.raw`
-import sys, json, copy, hashlib
+import sys, json, copy, hashlib, base64
 from mutagen import File
 from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TPE2, TALB, TDRC, TSRC, APIC
 from mutagen.flac import Picture
@@ -102,9 +111,14 @@ from mutagen.mp4 import MP4Cover
 filename, payload, cover = sys.argv[1:4]
 m = json.loads(payload)
 ext = filename.rsplit('.', 1)[-1].lower()
-if ext == 'mp3':
-    try: tags = ID3(filename, translate=False)
-    except ID3NoHeaderError: tags = ID3()
+if ext in ('mp3', 'wav'):
+    wave = File(filename) if ext == 'wav' else None
+    if wave is not None:
+        if wave.tags is None: wave.add_tags()
+        tags = wave.tags
+    else:
+        try: tags = ID3(filename, translate=False)
+        except ID3NoHeaderError: tags = ID3()
     version = tags.version[1] if tags.version[1] in (3, 4) else 4
     edited = {'TIT2', 'TPE1', 'TPE2', 'TALB'}
     if m.get('year'): edited.add('TDRC'); edited.add('TYER')
@@ -131,9 +145,10 @@ if ext == 'mp3':
     if cover and (m.get('replaceArtwork') or not tags.getall('APIC')):
         with open(cover, 'rb') as f: data = f.read()
         tags.add(APIC(encoding=3, mime=m['coverMime'], type=3, desc='Cover', data=data))
-    tags.save(filename, v2_version=version, v23_sep='; ')
-    after = snapshot(ID3(filename, translate=False))
-    after_tags = ID3(filename, translate=False)
+    if wave is not None: wave.save(v2_version=version, v23_sep='; ')
+    else: tags.save(filename, v2_version=version, v23_sep='; ')
+    after_tags = File(filename).tags if wave is not None else ID3(filename, translate=False)
+    after = snapshot(after_tags)
     if any(value not in [hashlib.sha256(frame.data).hexdigest() for frame in after_tags.getall('APIC')] for value in preserved_pictures):
         raise RuntimeError('A non-front ID3 picture changed during repair')
     if added_cover: after = {k:v for k,v in after.items() if not k.startswith('APIC:')}
@@ -152,6 +167,7 @@ else:
     before = snapshot(audio)
     pictures = [p.write() for p in getattr(audio, 'pictures', [])]
     preserved_pictures = [p.write() for p in getattr(audio, 'pictures', []) if p.type != 3] if m.get('replaceArtwork') else pictures
+    preserved_blocks = []
     for key, tag in names.items():
         if m.get(key):
             value = m[key].encode('utf-8') if mp4 and key == 'isrc' else m[key]
@@ -173,6 +189,16 @@ else:
                     if picture.type != 3: audio.add_picture(picture)
             if m.get('replaceArtwork') or expected_hash not in [hashlib.sha256(picture.data).hexdigest() for picture in existing]:
                 p = Picture(); p.data = data; p.type = 3; p.mime = m['coverMime']; audio.add_picture(p)
+        elif ext in ('ogg', 'opus'):
+            for encoded in audio.tags.get('metadata_block_picture', []):
+                try: old_picture = Picture(base64.b64decode(encoded))
+                except (ValueError, TypeError):
+                    preserved_blocks.append(encoded); continue
+                if not m.get('replaceArtwork') or old_picture.type != 3:
+                    preserved_blocks.append(encoded)
+            p = Picture(); p.data = data; p.type = 3; p.mime = m['coverMime']
+            encoded = base64.b64encode(p.write()).decode('ascii')
+            audio.tags['metadata_block_picture'] = [encoded] + [old for old in preserved_blocks if old != encoded]
     audio.save()
     reread = File(filename)
     after = snapshot(reread)
@@ -180,13 +206,15 @@ else:
     reread_pictures = [p.write() for p in getattr(reread, 'pictures', [])]
     if any(picture not in reread_pictures for picture in preserved_pictures):
         raise RuntimeError('Embedded artwork changed during repair')
+    if any(block not in reread.tags.get('metadata_block_picture', []) for block in preserved_blocks):
+        raise RuntimeError('Embedded Vorbis artwork changed during repair')
 `;
 
 export class AudioTaggerService {
   private readonly runner: ProcessRunner;
   private readonly fetchImpl: typeof fetch;
   constructor(private readonly options: AudioTaggerOptions = {}) {
-    this.runner = options.processRunner || new DefaultProcessRunner(); this.fetchImpl = options.fetchImpl || fetch;
+    this.runner = options.processRunner || new DefaultProcessRunner(); this.fetchImpl = gateFetch(options.fetchImpl || fetch, "artwork");
   }
   private tools() {
     const tools = this.options.getTools?.() || this.options;
@@ -195,6 +223,10 @@ export class AudioTaggerService {
       python: tools.pythonPath || (process.platform === "win32" ? "python" : "python3") };
   }
   async inspect(filePath: string): Promise<AudioTagInspection> {
+    if (!isSupportedAudioFile(filePath)) throw new Error("Unsupported audio container for metadata inspection");
+    // Vorbis/Opus store tags and artwork in comments, which ffprobe may omit
+    // from format_tags. Read these containers natively for reliable checks.
+    if ([".ogg", ".opus"].includes(path.extname(filePath).toLowerCase())) return this.inspectNative(filePath);
     let result;
     try {
       result = await this.runner.run(this.tools().ffprobe, ["-v", "error", "-show_entries",

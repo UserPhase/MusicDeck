@@ -2,6 +2,11 @@ export type StreamResult = {
   body: ReadableStream<Uint8Array> | null;
   status: number;
   headers: Headers;
+  audioStream?: {
+    direct: boolean;
+    requestedBitrateKbps: number | null;
+    sourceConnectionId?: string;
+  };
 };
 
 /**

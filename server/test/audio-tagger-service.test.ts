@@ -39,8 +39,29 @@ describe("AudioTaggerService", () => {
     expect(warning).toHaveBeenCalledWith(expect.stringContaining("EPERM"));
   });
   test("detects empty and generic artists", () => {
-    for (const artist of [null, "", " Unknown Artist ", "Various Artists", "Unknown Performer"]) expect(isInvalidArtist(artist)).toBe(true);
-    expect(isInvalidArtist("2hollis")).toBe(false);
+    for (const artist of [null, undefined, "", " UNKNOWN ", " Unknown Artist ", "Various Artists", "Unspecified"])
+      expect(isInvalidArtist(artist)).toBe(true);
+    for (const artist of ["2hollis", "Unknown Mortal Orchestra", "Unknown T", "Unknown Performer", "The Unknowns", "Various Artists Ensemble"])
+      expect(isInvalidArtist(artist)).toBe(false);
+  });
+  test.each(["Unknown Mortal Orchestra", "Unknown T"])("accepts correct %s tags without a forced repair", async artist => {
+    const file = path.join(temporary(), "song.mp3"); fs.writeFileSync(file, "original audio");
+    const tags = { ...good, artist, albumArtist: artist };
+    const canonical = { ...expected, artists: [artist], albumArtist: artist };
+    const run = vi.fn(() => ({ promise: Promise.resolve({ exitCode: 0, stderr: "", stdout: probe(tags) }) }));
+    const service = new AudioTaggerService({ ffprobePath: "ffprobe", processRunner: { run } as unknown as ProcessRunner });
+    expect(needsMetadataRepair(tags, canonical)).toBe(false);
+    await expect(service.verifyAndTag(file, canonical)).resolves.toMatchObject({ repaired: false, inspection: tags });
+    expect(run).toHaveBeenCalledOnce(); expect(fs.readFileSync(file, "utf8")).toBe("original audio");
+  });
+  test("retains a canonical compilation album artist", () => {
+    expect(needsMetadataRepair({ ...good, albumArtist: "Various Artists" }, { ...expected, albumArtist: "Various Artists" })).toBe(false);
+  });
+  test("unsupported containers are rejected before a metadata process starts", async () => {
+    const run = vi.fn();
+    const service = new AudioTaggerService({ processRunner: { run } as unknown as ProcessRunner });
+    await expect(service.inspect("song.exe")).rejects.toThrow("Unsupported audio container");
+    expect(run).not.toHaveBeenCalled();
   });
   test.each(["artist", "albumArtist", "title", "album", "year", "isrc", "hasArtwork"] as const)("repairs missing %s", (key) => {
     const canonical = key === "hasArtwork" ? { ...expected, artworkUrl: "https://i.scdn.co/image/cover" } : expected;
@@ -129,19 +150,25 @@ function execute(binary: string, args: string[]) {
   if (result.status !== 0) throw new Error(result.stderr || String(result.error)); return result.stdout.trim();
 }
 const fixture = String.raw`
-import sys
+import sys, base64
 from mutagen import File
 from mutagen.id3 import ID3, TPE1, TRCK, TPOS, TCON, TXXX, APIC
 from mutagen.flac import Picture
 from mutagen.mp4 import MP4Cover
 f, cover = sys.argv[1:]; data = open(cover, 'rb').read()
-if f.endswith('.mp3'):
-    t = ID3(f); t.add(TPE1(encoding=3, text=['Unknown Artist']))
+if f.endswith(('.mp3', '.wav')):
+    wave = File(f) if f.endswith('.wav') else None
+    if wave is not None and wave.tags is None: wave.add_tags()
+    t = wave.tags if wave is not None else ID3(f)
+    def save():
+        if wave is not None: wave.save()
+        else: t.save(f)
+    t.add(TPE1(encoding=3, text=['Unknown Artist']))
     t.add(TRCK(encoding=3, text=['7/12'])); t.add(TPOS(encoding=3, text=['2/2']))
     t.add(TCON(encoding=3, text=['Alternative'])); t.add(TXXX(encoding=3, desc='REPLAYGAIN_TRACK_GAIN', text=['-7.25 dB']))
     t.add(TXXX(encoding=3, desc='MusicDeck private frame', text=['must survive']))
-    t.add(APIC(encoding=3, type=3, mime='image/png', desc='Original cover', data=data)); t.save(f)
-    t.add(APIC(encoding=3, type=4, mime='image/png', desc='Back cover', data=data)); t.save(f)
+    t.add(APIC(encoding=3, type=3, mime='image/png', desc='Original cover', data=data)); save()
+    t.add(APIC(encoding=3, type=4, mime='image/png', desc='Back cover', data=data)); save()
 else:
     a = File(f)
     if a.tags is None: a.add_tags()
@@ -152,22 +179,27 @@ else:
     else:
         a.tags['artist'] = ['Unknown Artist']; a.tags['tracknumber'] = ['7/12']; a.tags['discnumber'] = ['2/2']
         a.tags['genre'] = ['Alternative']; a.tags['REPLAYGAIN_TRACK_GAIN'] = ['-7.25 dB']; a.tags['PRIVATE'] = ['must survive']
-        p = Picture(); p.type=3; p.mime='image/png'; p.data=data; a.add_picture(p)
-        p = Picture(); p.type=4; p.mime='image/png'; p.data=data; a.add_picture(p)
+        for kind in (3, 4):
+            p = Picture(); p.type=kind; p.mime='image/png'; p.data=data
+            if f.endswith('.flac'): a.add_picture(p)
+            else: a.tags['metadata_block_picture'] = list(a.tags.get('metadata_block_picture', [])) + [base64.b64encode(p.write()).decode('ascii')]
     a.save()
 `;
 const secondaryTags = String.raw`
-import sys, json, hashlib
+import sys, json, hashlib, base64
 from mutagen import File
 from mutagen.id3 import ID3
+from mutagen.flac import Picture
 f=sys.argv[1]
-if f.endswith('.mp3'):
-    t=ID3(f); result={k:v.pprint() for k,v in t.items() if k.startswith(('TRCK','TPOS','TCON','TXXX'))}
+if f.endswith(('.mp3', '.wav')):
+    t=File(f).tags if f.endswith('.wav') else ID3(f)
+    result={k:v.pprint() for k,v in t.items() if k.startswith(('TRCK','TPOS','TCON','TXXX'))}
     result['cover']=[hashlib.sha256(p.data).hexdigest() for p in t.getall('APIC')]
 else:
     a=File(f); keys=['trkn','disk','\xa9gen','----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN','----:com.apple.iTunes:PRIVATE','covr'] if f.endswith('.m4a') else ['tracknumber','discnumber','genre','replaygain_track_gain','PRIVATE']
     result={k:repr(a.tags[k]) for k in keys}
     result['cover']=[hashlib.sha256(bytes(p)).hexdigest() for p in a.tags.get('covr',[])] if f.endswith('.m4a') else [hashlib.sha256(p.data).hexdigest() for p in getattr(a,'pictures',[])]
+    if f.endswith(('.ogg','.opus')): result['cover'] = [hashlib.sha256(Picture(base64.b64decode(p)).data).hexdigest() for p in a.tags.get('metadata_block_picture',[])]
 print(json.dumps(result,sort_keys=True))
 `;
 describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integration", () => {
@@ -192,7 +224,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     })) : [] })), scanLibrary: vi.fn(async () => { scanned = true; return { scanning: false }; }) };
     const downloader = { fetchPlaylistTracks: vi.fn(async () => ({ status: "completed", files: [], playlistTracks: sources, playlistLength: 14 })), download: vi.fn() };
     const playlists = { create: vi.fn(async () => ({ id: "playlist", name: "14 songs" })), addProviderTrack: vi.fn(async () => ({ added: true })) };
-    const user = { id: "user" } as SessionUser;
+    const user = { id: "user", role: "user", externalPlaybackEnabled: true } as SessionUser;
     const service = new SpotifyPlaylistImportService(backend as unknown as MusicBackend, playlists as unknown as PlaylistService,
       downloader as unknown as DownloaderAdapter, root, vi.fn(async () => new Response("{}")) as typeof fetch, "Spotify Imports", tagger);
     const started = service.start("https://open.spotify.com/playlist/playlist14", user);
@@ -202,7 +234,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     expect(service.get(started.id, user.id)).toMatchObject({ status: "completed", expectedCount: 14, completedCount: 14, importedCount: 14, failedCount: 0 });
     expect(downloader.download).not.toHaveBeenCalled(); expect(playlists.addProviderTrack).toHaveBeenCalledTimes(14); expect(backend.scanLibrary).toHaveBeenCalledOnce();
   }, 60000);
-  test.each(["mp3", "flac", "m4a"])("repairs and verifies %s without ffprobe installed", async (extension) => {
+  test.each(["mp3", "flac", "m4a", "opus", "ogg", "wav"])("repairs and verifies %s without ffprobe installed", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension); const cover = path.join(directory, "cover.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=purple:s=32x32", "-frames:v", "1", "-y", cover]);
@@ -227,7 +259,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
       processRunner: { run: (command, args, options) => runner.run(command, args, { ...options, env: { PYTHONPATH: environment.PYTHONPATH || "" } }) } });
     await expect(service.verifyAndTag(audio, expected)).resolves.toMatchObject({ repaired: true, inspection: { year: "2024" } });
   });
-  test.each(["mp3", "flac", "m4a"])("adds cached cover art to %s when no embedded picture exists", async (extension) => {
+  test.each(["mp3", "flac", "m4a", "opus", "ogg", "wav"])("adds cached cover art to %s when no embedded picture exists", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension); const cover = path.join(directory, "cover.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=purple:s=32x32", "-frames:v", "1", "-y", cover]);
@@ -239,7 +271,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect((await service.verifyAndTag(audio, expected)).repaired).toBe(false);
   });
-  test.each(["mp3", "flac", "m4a"])("replaces a stale front cover in %s without dropping other tags", async (extension) => {
+  test.each(["mp3", "flac", "m4a", "opus", "ogg", "wav"])("replaces a stale front cover in %s without dropping other tags", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension);
     const oldCover = path.join(directory, "old.png"); const newCover = path.join(directory, "new.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
@@ -259,7 +291,7 @@ describe.skipIf(!ffmpeg || !fs.existsSync(ffprobe))("native container integratio
     expect(written.cover).toContain(expectedHash);
     expect(written.cover).toContain(createHash("sha256").update(fs.readFileSync(oldCover)).digest("hex"));
   });
-  test.each(["mp3", "flac", "m4a"])("preserves %s audio, artwork, track/disc numbers, genre, ReplayGain and custom tags", async (extension) => {
+  test.each(["mp3", "flac", "m4a", "opus", "ogg", "wav"])("preserves %s audio, artwork, track/disc numbers, genre, ReplayGain and custom tags", async (extension) => {
     const directory = temporary(); const audio = path.join(directory, "track." + extension); const cover = path.join(directory, "cover.png");
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-y", audio]);
     execute(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "color=c=purple:s=32x32", "-frames:v", "1", "-y", cover]);

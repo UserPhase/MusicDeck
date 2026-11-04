@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { currentPrivacyManager, type PrivacyCategory } from "../services/PrivacyManager.js";
 
 export type ProcessOptions = {
+  privacyCategory?: PrivacyCategory;
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
@@ -46,47 +48,89 @@ function appendBounded(current: Buffer, chunk: Buffer, limit: number): Buffer {
  */
 export class DefaultProcessRunner implements ProcessRunner {
   run(command: string, args: string[], options: ProcessOptions = {}): ProcessHandle {
+    const privacy = currentPrivacyManager();
+    if (options.privacyCategory) privacy?.assertExternalAllowed(options.privacyCategory);
     let child: ChildProcess | undefined;
     let stdoutData: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderrData: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stdoutBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderrBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let timeoutTimer: NodeJS.Timeout | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
     let isTerminated = false;
+    let closed = false;
+    let terminationError: Error | undefined;
+    let releasePrivacy: (() => void) | undefined;
+    const terminate = (signal: NodeJS.Signals | number) => {
+      if (!child?.pid || closed) return;
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, signal);
+        else {
+          const killer = spawn("taskkill.exe", [
+            "/PID", String(child.pid), "/T",
+            ...(signal === "SIGKILL" || signal === 9 ? ["/F"] : []),
+          ], { windowsHide: true, stdio: "ignore" });
+          killer.on("error", (error) => {
+            console.warn("Could not terminate media process tree", error);
+            if (!closed) child?.kill(signal);
+          });
+          killer.on("exit", (code) => {
+            if (code !== 0 && !closed) {
+              console.warn(`Media process tree termination exited with code ${code}`);
+              child?.kill(signal);
+            }
+          });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") console.warn("Could not terminate media process", error);
+      }
+    };
+    const cancel = (signal: NodeJS.Signals | number = "SIGTERM") => {
+      if (isTerminated || closed) return;
+      isTerminated = true;
+      terminationError = new Error("Process was cancelled");
+      terminationError.name = "AbortError";
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      terminate(signal);
+      if (signal !== "SIGKILL" && signal !== 9) {
+        killTimer = setTimeout(() => terminate("SIGKILL"), 3000);
+      }
+    };
 
     const promise = new Promise<ProcessResult>((resolve, reject) => {
+      if (options.signal?.aborted) {
+        const error = new Error("Process was cancelled");
+        error.name = "AbortError";
+        reject(error);
+        return;
+      }
       try {
+        if (options.privacyCategory) releasePrivacy = privacy?.track(options.privacyCategory, () => {
+          cancel("SIGKILL");
+          return promise.then(() => undefined, (error: unknown) => { if (!isTerminated) throw error; });
+        });
         child = spawn(command, args, {
           cwd: options.cwd,
           env: options.env ? { ...process.env, ...options.env } : process.env,
           windowsHide: true,
+          detached: process.platform !== "win32",
           stdio: ["ignore", "pipe", "pipe"],
         });
       } catch (err) {
+        releasePrivacy?.();
         return reject(err);
       }
 
       if (options.timeoutMs && options.timeoutMs > 0) {
         timeoutTimer = setTimeout(() => {
           isTerminated = true;
-          try {
-            child?.kill("SIGKILL");
-          } catch {}
-          reject(new Error(`Process timed out after ${options.timeoutMs}ms`));
+          terminationError = new Error(`Process timed out after ${options.timeoutMs}ms`);
+          terminate("SIGKILL");
         }, options.timeoutMs);
       }
 
       const onAbort = () => {
-        isTerminated = true;
-        try {
-          child?.kill("SIGTERM");
-          setTimeout(() => {
-            try {
-              child?.kill("SIGKILL");
-            } catch {}
-          }, 1000);
-        } catch {}
-        reject(new Error("Process was cancelled"));
+        cancel();
       };
 
       if (options.signal) {
@@ -130,19 +174,23 @@ export class DefaultProcessRunner implements ProcessRunner {
       });
 
       child.on("error", (err) => {
+        releasePrivacy?.();
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (killTimer) clearTimeout(killTimer);
         if (options.signal) options.signal.removeEventListener("abort", onAbort);
-        if (!isTerminated) {
-          reject(err);
-        }
+        reject(terminationError ?? err);
       });
 
       child.on("close", (exitCode, signal) => {
+        releasePrivacy?.();
+        if (isTerminated && process.platform !== "win32") terminate("SIGKILL");
+        closed = true;
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (killTimer) clearTimeout(killTimer);
         if (options.signal) options.signal.removeEventListener("abort", onAbort);
 
         if (isTerminated || options.signal?.aborted) {
-          return reject(new Error("Process was cancelled"));
+          return reject(terminationError ?? new Error("Process was cancelled"));
         }
 
         if (options.onStdoutLine && stdoutBuffer.toString("utf8").trim()) {
@@ -165,18 +213,8 @@ export class DefaultProcessRunner implements ProcessRunner {
       get pid() {
         return child?.pid;
       },
-      kill(signal = "SIGTERM") {
-        isTerminated = true;
-        try {
-          child?.kill(signal);
-        } catch {}
-      },
-      cancel(signal = "SIGTERM") {
-        isTerminated = true;
-        try {
-          child?.kill(signal);
-        } catch {}
-      },
+      kill: cancel,
+      cancel,
       promise,
       completion: promise,
     };

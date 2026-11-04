@@ -4,6 +4,8 @@ FROM node:24-bookworm-slim AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
+COPY tsconfig.json ./
+COPY scripts/build.cjs ./scripts/build.cjs
 COPY public ./public
 COPY src ./src
 RUN npm run build

@@ -3,27 +3,32 @@ import { MemoryRouter } from "react-router-dom";
 import { useAuth } from "./AuthContext";
 import { deleteServerAlbum, deleteServerTrack } from "../api/adminMedia";
 import { ServerDeletionProvider } from "./ServerDeletionContext";
-import TrackContextMenu from "../components/TrackContextMenu";
+import UniversalTrackContextMenu from "../components/UniversalTrackContextMenu";
 import AlbumDeleteButton from "../components/AlbumDeleteButton";
 
 jest.mock("./AuthContext", () => ({ useAuth: jest.fn() }));
 jest.mock("../api/adminMedia", () => ({ deleteServerAlbum: jest.fn(), deleteServerTrack: jest.fn() }));
-jest.mock("../components/TrackLikeButton", () => () => <button type="button">Like</button>);
 jest.mock("./PlayerContext", () => ({ usePlayer: () => ({ addToQueue: jest.fn() }) }));
 
 const song = { id: "track-1", title: "Midnight Signal" };
 
-function renderActions(role) {
+function renderActions(role, path = "/admin/library/tracks") {
   useAuth.mockReturnValue({ session: { id: "user-1", role } });
   // The menu stays visibility:hidden until it can anchor to its trigger.
   const triggerRef = { current: document.createElement("button") };
-  return render(<MemoryRouter><ServerDeletionProvider>
-    <TrackContextMenu song={song} isServerSynced offlineStatus="not-downloaded" triggerRef={triggerRef} />
+  return render(<MemoryRouter initialEntries={[path]}><ServerDeletionProvider>
+    <UniversalTrackContextMenu song={song} isServerSynced offlineStatus="not-downloaded" triggerRef={triggerRef} />
     <AlbumDeleteButton album={{ id: "album-1", name: "Night Drive" }} />
   </ServerDeletionProvider></MemoryRouter>);
 }
 
 beforeEach(() => jest.clearAllMocks());
+
+test("admin users cannot see deletion actions in the general library", () => {
+  renderActions("admin", "/library/tracks");
+  expect(screen.queryByRole("menuitem", { name: /delete from server/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: /more options for night drive/i })).toBeNull();
+});
 
 test("non-admin users cannot see deletion actions", () => {
   renderActions("user");

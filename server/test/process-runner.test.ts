@@ -26,4 +26,42 @@ describe("DefaultProcessRunner output capture", () => {
     expect(result.exitCode).toBe(0);
     expect(lines).toEqual(["first", "second"]);
   });
+
+  test("does not spawn an already-cancelled process", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const handle = new DefaultProcessRunner().run(process.execPath, ["-e", "process.exit(0)"], { signal: controller.signal });
+    expect(handle.pid).toBeUndefined();
+    await expect(handle.promise).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  test("cancellation settles only after the child has exited", async () => {
+    const controller = new AbortController();
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const handle = new DefaultProcessRunner().run(process.execPath, [
+      "-e", "console.log('ready'); setInterval(() => {}, 1000);",
+    ], { signal: controller.signal, onStdoutLine: () => ready() });
+    const cancelled = expect(handle.promise).rejects.toMatchObject({ name: "AbortError" });
+    await started;
+    controller.abort();
+    await cancelled;
+    expect(() => process.kill(handle.pid!, 0)).toThrow();
+  });
+
+  test.skipIf(process.platform === "win32")("escalates an ignored SIGTERM after three seconds", async () => {
+    const controller = new AbortController();
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const handle = new DefaultProcessRunner().run(process.execPath, [
+      "-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000);",
+    ], { signal: controller.signal, onStdoutLine: () => ready() });
+    const cancelled = expect(handle.promise).rejects.toMatchObject({ name: "AbortError" });
+    await started;
+    const start = Date.now();
+    controller.abort();
+    await cancelled;
+    expect(Date.now() - start).toBeGreaterThanOrEqual(2900);
+    expect(() => process.kill(handle.pid!, 0)).toThrow();
+  });
 });

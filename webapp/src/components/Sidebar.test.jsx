@@ -13,6 +13,8 @@ import {
 
 import {
   getCoverUrl,
+  getLikedAlbums,
+  listSmartPlaylists, createSmartPlaylist, previewSmartPlaylist,
 } from "../api/musicdeck";
 
 
@@ -25,6 +27,9 @@ jest.mock("../api/playlists", () => ({
 
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(),
+  getLikedAlbums: jest.fn(async () => []),
+  listSmartPlaylists: jest.fn(async () => ({ playlists: [] })),
+  createSmartPlaylist: jest.fn(), previewSmartPlaylist: jest.fn(), findSmartPlaylistSeeds: jest.fn(),
 }));
 jest.mock("../context/AuthContext", () => ({ useAuth: () => ({ session: { id: "test-user" } }) }));
 
@@ -37,6 +42,7 @@ function ImportStatusButton() {
 
 
 function renderSidebar(playlists, initialPath = "/") {
+  getLikedAlbums.mockResolvedValue([]);
   getCoverUrl.mockImplementation((id, size) =>
     id ? `/api/artwork/${id}${size ? `?size=${size}` : ""}` : null
   );
@@ -58,7 +64,64 @@ function renderSidebar(playlists, initialPath = "/") {
   );
 }
 
-beforeEach(() => { jest.clearAllMocks(); sessionStorage.clear(); });
+beforeEach(() => { jest.clearAllMocks(); sessionStorage.clear(); listSmartPlaylists.mockResolvedValue({ playlists: [] }); });
+
+test("saved discoveries is reachable from the main navigation with an active-page marker", async () => {
+  renderSidebar([], "/saved-discoveries");
+  const link = screen.getByRole("link", { name: "Saved Discoveries" });
+  expect(link).toHaveAttribute("href", "/saved-discoveries");
+  expect(link).toHaveAttribute("aria-current", "page");
+  await waitFor(() => expect(getPlaylists).toHaveBeenCalled());
+});
+
+test("navigation can be reordered without accepting a playlist drop", async () => {
+  localStorage.removeItem("musicdeck:sidebar-navigation:test-user");
+  const view = renderSidebar([]);
+  const liked = screen.getByRole("link", { name: "Liked Songs" });
+  const discover = screen.getByRole("link", { name: "Discover" });
+  const data = {};
+  const transfer = { types: ["application/x-musicdeck-sidebar-navigation"], setData: (key, value) => { data[key] = value; }, getData: key => data[key] };
+  fireEvent.dragStart(liked, { dataTransfer: transfer });
+  fireEvent.dragOver(discover, { dataTransfer: transfer });
+  expect(discover).toHaveAttribute("data-sidebar-drop", "before");
+  fireEvent.drop(discover, { dataTransfer: transfer });
+  expect(discover).not.toHaveAttribute("data-sidebar-drop");
+  const saved = () => JSON.parse(localStorage.getItem("musicdeck:sidebar-navigation:test-user"));
+  expect(saved()[0]).toBe("/liked");
+  fireEvent.drop(discover, { dataTransfer: { types: ["application/x-musicdeck-playlist-tree"], getData: () => "/liked" } });
+  expect(saved()[0]).toBe("/liked");
+  view.unmount();
+  renderSidebar([]);
+  expect(screen.getByRole("link", { name: "Liked Songs" }).previousElementSibling).toHaveTextContent("Your Library");
+  localStorage.removeItem("musicdeck:sidebar-navigation:test-user");
+});
+
+test("smart playlist creation lives under Add playlist instead of a separate navigation page", async () => {
+  renderSidebar([], "/library/smart-playlists");
+  expect(screen.queryByRole("link", { name: "Smart Playlists" })).not.toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Library" })).toHaveAttribute("aria-current", "page");
+  await waitFor(() => expect(getPlaylists).toHaveBeenCalled());
+});
+
+test("creates a smart playlist from the chooser and opens it as a saved playlist", async () => {
+  const playlist = { id: "smart-new", name: "My likes", rules: { operator: "AND", rules: [{ field: "is_favorite", operator: "equals", value: true }] } };
+  createSmartPlaylist.mockResolvedValue({ playlist });
+  previewSmartPlaylist.mockResolvedValue({ total: 1, tracks: [{ id: "song", title: "Night", artist: "Neon" }], refreshedAt: "2026-10-27", warning: null });
+  renderSidebar([]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
+  fireEvent.click(screen.getByRole("button", { name: /Make a mix Find the right songs/ }));
+  expect(screen.getByRole("dialog", { name: "Make a mix" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /An era/ }));
+  fireEvent.change(screen.getByLabelText("Playlist name"), { target: { value: "My likes" } });
+  listSmartPlaylists.mockResolvedValue({ playlists: [playlist] });
+  fireEvent.click(screen.getByRole("checkbox", { name: /Keep this mix updated/ }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save smart playlist" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Save smart playlist" }));
+  await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/smart-playlist/smart-new"));
+  expect(createSmartPlaylist).toHaveBeenCalledWith(expect.objectContaining({ name: "My likes", options: expect.objectContaining({ size: 50 }) }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(await screen.findByRole("link", { name: "My likes" })).toHaveAttribute("href", "/smart-playlist/smart-new");
+});
 
 
 test("sidebar playlist entries render the resolved playlist artwork", async () => {
@@ -130,13 +193,13 @@ test("sidebar falls back to the note placeholder for a playlist without artwork"
 test("both sidebar actions open the playlist path chooser", async () => {
   renderSidebar([]);
   await screen.findByText("Add playlist");
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[0]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   expect(screen.getByRole("dialog", { name: "Create New Playlist" })).toBeInTheDocument();
   expect(screen.getByRole("dialog").closest(".playlist-modal-backdrop").parentElement).toBe(document.body);
   expect(screen.getByRole("button", { name: /blank playlist/i })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /import spotify playlist/i })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Close playlist dialog" }));
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   expect(screen.getByRole("dialog", { name: "Create New Playlist" })).toBeInTheDocument();
 });
 
@@ -147,7 +210,7 @@ test("creates a blank playlist with its optional description", async () => {
     return playlist;
   });
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /blank playlist/i }));
   fireEvent.change(screen.getByLabelText(/playlist name/i), { target: { value: " Night Drive " } });
   fireEvent.change(screen.getByLabelText(/description/i), { target: { value: " After dark " } });
@@ -160,7 +223,7 @@ test("creates a blank playlist with its optional description", async () => {
 
 test("rejects invalid Spotify links before starting an import", () => {
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/track/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
@@ -173,14 +236,14 @@ test("rejects invalid Spotify links before starting an import", () => {
 test("opens the imported playlist when the background job completes", async () => {
   startSpotifyPlaylistImport.mockResolvedValue({ id: "job-1", status: "completed", playlistId: "mdpl_imported", playlistName: "Road Trip" });
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123?si=link" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
 
   await waitFor(() => expect(startSpotifyPlaylistImport).toHaveBeenCalledWith("https://open.spotify.com/playlist/abc123?si=link"));
   await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_imported"));
-  expect(screen.getByRole("status")).toHaveTextContent("Successfully imported 'Road Trip'!");
+  expect(screen.getByText("Successfully imported 'Road Trip'!")).toHaveAttribute("role", "status");
   expect(getSpotifyPlaylistImport).not.toHaveBeenCalled();
 });
 
@@ -190,7 +253,7 @@ test("warns about missing songs while opening a partially imported playlist", as
     expectedCount: 15, importedCount: 7, error: "Imported 7 of 15 songs. 8 could not be downloaded or indexed.",
   });
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
@@ -203,7 +266,7 @@ test("keeps the dialog loading while the import job is queued and polls for comp
   startSpotifyPlaylistImport.mockResolvedValue({ id: "job-2", status: "queued" });
   getSpotifyPlaylistImport.mockResolvedValue({ id: "job-2", status: "completed", playlistId: "mdpl_two", playlistName: "Mix" });
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
@@ -218,7 +281,7 @@ test("shows live track progress and reopens a minimized import", async () => {
   startSpotifyPlaylistImport.mockResolvedValue({ id: "job-live", status: "running", stage: "downloading", expectedCount: 12, downloadedCount: 1, currentTrack: 2, currentTrackName: "2hollis - crush" });
   getSpotifyPlaylistImport.mockResolvedValue({ id: "job-live", status: "running", stage: "downloading", expectedCount: 12, downloadedCount: 2, currentTrack: 3, currentTrackName: "Next song" });
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
@@ -227,7 +290,7 @@ test("shows live track progress and reopens a minimized import", async () => {
   expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
   fireEvent.click(screen.getByRole("button", { name: "Run in Background" }));
   expect(screen.queryByRole("dialog")).toBeNull();
-  expect(screen.getByRole("status")).toHaveTextContent("Importing playlist in the background...");
+  expect(screen.getByText("Importing playlist in the background...")).toHaveAttribute("role", "status");
   await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-live"), { timeout: 3000 });
   fireEvent.click(screen.getByRole("button", { name: "Show playlist import progress" }));
   expect(screen.getByRole("dialog", { name: "Importing Playlist..." })).toBeInTheDocument();
@@ -239,7 +302,7 @@ test("shows live track progress and reopens a minimized import", async () => {
 test("keeps the import form available for retry after a backend error", async () => {
   startSpotifyPlaylistImport.mockRejectedValueOnce(new Error("spotDL unavailable"));
   renderSidebar([]);
-  fireEvent.click(screen.getAllByRole("button", { name: /add playlist/i })[1]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));

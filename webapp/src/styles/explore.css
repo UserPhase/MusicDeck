@@ -4,9 +4,9 @@
 .explore-page-heading h1 { color: var(--text); font-size: 34px; font-weight: 750; letter-spacing: -.4px; line-height: 1.1; }
 .explore-section-heading--featured h2 { color: var(--accent-text); font-size: clamp(.875rem, 1.2vw, 1rem); font-weight: 700; letter-spacing: .12em; line-height: 1.3; text-transform: uppercase; }
 .explore-section-heading--featured p { font-size: .8125rem; }
-.explore-section { min-width: 0; margin-bottom: 3.25rem; }
-.explore-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1.125rem; }
-.explore-section-heading h2 { color: var(--text); font-size: 1.25rem; font-weight: 750; letter-spacing: -.025em; line-height: normal; }
+.explore-section, .home-section { min-width: 0; margin-bottom: 3.25rem; }
+.explore-section-heading, .home-section-header { display: flex; align-items: end; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
+.explore-section-heading h2, .home-section-header h2 { color: var(--text); font-size: 1.25rem; font-weight: var(--weight-bold); letter-spacing: -.025em; line-height: normal; }
 .explore-section-heading p { margin-top: .35rem; color: var(--text-secondary); font-size: .75rem; line-height: 1.4; }
 .explore-feed-message { display: grid; min-height: 4rem; align-items: center; color: var(--text-secondary); font-size: .8125rem; }
 .explore-action-message { margin: -1.5rem 0 1.5rem; padding: .75rem 1rem; border: 1px solid rgb(168 85 247 / 25%); border-radius: .5rem; background: rgb(168 85 247 / 8%); color: var(--text); font-size: .8125rem; }
@@ -37,6 +37,9 @@
 .explore-featured-card--lead h3 { font-size: clamp(2rem, 3vw, 3.5rem); }
 .explore-featured-copy p { overflow: hidden; color: rgb(255 255 255 / 78%); font-size: .8125rem; text-overflow: ellipsis; white-space: nowrap; }
 .explore-featured-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1.25rem; }
+.explore-featured-copy h3 a { color: inherit; text-decoration: none; }
+.explore-featured-actions a { display: inline-flex; align-items: center; min-height: 2.25rem; padding: .4rem .875rem; border: 1px solid rgb(255 255 255 / 28%); border-radius: 999px; background: rgb(12 12 16 / 45%); color: #fff; font-size: .75rem; font-weight: 700; text-decoration: none; }
+.explore-featured-actions a:hover { background: rgb(255 255 255 / 18%); }
 .explore-featured-actions button { min-height: 2.25rem; padding: .4rem .875rem; border: 1px solid rgb(255 255 255 / 28%); border-radius: 999px; background: rgb(12 12 16 / 45%); color: #fff; font-size: .75rem; font-weight: 700; cursor: pointer; transition: background 180ms ease, transform 180ms ease; }
 .explore-featured-actions button:first-child { border-color: transparent; background: var(--accent); color: #111; }
 .explore-featured-actions button:hover:not(:disabled) { transform: translateY(-2px); background: rgb(255 255 255 / 18%); }
@@ -59,6 +62,20 @@
 .explore-album-play { position: absolute; z-index: 1; right: .625rem; bottom: .625rem; display: grid; width: 2.5rem; height: 2.5rem; place-items: center; border: 0; border-radius: 50%; background: var(--accent); color: #111; font-size: .75rem; opacity: 0; cursor: pointer; transform: translateY(.35rem); transition: opacity 180ms ease, transform 180ms ease; }
 .explore-album:hover .explore-album-play, .explore-album:focus-within .explore-album-play { opacity: 1; transform: translateY(0); }
 .explore-album-image .album-admin-actions { top: .625rem; right: .625rem; }
+.external-album-action { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 2rem; margin-top: .5rem; padding: .3rem .8rem; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font-size: .75rem; font-weight: 700; cursor: pointer; }
+.external-album-action:hover:not(:disabled) { background: var(--accent); color: #111; }
+.external-album-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.external-album-action:disabled { cursor: default; opacity: .8; }
+.external-album-action.is-in-library { border-color: transparent; color: var(--text-secondary); }
+.external-album-action.is-failed { border-color: #f27474; color: #f27474; }
+.external-album-spinner { width: .7rem; height: .7rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: external-album-spin 800ms linear infinite; }
+@keyframes external-album-spin { to { transform: rotate(360deg); } }
+.external-album-progress { display: block; height: .2rem; margin-top: .4rem; overflow: hidden; border-radius: 999px; background: rgb(255 255 255 / 12%); }
+.external-album-progress > span { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
+.external-album-error, .external-album-warning { margin: .4rem 0 0; font-size: .7rem; line-height: 1.35; }
+.external-album-error { color: #f27474; }
+.external-album-warning { color: var(--text-secondary); }
+.external-album-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
 .explore-pulse { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2rem; margin-bottom: 3.25rem; }
 .explore-track-panel { min-width: 0; }
@@ -102,7 +119,7 @@
 }
 @container (max-width: 34rem) {
   .explore-page-heading { margin-bottom: 2rem; }
-  .explore-section, .explore-pulse { margin-bottom: 2.5rem; }
+  .explore-section, .explore-pulse, .home-section { margin-bottom: 2.5rem; }
   .explore-featured-grid, .explore-skeletons--hero { grid-template-columns: 1fr; }
   .explore-featured-card--lead, .explore-skeletons--hero .explore-skeleton:first-child { grid-column: auto; }
   .explore-featured-card { min-height: 12rem; }
@@ -112,7 +129,7 @@
   .explore-featured-actions { margin-top: .75rem; }
   .explore-artist-row, .explore-skeletons--circles { grid-auto-columns: minmax(6.5rem, 28vw); grid-auto-flow: column; grid-template-columns: none; overflow-x: auto; padding-bottom: .75rem; scroll-snap-type: x mandatory; scrollbar-width: none; }
   .explore-artist-row::-webkit-scrollbar, .explore-skeletons--circles::-webkit-scrollbar { display: none; }
-  .explore-artist, .explore-skeletons--circles .explore-skeleton { scroll-snap-align: start; }
+  .explore-artist, .explore-skeletons--circles .explore-skeleton, .explore-artist-row .home-skeleton { scroll-snap-align: start; }
   .explore-album-row, .explore-skeletons--squares { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .explore-album-play { opacity: 1; transform: none; }
 }

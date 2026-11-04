@@ -1,4 +1,4 @@
-import type { Album, Artist, IdentityHints, Playlist, Track } from "../types.js";
+import type { Album, Artist, IdentityHints, Playlist, SessionUser, Track } from "../types.js";
 import type { Availability, CatalogSearchResult, SourceOption } from "./catalog.js";
 
 export type SearchResultType = "track" | "album" | "artist" | "playlist";
@@ -10,6 +10,7 @@ export type CanonicalIdentity = {
 };
 
 export type SearchOptions = {
+  user?: SessionUser;
   types?: SearchResultType[];
   limit?: number;
   mode?: "library" | "hybrid" | "external";
@@ -34,6 +35,7 @@ export type UnifiedSearchResult = {
   title: string;
   subtitle: string | null;
   artist: string | null;
+  artistCredits?: Track["artistCredits"];
   album: string | null;
   artwork: { id: string; url: string } | null;
   previewUrl?: string | null;
@@ -51,6 +53,11 @@ export type UnifiedSearchResult = {
   localTrackId?: string;
   localAlbumId?: string;
   metadata: {
+    sourceServer?: string;
+    audioMetadata?: Track["audioMetadata"];
+    genres?: string[];
+    normalizationGainDb?: number;
+    loudness?: { integratedLufs: number; truePeakDb: number };
     durationSeconds?: number | null;
     year?: number | null;
     songCount?: number;
@@ -64,6 +71,7 @@ export type UnifiedSearchResult = {
     deezerTrackId?: number;
     deezerTrackUrl?: string;
     itunesTrackId?: number;
+    isrc?: string | null;
   };
   /** Internal matching input; removed before the API response. */
   identityHints?: IdentityHints;
@@ -88,22 +96,29 @@ function source(availability: Availability | null, options?: SourceOption[]) {
   };
 }
 
-export function toTrackSearchResult(track: Track & { availability: Availability; sources?: SourceOption[] }): UnifiedSearchResult {
+export function toTrackSearchResult(track: Track & { availability?: Availability; sources?: SourceOption[] }): UnifiedSearchResult {
   return {
     type: "track",
     id: track.id,
     title: track.title,
     subtitle: track.artistName,
     artist: track.artistName,
+    ...(track.artistCredits?.length ? { artistCredits: track.artistCredits } : {}),
     album: track.albumName,
     artwork: artwork(track.artworkId, track.artworkUrl),
     provider: "library",
     inLibrary: true,
     localTrackId: track.id,
-    source: source(track.availability, track.sources),
-    availability: track.availability,
+    source: source(track.availability ?? null, track.sources),
+    availability: track.availability ?? null,
     metadata: {
       durationSeconds: track.durationSeconds,
+      sourceServer: track.sourceServer,
+      audioMetadata: track.audioMetadata,
+      genres: track.genres,
+      year: track.year,
+      ...(Number.isFinite(track.normalizationGainDb) ? { normalizationGainDb: track.normalizationGainDb } : {}),
+      ...(track.loudness ? { loudness: track.loudness } : {}),
       artistId: track.artistId,
       albumId: track.albumId,
     },
@@ -127,6 +142,7 @@ export function toAlbumSearchResult(album: Album & { availability: Availability;
     availability: album.availability,
     metadata: {
       year: album.year,
+      sourceServer: album.sourceServer,
       songCount: album.songCount,
       artistId: album.artistId,
     },
@@ -206,6 +222,8 @@ export function toLegacySearchResponse(groups: SearchGroups) {
       albumId: item.metadata.albumId || null,
       albumName: item.album || "Unknown album",
       durationSeconds: item.metadata.durationSeconds || null,
+      ...(Number.isFinite(item.metadata.normalizationGainDb) ? { normalizationGainDb: item.metadata.normalizationGainDb } : {}),
+      ...(item.metadata.loudness ? { loudness: item.metadata.loudness } : {}),
       trackNumber: null,
       artworkId: item.artwork?.id || null,
       artworkUrl: item.artwork?.url || null,

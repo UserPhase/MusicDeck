@@ -198,7 +198,7 @@ test("recovers the four skipped retries in a 15-track import while reusing the o
   const tagger = { verifyAndTag: vi.fn(async () => ({ repaired: false })) };
   const service = new SpotifyPlaylistImportService(backend, playlists as unknown as PlaylistService, adapter, root,
     async () => response({}), "Spotify Imports", tagger as unknown as AudioTaggerService);
-  const user = { id: "owner", disabled: false } as SessionUser;
+  const user = { id: "owner", role: "user", externalPlaybackEnabled: true, disabled: false } as SessionUser;
   const initial = service.start("https://open.spotify.com/playlist/test", user);
   for (let n = 0; n < 400 && ["queued", "running"].includes(service.get(initial.id, user.id)!.status); n++) await new Promise((resolve) => setTimeout(resolve, 5));
   const job = service.get(initial.id, user.id)!;
@@ -245,7 +245,7 @@ test.each([true, false])("continues past a protected SoundCloud match with isola
   const tagger = { verifyAndTag: vi.fn(async () => ({ repaired: false })) };
   const service = new SpotifyPlaylistImportService(backend, playlists as unknown as PlaylistService, adapter, root,
     async () => response({}), "Spotify Imports", tagger as unknown as AudioTaggerService);
-  const user = { id: "owner", disabled: false } as SessionUser;
+  const user = { id: "owner", role: "user", externalPlaybackEnabled: true, disabled: false } as SessionUser;
   const initial = service.start("https://open.spotify.com/playlist/test", user);
   for (let n = 0; n < 400 && ["queued", "running"].includes(service.get(initial.id, user.id)!.status); n++) await new Promise((resolve) => setTimeout(resolve, 5));
   const job = service.get(initial.id, user.id)!;
@@ -286,7 +286,7 @@ test("the previously failing one-song import uses the fallback, verifies tags, l
   const repository = new SqliteImportJobRepository(db);
   const service = new SpotifyPlaylistImportService(backend, playlists as unknown as PlaylistService, adapter, root,
     async () => response({}), "Spotify Imports", tagger as unknown as AudioTaggerService, repository);
-  const user = { id: "owner", disabled: false } as SessionUser;
+  const user = { id: "owner", role: "user", externalPlaybackEnabled: true, disabled: false } as SessionUser;
   const initial = service.start("https://open.spotify.com/playlist/test", user);
   for (let n = 0; n < 400 && ["queued", "running"].includes(service.get(initial.id, user.id)!.status); n++) await new Promise((resolve) => setTimeout(resolve, 5));
   const job = service.get(initial.id, user.id)!;

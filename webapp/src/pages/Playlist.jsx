@@ -1,11 +1,23 @@
-import { useCallback, useEffect, useState, useRef } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState, useRef } from "react";
+import { normalizePlaylistSearch, playlistTrackSearchText } from "../utils/playlistSearch";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate } from "react-router-dom";
 
 import PlaylistCover from "../components/PlaylistCover";
+import PlaylistSearchBox from "../components/playlists/PlaylistSearchBox";
+import PlaylistTasteOption from "../components/playlists/PlaylistTasteOption";
+import PlaylistShareModal from "../components/playlists/PlaylistShareModal";
+import PlaylistPartyPanel from "../components/playlists/PlaylistPartyPanel";
+import { request } from "../api/musicdeck";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
 import TrackListHeader from "../components/TrackListHeader";
-import TrackRow from "../components/TrackRow";
+import VirtualizedTrackList from "../components/VirtualizedTrackList";
+
+import PlaylistRecommendations from "../components/PlaylistRecommendations";
+import { useTrackSelection } from "../hooks/useTrackSelection";
+import { usePlaylistUndo } from "../hooks/usePlaylistUndo";
+import { reorderPlaylistEntries } from "../utils/playlistEditing";
+
 import PlaylistDetailsDialog from "../components/PlaylistDetailsDialog";
 import FloatingPanel from "../components/ui/FloatingPanel";
 
@@ -16,9 +28,15 @@ import {
   setPlaylistArtwork,
   clearPlaylistArtwork,
   updatePlaylist,
+  reorderPlaylistItems,
+  editPlaylistTracks,
 } from "../api/playlists";
 
 import { usePlayer } from "../context/PlayerContext";
+import "../styles/playlist-organization.css";
+
+const trackSortLabels = { custom: "Custom order", added: "Date added", title: "Title", artist: "Artist", album: "Album", duration: "Duration" };
+const trackSortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 function Playlist() {
 
@@ -40,12 +58,92 @@ function Playlist() {
   ] = useState(null);
 
 
-  const menuRef = useRef(null);
   const optionsTriggerRef = useRef(null);
   const coverInputRef = useRef(null);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [editDetailsOpen, setEditDetailsOpen] = useState(false);
+  const [sharingOpen, setSharingOpen] = useState(false);
+  const [editingBusy, setEditingBusy] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [editStatus, setEditStatus] = useState("");
+  const [reloadToken, setReloadToken] = useState(0);
+  const editLock = useRef(false);
+  const batchLock = useRef(false);
+  const pageGeneration = useRef(0);
+  const playlistRef = useRef(playlist);
+  playlistRef.current = playlist;
+  const [trackQuery, setTrackQuery] = useState("");
+  const history = usePlaylistUndo();
+  const [trackSort, setTrackSort] = useState("custom");
+  const [sortDescending, setSortDescending] = useState(false);
+  const sortBy = (field) => {
+    setSortDescending(field !== "custom" && field === trackSort ? !sortDescending : false);
+    setTrackSort(field);
+  };
+  const [trackSortOpen, setTrackSortOpen] = useState(false);
+  const trackSortTrigger = useRef(null);
+  const deferredQuery = useDeferredValue(trackQuery);
+  const searchTokens = useMemo(() => normalizePlaylistSearch(deferredQuery).trim().split(/\s+/).filter(Boolean), [deferredQuery]);
+  const searchIndex = useMemo(() => (playlist?.entry || []).map(song => ({
+    song, text: playlistTrackSearchText(song), added: Date.parse(song.playlistAddedAt),
+  })), [playlist?.entry]);
+  const songs = useMemo(() => {
+    const matches = searchIndex.filter(item => searchTokens.every(token => item.text.includes(token)));
+    const direction = sortDescending ? -1 : 1;
+    if (trackSort === "added" || trackSort === "duration") {
+      const value = (entry) => trackSort === "added" ? entry.added : entry.song.duration;
+      matches.sort((a, b) => {
+        const left = value(a), right = value(b);
+        if (!Number.isFinite(left)) return Number(Number.isFinite(right));
+        if (!Number.isFinite(right)) return -1;
+        return (left - right) * direction;
+      });
+    } else if (trackSort !== "custom") {
+      matches.sort((a, b) => direction * trackSortCollator.compare(a.song[trackSort] || "", b.song[trackSort] || ""));
+    }
+    return matches.map(item => item.song);
+  }, [searchIndex, searchTokens, trackSort, sortDescending]);
+  const occurrenceIds = useMemo(() => songs.map((song, index) => song.playlistItemId || `${index}:${song.id}`), [songs]);
+  const selection = useTrackSelection(occurrenceIds, `${id}:${deferredQuery}`);
+  const { selectAll: selectAllTracks, clear: clearTrackSelection, selectedCount: trackSelectionCount } = selection;
+  const selectedSongs = useMemo(() => songs.filter((_song, index) => selection.selectedIds.has(occurrenceIds[index])),
+    [songs, occurrenceIds, selection.selectedIds]);
+  const canManage = playlist?.permissions?.canManage === true;
+  const canEditTracks = playlist?.permissions?.canEditTracks === true;
+  const canEditEntries = Boolean(canEditTracks && Array.isArray(playlist?.itemIds) && songs.every((song) => song.playlistItemId));
+  useEffect(() => {
+    const updated = (event) => {
+      if (String(event.detail?.playlistId) === String(id) && event.detail?.deletedAt) { navigate("/library/playlists"); return; }
+      if (String(event.detail?.playlistId) === String(id) && event.detail?.playlist?.id) setPlaylist(event.detail.playlist);
+    };
+    window.addEventListener("playlistsChanged", updated);
+    return () => window.removeEventListener("playlistsChanged", updated);
+  }, [id, navigate]);
+  useEffect(() => { setTrackQuery(""); setTrackSort("custom"); setSortDescending(false); setTrackSortOpen(false); }, [id]);
+  useEffect(() => {
+    let active = true, controller;
+    const check = async () => {
+      if (editLock.current || batchLock.current || document.visibilityState !== "visible") return;
+      controller?.abort(); const polling = new AbortController(); controller = polling;
+      try {
+        const state = await request(`/api/v1/playlists/${encodeURIComponent(id)}/access-state`, { signal: polling.signal });
+        if (!active || polling.signal.aborted || editLock.current || batchLock.current) return;
+        const current = playlistRef.current;
+        if (!current) return;
+        if (current.editRevision !== state.editRevision || current.sharingRevision !== state.sharingRevision) {
+          const updated = await getPlaylist(id);
+          if (active && !polling.signal.aborted && !editLock.current && !batchLock.current) setPlaylist(updated);
+        } else setPlaylist(previous => previous ? { ...previous, permissions: state.permissions } : previous);
+      } catch (failure) {
+        if (active && !polling.signal.aborted && /permission|access denied/i.test(failure.message)) { setError("Playlist access changed. Ask the owner to share it again."); setPlaylist(null); }
+      }
+    };
+    const timer = window.setInterval(check, 5000);
+    window.addEventListener("focus", check);
+    return () => { active = false; controller?.abort(); window.clearInterval(timer); window.removeEventListener("focus", check); };
+  }, [id]);
 
   const [
   showMenu,
@@ -71,16 +169,30 @@ function Playlist() {
     playContext,
     playQueue,
     addToQueue,
-    playSongFromSource,
     downloadQuality,
     isShuffleEnabled,
     toggleShuffle,
+    isRemotePlayback,
+    loopPlaylistId,
+    togglePlaylistLoop,
   } = usePlayer();
 
   const updatePlaylistMutation = useMutation({
-    mutationFn: (updates) => updatePlaylist(id, updates),
+    mutationFn: async ({ updates, cover }) => {
+      const updated = await updatePlaylist(id, updates);
+      if (cover === undefined) return updated;
+      try {
+        const artwork = cover === null ? await clearPlaylistArtwork(id) : await setPlaylistArtwork(id, cover);
+        return artwork ? { ...updated, coverArt: artwork.coverArt, coverMode: artwork.coverMode } : updated;
+      } catch (error) {
+        if (updated) setPlaylist(current => current?.id === playlist.id
+          ? { ...current, ...updated, entry: current.entry, songCount: current.songCount } : current);
+        notifyPlaylistChange();
+        throw new Error(`Playlist details were saved. ${error.message || "Could not save the playlist cover."}`);
+      }
+    },
     onSuccess: (updatedPlaylist) => {
-      if (updatedPlaylist) setPlaylist((current) => current
+      if (updatedPlaylist) setPlaylist((current) => current && String(current.id) === String(id)
         ? { ...current, ...updatedPlaylist, entry: current.entry, songCount: current.songCount }
         : current);
       setEditDetailsOpen(false);
@@ -93,13 +205,19 @@ function Playlist() {
   const closeEditDetails = useCallback(() => {
     if (!updatePlaylistMutation.isPending) setEditDetailsOpen(false);
   }, [updatePlaylistMutation.isPending]);
+  const openEditDetails = () => {
+    if (!canManage || artworkBusy) return;
+    updatePlaylistMutation.reset();
+    setEditDetailsOpen(true);
+  };
 
   function handleTrackPlayback(song, index) {
     playContext(
       songs,
       index,
       {
-        type: "playlist",
+        type: deferredQuery.trim() || trackSort !== "custom" ? "collection" : "playlist",
+        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist.id) } : {}),
         id: playlist.id,
         name: playlist.name,
         coverArt: playlist.coverArt,
@@ -107,46 +225,48 @@ function Playlist() {
     );
   }
 
-useEffect(() => {
-
-  function handleClickOutside(event) {
-
-    if (
-      menuRef.current &&
-      !menuRef.current.contains(
-        event.target
-      )
-    ) {
-
-      setMenuSongId(null);
-
+  useEffect(() => {
+    function selectAllSongs(event) {
+      if (event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.altKey ||
+          event.key.toLowerCase() !== "a" || loading || editingBusy || batchBusy || !songs.length) return;
+      const target = event.target instanceof Element ? event.target : document.activeElement;
+      // Keep normal select-all behavior in search fields, editors and dialogs.
+      if (target?.closest('input, textarea, select, [role="textbox"], [role="combobox"], [contenteditable]:not([contenteditable="false"]), [role="dialog"]') ||
+          document.querySelector('[aria-modal="true"], dialog[open]')) return;
+      event.preventDefault();
+      selectAllTracks();
     }
+    function deselectOutsideSongs(event) {
+      const target = event.target instanceof Element ? event.target : null;
+      // Row menus are portaled outside the list. Their actions still need the
+      // current selection when the click reaches the action handler.
+      if (target?.closest('.track[aria-selected], [data-track-selection-menu]')) return;
+      if (trackSelectionCount) clearTrackSelection();
+      setMenuSongId(null);
+    }
+    document.addEventListener("keydown", selectAllSongs);
+    document.addEventListener("click", deselectOutsideSongs, true);
+    return () => {
+      document.removeEventListener("keydown", selectAllSongs);
+      document.removeEventListener("click", deselectOutsideSongs, true);
+    };
+  }, [loading, editingBusy, batchBusy, songs.length, selectAllTracks, clearTrackSelection, trackSelectionCount]);
 
-  }
-
-
-  document.addEventListener(
-    "mousedown",
-    handleClickOutside
-  );
-
-
-  return () => {
-
-    document.removeEventListener(
-      "mousedown",
-      handleClickOutside
-    );
-
-  };
-
-}, []);
   /*
    * Load playlist from Navidrome
    */
 
   useEffect(() => {
     let cancelled = false;
+    const generation = pageGeneration.current + 1;
+    pageGeneration.current = generation;
+    editLock.current = false;
+    batchLock.current = false;
+    setEditingBusy(false);
+    setBatchBusy(false);
+    setEditError("");
+    setEditStatus("");
+    setMenuSongId(null);
 
     async function loadPlaylist() {
 
@@ -194,9 +314,9 @@ useEffect(() => {
 
     return () => {
       cancelled = true;
+      pageGeneration.current = generation + 1;
     };
-
-  }, [id]);
+  }, [id, reloadToken]);
 
 
   /*
@@ -241,6 +361,12 @@ useEffect(() => {
 
   }
 
+  function prepareCover(file) {
+    if (!ACCEPTED_COVER_TYPES.includes(file.type)) throw new Error("Choose a PNG, JPEG, WebP, or GIF image.");
+    if (file.size > MAX_COVER_BYTES) throw new Error("Cover images must be 5 MB or smaller.");
+    return readImageAsDataUrl(file);
+  }
+
 
   function applyArtwork(updated) {
 
@@ -280,26 +406,6 @@ useEffect(() => {
       return;
     }
 
-    if (!ACCEPTED_COVER_TYPES.includes(file.type)) {
-
-      setArtworkError(
-        "Choose a PNG, JPEG, WebP, or GIF image."
-      );
-
-      return;
-
-    }
-
-    if (file.size > MAX_COVER_BYTES) {
-
-      setArtworkError(
-        "Cover images must be 5 MB or smaller."
-      );
-
-      return;
-
-    }
-
     setArtworkBusy(true);
     setArtworkError(null);
 
@@ -308,7 +414,7 @@ useEffect(() => {
       applyArtwork(
         await setPlaylistArtwork(
           id,
-          await readImageAsDataUrl(file)
+          await prepareCover(file)
         )
       );
 
@@ -355,16 +461,111 @@ useEffect(() => {
   }
 
 
+  function notifyPlaylistChange() {
+    queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    queryClient.invalidateQueries({ queryKey: ["playlist", id] });
+    window.dispatchEvent(new Event("playlistsChanged"));
+  }
+
+  async function persistEntryEdit(nextPlaylist, requestEdit) {
+    if (editLock.current) throw new Error("A playlist edit is already being saved.");
+    const previous = playlistRef.current;
+    const generation = pageGeneration.current;
+    editLock.current = true;
+    setEditingBusy(true);
+    setEditError("");
+    setMenuSongId(null);
+    if (nextPlaylist) setPlaylist(nextPlaylist);
+    try {
+      const updated = await requestEdit();
+      if (generation !== pageGeneration.current) return;
+      setPlaylist((current) => ({
+        ...current, entry: updated.entry, itemIds: updated.itemIds, songCount: updated.songCount,
+      }));
+      notifyPlaylistChange();
+    } catch (failure) {
+      console.error("Could not save playlist entries:", failure);
+      if (generation === pageGeneration.current) {
+        if (nextPlaylist) setPlaylist((current) => ({
+          ...current, entry: previous.entry, itemIds: previous.itemIds, songCount: previous.songCount,
+        }));
+        setEditError(failure.message || "Could not save playlist changes.");
+      }
+      throw failure;
+    } finally {
+      if (generation === pageGeneration.current) {
+        editLock.current = false;
+        setEditingBusy(false);
+      }
+    }
+  }
+
+  async function reorderEntries(ids, targetIndex) {
+    if (!canEditEntries) throw new Error("Reload this playlist before reordering its tracks.");
+    const previous = playlistRef.current;
+    const visible = songs.map((song) => song.playlistItemId);
+    const reordered = reorderPlaylistEntries(visible, new Set(ids), targetIndex);
+    if (reordered.every((key, index) => key === visible[index])) return;
+    const visibleSet = new Set(visible);
+    let cursor = 0;
+    // Unavailable catalog entries keep their slots and cannot be accidentally deleted.
+    const itemIds = previous.itemIds.map((key) => visibleSet.has(key) ? reordered[cursor++] : key);
+    const byId = new Map(previous.entry.map((song) => [song.playlistItemId, song]));
+    await persistEntryEdit({ ...previous, itemIds, entry: itemIds.flatMap(key => byId.has(key) ? [byId.get(key)] : []) },
+      () => reorderPlaylistItems(id, itemIds, previous.itemIds));
+  }
+
+  async function removeEntries(ids) {
+    if (!canEditEntries) throw new Error("Reload this playlist before removing selected tracks.");
+    const expectedItemIds = playlistRef.current.itemIds;
+    await persistEntryEdit(null, () => editPlaylistTracks(id, {
+      action: "remove", itemIds: ids, expectedItemIds,
+    }));
+  }
+
+  async function runTrackAction(action) {
+    if (batchLock.current || editLock.current) return;
+    const generation = pageGeneration.current;
+    batchLock.current = true;
+    setBatchBusy(true);
+    setEditError("");
+    try {
+      await action();
+      if (generation === pageGeneration.current) setMenuSongId(null);
+    } catch (failure) {
+      console.error("Could not complete track action:", failure);
+      if (generation === pageGeneration.current) setEditError(failure.message || "Could not complete this action.");
+    } finally {
+      if (generation === pageGeneration.current) {
+        batchLock.current = false;
+        setBatchBusy(false);
+      }
+    }
+  }
+
+  function menuSongs(song) {
+    return selectedSongs.length ? selectedSongs : [song];
+  }
+
+
 async function handleRemoveSong(
   song,
   songIndex
 ) {
+  songIndex = playlistRef.current.entry.indexOf(song);
+  if (songIndex < 0) { setEditError("This track is no longer in the playlist. Reload before editing."); return; }
+  const generation = pageGeneration.current;
   try {
+    if (canEditEntries) {
+      await removeEntries([song.playlistItemId]);
+      return;
+    }
 
     await removeSongFromPlaylistRequest(
       id,
       songIndex
     );
+    if (generation !== pageGeneration.current) return;
 
       setPlaylist((currentPlaylist) => {
 
@@ -376,9 +577,7 @@ async function handleRemoveSong(
         const updatedSongs =
           (currentPlaylist.entry || [])
             .filter(
-              (playlistSong) =>
-                String(playlistSong.id) !==
-                String(song.id)
+              (_playlistSong, index) => index !== songIndex
             );
 
 
@@ -406,6 +605,7 @@ async function handleRemoveSong(
         "Could not remove song from playlist:",
         error
       );
+      if (generation === pageGeneration.current) setEditError(error.message || "Could not remove song from playlist.");
 
     }
 
@@ -415,7 +615,7 @@ async function handleRemoveSong(
 
     return (
 
-      <div className="playlist-page">
+      <div className="playlist-page" data-view-loading="true">
 
         <div className="loading">
           Loading playlist...
@@ -454,9 +654,6 @@ async function handleRemoveSong(
 
   }
 
-  const songs =
-    playlist.entry || [];
-
   function playPlaylist() {
 
     if (songs.length === 0) {
@@ -466,7 +663,8 @@ async function handleRemoveSong(
       songs,
       0,
       {
-        type: "playlist",
+        type: deferredQuery.trim() || trackSort !== "custom" ? "collection" : "playlist",
+        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist.id) } : {}),
         id: playlist.id,
         name: playlist.name,
         coverArt: playlist.coverArt,
@@ -479,6 +677,7 @@ async function handleRemoveSong(
 
     <div
       className="playlist-page detail-hero-gradient"
+      data-view-loading={String(playlist.id) !== id}
     >
 
 
@@ -501,7 +700,7 @@ async function handleRemoveSong(
             className="playlist-page-cover playlist-cover-editable"
             aria-label={`Choose photo for ${playlist.name}`}
             aria-busy={artworkBusy}
-            disabled={artworkBusy}
+            disabled={artworkBusy || !canManage}
             onClick={() => coverInputRef.current?.click()}
           >
 
@@ -510,7 +709,7 @@ async function handleRemoveSong(
               placeholderClassName="playlist-placeholder"
             />
 
-            <span className="playlist-cover-overlay" aria-hidden="true">
+            {canManage && <span className="playlist-cover-overlay" aria-hidden="true">
               <svg
                 className="playlist-cover-overlay-icon"
                 viewBox="0 0 24 24"
@@ -526,7 +725,7 @@ async function handleRemoveSong(
               <span>
                 {artworkBusy ? "Updating…" : "Choose photo"}
               </span>
-            </span>
+            </span>}
 
           </button>
 
@@ -559,7 +758,8 @@ async function handleRemoveSong(
 
 
           <h1>
-            {playlist.name}
+            {canManage ? <button type="button" className="playlist-title-edit" onClick={openEditDetails} disabled={artworkBusy}
+              aria-haspopup="dialog" title="Edit details">{playlist.name}</button> : playlist.name}
           </h1>
 
 
@@ -583,6 +783,7 @@ async function handleRemoveSong(
           </div>
 
         </div>
+
 
       </div>
 
@@ -609,15 +810,30 @@ async function handleRemoveSong(
               aria-label="Toggle shuffle"
               aria-pressed={Boolean(isShuffleEnabled)}
               onClick={toggleShuffle}
+              disabled={isRemotePlayback}
             >
-              ⇄
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3 6h3c5 0 6 12 11 12h4m-4-4 4 4-4 4M3 18h3c2 0 3.5-2 4.8-4.5M14 8.7C15 7 16 6 17 6h4m-4-4 4 4-4 4" />
+              </svg>
+            </button>
+
+            <button type="button" className={`detail-secondary-action${loopPlaylistId === String(playlist.id) ? " is-active" : ""}`}
+              aria-label="Loop playlist" aria-pressed={loopPlaylistId === String(playlist.id)}
+              disabled={!songs.length || isRemotePlayback} onClick={() => togglePlaylistLoop(String(playlist.id))}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="m17 3 4 4-4 4M3 7h18M7 21l-4-4 4-4m14 4H3" />
+              </svg>
             </button>
 
             <CollectionDownloadButton
               tracks={songs}
               quality={downloadQuality}
               label="playlist"
+              collectionId={playlist.id}
+              collectionName={playlist.name}
             />
+            {canManage && <button type="button" className="detail-secondary-action playlist-share-action" aria-label="Share playlist"
+              onClick={() => setSharingOpen(true)}><span>Share<br />playlist</span></button>}
 
 <div className="playlist-options">
 
@@ -642,6 +858,18 @@ async function handleRemoveSong(
   {showMenu && (
 
     <FloatingPanel anchorRef={optionsTriggerRef} onClose={() => setShowMenu(false)} className="playlist-options-menu" role="menu">
+      {canManage && <PlaylistTasteOption id={String(id)} excluded={Boolean(playlist.excludeFromTaste)} onChanged={value => setPlaylist(previous => ({ ...previous, excludeFromTaste: value,
+        entry: previous.entry.map(song => ({ ...song, excludeFromTaste: value })) }))} />}
+      <div className="playlist-history-menu" role="group" aria-label="Playlist history">
+        <span className="playlist-history-label">Playlist history</span>
+        <button type="button" role="menuitem" className="playlist-menu-item" disabled={!history.canUndo || history.busy}
+          onClick={() => { void history.undo().catch(() => undefined); }}><span aria-hidden="true">↶</span>Undo</button>
+        <button type="button" role="menuitem" className="playlist-menu-item" disabled={!history.canRedo || history.busy}
+          onClick={() => { void history.redo().catch(() => undefined); }}><span aria-hidden="true">↷</span>Redo</button>
+        {(history.error || history.message || history.busy) && <p className="playlist-history-message" role={history.error ? "alert" : "status"}>
+          {history.error || (history.busy ? "Saving playlist changes…" : history.message)}
+        </p>}
+      </div>
 
       <button
         type="button"
@@ -662,17 +890,17 @@ async function handleRemoveSong(
         type="button"
         className="playlist-menu-item"
         role="menuitem"
+        disabled={!canManage}
         onClick={() => {
           setShowMenu(false);
-          updatePlaylistMutation.reset();
-          setEditDetailsOpen(true);
+          openEditDetails();
         }}
       >
         <span aria-hidden="true">✎</span>
         Edit details
       </button>
 
-      {playlist.coverMode === "custom" && (
+      {canManage && playlist.coverMode === "custom" && (
         <button
           type="button"
           className="playlist-menu-item"
@@ -692,14 +920,14 @@ async function handleRemoveSong(
         type="button"
         className="playlist-delete"
         role="menuitem"
-        disabled={deleting}
+        disabled={deleting || !canManage}
         onClick={async (event) => {
 
           event.stopPropagation();
 
           const confirmed =
             window.confirm(
-              `Delete "${playlist.name}"?`
+              `Move "${playlist.name}" to Trash? You can restore it for 30 days.`
             );
 
           if (!confirmed) {
@@ -746,7 +974,7 @@ async function handleRemoveSong(
         }}
       >
         {deleting
-          ? "Deleting..."
+            ? "Moving to Trash..."
           : "Delete playlist"}
       </button>
 
@@ -756,76 +984,106 @@ async function handleRemoveSong(
 
 </div>
 
+        <div className="playlist-track-tools">
+          <PlaylistSearchBox key={id} label="Search this playlist" value={trackQuery} onChange={setTrackQuery} />
+          <button type="button" className="folder-sort-trigger" ref={trackSortTrigger} aria-label={`Sort tracks: ${trackSortLabels[trackSort]}`}
+            aria-haspopup="menu" aria-expanded={trackSortOpen} onClick={() => setTrackSortOpen(!trackSortOpen)}>
+            {trackSortLabels[trackSort]} <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h12M8 12h8M8 18h4M4 5v2m0 4v2m0 4v2" /></svg>
+          </button>
+          {trackSortOpen && <FloatingPanel anchorRef={trackSortTrigger} className="folder-sort-menu" aria-label="Sort playlist tracks" onClose={() => setTrackSortOpen(false)}>
+            <span className="folder-sort-caption" aria-hidden="true">Sort by</span>
+            {Object.entries(trackSortLabels).map(([value, label]) => <button key={value} type="button" role="menuitemradio" aria-checked={trackSort === value}
+              onClick={() => { sortBy(value); setTrackSortOpen(false); trackSortTrigger.current?.focus(); }}>
+              {label}{trackSort === value && <span aria-hidden="true">{value === "custom" ? "✓" : sortDescending ? "↓" : "↑"}</span>}
+            </button>)}
+          </FloatingPanel>}
+        </div>
 
       </div>
 
 
       {/* SONG LIST */}
 
-      <div className="track-list" role="table" aria-label="Playlist tracks">
+      {trackQuery && <p className="playlist-edit-message" role="status">{songs.length} of {playlist.entry?.length || 0} tracks</p>}
 
-        <TrackListHeader />
+      {!canEditTracks && songs.length > 0 && <p className="playlist-edit-message">Viewer access · You can listen and add tracks to your own queue.</p>}
+      {canEditTracks && !canEditEntries && songs.length > 0 && <p className="playlist-edit-message">Reload to enable batch removal and reordering.</p>}
+      {playlist.sharingMode === "COLLABORATIVE" && canEditTracks && <PlaylistPartyPanel playlistId={String(id)} canManage={canManage} selectedTracks={selectedSongs} />}
+      {editError && <div className="playlist-edit-message is-error" role="alert">
+        <span>{editError}</span>
+        <button type="button" disabled={editingBusy || batchBusy} onClick={() => { selection.clear(); setReloadToken((value) => value + 1); }}>Reload playlist</button>
+      </div>}
+      {editStatus && <p className="playlist-edit-message" role="status">{editStatus}</p>}
+      {editingBusy && <p className="playlist-edit-message" role="status">Saving playlist changes...</p>}
+      <div className="track-list playlist-track-list" role="grid" aria-label="Playlist tracks" aria-multiselectable="true" aria-rowcount={songs.length + 1}>
+
+        <TrackListHeader sort={{ field: trackSort, descending: sortDescending, onChange: sortBy }} />
 
         {songs.length === 0 ? (
 
           <div className="library-empty">
-            This playlist doesn't have any songs yet.
+            {trackQuery ? "No tracks match this search." : "This playlist doesn't have any songs yet."}
           </div>
 
         ) : (
 
-          songs.map((song, index) => (
-            <TrackRow
-              key={`${song.id}-${index}`}
-              song={song}
-              index={index}
-              actionsRef={menuRef}
+            <VirtualizedTrackList
+              itemCount={songs.length}
+              getItem={(index) => songs[index]}
+              getItemKey={(index) => occurrenceIds[index]}
+              dataKey={id}
               onPlay={handleTrackPlayback}
-              onSelectSource={playSongFromSource}
-              onToggleMenu={(selectedSong) => {
-                setMenuSongId(menuSongId === selectedSong.id ? null : selectedSong.id);
+              showDateAdded
+              searchTokens={searchTokens}
+
+
+              selection={selection}
+              editingDisabled={editingBusy || batchBusy}
+              onReorder={canEditEntries && trackSort === "custom" ? (ids, target) => {
+                if (batchLock.current || editLock.current) return;
+                const generation = pageGeneration.current;
+                void reorderEntries(ids, target).catch((failure) => {
+                  console.error("Playlist reorder failed:", failure);
+                  if (generation === pageGeneration.current) setEditError(failure.message || "Could not reorder playlist tracks.");
+                });
+              } : undefined}
+              onToggleEntryMenu={(_song, index) => {
+                setMenuSongId(menuSongId === occurrenceIds[index] ? null : occurrenceIds[index]);
               }}
-              menu={menuSongId === song.id ? (
+              renderMenu={(song, index) => canEditTracks && menuSongId === occurrenceIds[index] ? (
                 <div className="playlist-menu">
-
-                    <button
-                      className="playlist-menu-item"
-
-                      onClick={() =>
-                        handleRemoveSong(
-                          song,
-                          index
-                        )
-                      }
-                    >
-
-                      <span>
-                        −
-                      </span>
-
-                      <span>
-                        Remove from playlist
-                      </span>
-
-                    </button>
+                  <button type="button" role="menuitem" className="playlist-menu-item playlist-track-remove" disabled={editingBusy || batchBusy} onClick={() => { void runTrackAction(async () => {
+                      const tracks = menuSongs(song);
+                      if (tracks.length > 1 && !window.confirm(`Remove ${tracks.length} tracks from this playlist?`)) return;
+                      if (canEditEntries) await removeEntries(tracks.map((track) => track.playlistItemId));
+                      else await handleRemoveSong(song, index);
+                    }); }}>Remove from Playlist</button>
                 </div>
               ) : null}
             />
 
-          ))
-
         )}
 
       </div>
+
+      <PlaylistRecommendations key={id} playlistId={id} songs={songs} disabled={editingBusy || batchBusy}
+        onPlaylistChange={(updated) => {
+          setPlaylist((current) => current?.id === updated.id ? updated : current);
+          notifyPlaylistChange();
+        }} />
       {editDetailsOpen && (
         <PlaylistDetailsDialog
           playlist={playlist}
           busy={updatePlaylistMutation.isPending}
           error={updatePlaylistMutation.error?.message || ""}
           onClose={closeEditDetails}
-          onSave={(updates) => updatePlaylistMutation.mutate(updates)}
+          prepareCover={prepareCover}
+          onSave={(updates, cover) => updatePlaylistMutation.mutate({ updates, cover })}
         />
       )}
+      {sharingOpen && canManage && <PlaylistShareModal playlistId={String(id)} playlistName={playlist.name} onClose={() => setSharingOpen(false)}
+        onSaved={state => { setPlaylist(previous => ({ ...previous, sharingMode: state.mode, sharingRevision: state.revision,
+          entry: previous.entry.map(song => ({ ...song, showContributor: state.mode === "COLLABORATIVE" })) })); }} />}
 
     </div>
 

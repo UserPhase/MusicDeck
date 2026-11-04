@@ -1,6 +1,6 @@
 import type { Db } from "../db/database.js";
 
-const ALLOWED_USER_SETTINGS = new Set([
+export const ALLOWED_USER_SETTINGS = new Set([
   "playback.defaultVolume",
   "ui.compactLists",
   "catalog.sourceMode",
@@ -12,9 +12,14 @@ const ALLOWED_USER_SETTINGS = new Set([
   "playback.silenceTrim.thresholdDb",
   "playback.silenceTrim.minSilenceSeconds",
   "playback.crossfadeDuration",
+  "playback.transitionMode",
+  "playback.shuffleMode",
+  "playback.albumAware",
   "playback.streamQuality",
   "playback.downloadQuality",
   "playback.replayGain.enabled",
+  "playback.normalization.enabled",
+  "playback.normalization.targetLufs",
   "playback.autoplay.enabled",
   "ui.theme",
   "ui.layoutDensity",
@@ -24,6 +29,14 @@ const ALLOWED_USER_SETTINGS = new Set([
 ]);
 
 export const DEFAULT_APP_NAME = "MusicDeck";
+export const NORMALIZATION_TARGETS = [-18, -16, -14] as const;
+export function getNormalizationTarget(db: Db, userId: string): number {
+  const row = db.prepare("SELECT value FROM user_settings WHERE user_id = ? AND key = 'playback.normalization.targetLufs'").get(userId) as { value: string } | undefined;
+  try {
+    const target = row ? JSON.parse(row.value) : -16;
+    return NORMALIZATION_TARGETS.includes(target) ? target : -16;
+  } catch { return -16; }
+}
 const APP_NAME_SETTING_KEY = "branding.appName";
 
 const ALLOWED_SERVER_SETTINGS = new Set([

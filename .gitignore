@@ -24,8 +24,15 @@ data/
 *.sqlite-wal
 music/
 
-# === Leftover test artifacts (temp dirs created by test runs) ===
+# === Test artifacts (temp dirs, coverage, reports created by test runs) ===
 **/test/tmp-test-*/
+test-results/
+playwright-report/
+coverage/
+**/coverage/
+
+# === Local scratch (test logs, jest caches, npm cache, ad-hoc outputs) ===
+.tmp/
 
 # === Logs ===
 npm-debug.log*
@@ -33,10 +40,14 @@ yarn-debug.log*
 yarn-error.log*
 *.log
 
+# === TypeScript incremental build info ===
+*.tsbuildinfo
+
 # === OS / editor cruft ===
 .DS_Store
 Thumbs.db
 *.code-workspace
+.vscode/
 
 # === Misc local scratch files (not needed in the repo) ===
 music_copy.txt

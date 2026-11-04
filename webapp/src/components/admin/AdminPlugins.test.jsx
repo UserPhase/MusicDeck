@@ -11,6 +11,11 @@ import {
   updateAdminPlugin,
 } from "../../api/musicdeck";
 
+jest.mock("../../api/extensions", () => ({
+  getExtensions: jest.fn(async () => ({ extensions: [], issues: [] })),
+  discoverExtensions: jest.fn(async () => ({ extensions: [], issues: [] })),
+  setExtensionEnabled: jest.fn(),
+}));
 
 jest.mock("../../api/musicdeck", () => ({
   getAdminPlugins: jest.fn(),
@@ -91,6 +96,27 @@ beforeEach(() => {
 
 
 describe("Plugins page", () => {
+  test("spotDL format defaults are saved even without changing the selector, and a new format can be selected", async () => {
+    const plugin = { ...PLUGINS[0], id: "spotdl-downloader", name: "SpotDL Downloader", config: {},
+      configFields: [{ key: "outputFormat", label: "Audio format", type: "select", default: "best",
+        description: "Best preserves the source bitrate; FLAC cannot improve a lossy source.",
+        options: [{ value: "best", label: "Best source quality (M4A)" }, { value: "opus", label: "Opus" }, { value: "mp3", label: "MP3" }] },
+        { key: "autoScan", label: "Scan after import", default: false }] };
+    getAdminPlugins.mockResolvedValue([plugin]);
+    updateAdminPlugin.mockImplementation(async (_id, settings) => ({ ...plugin, config: settings.config }));
+    renderPlugins();
+    fireEvent.click(await screen.findByRole("button", { name: /open spotdl downloader/i }));
+    const format = await screen.findByRole("combobox", { name: /Audio format/ });
+    expect(format).toHaveValue("best");
+    expect(screen.getByRole("checkbox", { name: "Scan after import" })).not.toBeChecked();
+    expect(format).toHaveAccessibleDescription("Best preserves the source bitrate; FLAC cannot improve a lossy source.");
+    fireEvent.click(screen.getByRole("button", { name: "Save plugin settings" }));
+    await waitFor(() => expect(updateAdminPlugin).toHaveBeenCalledWith(plugin.id, expect.objectContaining({ config: { outputFormat: "best", autoScan: false } })));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save plugin settings" })).toBeEnabled());
+    fireEvent.change(format, { target: { value: "opus" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save plugin settings" }));
+    await waitFor(() => expect(updateAdminPlugin).toHaveBeenLastCalledWith(plugin.id, expect.objectContaining({ config: { outputFormat: "opus", autoScan: false } })));
+  });
   test("lists plugins with name, version and status", async () => {
     renderPlugins();
 

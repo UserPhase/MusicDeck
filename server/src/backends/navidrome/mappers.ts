@@ -1,4 +1,5 @@
-import type { Album, Artist, Playlist, Track } from "../../types.js";
+import type { Album, Artist, Playlist, Track, TrackArtistCredit } from "../../types.js";
+import { withTrackContent } from "../../services/media/contentRevision.js";
 
 function id(value: unknown) {
   return value === undefined || value === null ? null : String(value);
@@ -41,16 +42,33 @@ export function streamUrl(trackId: string) {
 
 export function mapTrack(song: any): Track {
   const trackId = String(song.id);
+  const artistCredits: TrackArtistCredit[] = Array.isArray(song.artists)
+    ? song.artists.flatMap((artist: { id?: unknown; name?: unknown } | null) =>
+      typeof artist?.name === "string" && artist.name.trim()
+        ? [{ id: id(artist.id) || null, name: artist.name.trim() }]
+        : [])
+    : [];
 
-  return {
+  return withTrackContent({
     id: trackId,
     providerId: trackId,
     title: song.title || "Unknown title",
-    artistId: id(song.artistId),
-    artistName: song.artist || "Unknown artist",
+    artistId: id(song.artistId) || artistCredits[0]?.id || null,
+    artistName: song.displayArtist || song.artist || artistCredits.map(({ name }) => name).join(", ") || "Unknown artist",
+    ...(artistCredits.length ? { artistCredits } : {}),
     albumId: id(song.albumId),
     albumName: song.album || "Unknown album",
     durationSeconds: typeof song.duration === "number" ? song.duration : null,
+    genres: Array.isArray(song.genres)
+      ? song.genres.flatMap((genre: unknown) => {
+        if (typeof genre === "string") return [genre];
+        return genre && typeof genre === "object" && "name" in genre && typeof genre.name === "string" ? [genre.name] : [];
+      })
+      : typeof song.genre === "string" ? [song.genre] : [],
+    moods: typeof song.mood === "string" ? [song.mood] : [],
+    year: typeof song.year === "number" ? song.year : null,
+    originalReleaseYear: typeof song.originalReleaseDate?.year === "number" ? song.originalReleaseDate.year : null,
+    bpm: typeof song.bpm === "number" && Number.isFinite(song.bpm) ? song.bpm : null,
     playCount: typeof song.playCount === "number" ? song.playCount : null,
     lastPlayedAt: typeof song.played === "string" ? song.played : null,
     addedAt: typeof song.created === "string" ? song.created : null,
@@ -58,9 +76,17 @@ export function mapTrack(song: any): Track {
     artworkId: id(song.coverArt),
     artworkUrl: artworkUrl(id(song.coverArt)),
     streamUrl: streamUrl(trackId),
+    audioMetadata: {
+      codec: typeof song.contentType === "string" ? song.contentType.replace(/^audio\//, "") : typeof song.suffix === "string" ? song.suffix : null,
+      container: typeof song.suffix === "string" ? song.suffix : null,
+      bitrateKbps: typeof song.bitRate === "number" && song.bitRate > 0 ? song.bitRate : null,
+      sampleRateHz: typeof song.samplingRate === "number" && song.samplingRate > 0 ? song.samplingRate : null,
+      bitDepth: typeof song.bitDepth === "number" && song.bitDepth > 0 ? song.bitDepth : null,
+      channels: typeof song.channelCount === "number" && song.channelCount > 0 ? song.channelCount : null,
+    },
     replayGain: replayGain(song),
     identityHints: identityHints(song),
-  };
+  }, { path: song.path, size: song.size, modified: song.modified, suffix: song.suffix });
 }
 
 export function mapAlbum(album: any): Album {

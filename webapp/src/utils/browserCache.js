@@ -3,9 +3,13 @@ const PRESERVED_LOCAL_STORAGE_KEYS = new Set([
   "recentlyPlayed",
   "playerVolume",
   "playerCrossfadeDuration",
+  "playerTransitionMode",
+  "playerShuffleMode",
+  "playerAlbumAware",
   "playerStreamQuality",
   "playerDownloadQuality",
   "playerReplayGainEnabled",
+  "playerNormalizationEnabled",
   "playerLayoutDensity",
   "playerAccentColor",
   "playerAutoOpenSidebar",
@@ -15,6 +19,7 @@ const PRESERVED_LOCAL_STORAGE_KEYS = new Set([
 
 const PRESERVED_STORAGE_KEY = /(?:preferences?|settings?|theme|auth|session|token|jwt)/i;
 const PRESERVED_DATABASE = /(?:preferences?|settings?|auth|session|token|jwt)/i;
+const EXPLICIT_DOWNLOAD_DATABASES = new Set(["musicdeck-offline", "musicdeck-downloads"]);
 const CACHE_STORAGE_KEY = /(?:cache|cached|artwork|normalized|trackmetadata|apiresponse)/i;
 const CACHE_DATABASE = /(?:^musicdeck(?:-|$)|cache|artwork|normalized|metadata|track-data|api-response)/i;
 const KNOWN_CACHE_DATABASES = [
@@ -120,6 +125,7 @@ export async function clearLocalBrowserCache() {
           .map((database) => database.name)
           .filter((name) =>
             name &&
+            !EXPLICIT_DOWNLOAD_DATABASES.has(name) &&
             !PRESERVED_DATABASE.test(name) &&
             CACHE_DATABASE.test(name)
           );

@@ -1,8 +1,10 @@
+import { isBrowserIntegrationAllowed } from "../services/privacyPolicy";
+import { playlistCommands, setPlaylistCommandNotifier } from "../services/playlists/PlaylistCommandStore";
 import {
   normalizeTrackData,
 } from "../utils/normalizeTrackData";
 
-async function request(path, options = {}) {
+export async function request(path, options = {}) {
   const response = await fetch(path, {
     credentials: "include",
     headers: {
@@ -26,7 +28,7 @@ async function request(path, options = {}) {
       // Keep the status-based message when the body is not JSON.
     }
 
-    throw new Error(message);
+    throw Object.assign(new Error(message), { status: response.status });
   }
 
   if (response.status === 204) {
@@ -36,8 +38,67 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+export const taskStreamUrl = () => "/api/v1/admin/tasks/stream";
+export const inspectAudioStream = (trackId, inspectionId, signal) =>
+  request(`/api/v1/stream/inspect/${encodeURIComponent(trackId)}?${new URLSearchParams({ inspectionId })}`, { signal });
+export const getMediaCheckpoints = (signal, type, mediaId) => {
+  const query = type && mediaId ? `?${new URLSearchParams({ type, mediaId })}` : "";
+  return request(`/api/v1/user/media-sessions${query}`, { signal });
+};
+export const saveMediaCheckpoint = (checkpoint, signal) => request("/api/v1/user/media-sessions", {
+  method: "POST", body: JSON.stringify(checkpoint), keepalive: true, signal,
+});
+export const getDataExportSummary = (signal) => request("/api/v1/user/export/summary", { signal });
+
+export function downloadUserData(kind, format, playlistId) {
+  const suffix = kind === "playlists" && playlistId ? `playlists/${encodeURIComponent(playlistId)}` : kind;
+  const anchor = document.createElement("a");
+  anchor.href = `/api/v1/user/export/${suffix}?${new URLSearchParams({ format })}`;
+  anchor.download = "";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+export const controlTask = (id, action) => request(`/api/v1/admin/tasks/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+export const setTaskPriority = (id, priority) => request(`/api/v1/admin/tasks/${encodeURIComponent(id)}/priority`, {
+  method: "PATCH", body: JSON.stringify({ priority }),
+});
+export const getTaskLogs = (id, signal) => request(`/api/v1/admin/tasks/${encodeURIComponent(id)}/logs`, { signal });
+export const clearTaskHistory = () => request("/api/v1/admin/tasks/history", { method: "DELETE" });
+
 function toSong(track) {
   return { ...normalizeTrackData(track), playedAt: track.playedAt || null, playCount: track.playCount || 0 };
+}
+
+export const getSavedDiscoveries = () => request("/api/v1/discoveries/saved");
+export const saveDiscovery = (item) => request("/api/v1/discoveries/save", {
+  method: "POST", body: JSON.stringify(item),
+});
+export const removeSavedDiscovery = (id) => request(`/api/v1/discoveries/saved/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+export const listSmartPlaylists = () => request("/api/v1/smart-playlists");
+export const getSmartPlaylist = (id) => request(`/api/v1/smart-playlists/${encodeURIComponent(id)}`);
+export const findSmartPlaylistSeeds = (query, signal, id) => request(`/api/v1/smart-playlists/seeds?${new URLSearchParams({ q: query, ...(id ? { id } : {}) })}`, { signal });
+export const createSmartPlaylist = (playlist) => request("/api/v1/smart-playlists", {
+  method: "POST", body: JSON.stringify(playlist),
+});
+export const saveMixPlaylist = (playlist) => request("/api/v1/smart-playlists/snapshot", {
+  method: "POST", body: JSON.stringify(playlist),
+});
+export const updateSmartPlaylist = (id, playlist) => request(`/api/v1/smart-playlists/${encodeURIComponent(id)}`, {
+  method: "PUT", body: JSON.stringify(playlist),
+});
+export const deleteSmartPlaylist = (id) => request(`/api/v1/smart-playlists/${encodeURIComponent(id)}`, { method: "DELETE" });
+export async function previewSmartPlaylist(rules, signal, options) {
+  const result = await request("/api/v1/smart-playlists/preview", {
+    method: "POST", body: JSON.stringify({ rules, limit: 12, ...(options ? { options } : {}) }), signal,
+  });
+  return { ...result, tracks: result.tracks.map(toSong) };
+}
+export async function getSmartPlaylistTracks(id, offset = 0, limit = 500) {
+  const result = await request(`/api/v1/smart-playlists/${encodeURIComponent(id)}/tracks?${new URLSearchParams({ offset, limit })}`);
+  return { ...result, tracks: result.tracks.map(toSong) };
 }
 
 function toAlbum(album, songs) {
@@ -51,6 +112,7 @@ function toAlbum(album, songs) {
     artistId: album.artistId,
     artist: external ? album.artist : album.artistName,
     year: album.year,
+    metadata: { ...album.metadata, sourceServer: album.sourceServer ?? album.metadata?.sourceServer },
     releaseDate: album.releaseDate || null,
     genre: album.genre || null,
     label: album.label || null,
@@ -70,6 +132,7 @@ function toAlbum(album, songs) {
     identity: album.identity,
     inLibrary: Boolean(album.inLibrary),
     localAlbumId: album.localAlbumId || null,
+    albumArtworkUrl: !external && !songs && album.id ? `/api/albums/${encodeURIComponent(album.id)}/artwork` : null,
     ...(songs ? { song: songs } : {}),
   };
 }
@@ -95,17 +158,39 @@ function toArtist(artist, albums) {
 function toPlaylist(playlist) {
   return {
     id: playlist.id,
+    ownerUserId: playlist.ownerUserId,
+    sharingMode: playlist.sharingMode,
+    sharingRevision: playlist.sharingRevision,
+    permissions: playlist.permissions,
+    excludeFromTaste: Boolean(playlist.excludeFromTaste),
+    editRevision: playlist.editRevision,
     name: playlist.name,
+    createdAt: playlist.createdAt,
     description: playlist.description ?? null,
     comment: playlist.description ?? null,
     coverArt: playlist.artworkId,
     coverMode: playlist.artworkMode || null,
     songCount: playlist.songCount,
-    entry: (playlist.tracks || []).map((track) =>
-      normalizeTrackData(track, "playlist")
-    ),
+    itemIds: playlist.itemIds,
+    entry: (playlist.tracks || []).map((track) => ({
+      ...normalizeTrackData(track, "playlist"),
+      genres: track.genres || [],
+      addedByUserId: track.addedByUserId ?? null,
+      addedBy: track.addedBy ?? null,
+      showContributor: playlist.sharingMode === "COLLABORATIVE",
+      tastePlaylistId: playlist.id,
+      excludeFromTaste: Boolean(playlist.excludeFromTaste),
+      ...(track.playlistItemId ? { playlistItemId: track.playlistItemId } : {}),
+      ...(track.playlistAddedAt ? { playlistAddedAt: track.playlistAddedAt } : {}),
+    })),
   };
 }
+
+setPlaylistCommandNotifier((result, playlistId) => {
+  window.dispatchEvent(new CustomEvent("playlistsChanged", { detail: {
+    playlistId, playlist: result.playlist ? toPlaylist(result.playlist) : null, deletedAt: result.deletedAt,
+  } }));
+});
 
 function toSearchItem(result) {
   if (result.type === "track") {
@@ -147,8 +232,8 @@ export async function logout() {
   await request("/api/auth/logout", { method: "POST" });
 }
 
-export async function getCurrentSession() {
-  return request("/api/auth/session");
+export async function getCurrentSession(signal) {
+  return request("/api/auth/session", signal ? { signal } : {});
 }
 
 export async function changePassword(currentPassword, newPassword) {
@@ -300,11 +385,6 @@ export async function testAdminSourceProvider(providerId) {
   return data.test;
 }
 
-export async function getPlugins() {
-  const data = await request("/api/plugins");
-  return data.plugins || [];
-}
-
 export async function getAdminPlugins() {
   const data = await request("/api/admin/plugins");
   return data.plugins || [];
@@ -399,9 +479,12 @@ export async function deleteUser(userId) {
  */
 export function getCoverUrl(coverArt, size) {
   if (!coverArt) return null;
-  if (typeof coverArt === "object") return coverArt.url || null;
+  if (typeof coverArt === "object") return getCoverUrl(coverArt.url, size);
 
   const id = String(coverArt);
+  if (!isBrowserIntegrationAllowed("artwork") && (
+    /^https?:\/\//i.test(id) || id.startsWith("extart_") || id.startsWith("/api/artwork/external/")
+  )) return null;
   if (/^https?:\/\//i.test(id) || (id.startsWith("/") && !id.startsWith("//"))) {
     return id;
   }
@@ -413,6 +496,37 @@ export function getCoverUrl(coverArt, size) {
   const url = `/api/artwork/${encodeURIComponent(id)}`;
 
   return size ? `${url}?size=${encodeURIComponent(size)}` : url;
+}
+
+export async function prepareNormalizedPlayback(songId, source, previewUrl, signal, streamQuality = "original", targetLufs = -16) {
+  return request("/api/playback/normalize", {
+    method: "POST",
+    signal,
+    body: JSON.stringify({
+      trackId: String(songId),
+      ...(source && typeof source === "object" && source.id ? { playableSource: source.id } : source ? { source } : {}),
+      ...(previewUrl ? { previewUrl } : {}),
+      ...(["128", "192", "256", "320"].includes(streamQuality) ? { bitRate: Number(streamQuality) } : {}),
+      background: true,
+      targetLufs,
+    }),
+  });
+}
+
+export async function getLoudnessScan(signal) {
+  return (await request("/api/playback/loudness-scan", { signal })).scan;
+}
+
+export async function startLoudnessScan() {
+  return (await request("/api/playback/loudness-scan", { method: "POST", body: "{}" })).scan;
+}
+
+export async function getSilenceScan(signal) {
+  return (await request("/api/playback/silence-scan", { signal })).scan;
+}
+
+export async function startSilenceScan(parameters) {
+  return (await request("/api/playback/silence-scan", { method: "POST", body: JSON.stringify(parameters) })).scan;
 }
 
 export function getStreamUrl(songId, source, streamQuality = "original") {
@@ -471,12 +585,16 @@ export async function getTrackArtistBiography(songId) {
   return typeof data.biography === "string" ? data.biography : null;
 }
 
-export async function getSilenceAnalysis(songId) {
+export async function getSilenceAnalysis(songId, options) {
   if (!songId) {
     return null;
   }
 
-  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/silence-analysis`);
+  const params = new URLSearchParams();
+  if (options?.thresholdDb !== undefined) params.set("thresholdDb", String(options.thresholdDb));
+  if (options?.minSilenceSeconds !== undefined) params.set("minSilenceSeconds", String(options.minSilenceSeconds));
+  const query = params.toString();
+  const data = await request(`/api/tracks/${encodeURIComponent(songId)}/silence-analysis${query ? `?${query}` : ""}`);
   return data.analysis;
 }
 
@@ -518,11 +636,6 @@ export async function getAlbums(limit = 20) {
   return (data.albums || []).map((album) => toAlbum(album));
 }
 
-export async function getRandomAlbums(limit = 16) {
-  const data = await request(`/api/library/random-albums?limit=${encodeURIComponent(limit)}`);
-  return (data.albums || []).map((album) => toAlbum(album));
-}
-
 export async function getRandomSongs(limit = 10) {
   const data = await request(`/api/library/random-tracks?limit=${encodeURIComponent(limit)}`);
   return (data.tracks || []).map(toSong);
@@ -545,6 +658,30 @@ export async function getAllSongs() {
   return (data.tracks || []).map((track) =>
     normalizeTrackData(track, "library")
   );
+}
+
+export async function getTrackPage({ offset = 0, limit = 200, filters = [], signal } = {}) {
+  const data = filters.length
+    ? await request("/api/library/tracks/filter", {
+      method: "POST", body: JSON.stringify({ filters, offset, limit }), signal,
+    })
+    : await request(`/api/tracks?offset=${offset}&limit=${limit}`, { signal });
+  return { items: (data.tracks || []).map(toSong), total: data.total, revision: data.revision };
+}
+
+export async function getAlbumPage({ offset = 0, limit = 200, signal } = {}) {
+  const data = await request(`/api/albums?offset=${offset}&limit=${limit}`, { signal });
+  return { items: (data.albums || []).map((album) => toAlbum(album)), total: data.total, revision: data.revision };
+}
+
+export async function getCollectorCatalog(includeAlbums, signal) {
+  const data = await request(`/api/library/collector?albums=${includeAlbums ? 1 : 0}`, { signal });
+  return {
+    ownerId: data.ownerId,
+    tracks: data.tracks.map(track => ({ ...toSong(track), favorite: track.favorite, played: track.played })),
+    albums: data.albums.map(album => toAlbum(album)),
+    degraded: data.degraded,
+  };
 }
 
 export async function getArtists() {
@@ -602,11 +739,28 @@ export async function startRadio(seed, limit = 20) {
   return (data.tracks || []).map(toSearchItem);
 }
 
+export const RECOMMENDATION_FEEDBACK_CHANGED_EVENT = "musicdeck:recommendation-feedback-changed";
+
+export async function getAutoplayTracks(seedId, limit = 10, excludeIds = [], taste = {}) {
+  const data = await request("/api/recommendations/autoplay", {
+    method: "POST",
+    body: JSON.stringify({ seedId: String(seedId), limit, excludeIds: excludeIds.map(String).slice(-500),
+      ...(taste.playlistId ? { playlistId: String(taste.playlistId), excludeFromTaste: Boolean(taste.excludeFromTaste) } : {}) }),
+  });
+  return (data.tracks || []).map((track) => ({
+    ...toSearchItem(track),
+    recommendationGenerated: true,
+    autoplayGenerated: true,
+  }));
+}
+
 export async function sendRecommendationFeedback(feedback) {
-  return request("/api/recommendations/feedback", {
+  const result = await request("/api/recommendations/feedback", {
     method: "POST",
     body: JSON.stringify(feedback),
   });
+  window.dispatchEvent(new CustomEvent(RECOMMENDATION_FEEDBACK_CHANGED_EVENT, { detail: feedback }));
+  return result;
 }
 
 export async function recordListeningEvent(trackId, eventType, completionRatio) {
@@ -677,7 +831,7 @@ export async function getArtistDiscography(artistId) {
 
 export async function getArtistTopTracks(artistId) {
   const data = await request(`/api/artists/${encodeURIComponent(artistId)}/top-tracks`);
-  return data.tracks || [];
+  return (data.tracks || []).map(toSong);
 }
 
 export async function getArtistPortrait(artistId, options = {}) {
@@ -703,47 +857,42 @@ export async function getRecentlyAddedSongs(limit = 6) {
   return (data.tracks || []).map(toSong);
 }
 
-export async function filterLibraryTracks(filters = [], limit = 200) {
-  const data = await request("/api/library/tracks/filter", {
-    method: "POST",
-    body: JSON.stringify({ filters, limit }),
-  });
-  return (data.tracks || []).map(toSong);
-}
-
 export async function getLibraryHealth() {
   return request("/api/library/health");
+}
+
+/** Admin background health check: poll this for progress and the report. */
+export async function getAdminHealthScan() {
+  const data = await request("/api/admin/library/health/scan");
+  return data.status;
+}
+
+export async function startAdminHealthScan() {
+  return request("/api/admin/library/health/scan", { method: "POST" });
+}
+
+export async function rescanLibraryArtwork() {
+  return request("/api/admin/library/health/repair/artwork", { method: "POST" });
+}
+
+export async function pruneOrphanedTracks() {
+  return request("/api/admin/library/health/repair/prune-orphans", { method: "POST" });
 }
 
 export async function getLibraryStatistics() {
   return request("/api/library/statistics");
 }
 
-export async function getSavedFilters() {
-  const data = await request("/api/library/saved-filters");
-  return data.filters || [];
-}
-
-export async function saveLibraryFilter(name, filters) {
-  const data = await request("/api/library/saved-filters", {
-    method: "POST",
-    body: JSON.stringify({ name, filters }),
-  });
-  return data.filter;
-}
-
-export async function setMediaRating(itemType, itemId, rating) {
-  return request(`/api/library/${encodeURIComponent(itemType)}/${encodeURIComponent(itemId)}/rating`, {
-    method: "PUT",
-    body: JSON.stringify({ rating }),
-  });
-}
-
-export async function setMediaFavorite(itemType, itemId, favorite) {
+export async function setMediaFavorite(itemType, itemId, favorite, album) {
   return request(`/api/library/${encodeURIComponent(itemType)}/${encodeURIComponent(itemId)}/favorite`, {
     method: "PUT",
-    body: JSON.stringify({ favorite }),
+    body: JSON.stringify({ favorite, ...(album ? { album } : {}) }),
   });
+}
+
+export async function getLikedAlbums() {
+  const data = await request("/api/favorites/albums");
+  return data.albums || [];
 }
 
 export async function getArtistTracks(artistId) {
@@ -786,12 +935,16 @@ export async function getPlaylists() {
   return (data.playlists || []).map(toPlaylist);
 }
 
-export async function getPlaylist(playlistId) {
-  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`);
+export async function getPlaylist(playlistId, signal) {
+  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`, signal ? { signal } : {});
   return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
 export async function patchPlaylist(playlistId, updates) {
+  if (playlistCommands.getSnapshot().owner) {
+    const result = await playlistCommands.execute(String(playlistId), { kind: "details", ...updates });
+    return result.playlist ? toPlaylist(result.playlist) : null;
+  }
   const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`, {
     method: "PATCH",
     body: JSON.stringify(updates),
@@ -810,16 +963,46 @@ export async function createPlaylist(name, description = "") {
 }
 
 export async function deletePlaylist(playlistId) {
+  if (playlistCommands.getSnapshot().owner) {
+    await playlistCommands.execute(String(playlistId), { kind: "trash" }); return;
+  }
   await request(`/api/playlists/${encodeURIComponent(playlistId)}`, {
     method: "DELETE",
   });
 }
 
 export async function addSongToPlaylist(playlistId, songId) {
+  if (playlistCommands.getSnapshot().owner) {
+    const result = await playlistCommands.execute(String(playlistId), { kind: "add", trackIds: [String(songId)] });
+    return { added: Boolean(result.command) };
+  }
   return request(`/api/playlists/${encodeURIComponent(playlistId)}/tracks`, {
     method: "POST",
     body: JSON.stringify({ trackId: String(songId) }),
   });
+}
+
+export async function reorderPlaylistItems(playlistId, itemIds, expectedItemIds) {
+  if (playlistCommands.getSnapshot().owner) {
+    const result = await playlistCommands.execute(String(playlistId), { kind: "reorder", itemIds, expectedItemIds });
+    return toPlaylist(result.playlist);
+  }
+  const data = await request(`/api/v1/playlists/${encodeURIComponent(playlistId)}/reorder`, {
+    method: "POST", body: JSON.stringify({ itemIds, expectedItemIds }),
+  });
+  return toPlaylist(data.playlist);
+}
+
+export async function editPlaylistTracks(playlistId, edit) {
+  if (playlistCommands.getSnapshot().owner) {
+    const { action, ...payload } = edit;
+    const result = await playlistCommands.execute(String(playlistId), { kind: action, ...payload });
+    return toPlaylist(result.playlist);
+  }
+  const data = await request(`/api/v1/playlists/${encodeURIComponent(playlistId)}/tracks/batch`, {
+    method: "POST", body: JSON.stringify(edit),
+  });
+  return toPlaylist(data.playlist);
 }
 
 export async function updatePlaylist(playlistId, songIdToAdd = null) {
@@ -841,8 +1024,12 @@ export async function removeSongFromPlaylist(playlistId, songIndex) {
     return;
   }
 
+  if (playlistCommands.getSnapshot().owner && song.playlistItemId) {
+    await playlistCommands.execute(String(playlistId), { kind: "remove", itemIds: [song.playlistItemId], expectedItemIds: playlist.itemIds }); return;
+  }
+
   await request(
-    `/api/playlists/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(song.id)}`,
+    `/api/playlists/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(song.playlistItemId || song.id)}`,
     { method: "DELETE" }
   );
 }
@@ -872,8 +1059,8 @@ export async function clearPlaylistArtwork(playlistId) {
   return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
-export async function getStarred() {
-  const data = await request("/api/favorites/tracks");
+export async function getStarred(signal) {
+  const data = await request("/api/favorites/tracks", signal ? { signal } : {});
   return (data.tracks || []).map((track) =>
     normalizeTrackData(track, "liked")
   );
@@ -896,6 +1083,10 @@ export async function getExternalCharts() {
   return request("/api/discovery/external");
 }
 
+export async function getPersonalizedDiscovery() {
+  return request("/api/discovery/personalized");
+}
+
 export async function hydrateExternalPreviews(tracks) {
   const data = await request("/api/discovery/external/previews", {
     method: "POST",
@@ -904,8 +1095,8 @@ export async function hydrateExternalPreviews(tracks) {
   return data.tracks || [];
 }
 
-export async function getRecentlyPlayed() {
-  const data = await request("/api/recently-played");
+export async function getRecentlyPlayed({ tasteOnly = false } = {}) {
+  const data = await request(`/api/recently-played${tasteOnly ? "?tasteOnly=1" : ""}`);
   return (data.tracks || []).map(toSong);
 }
 
@@ -935,8 +1126,9 @@ export async function createAcquisition(payload) {
   });
 }
 
-export async function getAcquisitions() {
-  const data = await request("/api/acquisitions");
+/** @param {{ ownOnly?: boolean, signal?: AbortSignal }} [options] */
+export async function getAcquisitions({ ownOnly = false, signal } = {}) {
+  const data = await request(ownOnly ? "/api/acquisitions?scope=mine" : "/api/acquisitions", { signal });
   return data.jobs || [];
 }
 

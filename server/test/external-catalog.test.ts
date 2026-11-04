@@ -402,7 +402,7 @@ describe("Deezer external artwork", () => {
         data: [{
           id: 111,
           title: "Deezer Song",
-          artist: { name: "Deezer Artist" },
+          artist: { id: 333, name: "Deezer Artist" },
           album: {
             id: 222,
             title: "Deezer Album",
@@ -419,7 +419,7 @@ describe("Deezer external artwork", () => {
         data: [{
           id: 222,
           title: "Deezer Album",
-          artist: { name: "Deezer Artist" },
+          artist: { id: 333, name: "Deezer Artist" },
           cover_medium: "https://e-cdns-images.dzcdn.net/images/cover/album/250x250.jpg",
           cover_big: "https://e-cdns-images.dzcdn.net/images/cover/album/500x500.jpg",
         }],
@@ -458,6 +458,8 @@ describe("Deezer external artwork", () => {
     const track = body.results.track.find((item: any) => item.id === "external_deezer_track_111");
     const album = body.results.album.find((item: any) => item.id === "external_deezer_album_222");
     const artist = body.results.artist.find((item: any) => item.id === "external_deezer_artist_333");
+    expect(track.metadata).toMatchObject({ artistId: artist.id, albumId: album.id });
+    expect(album.metadata.artistId).toBe(artist.id);
 
     expect(track.artwork).toEqual(expect.objectContaining({ id: expect.any(String), url: expect.stringContaining("/api/artwork/external/") }));
     expect(album.artwork).toEqual(expect.objectContaining({ id: expect.any(String), url: expect.stringContaining("/api/artwork/external/") }));
@@ -532,6 +534,24 @@ describe("External catalog detail navigation", () => {
     const detail = await new DeezerExternalCatalogProvider(fetchImpl).getArtist("external_deezer_artist_7743172");
     expect(detail?.albums).toHaveLength(101);
     expect(detail?.albums.map((album) => album.title)).toContain("Apologize");
+  });
+
+  test("adds releases from credited search tracks when the artist album feed is unavailable", async () => {
+    const fetchImpl = vi.fn(async (input: URL | string) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/albums") || url.pathname.endsWith("/top")) return new Response(null, { status: 503 });
+      if (url.pathname === "/artist/7743172") return Response.json({ id: 7743172, name: "Besomorph" });
+      expect(url.pathname).toBe("/search/track");
+      expect(url.searchParams.get("q")).toBe("Besomorph");
+      return Response.json({ data: [
+        { id: 1, title: "Zombie", artist: { id: 7743172, name: "Besomorph" }, album: { id: 11, title: "Zombie" } },
+        { id: 2, title: "Zombie (Techno)", artist: { id: 7743172, name: "Besomorph" }, album: { id: 12, title: "Zombie (Techno)" } },
+        { id: 3, title: "Unrelated", artist: { id: 88, name: "Besomorph" }, album: { id: 13, title: "Unrelated" } },
+      ] });
+    }) as typeof fetch;
+    const detail = await new DeezerExternalCatalogProvider(fetchImpl).getArtist("external_deezer_artist_7743172");
+    expect(detail?.albums.map((album) => album.title)).toEqual(["Zombie", "Zombie (Techno)"]);
+    expect(detail?.tracks.map((track) => track.metadata.albumId)).toEqual(["external_deezer_album_11", "external_deezer_album_12"]);
   });
 
   function deezerDetailFetch(input: URL | string) {
@@ -887,6 +907,74 @@ describe("Catalog completeness through the album/artist API", () => {
     return backend;
   }
 
+  test("popular tracks use the library recording even when it is missing from the artist's albums", async () => {
+    const artist = { ...LOCAL_ARTIST, name: "Linkin Park" };
+    const owned = { ...localTrack("owned-track", "In the End"), artistName: artist.name,
+      albumName: "Hybrid Theory", durationSeconds: 218, audioMetadata: {
+        codec: "flac", container: "flac", bitrateKbps: null, sampleRateHz: null, bitDepth: null, channels: null,
+      } };
+    const backend = createFakeBackend({
+      listArtists: vi.fn(async () => [artist]), getArtist: vi.fn(async () => artist),
+      getArtistAlbums: vi.fn(async () => []), getArtistTracks: vi.fn(async () => []),
+      search: vi.fn(async () => ({ artists: [], albums: [], tracks: [
+        { ...owned, id: "wrong-artist", artistName: "Another Artist" }, owned,
+      ] })),
+    });
+    const fetchImpl = vi.fn(async (input: URL | string) => {
+      const url = new URL(String(input));
+      if (url.hostname === "itunes.apple.com") return Response.json({ results: [] });
+      const externalArtist = { id: 42, name: artist.name };
+      if (url.pathname === "/search/artist") return Response.json({ data: [externalArtist] });
+      if (url.pathname === "/artist/42") return Response.json(externalArtist);
+      if (url.pathname === "/artist/42/top") return Response.json({ data: [
+        { id: 101, artist: externalArtist, title: "In the End", duration: 216,
+          album: { id: 111, title: "Hybrid Theory (Bonus Edition)" } },
+        { id: 102, artist: externalArtist, title: "In the End (Live)", duration: 217 },
+      ] });
+      return Response.json({ data: [] });
+    }) as typeof fetch;
+    current = await createTestServer(backend, {}, undefined, fetchImpl);
+    const { cookie } = await login(current.app);
+    const { artists } = (await current.app.inject({ url: "/api/artists", headers: { cookie } })).json();
+    const local = await current.app.inject({ url: `/api/artists/${artists[0].id}/top-tracks`, headers: { cookie } });
+    const external = await current.app.inject({ url: "/api/artists/external_deezer_artist_42/overview", headers: { cookie } });
+    expect(local.statusCode).toBe(200);
+    expect(external.statusCode).toBe(200);
+    for (const tracks of [local.json().tracks, external.json().topTracks]) {
+      expect(tracks).toHaveLength(2);
+      expect(tracks[0]).toMatchObject({ id: expect.stringMatching(/^md_/), artist: "Linkin Park", album: "Hybrid Theory",
+        inLibrary: true, source: { kind: "library" }, metadata: { durationSeconds: 218, audioMetadata: { codec: "flac" } } });
+      expect(tracks[1]).toMatchObject({ id: "external_deezer_track_102", source: { kind: "external" } });
+    }
+    expect(local.json().tracks[0].id).toBe(external.json().topTracks[0].id);
+  });
+
+  test("local artist discography includes search-only releases from a corroborated iTunes artist", async () => {
+    const anchor = LOCAL_TRACKS[0];
+    const fetchImpl = vi.fn(async (input: URL | string) => {
+      const url = new URL(String(input));
+      if (url.hostname !== "itunes.apple.com") return Response.json({ data: [] });
+      if (url.pathname === "/search" && url.searchParams.get("entity") === "song") {
+        const song = { artistId: 100, artistName: CATALOG_ARTIST_NAME, trackTimeMillis: (anchor.durationSeconds ?? 180) * 1000 };
+        return Response.json({ results: [
+          { ...song, trackId: 1, trackName: anchor.title, collectionId: 11, collectionName: "Other Release" },
+          { ...song, trackId: 2, trackName: "New Song", collectionId: 12, collectionName: "New Song" },
+          { ...song, trackId: 3, trackName: "New Song (Live)", collectionId: 13, collectionName: "New Song (Live)" },
+          { ...song, artistId: 200, trackId: 4, trackName: "Wrong Artist", collectionId: 14, collectionName: "Wrong Artist" },
+        ] });
+      }
+      return Response.json({ results: [] });
+    }) as typeof fetch;
+    current = await createTestServer(setupCompleteness(), {}, undefined, fetchImpl);
+    const { cookie } = await login(current.app);
+    const artists = await current.app.inject({ url: "/api/artists", headers: { cookie } });
+    const id = artists.json().artists[0].id;
+    const result = await current.app.inject({ url: `/api/artists/${id}/discography`, headers: { cookie } });
+    expect(result.statusCode).toBe(200);
+    expect(result.json().missingAlbums.map((album: { title: string }) => album.title))
+      .toEqual(["Other Release", "New Song", "New Song (Live)"]);
+  });
+
   test("partial album: shows all 12 catalog tracks with only 3 marked locally available", async () => {
     current = await createTestServer(setupCompleteness(), {}, undefined, completenessFetch as typeof fetch);
     current.externalCatalog.configure(true, CREDENTIALS);
@@ -1077,6 +1165,13 @@ describe("Catalog completeness through the album/artist API", () => {
     expect(data.topTracks.some((track: any) => track.title === "Roarrr")).toBe(false);
     expect(data.topTracks.some((track: any) => track.title === "Unrelated Song")).toBe(false);
     expect(data.artist.imageUrl).toBeNull();
+    const discography = await current.app.inject({
+      method: "GET", url: `/api/artists/${artistId}/discography`, headers: { cookie },
+    });
+    expect(discography.statusCode).toBe(200);
+    expect(discography.json().providers.deezer).toBe(true);
+    expect(discography.json().missingAlbums.map((album: { title: string }) => album.title))
+      .not.toContain("Ghetto Fairytales 2");
     const portrait = await current.app.inject({
       method: "GET", url: `/api/artists/${artistId}/portrait`, headers: { cookie },
     });

@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { getArtistPortrait, getCoverUrl, getMusicBrainzArtistPortrait } from "../api/musicdeck";
+import { usePrivacy } from "../context/PrivacyContext";
 
 const pendingPortraits = new Map();
 const AVATAR_CACHE_MS = 4 * 60_000;
@@ -100,16 +101,30 @@ export function ArtistAvatarFallback({ artistId, name }) {
 
 /** Local portraits are ID-scoped; external artist entities may supply artist artwork. */
 export default function ArtistAvatar({ artist, className = "", allowAlbumTileFallback = false,
-  enableMusicBrainzFallback = false }) {
+  enableMusicBrainzFallback = false, deferUntilVisible = false }) {
   const artistId = artist?.id ? String(artist.id) : "";
   const name = artist?.name || artist?.title || "Unknown artist";
   const [portrait, setPortrait] = useState(() => enableMusicBrainzFallback
     ? readCachedMusicBrainz(artistId, name) : null);
+  const { canArtwork } = usePrivacy();
   const [loaded, setLoaded] = useState(false);
   const [fallbackRequested, setFallbackRequested] = useState(false);
+  const avatar = useRef(null);
+  const [visible, setVisible] = useState(() => !deferUntilVisible || typeof IntersectionObserver !== "function");
   const activeArtist = useRef(artistId);
   const isExternal = Boolean(artist?.external || artist?.sample || artist?.source?.kind === "external"
     || /^(external_|extdetail_|deezer_)/.test(artistId));
+
+  useEffect(() => {
+    if (visible || !avatar.current) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) return;
+      observer.disconnect();
+      setVisible(true);
+    }, { rootMargin: "200px" });
+    observer.observe(avatar.current);
+    return () => observer.disconnect();
+  }, [visible]);
 
   useEffect(() => {
     let active = true;
@@ -117,7 +132,14 @@ export default function ArtistAvatar({ artist, className = "", allowAlbumTileFal
     setPortrait(null);
     setLoaded(false);
     setFallbackRequested(false);
-    if (!artistId) return () => { active = false; };
+    if (!artistId || !visible) return () => { active = false; };
+    if (!canArtwork) {
+      if (!isExternal) portraitFor(artistId).then((result) => {
+        const native = normalizePortrait(result);
+        if (active && native?.source === "native" && native.url.startsWith("/")) setPortrait(native);
+      }).catch((error) => { if (active) console.warn("Local artist portrait unavailable:", error); });
+      return () => { active = false; activeArtist.current = ""; };
+    }
     if (isExternal) {
       const url = artist?.imageUrl || getCoverUrl(artist?.coverArt, 500);
       if (url) setPortrait({ url, source: "external", kind: "artist" });
@@ -141,10 +163,10 @@ export default function ArtistAvatar({ artist, className = "", allowAlbumTileFal
     }).catch(() => { if (active && enableMusicBrainzFallback) setFallbackRequested(true); });
     return () => { active = false; activeArtist.current = ""; };
   }, [artistId, name, isExternal, artist?.imageUrl, artist?.coverArt,
-    allowAlbumTileFallback, enableMusicBrainzFallback]);
+    allowAlbumTileFallback, enableMusicBrainzFallback, canArtwork, visible]);
 
   useEffect(() => {
-    if (!fallbackRequested || !artistId || isExternal || !enableMusicBrainzFallback) return;
+    if (!canArtwork || !fallbackRequested || !artistId || isExternal || !enableMusicBrainzFallback) return;
     let active = true;
     let preloader;
     getMusicBrainzArtistPortrait(artistId).then((result) => {
@@ -157,9 +179,10 @@ export default function ArtistAvatar({ artist, className = "", allowAlbumTileFal
       preloader.src = result.url;
     }).catch(() => {});
     return () => { active = false; if (preloader) { preloader.onload = null; preloader.onerror = null; } };
-  }, [fallbackRequested, artistId, isExternal, enableMusicBrainzFallback]);
+  }, [fallbackRequested, artistId, isExternal, enableMusicBrainzFallback, canArtwork]);
 
   function handleImageError() {
+    if (!canArtwork) { setPortrait(null); return; }
     setLoaded(false);
     setPortrait(null);
     clearCachedPortrait(artistId);
@@ -182,9 +205,9 @@ export default function ArtistAvatar({ artist, className = "", allowAlbumTileFal
   }
 
   return (
-    <span className={`artist-avatar ${className}`} aria-hidden="true">
+    <span ref={avatar} className={`artist-avatar ${className}`} aria-hidden="true">
       <ArtistAvatarFallback artistId={artistId} name={name} />
-      {portrait && <img key={portrait.url} className={`artist-avatar-photo${loaded ? " is-loaded" : ""}`}
+      {portrait && (canArtwork || (portrait.source === "native" && portrait.url.startsWith("/"))) && <img key={portrait.url} className={`artist-avatar-photo${loaded ? " is-loaded" : ""}`}
         src={portrait.url} alt="" decoding="async" onLoad={() => {
           setLoaded(true);
           saveCachedPortrait(artistId, name, portrait);

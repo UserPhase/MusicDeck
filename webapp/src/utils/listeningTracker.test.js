@@ -25,6 +25,61 @@ function advance(seconds, mediaSeconds = seconds) {
   tracker.sample();
 }
 
+test("privacy survives an older in-flight acknowledgement and retains the original playlist context", async () => {
+  tracker.suspend(); let privateListening = false, playlistId = "party";
+  let finish;
+  report.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  tracker = createListeningTracker({ report, onCounted, now: () => clock, storage: sessionStorage, userId: "user-1", getTasteContext: () => ({ privateListening, playlistId }) });
+  tracker.begin(song, audio); advance(10); await settle();
+  privateListening = true; tracker.markTaste(); privateListening = false; playlistId = "different-list";
+  finish({ counted: false }); await settle();
+  const pending = JSON.parse(sessionStorage.getItem("musicdeck:listening-pending:user-1"));
+  expect(pending[0]).toMatchObject({ privateListening: true, playlistId: "party" });
+  tracker.flush(); await settle();
+  expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ privateListening: true, playlistId: "party" }));
+});
+
+test("server-side privacy decisions retract local heuristics and remain sticky after a delayed acknowledgement", async () => {
+  tracker.suspend(); const excluded = jest.fn(); report.mockResolvedValue({ counted: false, tasteExcluded: true });
+  tracker = createListeningTracker({ report, onCounted, onTasteExcluded: excluded, now: () => clock, storage: sessionStorage, userId: "user-1" });
+  tracker.begin(song, audio); advance(10); await settle();
+  expect(excluded).toHaveBeenCalledWith(expect.objectContaining({ trackId: song.id }), true);
+  tracker.flush(); await settle(); expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ excludeFromTaste: true }));
+});
+
+test("reports exactly when the scrobble point (20 s or 50%, whichever is first) is crossed, once", async () => {
+  tracker.begin(song, audio);
+  advance(12);
+  await settle();
+  const heartbeat = report.mock.calls.length;
+  expect(heartbeat).toBe(1);
+  advance(7.5);
+  await settle();
+  expect(report).toHaveBeenCalledTimes(heartbeat);
+  // Only 8 s since the heartbeat: this report is the scrobble trigger, not the 10 s cadence.
+  advance(0.5);
+  await settle();
+  expect(report).toHaveBeenCalledTimes(heartbeat + 1);
+  expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ listenedSeconds: 20, finished: false }));
+  advance(1);
+  await settle();
+  expect(report).toHaveBeenCalledTimes(heartbeat + 1);
+
+  tracker.finish();
+  await settle();
+  const short = { ...song, id: "short", duration: 16 };
+  audio.duration = 16;
+  audio.currentTime = 0;
+  report.mockClear();
+  tracker.begin(short, audio);
+  advance(7.5);
+  await settle();
+  expect(report).not.toHaveBeenCalled();
+  advance(0.5);
+  await settle();
+  expect(report).toHaveBeenCalledWith(expect.objectContaining({ trackId: "short", listenedSeconds: 8 }));
+});
+
 test("starting playback creates no counted listen; heartbeat reports actual cumulative seconds", async () => {
   tracker.begin(song, audio);
   expect(report).not.toHaveBeenCalled();
@@ -135,7 +190,12 @@ test("subsecond loop wraps are not mistaken for a seek", async () => {
   clock += 250;
   tracker.sample();
   await settle();
-  expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ listenedSeconds: 0.5, finished: true }));
+  // The scrobble-point report (0.25 s) is still in flight at the wrap, so the
+  // final report is delivered by the outbox retry.
+  clock += 10_000;
+  jest.advanceTimersByTime(1000);
+  await settle();
+  expect(report).toHaveBeenCalledWith(expect.objectContaining({ listenedSeconds: 0.5, finished: true }));
 });
 
 test("crossfade handoff preserves the actual overlap rather than losing the incoming intro", async () => {

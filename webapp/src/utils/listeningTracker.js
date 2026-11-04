@@ -1,6 +1,13 @@
+// The server scrobbles to the provider when a report first reaches this point:
+// 50% of the track or 20 seconds of actual listening, whichever comes first.
+export const SCROBBLE_MAX_SECONDS = 20;
+export function scrobblePointSeconds(durationSeconds) {
+  return Number(durationSeconds) > 0 ? Math.min(SCROBBLE_MAX_SECONDS, Number(durationSeconds) / 2) : SCROBBLE_MAX_SECONDS;
+}
+
 // One tracker per player, not per view. Each report replaces a cumulative
 // duration on the server, so retries cannot create another statistical play.
-export function createListeningTracker({ report, onCounted, now = () => Date.now(), storage, userId, thresholdSeconds = 30 }) {
+export function createListeningTracker({ report, onCounted, onTasteExcluded, now = () => Date.now(), storage, userId, thresholdSeconds = 30, getTasteContext = (_song) => ({}) }) {
   let active = null;
   let cleanup = null;
   const key = `musicdeck:listening-session:${userId}`;
@@ -26,8 +33,14 @@ export function createListeningTracker({ report, onCounted, now = () => Date.now
     const id = payload.playbackSessionId;
     inFlight.add(id);
     Promise.resolve().then(() => report({ ...payload, ownerUserId: userId })).then((result) => {
+      if (result?.tasteExcluded) {
+        const isActive = active?.payload.playbackSessionId === id;
+        if (isActive) { active.payload.excludeFromTaste = true; persist(); }
+        onTasteExcluded?.(payload, isActive);
+      }
       const latest = pending.get(id);
-      if (latest && latest.listenedSeconds <= payload.listenedSeconds && (!latest.finished || payload.finished)) {
+      if (latest && latest.listenedSeconds <= payload.listenedSeconds && (!latest.finished || payload.finished) &&
+          (!latest.privateListening || payload.privateListening) && (!latest.excludeFromTaste || payload.excludeFromTaste)) {
         pending.delete(id);
         persistPending();
       }
@@ -50,6 +63,10 @@ export function createListeningTracker({ report, onCounted, now = () => Date.now
 
   function send(finished = false) {
     if (!active) return;
+    const taste = getTasteContext(active.song);
+    active.payload.privateListening = Boolean(active.payload.privateListening || taste.privateListening);
+    active.payload.excludeFromTaste = Boolean(active.payload.excludeFromTaste || taste.excludeFromTaste);
+    active.payload.reportedAt = new Date(now()).toISOString();
     active.payload.finished = finished;
     active.lastSentSeconds = active.payload.listenedSeconds;
     const payload = { ...active.payload, track: { ...active.payload.track } };
@@ -93,9 +110,13 @@ export function createListeningTracker({ report, onCounted, now = () => Date.now
       return;
     }
     const threshold = Math.min(thresholdSeconds, active.payload.durationSeconds || Infinity);
-    if ((time - lastReport >= 10_000 && active.payload.listenedSeconds > active.lastSentSeconds) ||
+    const scrobbleCrossed = !active.scrobbleSent &&
+      active.payload.listenedSeconds >= scrobblePointSeconds(active.payload.durationSeconds);
+    if (scrobbleCrossed ||
+        (time - lastReport >= 10_000 && active.payload.listenedSeconds > active.lastSentSeconds) ||
         (!active.announced && active.payload.listenedSeconds >= threshold && !active.thresholdSent)) {
       active.thresholdSent = active.payload.listenedSeconds >= threshold;
+      if (scrobbleCrossed) active.scrobbleSent = true;
       send();
     }
   }
@@ -125,23 +146,29 @@ export function createListeningTracker({ report, onCounted, now = () => Date.now
         console.error("Could not restore interrupted listening session:", error);
       }
     }
-    const reusable = saved && saved.trackId === String(song.id) && !saved.finished &&
+    const taste = getTasteContext(song);
+    const reusable = saved && saved.trackId === String(song.id) && (saved.playlistId ?? null) === (taste.playlistId ?? null) && !saved.finished &&
       now() - Date.parse(saved.startedAt) < 30 * 86_400_000;
     active = {
       song, audio, lastTime: now(), lastPosition: Number(audio.currentTime) || 0, seeking: false,
       lastSentSeconds: reusable ? saved.listenedSeconds : initialSeconds,
       announced: Boolean(reusable && saved.listenedSeconds >= Math.min(thresholdSeconds, saved.durationSeconds || Infinity)),
       thresholdSent: false,
+      scrobbleSent: Boolean(reusable && saved.listenedSeconds >= scrobblePointSeconds(saved.durationSeconds)),
       payload: reusable ? saved : {
         playbackSessionId: typeof window.crypto?.randomUUID === "function" ? window.crypto.randomUUID() :
           `listen_${now()}_${Math.random().toString(36).slice(2)}`,
         trackId: String(song.id), startedAt: new Date(startedAt).toISOString(), listenedSeconds: initialSeconds,
+        clientName: "MusicDeck Web",
         durationSeconds: Number(song.duration) > 0 ? Number(song.duration) : null, finished: false,
         track: { title: song.title || "", artist: song.artist || "", album: song.album || "",
           artistId: song.artistId || null, albumId: song.albumId || null,
           coverArt: song.coverArt || null, coverUrl: song.coverUrl || null },
       },
     };
+    active.payload.playlistId = active.payload.playlistId ?? taste.playlistId ?? null;
+    active.payload.privateListening = Boolean(active.payload.privateListening || taste.privateListening);
+    active.payload.excludeFromTaste = Boolean(active.payload.excludeFromTaste || taste.excludeFromTaste);
     lastReport = now();
     const events = {
       timeupdate: sample,
@@ -171,6 +198,7 @@ export function createListeningTracker({ report, onCounted, now = () => Date.now
 
   return {
     begin, sample, finish,
+    markTaste() { if (active) { const taste = getTasteContext(active.song); active.payload.privateListening ||= Boolean(taste.privateListening); active.payload.excludeFromTaste ||= Boolean(taste.excludeFromTaste); persist(); send(); } },
     suspend() { sample(); send(); cleanup?.(); cleanup = null; active = null; clearInterval(timer); },
     flush() { sample(); send(); },
     isTracking(song) { return active?.song.id === song?.id; },

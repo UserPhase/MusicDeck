@@ -1,0 +1,25 @@
+.playlist-page.detail-hero-gradient > .playlist-recommendations { width: var(--detail-content-width); margin: 56px auto 32px; }
+.playlist-recommendations-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 16px; margin-bottom: 20px; }
+.playlist-recommendations-heading h2 { margin: 0 0 6px; color: var(--text); font-size: 24px; font-weight: 750; letter-spacing: -.6px; }
+.playlist-recommendations-heading p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.playlist-recommendations-refresh { border: 0; padding: 8px 0 8px 16px; background: transparent; color: var(--text-secondary); font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+.playlist-recommendations-refresh:hover:not(:disabled) { color: var(--text); }
+.playlist-recommendations-refresh:disabled { opacity: .5; cursor: wait; }
+.playlist-recommendations .track { grid-template-columns: 40px minmax(0, 1.4fr) minmax(0, 1fr) 130px; gap: 12px; min-height: 58px; padding: 8px 16px; }
+.playlist-recommendations .track-cover-art { width: 40px; height: 40px; border-radius: 4px; }
+.playlist-recommendations .track-server-status, .playlist-recommendations .track-duration { display: none; }
+.playlist-recommendations .track-row-actions { width: 130px; justify-content: flex-end; gap: 6px; }
+.playlist-recommendation-action { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 74px; min-height: 32px; border: 1px solid var(--border-hover); border-radius: 999px; padding: 5px 12px; background: transparent; color: var(--text); font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; white-space: nowrap; transition: border-color 140ms ease, background 140ms ease; }
+.playlist-recommendation-action:hover:not(:disabled) { border-color: var(--accent); background: var(--nav-hover); }
+.playlist-recommendation-action.is-external { color: var(--accent-text); }
+.playlist-recommendation-action svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.playlist-recommendation-action:disabled { opacity: .55; cursor: default; }
+.playlist-recommendation-action:focus-visible, .playlist-recommendations-refresh:focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
+.playlist-recommendations-status, .playlist-recommendation-note, .playlist-recommendation-error { margin: 12px 16px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.playlist-recommendation-error { color: var(--danger-text); }
+.playlist-recommendations-status button { color: var(--accent-text); background: transparent; border: 0; font: inherit; text-decoration: underline; cursor: pointer; }
+@media (max-width: 760px) {
+  .playlist-recommendations .track { grid-template-columns: 40px minmax(0, 1fr) 130px; }
+  .playlist-recommendations .track-album { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .playlist-recommendation-action { transition: none; } }

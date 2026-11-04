@@ -1,0 +1,34 @@
+.setup-recovery-view { max-width: 1240px; padding: 32px clamp(18px, 3vw, 48px) 120px; margin: auto; color: var(--text); }
+.recovery-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding-bottom: 30px; }
+.recovery-eyebrow { color: var(--text-muted); font-size: 10px; letter-spacing: .16em; }
+.recovery-heading h1 { margin: 12px 0; font-size: clamp(30px, 4vw, 48px); line-height: 1.1; letter-spacing: -.045em; }
+.recovery-heading p, .recovery-panel p, .recovery-section-heading p { font-size: 13px; line-height: 1.8; color: var(--text-secondary); margin: 8px 0; }
+.recovery-state { display: inline-block; border: 1px solid var(--panel-border); padding: 5px 9px; border-radius: 4px; font-size: 10px; letter-spacing: .08em; white-space: nowrap; }
+.recovery-state.pass { color: var(--accent); }.recovery-state.warning { color: #c99c43; }.recovery-state.fail { color: var(--danger, #e8857f); }
+.recovery-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--panel-border); margin-bottom: 30px; }
+.setup-recovery-view button, .setup-recovery-view a.recovery-primary { padding: 10px 14px; background: var(--panel-chrome); border: 1px solid var(--panel-border); border-radius: 5px; color: var(--text); font: inherit; font-size: 12px; cursor: pointer; }
+.setup-recovery-view button:hover { border-color: var(--accent); }.setup-recovery-view button:disabled { opacity: .45; cursor: default; }
+.setup-recovery-view button:focus-visible, .setup-recovery-view input:focus-visible, .setup-recovery-view select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.recovery-steps button { display: flex; align-items: center; gap: 12px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 20px 12px; text-align: left; background: transparent; }
+.recovery-steps button span { color: var(--text-muted); font-size: 11px; }.recovery-steps button[aria-current="step"] { border-bottom-color: var(--accent); color: var(--accent); }
+.recovery-panel { border: 1px solid var(--panel-border); background: var(--panel-chrome); padding: 24px; margin-bottom: 20px; }
+.recovery-section-heading { display: flex; align-items: baseline; gap: 16px; margin: 0 0 22px; }.recovery-section-heading > span { color: var(--accent); font-size: 11px; }
+.recovery-section-heading h2 { margin: 0; font-size: 21px; letter-spacing: -.025em; }.recovery-panel h3 { font-size: 17px; margin: 0 0 14px; }
+.recovery-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.recovery-form label { display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.recovery-form input, .recovery-form select { min-width: 0; width: 100%; box-sizing: border-box; padding: 11px 12px; border: 1px solid var(--panel-border); border-radius: 5px; background: var(--main-surface-solid, #181818); color: var(--text); font: inherit; }
+.recovery-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
+.setup-recovery-view .recovery-primary { background: var(--accent); color: var(--bg, #111); border-color: var(--accent); }
+.recovery-notice { margin: 16px 0; padding: 14px 18px; border-left: 2px solid var(--accent); background: var(--panel-chrome); font-size: 12px; line-height: 1.8; }
+.recovery-error { border-left: 2px solid var(--danger, #e8857f); padding: 12px 16px; color: var(--danger, #e8857f); font-size: 13px; line-height: 1.7; }
+.recovery-help { font-size: 11px !important; color: var(--text-muted) !important; line-height: 1.8; }
+.recovery-diagnostics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 24px 0; }
+.recovery-check { padding: 20px; border: 1px solid var(--panel-border); border-top: 2px solid var(--accent); overflow-wrap: anywhere; }.recovery-check.warning { border-top-color: #c99c43; }.recovery-check.fail { border-top-color: var(--danger, #e8857f); }
+.recovery-check-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-muted); font-size: 10px; }.recovery-check h3 { font-size: 14px; margin: 18px 0 10px; }
+.recovery-check p { font-size: 12px; line-height: 1.8; color: var(--text-secondary); }.recovery-fix { border-top: 1px solid var(--panel-border); padding-top: 12px; margin-top: 14px; }.recovery-fix strong { font-size: 11px; }
+.recovery-backup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }.recovery-toggle { display: flex; align-items: start; gap: 10px; font-size: 12px; line-height: 1.7; margin: 20px 0 12px; }.recovery-toggle input { accent-color: var(--accent); margin-top: 4px; }
+.recovery-panel input[type="file"] { max-width: 100%; display: block; margin: 20px 0; font-size: 12px; }.recovery-confirm { margin-top: 24px; padding: 18px; border: 1px solid var(--danger, #e8857f); }.setup-recovery-view .recovery-danger { border-color: var(--danger, #e8857f); color: var(--danger, #e8857f); }
+.recovery-backups { border-top: 1px solid var(--panel-border); }.recovery-backups > h3 { font-size: 16px; margin-top: 24px; }.recovery-backups article { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; border-bottom: 1px solid var(--panel-border); padding: 20px 0; }.recovery-backups strong { font-size: 13px; }.recovery-backups p, .recovery-backups small { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }.recovery-backups a { color: var(--accent); font-size: 12px; }
+.recovery-footer { border-top: 1px solid var(--panel-border); display: flex; gap: 16px; align-items: center; flex-wrap: wrap; padding: 24px 0; margin-top: 32px; font-size: 11px; }.recovery-footer > span { color: var(--text-muted); text-transform: uppercase; letter-spacing: .1em; }.recovery-footer strong { flex: 1; font-weight: 400; }
+@media (max-width: 1000px) { .recovery-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .recovery-heading { align-items: start; flex-direction: column; }.recovery-form, .recovery-backup-grid, .recovery-diagnostics { grid-template-columns: 1fr; }.recovery-steps button { padding: 15px 6px; gap: 6px; font-size: 11px; }.recovery-panel { padding: 18px; }.recovery-section-heading { gap: 10px; } }
