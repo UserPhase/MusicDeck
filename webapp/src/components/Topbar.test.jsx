@@ -3,7 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import Topbar from "./Topbar";
 import { useAuth } from "../context/AuthContext";
-import { searchNavidrome, getAcquisitions } from "../api/musicdeck";
+import { searchNavidrome } from "../api/musicdeck";
 import { useImport } from "../context/ImportContext";
 
 
@@ -21,9 +21,6 @@ jest.mock("../context/PlayerContext", () => ({
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(() => null),
   searchNavidrome: jest.fn(),
-  getAcquisitions: jest.fn(() => Promise.resolve([])),
-  cancelAcquisition: jest.fn(),
-  retryAcquisition: jest.fn(),
 }));
 
 
@@ -119,19 +116,8 @@ test("uses a play button and separate artist links for a live-search result", as
   jest.useRealTimers();
 });
 
-test("shows the Downloads button next to the account menu with active job count", async () => {
-  getAcquisitions.mockResolvedValueOnce([
-    { id: "acq-1", status: "downloading", progress: { percent: 42 }, files: [{ title: "We Will Rock You" }] },
-  ]);
-
+test("links to Downloads from the top bar", () => {
   renderTopbar({ username: "sam", displayName: "Sam", role: "user" });
 
-  const downloadsButton = await screen.findByRole("button", { name: "Downloads" });
-  expect(downloadsButton).toBeInTheDocument();
-  expect(await screen.findByText("1")).toBeInTheDocument();
-
-  fireEvent.click(downloadsButton);
-
-  expect(await screen.findByText("We Will Rock You")).toBeInTheDocument();
-  expect(screen.getByText("Downloading 42%")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Downloads" })).toHaveAttribute("href", "/downloads");
 });

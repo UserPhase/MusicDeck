@@ -157,7 +157,7 @@ test.each([".track-title-text", ".track-number", ".track-duration", ".track-row-
   },
 );
 
-test.each([".track-artist", ".track-album-link", ".track-play", ".track-menu"])(
+test.each([".track-artist-link", ".track-album-link", ".track-play", ".track-menu"])(
   "links and buttons (%s) cannot initiate a row drag", async (selector) => {
     const onReorder = jest.fn();
     const { container } = render(<Harness onReorder={onReorder} />);
