@@ -22,6 +22,46 @@ fn extract_session_cookie_from_set_cookie(header_val: &str) -> Option<(String, b
     Some((value.to_string(), is_persistent))
 }
 
+pub fn apply_response_cookies(
+    headers: &reqwest::header::HeaderMap,
+    config: &Arc<Mutex<DesktopConfig>>,
+    ephemeral_cookie: &Arc<Mutex<Option<String>>>,
+    config_dir: & std::path::Path,
+) {
+    for val in headers.get_all(reqwest::header::SET_COOKIE).iter() {
+        if let Ok(raw_cookie) = val.to_str() {
+            if let Some((token, is_persistent)) = extract_session_cookie_from_set_cookie(raw_cookie)
+            {
+                if token.is_empty() {
+                    if let Ok(mut eph) = ephemeral_cookie.lock() {
+                        *eph = None;
+                    }
+                    if let Ok(mut guard) = config.lock() {
+                        guard.session_cookie = None;
+                        let _ = save_config(config_dir, &guard);
+                    }
+                } else if is_persistent {
+                    if let Ok(mut eph) = ephemeral_cookie.lock() {
+                        *eph = Some(token.clone());
+                    }
+                    if let Ok(mut guard) = config.lock() {
+                        guard.session_cookie = Some(token);
+                        let _ = save_config(config_dir, &guard);
+                    }
+                } else {
+                    if let Ok(mut eph) = ephemeral_cookie.lock() {
+                        *eph = Some(token);
+                    }
+                    if let Ok(mut guard) = config.lock() {
+                        guard.session_cookie = None;
+                        let _ = save_config(config_dir, &guard);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedState>) {
     let mut buf = Vec::with_capacity(8192);
     let mut temp = [0u8; 4096];
@@ -92,6 +132,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             "HTTP/1.1 204 No Content\r\n\
              Access-Control-Allow-Origin: {request_origin}\r\n\
              Access-Control-Allow-Credentials: true\r\n\
+             Access-Control-Allow-Private-Network: true\r\n\
              Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
              Access-Control-Allow-Headers: Content-Type, Authorization, Range, Accept, Cache-Control\r\n\
              Access-Control-Max-Age: 86400\r\n\
@@ -196,38 +237,12 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
 
     // Capture Set-Cookie headers from login / session renewal / logout.
-    for val in resp.headers().get_all(reqwest::header::SET_COOKIE).iter() {
-        if let Ok(raw_cookie) = val.to_str() {
-            if let Some((token, is_persistent)) = extract_session_cookie_from_set_cookie(raw_cookie)
-            {
-                if token.is_empty() {
-                    if let Ok(mut eph) = shared.ephemeral_cookie.lock() {
-                        *eph = None;
-                    }
-                    if let Ok(mut guard) = shared.config.lock() {
-                        guard.session_cookie = None;
-                        let _ = save_config(&shared.config_dir, &guard);
-                    }
-                } else if is_persistent {
-                    if let Ok(mut eph) = shared.ephemeral_cookie.lock() {
-                        *eph = Some(token.clone());
-                    }
-                    if let Ok(mut guard) = shared.config.lock() {
-                        guard.session_cookie = Some(token);
-                        let _ = save_config(&shared.config_dir, &guard);
-                    }
-                } else {
-                    if let Ok(mut eph) = shared.ephemeral_cookie.lock() {
-                        *eph = Some(token);
-                    }
-                    if let Ok(mut guard) = shared.config.lock() {
-                        guard.session_cookie = None;
-                        let _ = save_config(&shared.config_dir, &guard);
-                    }
-                }
-            }
-        }
-    }
+    apply_response_cookies(
+        resp.headers(),
+        &shared.config,
+        &shared.ephemeral_cookie,
+        &shared.config_dir,
+    );
 
     let status = resp.status();
     let status_code = status.as_u16();
@@ -237,6 +252,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         "HTTP/1.1 {status_code} {reason}\r\n\
          Access-Control-Allow-Origin: {request_origin}\r\n\
          Access-Control-Allow-Credentials: true\r\n\
+         Access-Control-Allow-Private-Network: true\r\n\
          Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Disposition\r\n\
          Connection: close\r\n"
     );

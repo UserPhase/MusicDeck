@@ -3,7 +3,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DiscoveryArtistCard, DiscoveryAlbumCard } from "../components/DiscoveryCards";
-import ContinueListeningRow from "../components/ContinueListeningRow";
 import LightHero from "../components/Layout/LightHero";
 import { NewReleasesShelf } from "../views/NewReleasesView";
 import TrackRow from "../components/TrackRow";
@@ -165,9 +164,9 @@ function Home() {
 
       <section className="home-section home-continue" aria-labelledby="continue-listening-title">
         <SectionHeader id="continue-listening-title" title="Continue Listening" />
-        <ContinueListeningRow fallback={continueTracks.length ? (
-          <HomeTracks tracks={continueTracks} onPlay={playSong}  listId="continue" className="home-continue-grid" showArtwork />
-        ) : <p className="home-section-state">Start listening and your recent music will appear here.</p>} />
+        {continueTracks.length ? (
+          <HomeTracks tracks={continueTracks} onPlay={playSong} listId="continue" className="home-continue-grid" showArtwork />
+        ) : <p className="home-section-state">Start listening and your recent music will appear here.</p>}
       </section>
 
       <NewReleasesShelf />

@@ -3,8 +3,9 @@ pub mod proxy;
 pub mod updater;
 
 use config::{candidate_server_urls, load_config, save_config, DesktopConfig};
-use proxy::start_local_api_proxy;
+use proxy::{apply_response_cookies, start_local_api_proxy};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -60,6 +61,24 @@ pub struct PlaybackStatusPayload {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub is_playing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopApiRequest {
+    pub path: String,
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopApiResponse {
+    pub status: u16,
+    pub ok: bool,
+    pub headers: HashMap<String, String>,
+    pub body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +212,130 @@ async fn desktop_check_server(server_url: String) -> Result<ServerHealthResponse
         error: Some(format!(
             "Could not reach MusicDeck (tried {tried}: {last_error}). For Docker Compose, use port 8080 (e.g. http://192.168.2.38:8080) and ensure MUSICDECK_WEB_BIND=0.0.0.0 in your server .env."
         )),
+    })
+}
+
+#[tauri::command]
+async fn desktop_api_fetch(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    request: DesktopApiRequest,
+) -> Result<DesktopApiResponse, String> {
+    let raw_path = request.path.trim();
+    let relative_path = if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else if let Some(idx) = raw_path.find("/api/") {
+        raw_path[idx..].to_string()
+    } else if raw_path.ends_with("/api") {
+        "/api".to_string()
+    } else {
+        format!("/{raw_path}")
+    };
+
+    let (configured_url, cookie_token) = {
+        let cfg = state.config.lock().ok().map(|g| g.clone());
+        let eph = state.ephemeral_cookie.lock().ok().and_then(|g| g.clone());
+        let server_url = cfg
+            .as_ref()
+            .map(|c| c.server_url.clone())
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+        let token = eph.or_else(|| cfg.and_then(|c| c.session_cookie));
+        (server_url, token)
+    };
+
+    let method_str = request.method.as_deref().unwrap_or("GET").to_uppercase();
+    let method = reqwest::Method::from_bytes(method_str.as_bytes())
+        .map_err(|err| format!("Invalid HTTP method: {err}"))?;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| format!("Failed to initialize HTTP client: {err}"))?;
+
+    let candidates =
+        candidate_server_urls(&configured_url).unwrap_or_else(|_| vec![configured_url.clone()]);
+
+    let mut upstream_response = None;
+    let mut active_base_url = configured_url.clone();
+    let mut last_error = String::new();
+
+    for candidate_base in &candidates {
+        let target_url = format!("{candidate_base}{relative_path}");
+        let mut req_builder = client
+            .request(method.clone(), &target_url)
+            .header("Origin", candidate_base)
+            .header("Referer", format!("{candidate_base}/"));
+
+        if let Some(ref headers) = request.headers {
+            for (k, v) in headers {
+                req_builder = req_builder.header(k, v);
+            }
+        }
+
+        if let Some(ref token) = cookie_token {
+            if !token.is_empty() {
+                req_builder = req_builder.header("Cookie", format!("musicdeck_session={token}"));
+            }
+        }
+
+        if let Some(ref body) = request.body {
+            req_builder = req_builder.body(body.clone());
+        }
+
+        match req_builder.send().await {
+            Ok(resp) => {
+                active_base_url = candidate_base.clone();
+                upstream_response = Some(resp);
+                break;
+            }
+            Err(err) => {
+                last_error = err.to_string();
+            }
+        }
+    }
+
+    let Some(resp) = upstream_response else {
+        return Err(format!(
+            "Could not connect to MusicDeck server at {configured_url} ({last_error})"
+        ));
+    };
+
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("musicdeck-desktop"));
+
+    if active_base_url != configured_url {
+        if let Ok(mut guard) = state.config.lock() {
+            guard.server_url = active_base_url;
+            let _ = save_config(&config_dir, &guard);
+        }
+    }
+
+    apply_response_cookies(
+        resp.headers(),
+        &state.config,
+        &state.ephemeral_cookie,
+        &config_dir,
+    );
+
+    let status = resp.status().as_u16();
+    let ok = resp.status().is_success();
+    let mut headers = HashMap::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(val_str) = v.to_str() {
+            headers.insert(k.as_str().to_string(), val_str.to_string());
+        }
+    }
+
+    let body = resp.text().await.unwrap_or_default();
+
+    Ok(DesktopApiResponse {
+        status,
+        ok,
+        headers,
+        body,
     })
 }
 
@@ -457,6 +600,7 @@ pub fn run() {
             desktop_get_config,
             desktop_set_config,
             desktop_check_server,
+            desktop_api_fetch,
             desktop_update_playback,
             desktop_window_action,
             desktop_check_for_updates,

@@ -157,6 +157,46 @@ describe("desktopRuntime", () => {
     expect(document.documentElement.dataset.desktopApp).toBeUndefined();
   });
 
+  test("routes /api fetch requests through Tauri IPC desktop_api_fetch to bypass WebView CORS", async () => {
+    const invokeMock = jest.fn((cmd) => {
+      if (cmd === "desktop_api_fetch") {
+        return Promise.resolve({
+          status: 200,
+          ok: true,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ user: { id: "u-1", username: "admin", role: "admin" } }),
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    window.__TAURI__ = {
+      core: { invoke: invokeMock },
+    };
+
+    const cleanup = installDesktopRuntime();
+    const res = await window.fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "secret", rememberMe: true }),
+    });
+
+    expect(res.ok).toBe(true);
+    expect(await res.json()).toEqual({
+      user: { id: "u-1", username: "admin", role: "admin" },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("desktop_api_fetch", {
+      request: {
+        path: "/api/auth/login",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "admin", password: "secret", rememberMe: true }),
+      },
+    });
+
+    cleanup();
+  });
+
   test("checks server connection via Tauri command or HTTP fallback", async () => {
     window.__MUSICDECK_DESKTOP__ = true;
     global.fetch = jest.fn(() =>

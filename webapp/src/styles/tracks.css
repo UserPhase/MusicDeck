@@ -140,7 +140,7 @@
 :root[data-layout-density="compact"] .track-row-actions .track-menu { width: 28px; }
 :root[data-layout-density="compact"] .track-download-container { width: 32px; height: 32px; }
 
-.home-continue .home-continue-grid { --track-grid-columns: 3rem minmax(0, 1fr) 2.5rem 4.25rem; --track-grid-gap: .5rem; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem; }
+.home-continue .home-continue-grid { --track-grid-columns: 3rem minmax(0, 1fr) 2.5rem 4.25rem; --track-grid-gap: .5rem; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
 .home-continue .home-continue-grid .track { min-height: 4.25rem; padding: .5rem; border-radius: .5rem; }
 .home-continue .home-continue-grid .track-cover-art { width: 48px; height: 48px; border-radius: .375rem; }
 .home-continue .home-continue-grid .track-cover-art .explore-artwork-fallback { font-size: 1.125rem; }
@@ -148,10 +148,6 @@
 .home-continue .home-continue-grid .track-artist { margin-top: .25rem; font-size: .75rem; }
 .home-continue .home-continue-grid .track-duration { font-size: .6875rem; }
 .home-continue .home-continue-grid .track-play { width: 1.75rem; height: 1.75rem; font-size: .75rem; }
-
-@container (max-width: 48rem) {
-  .home-continue .home-continue-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
 
 @container (max-width: 40rem) {
   .home-continue .home-continue-grid { grid-template-columns: 1fr; }

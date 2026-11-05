@@ -34,7 +34,6 @@ jest.mock("../api/playlists", () => ({ getPlaylists: jest.fn(), addSongToPlaylis
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
-const resumeMedia = jest.fn();
 const album = { id: "album-1", name: "Discovery", artist: "Daft Punk", coverArt: "art-1" };
 const song = { id: "track-1", title: "Digital Love", artist: "Daft Punk", artistId: "artist-1", coverArt: "art-1", duration: 241 };
 const artist = { id: "artist-1", name: "Daft Punk", coverArt: "artist-art", playCount: 0 };
@@ -44,7 +43,7 @@ function renderHome({ recentlyPlayed = [song], albums = [album], artists = [arti
   getReleaseFeed.mockResolvedValue({ releases: [], artists: [], hasMore: false });
   getCoverUrl.mockImplementation((id) => id ? `/api/artwork/${id}` : null);
   useAuth.mockReturnValue({ session: { id: "sam", displayName: "Sam", username: "sam" } });
-  usePlayer.mockReturnValue({ playSong, playQueue, resumeMedia, recentlyPlayed });
+  usePlayer.mockReturnValue({ playSong, playQueue, recentlyPlayed });
   getMediaCheckpoints.mockResolvedValue({ items: checkpoints });
   getAlbums.mockResolvedValue(albums);
   getRecentlyAddedSongs.mockResolvedValue([song]);
@@ -128,7 +127,7 @@ test("opens artists using the same linked portrait card as Explore", async () =>
   expect(section.querySelector("button")).toBeNull();
 });
 
-test("plays a recently heard track from the Continue Listening fallback", async () => {
+test("plays a recently heard track from Continue Listening", async () => {
   renderHome();
   await waitForHome();
 
@@ -144,19 +143,6 @@ test("plays a recently heard track from the Continue Listening fallback", async 
   fireEvent.click(screen.getByRole("menuitem", { name: "Favorites" }));
   await waitFor(() => expect(editPlaylistTracks).toHaveBeenCalledWith("playlist-1", { action: "add", trackIds: ["track-1"] }));
   expect(playSong).toHaveBeenCalledTimes(1);
-});
-
-test("prefers saved collection progress and resumes the bookmarked track and position", async () => {
-  renderHome({ checkpoints: [{
-    type: "album", mediaId: album.id, title: album.name, trackId: song.id,
-    trackIndex: 0, trackCount: 1, positionSeconds: 102.125, progress: .42, capturedAt: 1,
-  }] });
-  const shelf = within(screen.getByRole("region", { name: "Continue Listening" }));
-  expect(await shelf.findByRole("img", { name: "42% complete" })).toBeInTheDocument();
-  expect(shelf.queryByText(song.title)).not.toBeInTheDocument();
-  fireEvent.click(shelf.getByRole("button", { name: "Resume from Track 1 - 1:42" }));
-  await waitFor(() => expect(resumeMedia).toHaveBeenCalledWith([song], 0,
-    expect.objectContaining({ type: "album", id: album.id }), 102.125));
 });
 
 test("plays an album through its fetched queue", async () => {
@@ -183,9 +169,12 @@ test("shows an empty listening state instead of recently added songs when histor
   });
 });
 
-test("shows only the last six listened songs in history order with cover artwork", async () => {
+test("shows the last six listened songs even when collection progress is saved", async () => {
   const history = Array.from({ length: 8 }, (_, index) => ({ ...song, id: `recent-${index}`, title: `Recent song ${index}` }));
-  renderHome({ recentlyPlayed: history });
+  renderHome({ recentlyPlayed: history, checkpoints: [{
+    type: "album", mediaId: album.id, title: album.name, trackId: song.id,
+    trackIndex: 0, trackCount: 1, positionSeconds: 102.125, progress: .42, capturedAt: 1,
+  }] });
   await waitForHome();
 
   const section = screen.getByRole("heading", { name: "Continue Listening" }).closest("section");
@@ -193,6 +182,7 @@ test("shows only the last six listened songs in history order with cover artwork
   expect(Array.from(section.querySelectorAll(".track-title")).map((title) => title.textContent)).toEqual(history.slice(0, 6).map((track) => track.title));
   expect(section.querySelectorAll(".track-cover-art")).toHaveLength(6);
   expect(section.querySelectorAll(".track-number-text")).toHaveLength(0);
+  expect(within(section).queryByRole("button", { name: /Resume from Track/ })).not.toBeInTheDocument();
 });
 
 test("ranks local discover albums and artists from listening-based recommendations", async () => {

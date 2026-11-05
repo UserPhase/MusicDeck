@@ -513,8 +513,48 @@ export function installDesktopRuntime() {
     originalFetch = window.fetch.bind(window);
     fetchInterceptorInstalled = true;
 
-    window.fetch = (input, init) => {
+    window.fetch = async (input, init) => {
       if (typeof input === "string") {
+        const relativePath = stripDesktopApiOrigin(input);
+        const isApiCall =
+          relativePath.startsWith("/api/") ||
+          relativePath === "/api" ||
+          relativePath.startsWith("/api?");
+
+        if (isApiCall && getTauriInvoke()) {
+          const headers = {};
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.forEach((value, key) => {
+                headers[key] = value;
+              });
+            } else if (Array.isArray(init.headers)) {
+              for (const [key, value] of init.headers) {
+                headers[key] = value;
+              }
+            } else if (typeof init.headers === "object") {
+              Object.assign(headers, init.headers);
+            }
+          }
+
+          const ipcResult = await invokeDesktopCommand("desktop_api_fetch", {
+            request: {
+              path: relativePath,
+              method: init?.method || "GET",
+              headers,
+              body: typeof init?.body === "string" ? init.body : null,
+            },
+          });
+
+          if (ipcResult && typeof ipcResult === "object" && typeof ipcResult.status === "number") {
+            const responseBody = ipcResult.status === 204 ? null : ipcResult.body ?? "";
+            return new Response(responseBody, {
+              status: ipcResult.status,
+              headers: ipcResult.headers || {},
+            });
+          }
+        }
+
         const resolved = resolveDesktopApiUrl(input);
         if (resolved !== input) {
           return originalFetch(resolved, {

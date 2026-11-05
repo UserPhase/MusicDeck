@@ -65,6 +65,7 @@ function validateDesktopProject() {
     "desktop_get_config",
     "desktop_set_config",
     "desktop_check_server",
+    "desktop_api_fetch",
     "desktop_update_playback",
     "desktop_window_action",
     "desktop_check_for_updates",
