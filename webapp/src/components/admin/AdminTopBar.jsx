@@ -4,6 +4,12 @@ import { Link } from "react-router-dom";
 
 import { useAuth } from "../../context/AuthContext";
 import { useBranding } from "../../context/BrandingContext";
+import DesktopWindowControls from "../desktop/DesktopWindowControls";
+import {
+  handleDesktopTitlebarDoubleClick,
+  handleDesktopTitlebarMouseDown,
+  isDesktopRuntime,
+} from "../../services/desktop/desktopRuntime";
 import UserAvatar from "../UserAvatar";
 
 
@@ -14,12 +20,17 @@ function AdminTopBar() {
   const triggerRef = useRef(null);
 
   return (
-    <header className="admin-topbar">
+    <header
+      className="admin-topbar"
+      data-tauri-drag-region={isDesktopRuntime() ? "" : undefined}
+      onMouseDown={handleDesktopTitlebarMouseDown}
+      onDoubleClick={handleDesktopTitlebarDoubleClick}
+    >
       <Link to="/admin" className="admin-topbar-brand">
         {appName} <span>Admin</span>
       </Link>
 
-      <div className="admin-topbar-profile">
+      <div className="admin-topbar-profile" style={{ display: "flex", alignItems: "center", gap: "10px" }}>
         <button
           type="button"
           className="admin-profile-button"
@@ -46,6 +57,7 @@ function AdminTopBar() {
             </button>
           </FloatingPanel>
         )}
+        <DesktopWindowControls />
       </div>
     </header>
   );

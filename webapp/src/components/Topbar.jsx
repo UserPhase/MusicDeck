@@ -26,9 +26,15 @@ import {
 
 import FloatingPanel from "./ui/FloatingPanel";
 import UserAvatar from "./UserAvatar";
+import DesktopWindowControls from "./desktop/DesktopWindowControls";
 import { useImport } from "../context/ImportContext";
 import { BrandWordmark } from "../context/BrandingContext";
 import { useViewStateValue } from "../hooks/useViewStateStore";
+import {
+  handleDesktopTitlebarDoubleClick,
+  handleDesktopTitlebarMouseDown,
+  isDesktopRuntime,
+} from "../services/desktop/desktopRuntime";
 
 // Primary destinations for header-navigation layouts (YouTube Music, SoundCloud).
 export const HEADER_NAV_ITEMS = [
@@ -355,7 +361,12 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
   return (
 
-    <header className={`topbar${playerSlot ? " topbar--player" : ""}${showPrimaryNav ? " topbar--topnav" : ""}`}>
+    <header
+      className={`topbar${playerSlot ? " topbar--player" : ""}${showPrimaryNav ? " topbar--topnav" : ""}`}
+      data-tauri-drag-region={isDesktopRuntime() ? "" : undefined}
+      onMouseDown={handleDesktopTitlebarMouseDown}
+      onDoubleClick={handleDesktopTitlebarDoubleClick}
+    >
 
 
       {/* LOGO */}
@@ -613,8 +624,9 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
       </div>
 
 
-      {/* PROFILE */}
+      {/* PROFILE & DESKTOP WINDOW CONTROLS */}
 
+      <div className="topbar-end">
       <div
         className="profile"
         ref={accountRef}
@@ -737,6 +749,8 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
         )}
 
+      </div>
+      <DesktopWindowControls />
       </div>
 
 

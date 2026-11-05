@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import DesktopServerModal from "../../components/desktop/DesktopServerModal";
 import DesktopUpdateBanner from "../../components/desktop/DesktopUpdateBanner";
+import DesktopWindowControls from "../../components/desktop/DesktopWindowControls";
 import { AuthProvider } from "../../context/AuthContext";
 import Login, {
   REMEMBER_ME_STORAGE_KEY,
@@ -496,5 +497,21 @@ describe("desktopRuntime", () => {
     fireEvent.click(rememberCheckboxSecond);
     expect(rememberCheckboxSecond).not.toBeChecked();
     expect(localStorage.getItem(REMEMBERED_USERNAME_STORAGE_KEY)).toBeNull();
+  });
+
+  test("renders seamless Spotify-style window controls in desktop mode and invokes window actions", async () => {
+    const invokeMock = jest.fn(() => Promise.resolve(null));
+    window.__TAURI__ = { core: { invoke: invokeMock } };
+
+    render(<DesktopWindowControls floating />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Minimize window/i }));
+    expect(invokeMock).toHaveBeenCalledWith("desktop_window_action", { action: "minimize" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Maximize window/i }));
+    expect(invokeMock).toHaveBeenCalledWith("desktop_window_action", { action: "toggle-maximize" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Close window/i }));
+    expect(invokeMock).toHaveBeenCalledWith("desktop_window_action", { action: "close" });
   });
 });

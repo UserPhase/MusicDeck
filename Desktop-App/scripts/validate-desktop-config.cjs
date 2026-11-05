@@ -21,6 +21,7 @@ function validateDesktopProject() {
   assert.equal(tauriConf.build.devUrl, "http://localhost:3000");
   assert.equal(tauriConf.build.frontendDist, "../../webapp/build");
   assert.equal(tauriConf.app.withGlobalTauri, true);
+  assert.equal(tauriConf.app.windows[0].decorations, false, "Main window must use decorations: false for seamless titlebar");
 
   const resolvedWebappDir = path.resolve(tauriRoot, tauriConf.build.frontendDist, "..");
   assert.equal(
@@ -35,6 +36,7 @@ function validateDesktopProject() {
   assert.ok(Array.isArray(capability.windows) && capability.windows.includes("main"));
   assert.ok(Array.isArray(capability.permissions) && capability.permissions.includes("core:default"));
   assert.ok(capability.permissions.includes("core:tray:default"));
+  assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
 
   for (const iconRel of tauriConf.bundle.icon) {
     const iconPath = path.join(tauriRoot, iconRel);

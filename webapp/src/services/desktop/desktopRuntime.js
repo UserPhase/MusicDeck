@@ -412,6 +412,48 @@ export async function syncDesktopPlaybackState({ title, artist, isPlaying }) {
   }
 }
 
+export async function performDesktopWindowAction(action) {
+  if (!isDesktopRuntime()) return;
+  try {
+    await invokeDesktopCommand("desktop_window_action", { action });
+  } catch {
+    // Ignore window action errors when running outside native Tauri host.
+  }
+}
+
+const INTERACTIVE_TITLEBAR_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "select",
+  "textarea",
+  "label",
+  "[role='button']",
+  "[role='menuitem']",
+  "[role='listbox']",
+  "[data-no-drag='true']",
+  ".search-dropdown",
+  ".account-menu",
+  ".desktop-window-controls",
+].join(",");
+
+export function isInteractiveTitlebarTarget(target) {
+  if (!target || typeof target.closest !== "function") return false;
+  return Boolean(target.closest(INTERACTIVE_TITLEBAR_SELECTOR));
+}
+
+export function handleDesktopTitlebarMouseDown(event) {
+  if (!isDesktopRuntime() || event.button !== 0 || event.detail > 1) return;
+  if (isInteractiveTitlebarTarget(event.target)) return;
+  void performDesktopWindowAction("start-dragging");
+}
+
+export function handleDesktopTitlebarDoubleClick(event) {
+  if (!isDesktopRuntime()) return;
+  if (isInteractiveTitlebarTarget(event.target)) return;
+  void performDesktopWindowAction("toggle-maximize");
+}
+
 export function subscribeDesktopRuntimeEvents({
   onMediaControl,
   onOpenServerSettings,

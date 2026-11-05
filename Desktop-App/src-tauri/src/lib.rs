@@ -398,6 +398,7 @@ fn desktop_window_action(app: AppHandle, action: String) -> Result<(), String> {
     };
 
     match action.as_str() {
+        "start-dragging" => window.start_dragging().map_err(|e| e.to_string()),
         "minimize" => window.minimize().map_err(|e| e.to_string()),
         "toggle-maximize" => {
             if window.is_maximized().unwrap_or(false) {
@@ -406,7 +407,17 @@ fn desktop_window_action(app: AppHandle, action: String) -> Result<(), String> {
                 window.maximize().map_err(|e| e.to_string())
             }
         }
-        "close" => window.close().map_err(|e| e.to_string()),
+        "close" => {
+            let close_to_tray = app
+                .try_state::<DesktopState>()
+                .and_then(|s| s.config.lock().ok().map(|c| c.close_to_tray))
+                .unwrap_or(true);
+            if close_to_tray {
+                window.hide().map_err(|e| e.to_string())
+            } else {
+                window.close().map_err(|e| e.to_string())
+            }
+        }
         "show" => {
             show_main_window(&app);
             Ok(())

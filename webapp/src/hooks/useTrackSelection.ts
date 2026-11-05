@@ -37,31 +37,83 @@ export function selectTrackRange(
   return { selectedIds: next, anchor: id };
 }
 
+const EMPTY_SELECTION: ReadonlySet<string> = new Set<string>();
+
 export function useTrackSelection(ids: readonly string[], dataKey?: unknown): TrackSelection {
-  const [state, setState] = useState<{ selectedIds: ReadonlySet<string>; anchor: string | null; key: unknown }>(
-    () => ({ selectedIds: new Set(), anchor: null, key: dataKey }),
-  );
   const valid = useMemo(() => new Set(ids), [ids]);
-  const selectedIds = useMemo(() => state.key !== dataKey ? new Set<string>()
-    : new Set([...state.selectedIds].filter((id) => valid.has(id))), [state, valid, dataKey]);
-  const live = useRef<{ ids: readonly string[]; selectedIds: ReadonlySet<string>; anchor: string | null; key: unknown }>(
-    { ids, selectedIds, anchor: state.key === dataKey ? state.anchor : null, key: dataKey },
-  );
-  live.current = { ids, selectedIds, anchor: state.key === dataKey ? state.anchor : null, key: dataKey };
+  const [state, setState] = useState<{
+    selectedIds: ReadonlySet<string>;
+    anchor: string | null;
+    key: unknown;
+    valid: ReadonlySet<string>;
+  }>(() => ({ selectedIds: EMPTY_SELECTION, anchor: null, key: dataKey, valid }));
+
+  const selectedIds = useMemo(() => {
+    if (state.key !== dataKey || state.selectedIds.size === 0) return EMPTY_SELECTION;
+    if (state.valid === valid || state.selectedIds === valid) return state.selectedIds;
+    const pruned = new Set<string>();
+    state.selectedIds.forEach((id) => {
+      if (valid.has(id)) pruned.add(id);
+    });
+    return pruned.size === state.selectedIds.size ? state.selectedIds : pruned;
+  }, [state, valid, dataKey]);
+
+  const live = useRef<{
+    ids: readonly string[];
+    valid: ReadonlySet<string>;
+    selectedIds: ReadonlySet<string>;
+    anchor: string | null;
+    key: unknown;
+  }>({
+    ids,
+    valid,
+    selectedIds,
+    anchor: state.key === dataKey ? state.anchor : null,
+    key: dataKey,
+  });
+  live.current = {
+    ids,
+    valid,
+    selectedIds,
+    anchor: state.key === dataKey ? state.anchor : null,
+    key: dataKey,
+  };
+
   useEffect(() => {
     if (state.key !== dataKey || state.selectedIds.size !== selectedIds.size) {
-      setState({ selectedIds, anchor: live.current.anchor, key: dataKey });
+      setState({
+        selectedIds,
+        anchor: live.current.anchor,
+        key: dataKey,
+        valid: live.current.valid,
+      });
     }
   }, [dataKey, selectedIds, state]);
+
   const commit = useCallback((next: { selectedIds: ReadonlySet<string>; anchor: string | null }) => {
-    live.current = { ...live.current, ...next };
-    setState({ ...next, key: live.current.key });
+    const current = live.current;
+    live.current = { ...current, ...next };
+    setState({ ...next, key: current.key, valid: current.valid });
   }, []);
+
   const select = useCallback((index: number, modifiers?: SelectionModifiers) => {
     const current = live.current;
     commit(selectTrackRange(current.ids, current.selectedIds, current.anchor, index, modifiers));
   }, [commit]);
-  const selectAll = useCallback(() => commit({ selectedIds: new Set(live.current.ids), anchor: live.current.ids[0] ?? null }), [commit]);
-  const clear = useCallback(() => commit({ selectedIds: new Set(), anchor: null }), [commit]);
-  return { selectedIds, selectedCount: selectedIds.size, allSelected: ids.length > 0 && selectedIds.size === ids.length, select, selectAll, clear };
+
+  const selectAll = useCallback(() => {
+    const current = live.current;
+    commit({ selectedIds: current.valid, anchor: current.ids[0] ?? null });
+  }, [commit]);
+
+  const clear = useCallback(() => commit({ selectedIds: EMPTY_SELECTION, anchor: null }), [commit]);
+
+  return {
+    selectedIds,
+    selectedCount: selectedIds.size,
+    allSelected: ids.length > 0 && selectedIds.size === ids.length,
+    select,
+    selectAll,
+    clear,
+  };
 }

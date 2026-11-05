@@ -3,7 +3,14 @@
 .topbar-center { display: flex; align-items: center; gap: 12px; }
 .homebutton { width: 44px; height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: center; background: var(--control-surface); border-radius: 50%; color: var(--text-secondary); text-decoration: none; transition: background 0.15s ease, border-color 0.15s ease; }
 .homebutton:hover { border-color: var(--border-hover); }
+.topbar-end { justify-self: end; display: flex; align-items: center; gap: 10px; }
 .profile { position: relative; justify-self: end; display: flex; align-items: center; gap: 10px; padding: 5px 12px 5px 6px; background: var(--control-surface); border: 1px solid transparent; border-radius: 22px; color: var(--text-secondary); }
+.desktop-window-controls { display: inline-flex; align-items: center; gap: 2px; margin-left: 4px; -webkit-app-region: no-drag; }
+.desktop-window-btn { width: 36px; height: 32px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 6px; background: transparent; color: var(--text-secondary); cursor: pointer; transition: background 0.14s ease, color 0.14s ease; }
+.desktop-window-btn:hover { background: rgba(var(--tint-rgb, 255, 255, 255), 0.1); color: var(--text); }
+.desktop-window-btn--close:hover { background: #e81123; color: #ffffff; }
+.desktop-floating-titlebar { position: fixed; top: 0; left: 0; right: 0; height: 44px; padding: 0 12px; display: flex; align-items: center; justify-content: flex-end; z-index: 40; user-select: none; }
+:root[data-desktop-app="true"] .topbar, :root[data-desktop-app="true"] .admin-topbar { user-select: none; }
 .topbar-import-status { display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .6rem; border: 1px solid rgb(168 85 247 / 25%); border-radius: 1rem; background: rgb(168 85 247 / 9%); color: var(--text-secondary); font-size: .72rem; white-space: nowrap; cursor: pointer; }
 .topbar-import-status:hover:not(:disabled) { color: var(--text); }
 .topbar-import-status:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }

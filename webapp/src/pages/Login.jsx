@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import DesktopWindowControls from "../components/desktop/DesktopWindowControls";
 import {
   DESKTOP_CONFIG_CHANGED_EVENT,
   DESKTOP_OPEN_SERVER_MODAL_EVENT,
@@ -93,6 +94,7 @@ function Login({ redirectTo } = {}) {
 
   return (
     <div className="login-page">
+      <DesktopWindowControls floating />
       <form
         className="login-form"
         onSubmit={handleSubmit}
