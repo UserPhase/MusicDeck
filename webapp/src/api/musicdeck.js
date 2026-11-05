@@ -1,11 +1,12 @@
 import { isBrowserIntegrationAllowed } from "../services/privacyPolicy";
+import { resolveDesktopApiUrl } from "../services/desktop/desktopRuntime";
 import { playlistCommands, setPlaylistCommandNotifier } from "../services/playlists/PlaylistCommandStore";
 import {
   normalizeTrackData,
 } from "../utils/normalizeTrackData";
 
 export async function request(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(resolveDesktopApiUrl(path), {
     credentials: "include",
     headers: {
       // Only send a JSON content-type when there's actually a JSON body —
@@ -38,7 +39,7 @@ export async function request(path, options = {}) {
   return response.json();
 }
 
-export const taskStreamUrl = () => "/api/v1/admin/tasks/stream";
+export const taskStreamUrl = () => resolveDesktopApiUrl("/api/v1/admin/tasks/stream");
 export const inspectAudioStream = (trackId, inspectionId, signal) =>
   request(`/api/v1/stream/inspect/${encodeURIComponent(trackId)}?${new URLSearchParams({ inspectionId })}`, { signal });
 export const getMediaCheckpoints = (signal, type, mediaId) => {
@@ -53,7 +54,7 @@ export const getDataExportSummary = (signal) => request("/api/v1/user/export/sum
 export function downloadUserData(kind, format, playlistId) {
   const suffix = kind === "playlists" && playlistId ? `playlists/${encodeURIComponent(playlistId)}` : kind;
   const anchor = document.createElement("a");
-  anchor.href = `/api/v1/user/export/${suffix}?${new URLSearchParams({ format })}`;
+  anchor.href = resolveDesktopApiUrl(`/api/v1/user/export/${suffix}?${new URLSearchParams({ format })}`);
   anchor.download = "";
   document.body.appendChild(anchor);
   anchor.click();
@@ -219,10 +220,15 @@ function toSearchItem(result) {
   };
 }
 
-export async function login(username, password) {
+export async function login(username, password, options = {}) {
+  const payload = {
+    username,
+    password,
+    ...(typeof options?.rememberMe === "boolean" ? { rememberMe: options.rememberMe } : {}),
+  };
   const data = await request("/api/auth/login", {
     method: "POST",
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify(payload),
   });
 
   return data.user;
@@ -333,9 +339,11 @@ export async function clearAdminLogs() {
 }
 
 export function adminLogsStreamUrl(afterSeq) {
-  return Number.isInteger(afterSeq) && afterSeq > 0
-    ? `/api/admin/logs/stream?after=${afterSeq}`
-    : "/api/admin/logs/stream";
+  return resolveDesktopApiUrl(
+    Number.isInteger(afterSeq) && afterSeq > 0
+      ? `/api/admin/logs/stream?after=${afterSeq}`
+      : "/api/admin/logs/stream"
+  );
 }
 
 export async function getAdminBackendConnections() {
@@ -486,16 +494,16 @@ export function getCoverUrl(coverArt, size) {
     /^https?:\/\//i.test(id) || id.startsWith("extart_") || id.startsWith("/api/artwork/external/")
   )) return null;
   if (/^https?:\/\//i.test(id) || (id.startsWith("/") && !id.startsWith("//"))) {
-    return id;
+    return resolveDesktopApiUrl(id);
   }
 
   if (id.startsWith("extart_")) {
-    return `/api/artwork/external/${encodeURIComponent(id)}`;
+    return resolveDesktopApiUrl(`/api/artwork/external/${encodeURIComponent(id)}`);
   }
 
   const url = `/api/artwork/${encodeURIComponent(id)}`;
 
-  return size ? `${url}?size=${encodeURIComponent(size)}` : url;
+  return resolveDesktopApiUrl(size ? `${url}?size=${encodeURIComponent(size)}` : url);
 }
 
 export async function prepareNormalizedPlayback(songId, source, previewUrl, signal, streamQuality = "original", targetLufs = -16) {

@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import type { AppConfig } from "../config.js";
 import type { Db } from "../db/database.js";
-import { createSession, clearSessionCookie, deleteSession, getSessionUser, revokeUserSessions, setSessionCookie, SESSION_COOKIE } from "../auth/sessions.js";
+import { createSession, clearSessionCookie, deleteSession, getSessionUser, refreshSessionIfRemembered, revokeUserSessions, setSessionCookie, SESSION_COOKIE } from "../auth/sessions.js";
 import { notifySessionChanges } from "../auth/session-events.js";
 import { requireUser } from "../auth/authorization.js";
 import { hashPassword, verifyPassword } from "../auth/passwords.js";
@@ -14,6 +14,7 @@ import { LoginRateLimiter } from "../auth/login-rate-limiter.js";
 const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
+  rememberMe: z.boolean().optional(),
 });
 
 const changePasswordSchema = z.object({
@@ -55,14 +56,15 @@ export async function registerAuthRoutes(app: FastifyInstance, db: Db, config: A
         return sendError(reply, 401, "Invalid username or password");
       }
 
+      const rememberMe = parsed.data.rememberMe !== false;
       const authenticated = db.transaction(() => {
         const current = getUserByUsername(db, parsed.data.username) as typeof row;
         if (!current || current.disabled || current.password_hash !== row.password_hash) return null;
-        return { current, session: createSession(db, current.id), lastLoginAt: recordLogin(db, current.id) };
+        return { current, session: createSession(db, current.id, rememberMe), lastLoginAt: recordLogin(db, current.id) };
       })();
       if (!authenticated) return sendError(reply, 401, "Invalid username or password");
       const { current, session, lastLoginAt } = authenticated;
-      setSessionCookie(reply, session.id, session.expiresAt, config.secureCookies);
+      setSessionCookie(reply, session.id, session.expiresAt, config.secureCookies, session.persistent);
 
       return { user: toPublicUser({ ...current, last_login_at: lastLoginAt }) };
     } finally {
@@ -76,8 +78,11 @@ export async function registerAuthRoutes(app: FastifyInstance, db: Db, config: A
     return { ok: true };
   });
 
-  app.get("/api/auth/session", async (request) => {
+  app.get("/api/auth/session", async (request, reply) => {
     const user = getSessionUser(db, request);
+    if (user) {
+      refreshSessionIfRemembered(db, reply, request.cookies[SESSION_COOKIE], config.secureCookies);
+    }
     return {
       authenticated: Boolean(user),
       user,

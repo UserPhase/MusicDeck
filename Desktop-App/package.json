@@ -1,0 +1,17 @@
+{
+  "name": "musicdeck-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tauri v2 desktop application shell for MusicDeck reusing the shared React webapp.",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "webapp:start": "npm --prefix ../webapp start",
+    "webapp:build": "npm --prefix ../webapp run build",
+    "validate": "node scripts/validate-desktop-config.cjs",
+    "test": "node --test test/desktop-config.test.cjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0"
+  }
+}

@@ -16,7 +16,10 @@ import './styles/glassmorphic.css';
 import './styles/tactile.css';
 import './styles/theme.css';
 import App from './App';
+import { installDesktopRuntime } from './services/desktop/desktopRuntime';
 import { registerServiceWorker } from './services/serviceWorkerRegistration';
+
+installDesktopRuntime();
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(

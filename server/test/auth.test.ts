@@ -136,4 +136,43 @@ describe("auth and health", () => {
     const newLogin = await login(app, "admin", "new-password");
     expect(newLogin.response.statusCode).toBe(200);
   });
+
+  test("rememberMe controls persistent vs session-only cookie expiration", async () => {
+    const { app } = await setup();
+
+    const remembered = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "admin", password: "admin-password", rememberMe: true },
+    });
+    expect(remembered.statusCode).toBe(200);
+    const rememberedCookie = String(remembered.headers["set-cookie"]);
+    expect(rememberedCookie).toContain("Expires=");
+
+    const refreshed = await app.inject({
+      method: "GET",
+      url: "/api/auth/session",
+      headers: { cookie: rememberedCookie.split(";")[0] },
+    });
+    expect(refreshed.statusCode).toBe(200);
+    expect(String(refreshed.headers["set-cookie"])).toContain("Expires=");
+
+    const ephemeral = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "admin", password: "admin-password", rememberMe: false },
+    });
+    expect(ephemeral.statusCode).toBe(200);
+    const ephemeralCookie = String(ephemeral.headers["set-cookie"]);
+    expect(ephemeralCookie).toContain("musicdeck_session=");
+    expect(ephemeralCookie).not.toContain("Expires=");
+
+    const ephemeralCheck = await app.inject({
+      method: "GET",
+      url: "/api/auth/session",
+      headers: { cookie: ephemeralCookie.split(";")[0] },
+    });
+    expect(ephemeralCheck.statusCode).toBe(200);
+    expect(ephemeralCheck.headers["set-cookie"]).toBeUndefined();
+  });
 });

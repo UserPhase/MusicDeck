@@ -1,4 +1,7 @@
+import { isDesktopRuntime } from "./desktop/desktopRuntime";
+
 export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
+  if (isDesktopRuntime()) return null;
   if (process.env.NODE_ENV !== "production" || !("serviceWorker" in navigator) || !window.isSecureContext) return null;
   try {
     const publicPath = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");

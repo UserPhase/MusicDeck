@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MusicDeck",
+  "version": "0.1.0",
+  "identifier": "app.musicdeck.desktop",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../webapp start",
+    "devUrl": "http://localhost:3000",
+    "beforeBuildCommand": "npm --prefix ../webapp run build",
+    "frontendDist": "../../webapp/build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "MusicDeck",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost tauri: http: https: data: blob: ws: wss:; img-src 'self' asset: http://asset.localhost http: https: data: blob:; media-src 'self' asset: http://asset.localhost http: https: data: blob:; style-src 'self' 'unsafe-inline' http: https:; script-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

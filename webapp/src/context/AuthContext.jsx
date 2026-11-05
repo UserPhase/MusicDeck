@@ -22,7 +22,7 @@ import { playlistCommands } from "../services/playlists/PlaylistCommandStore";
 
 
 /** @typedef {{ id: string, username?: string, role: "admin" | "user", externalSearchEnabled?: boolean, acquisitionEnabled?: boolean, [key: string]: unknown }} AuthSession */
-/** @typedef {{ session: AuthSession | null, isAuthenticated: boolean, isLoading: boolean, signIn(username: string, password: string): Promise<void>, signOut(): Promise<void>, updateSession(user: AuthSession): void }} AuthState */
+/** @typedef {{ session: AuthSession | null, isAuthenticated: boolean, isLoading: boolean, signIn(username: string, password: string, options?: { rememberMe?: boolean }): Promise<void>, signOut(): Promise<void>, updateSession(user: AuthSession): void }} AuthState */
 const AuthContext =
   createContext(/** @type {AuthState | null} */ (null));
 
@@ -88,9 +88,10 @@ export function AuthProvider({
   }, []);
 
 
-  async function signIn(username, password) {
-    const user = await authenticate(username, password);
-    await rememberDownloadOwner(String(user.id));
+  async function signIn(username, password, options = {}) {
+    const user = await authenticate(username, password, options);
+    const shouldRemember = options?.rememberMe !== false;
+    await rememberDownloadOwner(shouldRemember ? String(user.id) : null);
     await offlineDownloadEngine.activate(String(user.id));
     offlineAuditor.reset();
     playlistCommands.activate(String(user.id)); tasteProfileStore.activate(String(user.id));

@@ -65,6 +65,13 @@ import PlaylistUndoShortcuts from "./components/playlists/PlaylistUndoShortcuts"
 import useAutoDownloadSync from "./hooks/useAutoDownloadSync";
 import { offlineDownloadEngine } from "./services/storage/OfflineDownloadEngine";
 import useGlobalHotkeys from "./hooks/useGlobalHotkeys";
+import DesktopServerModal from "./components/desktop/DesktopServerModal";
+import DesktopUpdateBanner from "./components/desktop/DesktopUpdateBanner";
+import {
+  isDesktopRuntime,
+  subscribeDesktopRuntimeEvents,
+  syncDesktopPlaybackState,
+} from "./services/desktop/desktopRuntime";
 
 const AdminTopBar = lazy(() => import("./components/admin/AdminTopBar"));
 const AdminSidebar = lazy(() => import("./components/admin/AdminSidebar"));
@@ -128,6 +135,8 @@ function AuthenticatedApp() {
   const {
     activeSidebar,
     setActiveSidebar,
+    currentSong,
+    isPlaying,
     togglePlay,
     nextSong,
     previousSong,
@@ -246,6 +255,25 @@ function AuthenticatedApp() {
     onOpenPalette: () => setIsCommandPaletteOpen(true),
   });
 
+  useEffect(() => {
+    void syncDesktopPlaybackState({
+      title: currentSong?.title || null,
+      artist: currentSong?.artist || null,
+      isPlaying: Boolean(currentSong && isPlaying),
+    });
+  }, [currentSong, isPlaying]);
+
+  useEffect(() => {
+    return subscribeDesktopRuntimeEvents({
+      onMediaControl: (action) => {
+        if (action === "toggle-play") togglePlay?.();
+        else if (action === "next") nextSong?.();
+        else if (action === "previous") previousSong?.();
+        else if (action === "mute") toggleMute();
+      },
+    });
+  }, [nextSong, previousSong, toggleMute, togglePlay]);
+
   return (
     <>
       {!isAdminRoute && <AmbientBackground />}
@@ -356,6 +384,15 @@ function AppContent() {
 
 
 function App() {
+  const [isDesktopServerModalOpen, setIsDesktopServerModalOpen] = useState(false);
+
+  useEffect(() => {
+    if (!isDesktopRuntime()) return undefined;
+    return subscribeDesktopRuntimeEvents({
+      onOpenServerSettings: () => setIsDesktopServerModalOpen(true),
+    });
+  }, []);
+
   return (
     <QueryClientProvider client={artistOverviewQueryClient}>
       <BrowserRouter>
@@ -366,6 +403,15 @@ function App() {
             <PlayerProvider>
               <PlaylistUndoShortcuts />
               <AppContent />
+              {isDesktopRuntime() && (
+                <>
+                  <DesktopUpdateBanner />
+                  <DesktopServerModal
+                    isOpen={isDesktopServerModalOpen}
+                    onClose={() => setIsDesktopServerModalOpen(false)}
+                  />
+                </>
+              )}
             </PlayerProvider>
             </PrivacyProvider>
           </AuthProvider>

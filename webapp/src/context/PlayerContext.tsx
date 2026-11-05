@@ -12,6 +12,7 @@ import { PlayerItemStateProvider } from "./PlayerItemState";
 import { RemoteSessionContext } from "./RemoteSessionContext";
 import { CastContext } from "./CastContext";
 import { useCastSession } from "../hooks/useCastSession";
+import { resolveDesktopApiUrl } from "../services/desktop/desktopRuntime";
 import { usePrivacy } from "./PrivacyContext";
 import { useRemoteSession } from "../hooks/useRemoteSession";
 import type { RemotePlaybackSnapshot, RemotePlayerAdapter } from "../types/remoteSession";
@@ -744,7 +745,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       } } : {}),
       albumPlaybackId: albumPlayback(entry.track) ? entry.track.albumPlaybackId : undefined,
       albumTrackIndex: albumPlayback(entry.track) ? entry.track.albumTrackIndex : undefined,
-      src: resolved.url,
+      src: resolveDesktopApiUrl(resolved.url),
       gain,
       trimStart: albumPlayback(entry.track) ? 0 : trim?.leading ?? 0,
       // A preview is only a fragment of the recording: the engine ends it here.
