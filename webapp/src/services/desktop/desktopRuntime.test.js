@@ -47,9 +47,15 @@ describe("desktopRuntime", () => {
     expect(isDesktopRuntime()).toBe(true);
   });
 
-  test("normalizes valid server URLs and rejects invalid ones", () => {
+  test("normalizes valid server URLs, bare LAN IPs, and rejects invalid ones", () => {
     expect(normalizeDesktopServerUrl("  http://192.168.1.50:8080/  ")).toBe(
       "http://192.168.1.50:8080"
+    );
+    expect(normalizeDesktopServerUrl("192.168.2.38")).toBe(
+      "http://192.168.2.38:8080"
+    );
+    expect(normalizeDesktopServerUrl("192.168.2.38:8080/")).toBe(
+      "http://192.168.2.38:8080"
     );
     expect(normalizeDesktopServerUrl("https://music.example.com///")).toBe(
       "https://music.example.com"
@@ -62,6 +68,31 @@ describe("desktopRuntime", () => {
     expect(() => normalizeDesktopServerUrl("http://user:pass@localhost:4534")).toThrow(
       /credentials/i
     );
+  });
+
+  test("auto-discovers Docker port 8080 when user enters port 4534", async () => {
+    window.__MUSICDECK_DESKTOP__ = true;
+    global.fetch = jest.fn((url) => {
+      if (String(url) === "http://192.168.2.38:4534/api/public/config") {
+        return Promise.reject(new Error("Connection refused"));
+      }
+      if (String(url) === "http://192.168.2.38:8080/api/public/config") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ appName: "LAN MusicDeck" }),
+        });
+      }
+      return Promise.reject(new Error("Unreachable"));
+    });
+
+    const result = await checkDesktopServerConnection("http://192.168.2.38:4534");
+    expect(result).toEqual({
+      reachable: true,
+      serverUrl: "http://192.168.2.38:8080",
+      appName: "LAN MusicDeck",
+      error: null,
+    });
   });
 
   test("leaves relative /api paths unchanged in standard web browser mode", () => {

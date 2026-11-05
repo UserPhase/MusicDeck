@@ -57,6 +57,9 @@ function validateDesktopProject() {
   const updaterRsPath = path.join(tauriRoot, "src", "updater.rs");
   assert.ok(fs.existsSync(updaterRsPath), "src-tauri/src/updater.rs must exist");
 
+  const proxyRsPath = path.join(tauriRoot, "src", "proxy.rs");
+  assert.ok(fs.existsSync(proxyRsPath), "src-tauri/src/proxy.rs must exist");
+
   const libRs = fs.readFileSync(path.join(tauriRoot, "src", "lib.rs"), "utf8");
   for (const cmd of [
     "desktop_get_config",

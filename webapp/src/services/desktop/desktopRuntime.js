@@ -12,6 +12,7 @@ export const DESKTOP_UPDATE_STATUS_EVENT = "musicdeck:desktop-update-status";
 
 let fetchInterceptorInstalled = false;
 let originalFetch = null;
+let activeDesktopProxyUrl = null;
 
 export function isDesktopRuntime(win = typeof window !== "undefined" ? window : undefined) {
   if (!win) return false;
@@ -32,13 +33,21 @@ export function normalizeDesktopServerUrl(raw) {
     throw new Error("Server URL is required.");
   }
 
-  if (!/^https?:\/\//i.test(trimmed)) {
+  let candidate = trimmed;
+  if (!candidate.includes("://")) {
+    const hostPart = candidate.split("/")[0] || "";
+    const isIpv4OrLocal =
+      /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostPart) || hostPart.toLowerCase() === "localhost";
+    candidate = !hostPart.includes(":") && isIpv4OrLocal
+      ? `http://${hostPart}:8080`
+      : `http://${candidate}`;
+  } else if (!/^https?:\/\//i.test(candidate)) {
     throw new Error("Server URL must start with http:// or https://.");
   }
 
   let parsed;
   try {
-    parsed = new URL(trimmed);
+    parsed = new URL(candidate);
   } catch {
     throw new Error("Enter a valid http:// or https:// MusicDeck server URL.");
   }
@@ -53,6 +62,28 @@ export function normalizeDesktopServerUrl(raw) {
 
   const cleanPath = parsed.pathname.replace(/\/+$/, "");
   return `${parsed.protocol}//${parsed.host}${cleanPath}`;
+}
+
+export function getCandidateDesktopServerUrls(raw) {
+  const primary = normalizeDesktopServerUrl(raw);
+  const parsed = new URL(primary);
+  const candidates = [primary];
+
+  if (!parsed.pathname || parsed.pathname === "/") {
+    const scheme = `${parsed.protocol}//`;
+    const hostOnly = parsed.hostname;
+    for (const alt of [
+      `${scheme}${hostOnly}:8080`,
+      `${scheme}${hostOnly}:4534`,
+      `${scheme}${hostOnly}`,
+    ]) {
+      if (!candidates.includes(alt)) {
+        candidates.push(alt);
+      }
+    }
+  }
+
+  return candidates;
 }
 
 export function hasStoredDesktopServerUrl() {
@@ -124,6 +155,18 @@ export async function invokeDesktopCommand(command, args = {}) {
   return invoke(command, args);
 }
 
+export function stripDesktopApiOrigin(url) {
+  if (typeof url !== "string" || !isDesktopRuntime()) return url;
+  if (activeDesktopProxyUrl && url.startsWith(`${activeDesktopProxyUrl}/api/`)) {
+    return url.slice(activeDesktopProxyUrl.length);
+  }
+  const serverUrl = getDesktopServerUrl();
+  if (serverUrl && url.startsWith(`${serverUrl}/api/`)) {
+    return url.slice(serverUrl.length);
+  }
+  return url;
+}
+
 export function resolveDesktopApiUrl(pathOrUrl) {
   if (typeof pathOrUrl !== "string" || !isDesktopRuntime()) {
     return pathOrUrl;
@@ -131,6 +174,10 @@ export function resolveDesktopApiUrl(pathOrUrl) {
 
   if (!pathOrUrl.startsWith("/api/") && pathOrUrl !== "/api" && !pathOrUrl.startsWith("/api?")) {
     return pathOrUrl;
+  }
+
+  if (activeDesktopProxyUrl) {
+    return `${activeDesktopProxyUrl}${pathOrUrl}`;
   }
 
   const serverUrl = getDesktopServerUrl();
@@ -200,7 +247,8 @@ export async function saveDesktopConfig({ serverUrl, closeToTray, autoCheckUpdat
 }
 
 export async function checkDesktopServerConnection(candidateUrl) {
-  const normalized = normalizeDesktopServerUrl(candidateUrl);
+  const candidates = getCandidateDesktopServerUrls(candidateUrl);
+  const normalized = candidates[0];
 
   try {
     const nativeResult = await invokeDesktopCommand("desktop_check_server", {
@@ -219,36 +267,38 @@ export async function checkDesktopServerConnection(candidateUrl) {
   }
 
   const fetchImpl = originalFetch || (typeof window !== "undefined" ? window.fetch?.bind(window) : fetch);
-  try {
-    const response = await fetchImpl(`${normalized}/api/public/config`, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok) {
+  let lastError = "Could not connect to MusicDeck server.";
+
+  for (const candidate of candidates) {
+    try {
+      const response = await fetchImpl(`${candidate}/api/public/config`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        lastError = `${candidate} responded with HTTP ${response.status}`;
+        continue;
+      }
+      const payload = await response.json().catch(() => ({}));
       return {
-        reachable: false,
-        serverUrl: normalized,
-        appName: null,
-        error: `Server responded with HTTP ${response.status}`,
+        reachable: true,
+        serverUrl: candidate,
+        appName: typeof payload?.appName === "string" && payload.appName.trim()
+          ? payload.appName.trim()
+          : "MusicDeck",
+        error: null,
       };
+    } catch (err) {
+      lastError = err?.message || lastError;
     }
-    const payload = await response.json().catch(() => ({}));
-    return {
-      reachable: true,
-      serverUrl: normalized,
-      appName: typeof payload?.appName === "string" && payload.appName.trim()
-        ? payload.appName.trim()
-        : "MusicDeck",
-      error: null,
-    };
-  } catch (err) {
-    return {
-      reachable: false,
-      serverUrl: normalized,
-      appName: null,
-      error: err?.message || "Could not connect to MusicDeck server.",
-    };
   }
+
+  return {
+    reachable: false,
+    serverUrl: normalized,
+    appName: null,
+    error: `${lastError} (For Docker Compose, use port 8080 e.g. http://192.168.2.38:8080 and set MUSICDECK_WEB_BIND=0.0.0.0 in .env)`,
+  };
 }
 
 export async function checkDesktopUpdates(manifestUrl) {
@@ -480,6 +530,9 @@ export function installDesktopRuntime() {
   void invokeDesktopCommand("desktop_get_config")
     .then((config) => {
       if (!config || typeof config !== "object") return;
+      if (typeof config.proxyUrl === "string" && config.proxyUrl.trim()) {
+        activeDesktopProxyUrl = config.proxyUrl.trim().replace(/\/+$/, "");
+      }
       if (typeof config.serverUrl === "string" && config.serverUrl.trim() && !hasStoredDesktopServerUrl()) {
         try {
           localStorage.setItem(
@@ -513,6 +566,7 @@ export function installDesktopRuntime() {
       fetchInterceptorInstalled = false;
       originalFetch = null;
     }
+    activeDesktopProxyUrl = null;
     delete document.documentElement.dataset.desktopApp;
   };
 }

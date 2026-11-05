@@ -53,8 +53,13 @@ function DesktopServerModal({ isOpen, onClose, onSaved }) {
     setStatus(null);
     setSaving(true);
     try {
+      let resolvedUrl = serverUrl;
+      const probe = await checkDesktopServerConnection(serverUrl).catch(() => null);
+      if (probe?.reachable && probe.serverUrl) {
+        resolvedUrl = probe.serverUrl;
+      }
       const saved = await saveDesktopConfig({
-        serverUrl,
+        serverUrl: resolvedUrl,
         closeToTray,
         autoCheckUpdates,
       });
@@ -130,10 +135,10 @@ function DesktopServerModal({ isOpen, onClose, onSaved }) {
         <label style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "0.875rem" }}>
           <span>MusicDeck Server URL</span>
           <input
-            type="url"
+            type="text"
             value={serverUrl}
             onChange={(event) => setServerUrl(event.target.value)}
-            placeholder="http://localhost:4534"
+            placeholder="http://192.168.2.38:8080"
             aria-label="MusicDeck Server URL"
             required
             style={{
@@ -144,6 +149,9 @@ function DesktopServerModal({ isOpen, onClose, onSaved }) {
               color: "var(--text-primary, #f9fafb)",
             }}
           />
+          <small style={{ color: "var(--text-secondary, #9ca3af)", fontSize: "0.78rem" }}>
+            Docker Compose servers use port 8080 (e.g. http://192.168.2.38:8080).
+          </small>
         </label>
 
         <label

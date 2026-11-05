@@ -1,11 +1,13 @@
 pub mod config;
+pub mod proxy;
 pub mod updater;
 
-use config::{load_config, normalize_server_url, save_config, DesktopConfig};
+use config::{candidate_server_urls, load_config, save_config, DesktopConfig};
+use proxy::start_local_api_proxy;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tauri::{
@@ -18,8 +20,20 @@ use updater::{
 };
 
 pub struct DesktopState {
-    pub config: Mutex<DesktopConfig>,
+    pub config: Arc<Mutex<DesktopConfig>>,
+    pub ephemeral_cookie: Arc<Mutex<Option<String>>>,
+    pub proxy_url: Option<String>,
     pub quitting: AtomicBool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopConfigResponse {
+    pub server_url: String,
+    pub proxy_url: Option<String>,
+    pub close_to_tray: bool,
+    pub start_minimized: bool,
+    pub auto_check_updates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +77,18 @@ fn show_main_window(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn desktop_get_config(state: State<'_, DesktopState>) -> Result<DesktopConfig, String> {
+fn desktop_get_config(state: State<'_, DesktopState>) -> Result<DesktopConfigResponse, String> {
     let guard = state
         .config
         .lock()
         .map_err(|_| "Desktop configuration lock poisoned".to_string())?;
-    Ok(guard.clone())
+    Ok(DesktopConfigResponse {
+        server_url: guard.server_url.clone(),
+        proxy_url: state.proxy_url.clone(),
+        close_to_tray: guard.close_to_tray,
+        start_minimized: guard.start_minimized,
+        auto_check_updates: guard.auto_check_updates,
+    })
 }
 
 #[tauri::command]
@@ -76,22 +96,36 @@ fn desktop_set_config(
     app: AppHandle,
     state: State<'_, DesktopState>,
     update: DesktopConfigUpdate,
-) -> Result<DesktopConfig, String> {
+) -> Result<DesktopConfigResponse, String> {
     let mut guard = state
         .config
         .lock()
         .map_err(|_| "Desktop configuration lock poisoned".to_string())?;
 
+    let next_server_url = update
+        .server_url
+        .unwrap_or_else(|| guard.server_url.clone());
+    let server_changed = next_server_url.trim() != guard.server_url.trim();
+
     let candidate = DesktopConfig {
-        server_url: update
-            .server_url
-            .unwrap_or_else(|| guard.server_url.clone()),
+        server_url: next_server_url,
         close_to_tray: update.close_to_tray.unwrap_or(guard.close_to_tray),
         start_minimized: update.start_minimized.unwrap_or(guard.start_minimized),
         auto_check_updates: update
             .auto_check_updates
             .unwrap_or(guard.auto_check_updates),
+        session_cookie: if server_changed {
+            None
+        } else {
+            guard.session_cookie.clone()
+        },
     };
+
+    if server_changed {
+        if let Ok(mut eph) = state.ephemeral_cookie.lock() {
+            *eph = None;
+        }
+    }
 
     let config_dir = app
         .path()
@@ -99,49 +133,67 @@ fn desktop_set_config(
         .map_err(|err| format!("Unable to resolve app config directory: {err}"))?;
     let saved = save_config(&config_dir, &candidate)?;
     *guard = saved.clone();
-    let _ = app.emit("desktop://config-changed", &saved);
 
-    Ok(saved)
+    let response = DesktopConfigResponse {
+        server_url: saved.server_url,
+        proxy_url: state.proxy_url.clone(),
+        close_to_tray: saved.close_to_tray,
+        start_minimized: saved.start_minimized,
+        auto_check_updates: saved.auto_check_updates,
+    };
+    let _ = app.emit("desktop://config-changed", &response);
+
+    Ok(response)
 }
 
 #[tauri::command]
 async fn desktop_check_server(server_url: String) -> Result<ServerHealthResponse, String> {
-    let normalized = normalize_server_url(&server_url)?;
-    if normalized.is_empty() {
-        return Err("Server URL is required".to_string());
-    }
+    let candidates = candidate_server_urls(&server_url)?;
+    let primary = candidates
+        .first()
+        .cloned()
+        .ok_or_else(|| "Server URL is required".to_string())?;
 
-    let endpoint = format!("{normalized}/api/public/config");
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(6))
         .build()
         .map_err(|err| format!("Failed to initialize HTTP client: {err}"))?;
 
-    match client.get(&endpoint).send().await {
-        Ok(response) if response.status().is_success() => {
-            let payload = response.json::<PublicConfigPayload>().await.ok();
-            Ok(ServerHealthResponse {
-                reachable: true,
-                server_url: normalized,
-                app_name: payload
-                    .and_then(|p| p.app_name)
-                    .or_else(|| Some("MusicDeck".to_string())),
-                error: None,
-            })
+    let mut last_error = String::new();
+
+    for candidate in &candidates {
+        let endpoint = format!("{candidate}/api/public/config");
+        match client.get(&endpoint).send().await {
+            Ok(response) if response.status().is_success() => {
+                let payload = response.json::<PublicConfigPayload>().await.ok();
+                return Ok(ServerHealthResponse {
+                    reachable: true,
+                    server_url: candidate.clone(),
+                    app_name: payload
+                        .and_then(|p| p.app_name)
+                        .or_else(|| Some("MusicDeck".to_string())),
+                    error: None,
+                });
+            }
+            Ok(response) => {
+                last_error = format!("{candidate} responded with HTTP {}", response.status());
+            }
+            Err(err) => {
+                last_error = format!("{err}");
+            }
         }
-        Ok(response) => Ok(ServerHealthResponse {
-            reachable: false,
-            server_url: normalized,
-            app_name: None,
-            error: Some(format!("Server responded with HTTP {}", response.status())),
-        }),
-        Err(err) => Ok(ServerHealthResponse {
-            reachable: false,
-            server_url: normalized,
-            app_name: None,
-            error: Some(format!("Could not connect to MusicDeck server: {err}")),
-        }),
     }
+
+    let tried = candidates.join(", ");
+    Ok(ServerHealthResponse {
+        reachable: false,
+        server_url: primary,
+        app_name: None,
+        error: Some(format!(
+            "Could not reach MusicDeck (tried {tried}: {last_error}). For Docker Compose, use port 8080 (e.g. http://192.168.2.38:8080) and ensure MUSICDECK_WEB_BIND=0.0.0.0 in your server .env."
+        )),
+    })
 }
 
 #[tauri::command]
@@ -354,9 +406,20 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir().join("musicdeck-desktop"));
             let initial_config = load_config(&config_dir);
             let start_minimized = initial_config.start_minimized;
+            let initial_cookie = initial_config.session_cookie.clone();
+
+            let shared_config = Arc::new(Mutex::new(initial_config));
+            let shared_cookie = Arc::new(Mutex::new(initial_cookie));
+            let proxy_url = start_local_api_proxy(
+                Arc::clone(&shared_config),
+                Arc::clone(&shared_cookie),
+                config_dir,
+            );
 
             app.manage(DesktopState {
-                config: Mutex::new(initial_config),
+                config: shared_config,
+                ephemeral_cookie: shared_cookie,
+                proxy_url,
                 quitting: AtomicBool::new(false),
             });
 

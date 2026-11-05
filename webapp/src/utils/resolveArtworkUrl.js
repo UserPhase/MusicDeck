@@ -1,16 +1,7 @@
 import { getCoverUrl } from "../api/musicdeck";
 import { isDefaultPlaceholder } from "./placeholderDetector";
 import { isBrowserIntegrationAllowed } from "../services/privacyPolicy";
-import { getDesktopServerUrl, isDesktopRuntime, resolveDesktopApiUrl } from "../services/desktop/desktopRuntime";
-
-function stripDesktopOrigin(url) {
-  if (typeof url !== "string" || !isDesktopRuntime()) return url;
-  const serverUrl = getDesktopServerUrl();
-  if (serverUrl && url.startsWith(`${serverUrl}/api/`)) {
-    return url.slice(serverUrl.length);
-  }
-  return url;
-}
+import { resolveDesktopApiUrl, stripDesktopApiOrigin } from "../services/desktop/desktopRuntime";
 
 function ownArtwork(entity, size) {
   if (!entity || typeof entity !== "object") return [];
@@ -22,7 +13,7 @@ function ownArtwork(entity, size) {
     isDefaultPlaceholder(id) ? null : getCoverUrl(id, size),
   ].filter((url) => {
     if (typeof url !== "string" || isDefaultPlaceholder(url)) return false;
-    const relative = stripDesktopOrigin(url);
+    const relative = stripDesktopApiOrigin(url);
     const valid = /^https?:\/\//i.test(relative) || (relative.startsWith("/") && !relative.startsWith("//"));
     if (!valid) return false;
     return isBrowserIntegrationAllowed("artwork") || (
@@ -45,7 +36,7 @@ export function artworkCandidates(entity, size) {
     ]),
   ];
   const blocked = new Set((entity?.unavailableArtworkIds || []).map((id) => `/api/artwork/${encodeURIComponent(id)}`));
-  return [...new Set(candidates)].filter((url) => url && !blocked.has(stripDesktopOrigin(url).split("?")[0]));
+  return [...new Set(candidates)].filter((url) => url && !blocked.has(stripDesktopApiOrigin(url).split("?")[0]));
 }
 
 export function resolveArtworkUrl(entity, size) {
