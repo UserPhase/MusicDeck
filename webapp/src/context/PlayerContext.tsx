@@ -12,7 +12,11 @@ import { PlayerItemStateProvider } from "./PlayerItemState";
 import { RemoteSessionContext } from "./RemoteSessionContext";
 import { CastContext } from "./CastContext";
 import { useCastSession } from "../hooks/useCastSession";
-import { resolveDesktopApiUrl } from "../services/desktop/desktopRuntime";
+import {
+  DESKTOP_CONFIG_CHANGED_EVENT,
+  isDesktopRuntime,
+  resolveDesktopApiUrl,
+} from "../services/desktop/desktopRuntime";
 import { usePrivacy } from "./PrivacyContext";
 import { useRemoteSession } from "../hooks/useRemoteSession";
 import type { RemotePlaybackSnapshot, RemotePlayerAdapter } from "../types/remoteSession";
@@ -629,6 +633,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     crossfadeSeconds: crossfadeDuration,
     volume: perceptualVolumeToGain(volume),
     createAudioElement,
+    ...(isDesktopRuntime() ? { audioContext: null } : {}),
   });
   const engineRef = useRef<PlaybackEngine | null>(engine);
   engineRef.current = engine;
@@ -644,6 +649,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const normalizationRequestsRef = useRef(new Map<string, NormalizationRequest>());
   const normalizationControllersRef = useRef(new Set<AbortController>());
   const normalizationCacheRef = useRef(new Map<string, { result: NormalizationResult; expires: number }>());
+
+  useEffect(() => {
+    if (!isDesktopRuntime()) return undefined;
+    function handleDesktopConfigChanged() {
+      sourceCacheRef.current.clear();
+    }
+    window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, handleDesktopConfigChanged);
+    return () => window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, handleDesktopConfigChanged);
+  }, []);
 
   function albumPlayback(song: Song): boolean {
     return albumAwareRef.current && !shuffleEnabledRef.current && isLibraryPlayable(song) &&

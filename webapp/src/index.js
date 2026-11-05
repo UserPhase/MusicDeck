@@ -16,16 +16,21 @@ import './styles/glassmorphic.css';
 import './styles/tactile.css';
 import './styles/theme.css';
 import App from './App';
-import { installDesktopRuntime } from './services/desktop/desktopRuntime';
+import { initDesktopRuntime, isDesktopRuntime } from './services/desktop/desktopRuntime';
 import { registerServiceWorker } from './services/serviceWorkerRegistration';
 
-installDesktopRuntime();
+function mountApp() {
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+  );
+  void registerServiceWorker();
+}
 
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
-
-void registerServiceWorker();
+if (isDesktopRuntime()) {
+  void initDesktopRuntime().finally(mountApp);
+} else {
+  mountApp();
+}

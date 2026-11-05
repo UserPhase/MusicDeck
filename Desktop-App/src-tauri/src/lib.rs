@@ -2,7 +2,7 @@ pub mod config;
 pub mod proxy;
 pub mod updater;
 
-use config::{candidate_server_urls, load_config, save_config, DesktopConfig};
+use config::{candidate_server_urls, load_config, normalize_server_url, save_config, DesktopConfig};
 use proxy::{apply_response_cookies, start_local_api_proxy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -70,6 +70,7 @@ pub struct DesktopApiRequest {
     pub method: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub body: Option<String>,
+    pub server_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,7 +125,9 @@ fn desktop_set_config(
     let next_server_url = update
         .server_url
         .unwrap_or_else(|| guard.server_url.clone());
-    let server_changed = next_server_url.trim() != guard.server_url.trim();
+    let prev_normalized = normalize_server_url(&guard.server_url).unwrap_or_else(|_| guard.server_url.clone());
+    let next_normalized = normalize_server_url(&next_server_url).unwrap_or_else(|_| next_server_url.clone());
+    let server_changed = prev_normalized != next_normalized;
 
     let candidate = DesktopConfig {
         server_url: next_server_url,
@@ -235,10 +238,21 @@ async fn desktop_api_fetch(
     let (configured_url, cookie_token) = {
         let cfg = state.config.lock().ok().map(|g| g.clone());
         let eph = state.ephemeral_cookie.lock().ok().and_then(|g| g.clone());
-        let server_url = cfg
+        let rust_url = cfg
             .as_ref()
             .map(|c| c.server_url.clone())
             .unwrap_or_else(|| "http://localhost:8080".to_string());
+        let req_url = request
+            .server_url
+            .as_deref()
+            .and_then(|u| normalize_server_url(u).ok())
+            .filter(|u| !u.is_empty());
+        let server_url = match req_url {
+            Some(ref u) if (rust_url.contains("localhost") || rust_url.contains("127.0.0.1")) && !u.contains("localhost") => {
+                u.clone()
+            }
+            _ => rust_url,
+        };
         let token = eph.or_else(|| cfg.and_then(|c| c.session_cookie));
         (server_url, token)
     };
@@ -306,8 +320,8 @@ async fn desktop_api_fetch(
         .app_config_dir()
         .unwrap_or_else(|_| std::env::temp_dir().join("musicdeck-desktop"));
 
-    if active_base_url != configured_url {
-        if let Ok(mut guard) = state.config.lock() {
+    if let Ok(mut guard) = state.config.lock() {
+        if guard.server_url != active_base_url {
             guard.server_url = active_base_url;
             let _ = save_config(&config_dir, &guard);
         }

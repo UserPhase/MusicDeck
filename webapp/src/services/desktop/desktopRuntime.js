@@ -2,6 +2,7 @@ export const DEFAULT_DESKTOP_SERVER_URL = "http://localhost:4534";
 export const DEFAULT_DESKTOP_UPDATE_MANIFEST_URL =
   "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/latest.json";
 export const DESKTOP_SERVER_URL_KEY = "musicdeck.desktop.serverUrl";
+export const DESKTOP_PROXY_URL_KEY = "musicdeck.desktop.proxyUrl";
 export const DESKTOP_CLOSE_TO_TRAY_KEY = "musicdeck.desktop.closeToTray";
 export const DESKTOP_AUTO_UPDATE_KEY = "musicdeck.desktop.autoCheckUpdates";
 export const DESKTOP_CONFIG_CHANGED_EVENT = "musicdeck:desktop-config-changed";
@@ -13,6 +14,24 @@ export const DESKTOP_UPDATE_STATUS_EVENT = "musicdeck:desktop-update-status";
 let fetchInterceptorInstalled = false;
 let originalFetch = null;
 let activeDesktopProxyUrl = null;
+let runtimeSyncPromise = null;
+
+function isBinaryOrStreamApiPath(path) {
+  if (typeof path !== "string") return false;
+  return (
+    /^\/api\/tracks\/[^/?]+\/stream(?:\?|$)/.test(path) ||
+    /^\/api\/playback\/normalized\//.test(path) ||
+    /^\/api\/playback\/preview(?:\?|$)/.test(path) ||
+    /^\/api\/artwork\//.test(path) ||
+    /^\/api\/albums\/[^/?]+\/artwork(?:\?|$)/.test(path) ||
+    /^\/api\/playlists\/[^/?]+\/artwork(?:\?|$)/.test(path) ||
+    /^\/api\/metadata\/album-artwork(?:\?|$)/.test(path) ||
+    /^\/api\/users\/[^/?]+\/avatar(?:\?|$)/.test(path) ||
+    (/^\/api\/v1\/user\/export\//.test(path) &&
+      !/^\/api\/v1\/user\/export\/summary(?:\?|$)/.test(path)) ||
+    /\/(?:stream|events)(?:\?|$)/.test(path)
+  );
+}
 
 export function isDesktopRuntime(win = typeof window !== "undefined" ? window : undefined) {
   if (!win) return false;
@@ -178,6 +197,16 @@ export function resolveDesktopApiUrl(pathOrUrl) {
 
   if (activeDesktopProxyUrl) {
     return `${activeDesktopProxyUrl}${pathOrUrl}`;
+  }
+
+  try {
+    const cachedProxy = localStorage.getItem(DESKTOP_PROXY_URL_KEY);
+    if (cachedProxy && cachedProxy.trim()) {
+      activeDesktopProxyUrl = cachedProxy.trim().replace(/\/+$/, "");
+      return `${activeDesktopProxyUrl}${pathOrUrl}`;
+    }
+  } catch {
+    // Ignore storage read errors.
   }
 
   const serverUrl = getDesktopServerUrl();
@@ -521,7 +550,7 @@ export function installDesktopRuntime() {
           relativePath === "/api" ||
           relativePath.startsWith("/api?");
 
-        if (isApiCall && getTauriInvoke()) {
+        if (isApiCall && !isBinaryOrStreamApiPath(relativePath) && getTauriInvoke()) {
           const headers = {};
           if (init?.headers) {
             if (init.headers instanceof Headers) {
@@ -567,20 +596,36 @@ export function installDesktopRuntime() {
     };
   }
 
-  void invokeDesktopCommand("desktop_get_config")
-    .then((config) => {
+  runtimeSyncPromise = Promise.resolve()
+    .then(() => invokeDesktopCommand("desktop_get_config"))
+    .then(async (config) => {
       if (!config || typeof config !== "object") return;
       if (typeof config.proxyUrl === "string" && config.proxyUrl.trim()) {
         activeDesktopProxyUrl = config.proxyUrl.trim().replace(/\/+$/, "");
-      }
-      if (typeof config.serverUrl === "string" && config.serverUrl.trim() && !hasStoredDesktopServerUrl()) {
         try {
-          localStorage.setItem(
-            DESKTOP_SERVER_URL_KEY,
-            normalizeDesktopServerUrl(config.serverUrl)
-          );
+          localStorage.setItem(DESKTOP_PROXY_URL_KEY, activeDesktopProxyUrl);
         } catch {
-          // Ignore invalid or unpersisted config.
+          // Ignore storage errors.
+        }
+      }
+      const hadStoredUrl = hasStoredDesktopServerUrl();
+      const storedUrl = hadStoredUrl ? getDesktopServerUrl() : null;
+      if (typeof config.serverUrl === "string" && config.serverUrl.trim()) {
+        const normalizedRustUrl = normalizeDesktopServerUrl(config.serverUrl);
+        const rustIsDefaultLocal =
+          normalizedRustUrl === "http://localhost:8080" ||
+          normalizedRustUrl === "http://localhost:4534";
+        if (!hadStoredUrl || !rustIsDefaultLocal) {
+          try {
+            localStorage.setItem(DESKTOP_SERVER_URL_KEY, normalizedRustUrl);
+          } catch {
+            // Ignore invalid or unpersisted config.
+          }
+        } else if (storedUrl && storedUrl !== normalizedRustUrl) {
+          // Ensure the Rust proxy and IPC client use the user's stored non-default server URL.
+          await invokeDesktopCommand("desktop_set_config", {
+            update: { serverUrl: storedUrl },
+          }).catch(() => {});
         }
       }
       if (typeof config.closeToTray === "boolean") {
@@ -607,6 +652,18 @@ export function installDesktopRuntime() {
       originalFetch = null;
     }
     activeDesktopProxyUrl = null;
+    runtimeSyncPromise = null;
     delete document.documentElement.dataset.desktopApp;
   };
+}
+
+export async function initDesktopRuntime() {
+  const cleanup = installDesktopRuntime();
+  if (runtimeSyncPromise) {
+    await Promise.race([
+      runtimeSyncPromise,
+      new Promise((resolve) => setTimeout(resolve, 600)),
+    ]);
+  }
+  return cleanup;
 }

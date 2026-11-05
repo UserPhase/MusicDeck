@@ -466,6 +466,19 @@ export class MediaDeck implements PlaybackOutput {
     this.seekedSinceLoad = false;
     this.gain.reset();
     this.gain.setLevel(trackLevel(track.gain));
+    if (
+      this.routedThroughWebAudio &&
+      typeof window !== "undefined" &&
+      /^https?:\/\//i.test(track.src)
+    ) {
+      try {
+        if (new URL(track.src, window.location.origin).origin !== window.location.origin) {
+          this.element.crossOrigin = "anonymous";
+        }
+      } catch {
+        // Leave existing crossOrigin configuration unchanged.
+      }
+    }
     this.element.preload = preload;
     this.element.src = track.src;
     this.element.load();

@@ -12,6 +12,7 @@ import {
   DEFAULT_DESKTOP_SERVER_URL,
   DESKTOP_SERVER_URL_KEY,
   getDesktopServerUrl,
+  initDesktopRuntime,
   installDesktopRuntime,
   isDesktopRuntime,
   normalizeDesktopServerUrl,
@@ -193,6 +194,44 @@ describe("desktopRuntime", () => {
         body: JSON.stringify({ username: "admin", password: "secret", rememberMe: true }),
       },
     });
+
+    cleanup();
+  });
+
+  test("routes audio stream URLs through the local binary proxy instead of text-only desktop_api_fetch", async () => {
+    const invokeMock = jest.fn((cmd) => {
+      if (cmd === "desktop_get_config") {
+        return Promise.resolve({
+          serverUrl: "http://192.168.2.38:8080",
+          proxyUrl: "http://127.0.0.1:4535",
+          closeToTray: true,
+          autoCheckUpdates: true,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    window.__TAURI__ = {
+      core: { invoke: invokeMock },
+    };
+
+    const rawFetch = jest.fn(() =>
+      Promise.resolve(new Response(new Uint8Array([1, 2, 3, 4]), { status: 206 }))
+    );
+    window.fetch = rawFetch;
+
+    const cleanup = await initDesktopRuntime();
+
+    expect(resolveDesktopApiUrl("/api/tracks/mdtrk_1/stream?inspectionId=abc")).toBe(
+      "http://127.0.0.1:4535/api/tracks/mdtrk_1/stream?inspectionId=abc"
+    );
+
+    await window.fetch("/api/tracks/mdtrk_1/stream?inspectionId=abc");
+    expect(invokeMock).not.toHaveBeenCalledWith("desktop_api_fetch", expect.anything());
+    expect(rawFetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:4535/api/tracks/mdtrk_1/stream?inspectionId=abc",
+      expect.objectContaining({ credentials: "include" })
+    );
 
     cleanup();
   });

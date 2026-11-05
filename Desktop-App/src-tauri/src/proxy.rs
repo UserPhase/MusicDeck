@@ -98,7 +98,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     };
 
     let mut content_length: usize = 0;
-    let mut request_origin = "http://tauri.localhost".to_string();
+    let mut request_origin: Option<String> = None;
     let mut forwarded_headers: Vec<(String, String)> = Vec::new();
 
     for line in lines {
@@ -111,13 +111,14 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             let lower = key.to_ascii_lowercase();
             if lower == "content-length" {
                 content_length = value.parse::<usize>().unwrap_or(0);
-            } else if lower == "origin" {
-                request_origin = value.to_string();
+            } else if lower == "origin" && !value.is_empty() && value != "null" {
+                request_origin = Some(value.to_string());
             } else if matches!(
                 lower.as_str(),
                 "content-type"
                     | "accept"
                     | "range"
+                    | "if-range"
                     | "if-none-match"
                     | "if-modified-since"
                     | "cache-control"
@@ -127,19 +128,22 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         }
     }
 
+    let cors_origin = request_origin.as_deref().unwrap_or("*");
+
     if method_str.eq_ignore_ascii_case("OPTIONS") {
         let preflight = format!(
             "HTTP/1.1 204 No Content\r\n\
-             Access-Control-Allow-Origin: {request_origin}\r\n\
+             Access-Control-Allow-Origin: {cors_origin}\r\n\
              Access-Control-Allow-Credentials: true\r\n\
              Access-Control-Allow-Private-Network: true\r\n\
-             Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type, Authorization, Range, Accept, Cache-Control\r\n\
+             Access-Control-Allow-Methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Content-Type, Authorization, Range, If-Range, Accept, Cache-Control\r\n\
              Access-Control-Max-Age: 86400\r\n\
              Content-Length: 0\r\n\
              Connection: close\r\n\r\n"
         );
         let _ = stream.write_all(preflight.as_bytes()).await;
+        let _ = stream.flush().await;
         return;
     }
 
@@ -217,7 +221,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         let reply = format!(
             "HTTP/1.1 502 Bad Gateway\r\n\
              Content-Type: application/json\r\n\
-             Access-Control-Allow-Origin: {request_origin}\r\n\
+             Access-Control-Allow-Origin: {cors_origin}\r\n\
              Access-Control-Allow-Credentials: true\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\r\n{}",
@@ -225,6 +229,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             err_json
         );
         let _ = stream.write_all(reply.as_bytes()).await;
+        let _ = stream.flush().await;
         return;
     };
 
@@ -250,10 +255,10 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
 
     let mut response_head = format!(
         "HTTP/1.1 {status_code} {reason}\r\n\
-         Access-Control-Allow-Origin: {request_origin}\r\n\
+         Access-Control-Allow-Origin: {cors_origin}\r\n\
          Access-Control-Allow-Credentials: true\r\n\
          Access-Control-Allow-Private-Network: true\r\n\
-         Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Disposition\r\n\
+         Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition\r\n\
          Connection: close\r\n"
     );
 
@@ -293,6 +298,17 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             Err(_) => break,
         }
     }
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+}
+
+fn bind_proxy_listener() -> Option<std::net::TcpListener> {
+    for port in 4535..=4545 {
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return Some(listener);
+        }
+    }
+    std::net::TcpListener::bind("127.0.0.1:0").ok()
 }
 
 pub fn start_local_api_proxy(
@@ -300,7 +316,7 @@ pub fn start_local_api_proxy(
     ephemeral_cookie: Arc<Mutex<Option<String>>>,
     config_dir: PathBuf,
 ) -> Option<String> {
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let std_listener = bind_proxy_listener()?;
     std_listener.set_nonblocking(true).ok()?;
     let local_addr = std_listener.local_addr().ok()?;
     let proxy_url = format!("http://127.0.0.1:{}", local_addr.port());
@@ -318,18 +334,28 @@ pub fn start_local_api_proxy(
         client,
     });
 
-    tauri::async_runtime::spawn(async move {
-        let Ok(listener) = TcpListener::from_std(std_listener) else {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        else {
             return;
         };
-        loop {
-            if let Ok((stream, _)) = listener.accept().await {
-                let state_clone = Arc::clone(&shared);
-                tokio::spawn(async move {
-                    handle_proxy_connection(stream, state_clone).await;
-                });
+
+        rt.block_on(async move {
+            let Ok(listener) = TcpListener::from_std(std_listener) else {
+                return;
+            };
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let state_clone = Arc::clone(&shared);
+                    tokio::spawn(async move {
+                        handle_proxy_connection(stream, state_clone).await;
+                    });
+                }
             }
-        }
+        });
     });
 
     Some(proxy_url)
