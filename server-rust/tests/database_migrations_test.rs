@@ -541,6 +541,7 @@ async fn enforces_wal_mode_and_protects_database_and_sidecar_files() {
 
     #[cfg(unix)]
     {
+        use musicdeck_server::db::prepare_database_path;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let parent_dir = fixture.db_path.parent().expect("parent dir");
