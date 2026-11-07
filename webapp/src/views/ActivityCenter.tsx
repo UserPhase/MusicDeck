@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { startVisualPolling } from "../services/visualActivity";
 import { Link } from "react-router-dom";
 import { getTaskLogs } from "../api/musicdeck";
 import { scanReleases } from "../api/artistFollows";
@@ -71,9 +72,9 @@ function Diagnostics({ task }: { task: ActivityTask }) {
         if (!disposed) setError(errorMessage(failure));
       } finally { inFlight = false; }
     }
-    void load();
-    const timer = terminal ? undefined : setInterval(() => { void load(); }, 2000);
-    return () => { disposed = true; controller?.abort(); clearInterval(timer); };
+    if (terminal) void load();
+    const stopPolling = terminal ? undefined : startVisualPolling(load, 2000);
+    return () => { disposed = true; controller?.abort(); stopPolling?.(); };
   }, [task.id, terminal, refresh]);
   return <div className="activity-diagnostics">
     <div className="activity-diagnostics-heading"><span>Diagnostic tail / last 200 entries</span>

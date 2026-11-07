@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getVisualActivity, startVisualPolling } from "../services/visualActivity";
 import { Link } from "react-router-dom";
 import { getReleaseFeed, unfollowArtist, followsChanged, type NewRelease, type ReleaseFeed } from "../api/artistFollows";
 import { request } from "../api/musicdeck";
@@ -96,12 +97,12 @@ function Feed({ ownerId, shelf = false }: { ownerId: string; shelf?: boolean }) 
       .finally(() => { if (!active.signal.aborted) setLoading(false); });
   }, [offset, limit]);
   useEffect(() => {
-    mounted.current = true; setLoading(true); load();
-    const refreshVisible = () => { if (document.visibilityState === "visible") load(); };
-    const timer = window.setInterval(refreshVisible, 30_000);
-    window.addEventListener("musicdeck:artist-follows-changed", load); window.addEventListener("online", load);
-    return () => { mounted.current = false; controller.current?.abort(); action.current?.abort(); window.clearInterval(timer);
-      window.removeEventListener("musicdeck:artist-follows-changed", load); window.removeEventListener("online", load); };
+    mounted.current = true; setLoading(true);
+    const stopPolling = startVisualPolling(load, 30_000);
+    const refresh = () => { if (getVisualActivity()) load(); };
+    window.addEventListener("musicdeck:artist-follows-changed", refresh); window.addEventListener("online", refresh);
+    return () => { mounted.current = false; controller.current?.abort(); action.current?.abort(); stopPolling();
+      window.removeEventListener("musicdeck:artist-follows-changed", refresh); window.removeEventListener("online", refresh); };
   }, [load]);
   const operate = async (work: (signal: AbortSignal) => Promise<unknown>, success: string) => {
     if (action.current) return; const active = new AbortController(); action.current = active; setBusy(true); setError("");

@@ -3,9 +3,12 @@ import { useEffect, useRef } from "react";
 interface SessionPlayer {
   currentSong: { id: string | number; title?: string; artist?: unknown; album?: unknown } | null;
   isPlaying: boolean;
+  isBuffering?: boolean;
   isRemotePlayback: boolean;
   isCasting: boolean;
   currentTime: number;
+  playbackPositionKey?: string;
+  readPlaybackPosition?: () => number;
   duration: number;
   togglePlay(): void | Promise<void>;
   previousSong(): void | Promise<void>;
@@ -19,6 +22,7 @@ export function useBrowserMediaSession(player: SessionPlayer): void {
   latest.current = player;
   const available = typeof navigator !== "undefined" && "mediaSession" in navigator;
   const local = !player.isRemotePlayback && !player.isCasting;
+  const { currentTime, duration, isPlaying, isBuffering, playbackPositionKey, readPlaybackPosition } = player;
   const song = player.currentSong;
   const hasSong = Boolean(song);
   const title = song?.title || "Unknown title";
@@ -38,14 +42,15 @@ export function useBrowserMediaSession(player: SessionPlayer): void {
         current.seek(Math.min(100, Math.max(0, position / current.duration * 100)));
       }
     };
+    const position = () => latest.current.readPlaybackPosition?.() ?? latest.current.currentTime;
     const handlers: Partial<Record<MediaSessionAction, MediaSessionActionHandler>> = {
       play: () => { if (!latest.current.isPlaying) invoke(() => latest.current.togglePlay()); },
       pause: () => { if (latest.current.isPlaying) invoke(() => latest.current.togglePlay()); },
       previoustrack: () => invoke(() => latest.current.previousSong()),
       nexttrack: () => invoke(() => latest.current.nextSong()),
-      seekto: event => seek(event.seekTime ?? latest.current.currentTime),
-      seekbackward: event => seek(latest.current.currentTime - (event.seekOffset ?? 10)),
-      seekforward: event => seek(latest.current.currentTime + (event.seekOffset ?? 10)),
+      seekto: event => seek(event.seekTime ?? position()),
+      seekbackward: event => seek(position() - (event.seekOffset ?? 10)),
+      seekforward: event => seek(position() + (event.seekOffset ?? 10)),
     };
     const registered: MediaSessionAction[] = [];
     if (local) for (const [name, handler] of Object.entries(handlers)) {
@@ -67,8 +72,8 @@ export function useBrowserMediaSession(player: SessionPlayer): void {
 
   useEffect(() => {
     if (!available) return;
-    navigator.mediaSession.playbackState = !hasSong || !local ? "none" : player.isPlaying ? "playing" : "paused";
-    const duration = player.duration, position = player.currentTime;
+    navigator.mediaSession.playbackState = !hasSong || !local ? "none" : isPlaying && !isBuffering ? "playing" : "paused";
+    const position = readPlaybackPosition?.() ?? currentTime;
     if (typeof navigator.mediaSession.setPositionState === "function") {
       try {
         navigator.mediaSession.setPositionState(hasSong && local && Number.isFinite(duration) && duration > 0
@@ -76,5 +81,5 @@ export function useBrowserMediaSession(player: SessionPlayer): void {
           : undefined);
       } catch { /* Some media implementations reject position updates while changing streams. */ }
     }
-  }, [available, local, hasSong, player.isPlaying, player.duration, player.currentTime]);
+  }, [available, local, hasSong, song?.id, isPlaying, isBuffering, duration, currentTime, playbackPositionKey, readPlaybackPosition]);
 }

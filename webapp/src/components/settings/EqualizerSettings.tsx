@@ -15,7 +15,9 @@ const signed = (gain: number) => `${gain > 0 ? "+" : ""}${gain} dB`;
 const parametricFields = { frequency: "Frequency (Hz)", gain: "Gain (dB)", q: "Q" } as const;
 const defaultParametricBands = cleanParametricBands(null);
 
-export default function EqualizerSettings({ engine, local }: { engine: PlaybackEngine; local: boolean }) {
+export default function EqualizerSettings({ engine, local, playing = false }: {
+  engine: PlaybackEngine; local: boolean; playing?: boolean;
+}) {
   const heading = useId();
   const [settings, setSettings] = useState(() => engine.getEqualizerSettings());
   const [notice, setNotice] = useState("");
@@ -107,7 +109,7 @@ export default function EqualizerSettings({ engine, local }: { engine: PlaybackE
         <p>Drag a point to adjust its frequency and, where supported, gain. Use Q to adjust width or resonance.</p>
         <ParametricEqGraph bands={parametricBands} active={selectedBand}
           sampleRate={engine.getAudioDiagnostics?.().sampleRateHz ?? 48000}
-          onSelect={setSelectedBand} onChange={updateBand} getAnalyser={getAnalyser} />
+          onSelect={setSelectedBand} onChange={updateBand} getAnalyser={getAnalyser} playing={playing} />
         <div className="eq-band-picker" role="group" aria-label="Choose a band to edit">
           {parametricBands.map((_, index) => <button key={index} type="button"
             className={`eq-band-color-${index + 1}`} aria-pressed={index === selectedBand}

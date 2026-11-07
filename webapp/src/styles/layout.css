@@ -5,7 +5,7 @@ button, input, select, textarea { font: inherit; }
 button { border: none; cursor: pointer; }
 a { color: inherit; }
 .ambient-background { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; background: var(--bg-app); }
-.ambient-background-blob { position: absolute; width: min(64vw, 1120px); height: min(76vw, 1240px); border-radius: 50%; background: var(--ambient-blob); filter: blur(150px); opacity: .19; transform: scale(1.5); will-change: transform; }
+.ambient-background-blob { position: absolute; width: min(64vw, 1120px); height: min(76vw, 1240px); border-radius: 50%; background: var(--ambient-blob); filter: blur(150px); opacity: .19; transform: scale(1.5); }
 .ambient-background-blob-top { top: -22%; right: -16%; }
 .ambient-background-blob-bottom { bottom: -44%; left: -24%; opacity: .14; }
 
@@ -19,6 +19,20 @@ a { color: inherit; }
   -webkit-backdrop-filter: none !important;
 }
 :root[data-visual-active="false"] :is(.ambient-background, .lyrics-reader-backdrop) { display: none; }
+
+/* Keep the desktop shell inexpensive to composite during playback. */
+:root[data-desktop-app="true"] :is(.ambient-background, .lyrics-reader-backdrop) { display: none; }
+:root[data-desktop-app="true"] :is(.topbar, .sidebar, .main, .sidebar-panel, .right-sidebar, .queue-sidebar, .player, .now-playing-next-queue, .activity-panel) {
+  background-color: color-mix(in srgb, var(--bg-app) 96%, var(--text));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-desktop-app="true"] :is(.nav-drawer-scrim, .audio-inspector-backdrop, .remote-device-backdrop, .mix-builder-backdrop, .command-palette-backdrop, .playlist-modal-backdrop, .playlist-details-backdrop, .server-delete-backdrop) {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-desktop-app="true"] .track-equalizer.is-animating i { animation: none; }
+:root[data-desktop-app="true"] .track-equalizer.is-animating i:nth-child(2) { transform: scaleY(1.45); }
 
 .sidebar { position: fixed; left: var(--frame); top: 80px; bottom: calc(var(--player-height) + var(--frame)); width: var(--sidebar-width); box-sizing: border-box; display: flex; flex-direction: column; overflow-y: auto; z-index: 10; padding: var(--space-3) var(--space-2) var(--space-4); background: var(--sidebar-surface); border: 1px solid var(--panel-border); border-radius: 16px; box-shadow: var(--panel-shadow); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); scrollbar-width: thin; scrollbar-color: rgb(var(--tint-rgb) / 10%) transparent; }
 .nav-section { margin: 0 0 var(--space-4); }

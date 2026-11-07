@@ -1,5 +1,6 @@
 import { usePlayer } from "../../../context/PlayerContext";
 import { useAlbumArtwork } from "../../../hooks/useAlbumArtwork";
+import { usePlaybackDisplayPosition } from "../../../hooks/usePlaybackDisplayPosition";
 import { usePreviewImport } from "../../../hooks/usePreviewImport";
 import { usePrivacy } from "../../../context/PrivacyContext";
 import { formatTime } from "../../Player";
@@ -7,6 +8,28 @@ import AudioQualityBadge from "../../player/AudioQualityBadge";
 import PlayerAudioTools from "../../player/PlayerAudioTools";
 import DeviceSelectorButton from "../../player/DeviceSelectorButton";
 
+function HeaderScrubber({ player }) {
+  const { currentSong, duration, seek } = player;
+  const currentTime = usePlaybackDisplayPosition(player);
+  const progress = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  return (
+    <div className="header-player-scrubber">
+      <span className="header-player-time">{formatTime(currentTime)}</span>
+      <input
+        type="range"
+        min="0"
+        max="100"
+        value={progress}
+        onChange={(event) => seek(Number(event.target.value))}
+        disabled={!currentSong}
+        className="header-player-progress tactile-slider"
+        style={{ "--range-progress": `${progress}%` }}
+        aria-label="Song progress"
+      />
+      <span className="header-player-time">{formatTime(duration)}</span>
+    </div>
+  );
+}
 
 function TransportIcon({ name }) {
   if (name === "shuffle") {
@@ -65,15 +88,13 @@ function TransportIcon({ name }) {
  * bar, so switching layouts never interrupts playback.
  */
 function AppleHeaderPlayer() {
+  const player = usePlayer();
   const {
     currentSong,
     isPlaying,
     isRemotePlayback,
     isCasting,
-    currentTime,
-    duration,
     togglePlay,
-    seek,
     nextSong,
     previousSong,
     toggleShuffle,
@@ -90,13 +111,12 @@ function AppleHeaderPlayer() {
     isPreparingPlayback,
     activeSidebar,
     setActiveSidebar,
-  } = usePlayer();
+  } = player;
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 48);
   const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(currentSong);
   const { canImport } = usePrivacy();
 
   const hasSong = Boolean(currentSong);
-  const progress = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const volumePercent = Math.min(100, Math.max(0, (Number(volume) || 0) * 100));
   const isNowPlayingOpen = activeSidebar === "now-playing";
   const isQueueOpen = activeSidebar === "queue";
@@ -163,21 +183,7 @@ function AppleHeaderPlayer() {
           <span className="header-player-artist">
             {hasSong ? [currentSong.artist || "Unknown artist", currentSong.album].filter(Boolean).join(" — ") : "Choose a song to start"}
           </span>
-          <div className="header-player-scrubber">
-            <span className="header-player-time">{formatTime(currentTime)}</span>
-            <input
-              type="range"
-              min="0"
-              max="100"
-              value={progress}
-              onChange={(event) => seek(Number(event.target.value))}
-              disabled={!hasSong}
-              className="header-player-progress tactile-slider"
-              style={{ "--range-progress": `${progress}%` }}
-              aria-label="Song progress"
-            />
-            <span className="header-player-time">{formatTime(duration)}</span>
-          </div>
+          <HeaderScrubber player={player} />
         </div>
         {hasSong && (
           <button

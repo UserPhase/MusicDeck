@@ -53,11 +53,21 @@ function responsePaths(nodes: BiquadFilterNode[], bands: readonly ParametricBand
 type Drag = { pointer: number; startX: number; startY: number; width: number; height: number; moved: boolean };
 type BandPosition = Pick<ParametricBand, "frequency" | "gain">;
 
-function Spectrum({ getAnalyser }: { getAnalyser(): AnalyserNode | null }) {
+const SPECTRUM_INTERVAL_MS = Math.ceil(1000 / 30);
+
+function Spectrum({ getAnalyser, playing }: { getAnalyser(): AnalyserNode | null; playing: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const visualActive = useVisualActivity();
+  const [inView, setInView] = useState(() => typeof IntersectionObserver === "undefined");
   useEffect(() => {
-    if (!visualActive) return;
+    const canvas = ref.current;
+    if (!canvas || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(([entry]) => setInView(entry.isIntersecting));
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!visualActive || !inView || !playing) return;
     const canvas = ref.current;
     const analyser = getAnalyser();
     if (!canvas || !analyser) return;
@@ -67,12 +77,7 @@ function Spectrum({ getAnalyser }: { getAnalyser(): AnalyserNode | null }) {
     const binWidth = analyser.context.sampleRate / analyser.fftSize;
     const points = Array.from({ length: 160 }, (_, index) => Math.min(bins.length - 1,
       Math.round(minHz * Math.exp(frequencySpan * index / 159) / binWidth)));
-    let frame = 0;
-    let last = -Infinity;
-    const draw = (time: number) => {
-      frame = requestAnimationFrame(draw);
-      if (time - last < 32) return;
-      last = time;
+    const draw = () => {
       const density = Math.min(2, window.devicePixelRatio || 1);
       const width = Math.round(canvas.clientWidth * density), height = Math.round(canvas.clientHeight * density);
       if (!width || !height) return;
@@ -87,19 +92,21 @@ function Spectrum({ getAnalyser }: { getAnalyser(): AnalyserNode | null }) {
       context.fillStyle = getComputedStyle(canvas).color;
       context.fill();
     };
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
-  }, [getAnalyser, visualActive]);
-  return <canvas ref={ref} className="eq-spectrum" aria-hidden="true" />;
+    draw();
+    const timer = window.setInterval(draw, SPECTRUM_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [getAnalyser, inView, playing, visualActive]);
+  return <canvas ref={ref} className="eq-spectrum" hidden={!playing || !visualActive} aria-hidden="true" />;
 }
 
-export default function ParametricEqGraph({ bands, active, sampleRate, onSelect, onChange, getAnalyser }: {
+export default function ParametricEqGraph({ bands, active, sampleRate, onSelect, onChange, getAnalyser, playing }: {
   bands: readonly ParametricBand[];
   active: number;
   sampleRate: number;
   onSelect(index: number): void;
   onChange(index: number, position: BandPosition): void;
   getAnalyser(): AnalyserNode | null;
+  playing: boolean;
 }) {
   const plot = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
@@ -120,7 +127,7 @@ export default function ParametricEqGraph({ bands, active, sampleRate, onSelect,
     <div className="eq-response-y" aria-hidden="true">{gainTicks.map(gain =>
       <span key={gain} style={{ top: `${y(gain) * 100}%` }}>{gain > 0 ? "+" : ""}{gain} dB</span>)}</div>
     <div ref={plot} className={`eq-response-plot eq-band-color-${active + 1}`} role="group" aria-label="Parametric EQ response">
-      <Spectrum getAnalyser={getAnalyser} />
+      <Spectrum getAnalyser={getAnalyser} playing={playing} />
       <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
         {ticks.map(hz => <line key={hz} x1={x(hz) * width} x2={x(hz) * width} y1="0" y2={height} />)}
         {gainTicks.map(gain => <line key={gain} className={gain === 0 ? "eq-response-zero" : undefined}

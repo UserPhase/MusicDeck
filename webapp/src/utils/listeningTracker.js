@@ -16,6 +16,8 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
   const inFlight = new Set();
   let lastReport = 0;
   let lastRetry = now();
+  let timer = null;
+  let suspended = false;
   try {
     for (const payload of JSON.parse(storage?.getItem(pendingKey) || "[]")) {
       if (payload?.playbackSessionId && typeof payload.listenedSeconds === "number") pending.set(payload.playbackSessionId, payload);
@@ -49,7 +51,7 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
         onCounted?.(active.song, payload.startedAt);
       }
     }).catch((error) => console.error("Could not record listening activity; next report will retry:", error))
-      .finally(() => inFlight.delete(id));
+      .finally(() => { inFlight.delete(id); syncTimer(); });
   }
 
   function persist() {
@@ -128,6 +130,7 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
     cleanup = null;
     active = null;
     persist();
+    syncTimer();
   }
 
   function finish() {
@@ -183,6 +186,7 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
       Object.entries(events).forEach(([name, listener]) => audio.removeEventListener(name, listener));
     };
     persist();
+    syncTimer();
   }
 
   function retry() {
@@ -190,16 +194,24 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
     retryable.slice(0, 5).forEach(transmit);
     lastRetry = now();
   }
-  const timer = setInterval(() => {
-    sample();
-    if (now() - lastRetry >= 10_000) retry();
-  }, 1000);
+  function syncTimer() {
+    if (!suspended && (active || pending.size > 0)) {
+      if (timer === null) timer = setInterval(() => {
+        sample();
+        if (now() - lastRetry >= 10_000) retry();
+      }, 1000);
+    } else if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+  syncTimer();
   if (pending.size) retry();
 
   return {
     begin, sample, finish,
     markTaste() { if (active) { const taste = getTasteContext(active.song); active.payload.privateListening ||= Boolean(taste.privateListening); active.payload.excludeFromTaste ||= Boolean(taste.excludeFromTaste); persist(); send(); } },
-    suspend() { sample(); send(); cleanup?.(); cleanup = null; active = null; clearInterval(timer); },
+    suspend() { suspended = true; sample(); send(); cleanup?.(); cleanup = null; active = null; syncTimer(); },
     flush() { sample(); send(); },
     isTracking(song) { return active?.song.id === song?.id; },
     setThreshold(value) { if (Number.isFinite(value) && value >= 1 && value <= 240) thresholdSeconds = value; },

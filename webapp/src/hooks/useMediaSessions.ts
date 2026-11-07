@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { getVisualActivity, startVisualPolling } from "../services/visualActivity";
 import { getMediaCheckpoints } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
 import { MEDIA_CHECKPOINT_CHANGED } from "../services/mediaSessions";
@@ -37,6 +38,7 @@ export function useMediaSessions() {
       });
     };
     const update = (event: Event) => {
+      if (!getVisualActivity()) return;
       const detail = (event as CustomEvent<{ userId: string; checkpoint: MediaCheckpoint | null; input: MediaCheckpointInput }>).detail;
       if (detail.userId !== userId) return;
       const { checkpoint, input } = detail;
@@ -52,14 +54,11 @@ export function useMediaSessions() {
         return { owner: userId, items: checkpoint ? [checkpoint, ...items].slice(0, 100) : items, loading: false, error: "" };
       });
     };
-    load();
-    const poll = window.setInterval(() => { if (!document.hidden) load(); }, 30_000);
-    window.addEventListener("focus", load);
+    const stopPolling = startVisualPolling(load, 30_000, { refreshOnWindowFocus: true });
     window.addEventListener(MEDIA_CHECKPOINT_CHANGED, update);
     return () => {
       controller?.abort();
-      window.clearInterval(poll);
-      window.removeEventListener("focus", load);
+      stopPolling();
       window.removeEventListener(MEDIA_CHECKPOINT_CHANGED, update);
     };
   }, [userId, revision]);

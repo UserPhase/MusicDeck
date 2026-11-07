@@ -174,12 +174,15 @@ export function useQueueReorder({ queue, queueIndex, moveQueueItem, enabled, lis
     window.addEventListener("pointercancel", onCancel);
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("blur", cancel);
+    const onVisibilityChange = () => { if (document.hidden) cancel(); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     cleanup.current = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onCancel);
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("blur", cancel);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       if (frame !== null) window.cancelAnimationFrame(frame);
       if (row.hasPointerCapture?.(state.pointerId)) row.releasePointerCapture(state.pointerId);
       cleanup.current = null;

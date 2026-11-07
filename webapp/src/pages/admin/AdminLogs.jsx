@@ -1,6 +1,7 @@
 import { memo, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { adminLogsStreamUrl, clearAdminLogs, getAdminLogs } from "../../api/musicdeck";
+import { useVisualActivity } from "../../hooks/useVisualActivity";
 import "../../styles/admin-logs.css";
 
 export const MAX_CLIENT_LOGS = 1000;
@@ -106,6 +107,8 @@ export default function AdminLogs() {
   const [stats, setStats] = useState(null);
 
   const lastSeqRef = useRef(0);
+  const hasLoadedLogs = useRef(false);
+  const visualActive = useVisualActivity();
   const pausedRef = useRef(false);
   const viewportRef = useRef(null);
   const noticeTimerRef = useRef(null);
@@ -130,22 +133,29 @@ export default function AdminLogs() {
   }, []);
 
   useEffect(() => {
+    if (!visualActive) return;
     let cancelled = false;
     let source = null;
+    const controller = new AbortController();
+    setStatus(pausedRef.current ? "paused" : "connecting");
 
     async function start() {
-      try {
-        const data = await getAdminLogs({ limit: MAX_CLIENT_LOGS });
-        if (cancelled) return;
-        const initial = data?.entries || [];
-        setEntries(initial);
-        setStats(data?.stats || null);
-        lastSeqRef.current = initial.length ? initial[initial.length - 1].seq : (data?.stats?.lastSeq || 0);
-      } catch (error) {
-        if (cancelled) return;
-        setLoadError(error.message || "Could not load server logs.");
-      } finally {
-        if (!cancelled) setLoading(false);
+      if (!hasLoadedLogs.current) {
+        try {
+          const data = await getAdminLogs({ limit: MAX_CLIENT_LOGS, signal: controller.signal });
+          if (cancelled) return;
+          const initial = data?.entries || [];
+          setEntries(initial);
+          setStats(data?.stats || null);
+          setLoadError("");
+          lastSeqRef.current = initial.length ? initial[initial.length - 1].seq : (data?.stats?.lastSeq || 0);
+          hasLoadedLogs.current = true;
+        } catch (error) {
+          if (cancelled) return;
+          setLoadError(error.message || "Could not load server logs.");
+        } finally {
+          if (!cancelled) setLoading(false);
+        }
       }
 
       if (cancelled) return;
@@ -157,8 +167,11 @@ export default function AdminLogs() {
       // EventSource resends the last frame id on reconnect, so the server
       // replays anything missed while the connection was down.
       source = new window.EventSource(adminLogsStreamUrl(lastSeqRef.current));
-      source.addEventListener("open", () => setStatus(pausedRef.current ? "paused" : "live"));
+      source.addEventListener("open", () => {
+        if (!cancelled) setStatus(pausedRef.current ? "paused" : "live");
+      });
       source.addEventListener("ready", (event) => {
+        if (cancelled) return;
         setStatus(pausedRef.current ? "paused" : "live");
         try {
           setStats(JSON.parse(event.data).stats || null);
@@ -167,6 +180,7 @@ export default function AdminLogs() {
         }
       });
       source.addEventListener("logs", (event) => {
+        if (cancelled) return;
         try {
           ingest(JSON.parse(event.data).entries || []);
         } catch {
@@ -174,6 +188,7 @@ export default function AdminLogs() {
         }
       });
       source.addEventListener("cleared", () => {
+        if (cancelled) return;
         setEntries([]);
         setHeld([]);
         setExpanded(new Set());
@@ -186,9 +201,10 @@ export default function AdminLogs() {
     start();
     return () => {
       cancelled = true;
+      controller.abort();
       source?.close();
     };
-  }, [ingest]);
+  }, [ingest, visualActive]);
 
   const visible = useMemo(
     () => entries.filter((entry) => (levelFilter === "all" || entry.level === levelFilter) && matchesSearch(entry, deferredSearch)),

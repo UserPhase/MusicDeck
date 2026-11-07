@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useVisualActivity } from "../../hooks/useVisualActivity";
 
 import {
   getAdminHealthScan,
@@ -190,12 +191,13 @@ export default function LibraryHealth() {
     };
   }, [startScan]);
 
+  const visualActive = useVisualActivity();
   const running = status?.state === "running";
   const scanId = status?.id ?? null;
 
   // Poll only while a check runs; back off when the connection drops.
   useEffect(() => {
-    if (!running) return undefined;
+    if (!running || !visualActive) return undefined;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let delay = POLL_MS;
@@ -221,7 +223,7 @@ export default function LibraryHealth() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [running, scanId]);
+  }, [running, scanId, visualActive]);
 
   // Announce the prune outcome once the pruning check finishes.
   useEffect(() => {

@@ -85,6 +85,10 @@
   background: #170f264a;
   backdrop-filter: blur(14px);
 }
+:root[data-desktop-app="true"] .lyrics-reader .lyrics-scroll {
+  background: var(--bg-panel);
+  backdrop-filter: none;
+}
 .lyrics-reader .right-sidebar-lyric-line, .lyrics-reader .right-sidebar-lyrics-plain {
   font-size: clamp(1.25rem, 4vw, 3rem);
   font-weight: 700;

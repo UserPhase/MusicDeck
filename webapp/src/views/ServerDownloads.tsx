@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useVisualActivity } from "../hooks/useVisualActivity";
 import { getAcquisitions } from "../api/musicdeck";
 import { formatStorageSize } from "../utils/browserCache";
 
@@ -46,9 +47,10 @@ function ServerDownloadRow({ job }: { job: ServerJob }) {
 export default function ServerDownloads({ online }: { online: boolean }) {
   const [jobs, setJobs] = useState<ServerJob[] | null>(null);
   const [error, setError] = useState(false);
+  const visualActive = useVisualActivity();
 
   useEffect(() => {
-    if (!online) return;
+    if (!online || !visualActive) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     async function refresh() {
@@ -67,7 +69,7 @@ export default function ServerDownloads({ online }: { online: boolean }) {
     }
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [online]);
+  }, [online, visualActive]);
 
   const active = jobs?.filter(isActive) ?? [];
   const recent = jobs?.filter((job) => !isActive(job)).slice(0, 5) ?? [];

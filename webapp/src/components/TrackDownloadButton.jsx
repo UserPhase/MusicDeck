@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { createAcquisition, getAcquisition } from "../api/musicdeck";
 import { usePrivacy } from "../context/PrivacyContext";
+import { startVisualPolling } from "../services/visualActivity";
 
 function ServerIcon() {
   return (
@@ -31,16 +32,14 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
-  const pollTimerRef = useRef(null);
+  const stopPollingRef = useRef(null);
   const isMountedRef = useRef(true);
 
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-      }
+      stopPollingRef.current?.();
     };
   }, []);
 
@@ -125,14 +124,14 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
       const jobId = res.jobId || res.job?.id;
       if (!jobId) return;
 
-      if (pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-      }
-
-      pollTimerRef.current = setInterval(async () => {
+      stopPollingRef.current?.();
+      let inFlight = false;
+      const stopPolling = startVisualPolling(async () => {
+        if (inFlight) return;
+        inFlight = true;
         try {
           const job = await getAcquisition(jobId);
-          if (!isMountedRef.current) return;
+          if (!isMountedRef.current || stopPollingRef.current !== stopPolling) return;
 
           if (job) {
             setStatus(job.status);
@@ -141,23 +140,24 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
             }
 
             if (job.status === "completed") {
-              clearInterval(pollTimerRef.current);
+              stopPolling();
               setStatus("completed");
             } else if (job.status === "failed") {
-              clearInterval(pollTimerRef.current);
+              stopPolling();
               setStatus("failed");
               setErrorMessage(job.errorMessage || "Download failed");
             } else if (job.status === "cancelled") {
-              clearInterval(pollTimerRef.current);
+              stopPolling();
               setStatus("idle");
             }
           }
-        } catch (pollErr) {
-          if (pollTimerRef.current) {
-            clearInterval(pollTimerRef.current);
-          }
+        } catch {
+          stopPolling();
+        } finally {
+          inFlight = false;
         }
-      }, 1000);
+      }, 1000, { immediate: false });
+      stopPollingRef.current = stopPolling;
     } catch (err) {
       if (isMountedRef.current) {
         setStatus("failed");

@@ -151,6 +151,11 @@ export class CastManager implements RemoteAudioOutput {
   }
   private readonly changed = () => {
     const session = this.context?.getCurrentSession();
+    if (session && this.timer === null) this.timer = setInterval(() => this.poll(), 250);
+    if (!session && this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
     this.update({ available: this.context?.getCastState() !== "NO_DEVICES_AVAILABLE",
       connected: Boolean(session), device: session?.getCastDevice().friendlyName ?? "" });
     if (!session && this.snapshot.key) {
@@ -171,7 +176,6 @@ export class CastManager implements RemoteAudioOutput {
         const events = this.sdk.framework.CastContextEventType;
         this.context.addEventListener(events.CAST_STATE_CHANGED, this.changed);
         this.context.addEventListener(events.SESSION_STATE_CHANGED, this.changed);
-        this.timer = setInterval(() => this.poll(), 250);
       }
       await this.context.requestSession();
       if (this.disposed) { this.context.endCurrentSession(true); throw new Error("Cast was cancelled because the controller closed."); }

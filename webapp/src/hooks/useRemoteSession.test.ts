@@ -1,5 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { useRemoteSession } from "./useRemoteSession";
+import { setDesktopForeground } from "../services/visualActivity";
 import type { RemotePlaybackSnapshot, RemotePlayerAdapter, RemotePlayerState } from "../types/remoteSession";
 
 const initial: RemotePlayerState = { current_track: { id: "one", title: "Set" }, position_ms: 123456.789, duration_ms: 600000, playing: false, volume: .6 };
@@ -59,6 +60,29 @@ test("registers same-origin cookies-only control, publishes explicit playback cl
   act(() => ws.onclose?.({ code: 1006, reason: "" }));
   expect(result.current.status).toBe("connected");
   unmount(); expect(next.readyState).toBe(3);
+});
+
+test("reduces background state traffic while keeping the same remote socket open", () => {
+  const player = adapter();
+  const { unmount } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  try {
+    act(() => ws.open());
+    act(() => setDesktopForeground(false));
+    player.state.mockReturnValue({ ...initial, playing: true });
+    act(() => jest.advanceTimersByTime(1999));
+    expect(ws.sent).toHaveLength(1);
+    act(() => jest.advanceTimersByTime(1));
+    expect(ws.sent[1]).toMatchObject({ type: "STATE", claim: true });
+    player.state.mockReturnValue({ ...initial, playing: true, position_ms: 140000 });
+    act(() => setDesktopForeground(true));
+    expect(ws.sent[2]).toMatchObject({ type: "STATE", state: { position_ms: 140000 } });
+    expect(ws.readyState).toBe(FakeSocket.OPEN);
+    expect(FakeSocket.instances).toHaveLength(1);
+  } finally {
+    unmount();
+    setDesktopForeground(null);
+  }
 });
 test("coalesces 500 continuous seeks into one latest-value command in an 80 ms window", async () => {
   const { result } = renderHook(() => useRemoteSession("user", adapter()));

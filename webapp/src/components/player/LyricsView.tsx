@@ -8,6 +8,7 @@ import {
 import FullScreenLyricsModal from "./FullScreenLyricsModal";
 import "../../styles/lyrics-view.css";
 import { useVisualActivity } from "../../hooks/useVisualActivity";
+import { usePlaybackDisplayPosition, type PlaybackPositionSource } from "../../hooks/usePlaybackDisplayPosition";
 
 export type LyricsData = {
   syncedLyrics?: unknown;
@@ -25,6 +26,7 @@ type Props = {
   loading: boolean;
   error?: string;
   currentTime: number;
+  positionSource?: PlaybackPositionSource;
   readPosition?: () => number;
   seekToSeconds?: (seconds: number) => void;
 };
@@ -39,10 +41,11 @@ const LyricRow = memo(function LyricRow({ line, active, seek }: {
   </button>;
 });
 
-function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, loading, error }: {
+function LyricLines({ lines, offsetMs, currentTime, positionSource, readPosition, seek, plain, loading, error }: {
   lines: readonly LyricLine[];
   offsetMs: number;
   currentTime: number;
+  positionSource?: PlaybackPositionSource;
   readPosition?: () => number;
   seek?: (milliseconds: number) => void;
   plain?: string | null;
@@ -51,10 +54,11 @@ function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, l
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const visualActive = useVisualActivity();
+  const position = usePlaybackDisplayPosition(positionSource ?? { currentTime }, lines.length > 0, 0.25);
   const lastScroll = useRef(-Infinity);
   const [live, setLive] = useState<{ lines: readonly LyricLine[]; offsetMs: number; index: number }>();
   const active = readPosition && live?.lines === lines && live.offsetMs === offsetMs
-    ? live.index : activeLyricIndex(lines, currentTime * 1000, offsetMs);
+    ? live.index : activeLyricIndex(lines, position * 1000, offsetMs);
 
   useEffect(() => {
     if (!visualActive || !readPosition || !lines.length) return;
@@ -114,7 +118,7 @@ function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, l
   </div>;
 }
 
-export default function LyricsView({ trackId, title, artist, artwork, lyrics, loading, error, currentTime, readPosition, seekToSeconds }: Props) {
+export default function LyricsView({ trackId, title, artist, artwork, lyrics, loading, error, currentTime, positionSource, readPosition, seekToSeconds }: Props) {
   const auth = useAuth();
   const account = auth?.session?.id ?? null;
   const owner = account ?? (auth && !auth.isLoading ? offlineDownloadEngine.getOwner() : null);
@@ -129,7 +133,7 @@ export default function LyricsView({ trackId, title, artist, artwork, lyrics, lo
   }, [prefs.offsetMs]);
   const display = <>
     {prefs.error && <p role="alert">{prefs.error}</p>}
-    <LyricLines lines={lines} offsetMs={prefs.offsetMs} currentTime={currentTime} readPosition={readPosition}
+    <LyricLines lines={lines} offsetMs={prefs.offsetMs} currentTime={currentTime} positionSource={positionSource} readPosition={readPosition}
       seek={seekToSeconds ? seek : undefined} plain={prefs.replacement ?? lyrics?.plainLyrics}
       loading={loading && prefs.replacement === null} error={error} />
   </>;

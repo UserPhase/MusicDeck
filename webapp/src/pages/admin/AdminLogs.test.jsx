@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 
 import AdminLogs, { formatLogTime } from "./AdminLogs";
 import { clearAdminLogs, getAdminLogs } from "../../api/musicdeck";
+import { setDesktopForeground } from "../../services/visualActivity";
 
 jest.mock("../../api/musicdeck", () => ({
   getAdminLogs: jest.fn(),
@@ -85,6 +86,26 @@ test("loads history, then streams from the last sequence number", async () => {
   expect(screen.getByText("GET /api/health 200")).toBeInTheDocument();
   expect(screen.queryByText("duplicate")).not.toBeInTheDocument();
   expect(screen.getByRole("status")).toHaveTextContent("Live");
+});
+
+test("suspends the log stream in the background and replays from the last visible entry", async () => {
+  const view = await renderLogs();
+  const source = FakeEventSource.instances[0];
+  try {
+    act(() => source.emit("logs", { entries: [entry(4, "info", "last visible entry")] }));
+    act(() => setDesktopForeground(false));
+    expect(source.closed).toBe(true);
+    act(() => source.emit("logs", { entries: [entry(5, "info", "missed entry")] }));
+    expect(screen.queryByText("missed entry")).not.toBeInTheDocument();
+    act(() => setDesktopForeground(true));
+    expect(FakeEventSource.instances[1].url).toBe("/api/admin/logs/stream?after=4");
+    expect(screen.getByText("last visible entry")).toBeInTheDocument();
+    act(() => FakeEventSource.instances[1].emit("logs", { entries: [entry(5, "info", "missed entry")] }));
+    expect(screen.getByText("missed entry")).toBeInTheDocument();
+  } finally {
+    view.unmount();
+    setDesktopForeground(null);
+  }
 });
 
 test("filters by level and search text", async () => {

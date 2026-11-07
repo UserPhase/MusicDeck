@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { startVisualPolling } from "../../services/visualActivity";
 import { NavLink, Route, Routes } from "react-router-dom";
 import PrivacySettingsPanel from "../../components/settings/PrivacySettingsPanel";
 import ScrobbleSettingsPanel from "../../components/settings/ScrobbleSettingsPanel";
@@ -142,17 +143,17 @@ function LibraryScanControl({ status, onStatus }) {
   useEffect(() => {
     if (!running) return undefined;
     let cancelled = false;
-    const timer = setInterval(async () => {
+    const stopPolling = startVisualPolling(async () => {
       try {
         const next = await getAdminLibraryScanStatus();
         if (!cancelled) onStatus(next);
       } catch {
         // Transient poll failures are retried on the next tick.
       }
-    }, SCAN_POLL_MS);
+    }, SCAN_POLL_MS, { immediate: false });
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      stopPolling();
     };
   }, [running, onStatus]);
 

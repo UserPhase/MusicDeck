@@ -51,6 +51,7 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setBrowserPrivacy(null);
     setBusy(false);
+    if (!userId) return;
     refresh();
     const interval = window.setInterval(refresh, 5000);
     window.addEventListener("focus", refresh);
@@ -59,7 +60,7 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
       saving.current = null;
       window.clearInterval(interval); window.removeEventListener("focus", refresh); setBrowserPrivacy(null);
     };
-  }, [refresh]);
+  }, [refresh, userId]);
   const save = async (settings: PrivacySettings) => {
     if (saving.current || !userId) throw new Error("Privacy settings are busy or authentication is unavailable");
     const operation = Symbol("privacy-save");

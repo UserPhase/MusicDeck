@@ -328,10 +328,10 @@ export async function getAdminHealth() {
   return request("/api/admin/health");
 }
 
-export async function getAdminLogs({ level, limit = 1000 } = {}) {
+export async function getAdminLogs({ level, limit = 1000, signal } = {}) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (level) params.set("level", level);
-  return request(`/api/admin/logs?${params}`);
+  return request(`/api/admin/logs?${params}`, { signal });
 }
 
 export async function clearAdminLogs() {

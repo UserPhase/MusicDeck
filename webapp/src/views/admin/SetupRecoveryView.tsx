@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { startVisualPolling } from "../../services/visualActivity";
 import {
   completeSystemSetup, createSystemBackup, getSystemRecoveryStatus, restoreSystemBackup, runSystemDiagnostics,
   saveSystemConfiguration, systemBackupUrl, SystemRecoveryRequestError, updateDailyBackupPolicy,
@@ -57,8 +58,8 @@ export default function SetupRecoveryView() {
         else if (Date.now() > deadline && restarting) { setRestarting(false); setError("The server has not returned within two minutes. Check server logs and recovery status before retrying the operation."); }
       } finally { pending = false; }
     };
-    const timer = setInterval(() => { void poll(); }, 2000);
-    return () => { disposed = true; clearInterval(timer); };
+    const stopPolling = startVisualPolling(poll, 2000, { immediate: false });
+    return () => { disposed = true; stopPolling(); };
   }, [restarting, busy, load]);
   async function run(label: string, action: () => Promise<void>) {
     if (operation.current || restarting) return;

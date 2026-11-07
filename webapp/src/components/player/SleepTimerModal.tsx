@@ -1,4 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
+import { startVisualPolling } from "../../services/visualActivity";
 import type { PlaybackEngine } from "../../services/audio/PlaybackEngine";
 import { SLEEP_MINUTES, type SleepMinutes } from "../../services/audio/SleepTimerService";
 
@@ -13,8 +14,7 @@ export default function SleepTimerModal({ engine, albumKeys, local }: {
   const deadline = state.deadline;
   useEffect(() => {
     if (deadline === null) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
+    return startVisualPolling(() => setNow(Date.now()), 1000);
   }, [deadline]);
   const seconds = Math.max(0, Math.ceil(((deadline ?? now) - now) / 1000));
   const trackKey = engine.getSnapshot().key;

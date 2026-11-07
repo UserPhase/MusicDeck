@@ -1,5 +1,7 @@
 import { useLayoutEffect, useRef } from "react";
 import { useVisualActivity } from "../hooks/useVisualActivity";
+import { usePlaybackDisplayPosition } from "../hooks/usePlaybackDisplayPosition";
+import { isDesktopRuntime } from "../services/desktop/desktopRuntime";
 import PlayerAudioTools from "./player/PlayerAudioTools";
 import TrackArtistLinks from "./TrackArtistLinks";
 
@@ -53,6 +55,59 @@ function progressPercent(position, duration) {
   return duration > 0 && Number.isFinite(position) ? Math.min(100, Math.max(0, position / duration * 100)) : 0;
 }
 
+function PlayerProgress({ player }) {
+  const { currentSong, isPlaying, isBuffering, duration, seek, readPlaybackPosition } = player;
+  const currentTime = usePlaybackDisplayPosition(player);
+  const progressInput = useRef(null);
+  const visualActive = useVisualActivity();
+  const desktop = isDesktopRuntime();
+  const animateProgress = Boolean(!desktop && visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
+
+  useLayoutEffect(() => {
+    if (!visualActive) return;
+    const position = !desktop && currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
+    paintProgress(progressInput.current, progressPercent(position, duration));
+  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive, desktop]);
+
+  // Repaint only the scrubber between media events so the rest of the UI stays idle.
+  useLayoutEffect(() => {
+    if (!animateProgress) return;
+    const input = progressInput.current;
+    let frame;
+    const draw = () => {
+      const percent = progressPercent(readPlaybackPosition(), duration);
+      if (input.valueAsNumber !== percent) paintProgress(input, percent);
+      frame = requestAnimationFrame(draw);
+    };
+    frame = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(frame);
+  }, [animateProgress, duration, readPlaybackPosition]);
+
+
+  return (
+    <div className="progress-container">
+      <span className="time">{formatTime(currentTime)}</span>
+      <input
+        ref={progressInput}
+        type="range"
+        min="0"
+        max="100"
+        step="any"
+        defaultValue={0}
+        onChange={(event) => {
+          const percent = event.currentTarget.valueAsNumber;
+          paintProgress(event.currentTarget, percent);
+          seek(percent);
+        }}
+        disabled={!currentSong || !(duration > 0)}
+        className="progress tactile-slider"
+        aria-label="Song progress"
+      />
+      <span className="time">{formatTime(duration)}</span>
+    </div>
+  );
+}
+
 /**
  * Docked player bar. `variant="drawer"` restyles it as the floating,
  * expandable bar used by the YouTube Music layout; `actions` renders extra
@@ -65,18 +120,14 @@ function Player({
   actions = null,
 }) {
 
+  const player = usePlayer();
   const {
     currentSong,
     isPlaying,
     isRemotePlayback,
     isCasting,
-    isBuffering,
-    currentTime,
-    readPlaybackPosition,
-    duration,
 
     togglePlay,
-    seek,
 
     nextSong,
     previousSong,
@@ -96,47 +147,19 @@ function Player({
     playbackMessage,
     isPreparingPlayback,
 
-  } = usePlayer();
+  } = player;
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
   const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(currentSong);
   const { canImport } = usePrivacy();
 
 
-  /*
-   * PROGRESS
-   */
-
-  const progressInput = useRef(null);
   const lastAudibleVolume = useRef(0.5);
   const isMuted = volume === 0;
-  const visualActive = useVisualActivity();
   const muteLabel = isMuted ? "Unmute" : "Mute";
-  const animateProgress = Boolean(visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
 
   useLayoutEffect(() => {
     if (volume > 0) lastAudibleVolume.current = volume;
   }, [volume]);
-
-  useLayoutEffect(() => {
-    if (!visualActive) return;
-    const position = currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
-    paintProgress(progressInput.current, progressPercent(position, duration));
-  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive]);
-
-  // Repaint only the scrubber between media events so the rest of the UI stays idle.
-  useLayoutEffect(() => {
-    if (!animateProgress) return;
-    const input = progressInput.current;
-    let frame;
-    const draw = () => {
-      const percent = progressPercent(readPlaybackPosition(), duration);
-      if (input.valueAsNumber !== percent) paintProgress(input, percent);
-      frame = requestAnimationFrame(draw);
-    };
-    frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
-  }, [animateProgress, duration, readPlaybackPosition]);
-
 
   return (
 
@@ -431,40 +454,7 @@ function Player({
 
         {/* PROGRESS */}
 
-        <div className="progress-container">
-
-          <span className="time">
-            {formatTime(
-              currentTime
-            )}
-          </span>
-
-
-          <input
-            ref={progressInput}
-            type="range"
-            min="0"
-            max="100"
-            step="any"
-            defaultValue={0}
-            onChange={(event) => {
-              const percent = event.currentTarget.valueAsNumber;
-              paintProgress(event.currentTarget, percent);
-              seek(percent);
-            }}
-            disabled={!currentSong || !(duration > 0)}
-            className="progress tactile-slider"
-            aria-label="Song progress"
-          />
-
-
-          <span className="time">
-            {formatTime(
-              duration
-            )}
-          </span>
-
-        </div>
+        <PlayerProgress player={player} />
 
       </div>
 

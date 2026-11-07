@@ -135,6 +135,51 @@ test("stops visual progress updates in the background and catches up on focus wi
   }
 });
 
+test("desktop playback updates the scrubber once per second without a frame loop", () => {
+  window.__MUSICDECK_DESKTOP__ = true;
+  const schedule = jest.spyOn(window, "requestAnimationFrame");
+  const listeners = new Set();
+  let position = 10;
+  const idleTimer = { status: "idle" };
+  const audioEngine = {
+    sleepTimer: { subscribe: () => () => {}, getSnapshot: () => idleTimer },
+    on: jest.fn((event, listener) => {
+      expect(event).toBe("timeUpdate");
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    }),
+  };
+  const advance = (seconds) => act(() => {
+    position = seconds;
+    listeners.forEach(listener => listener({ position }));
+  });
+  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" },
+    currentTime: 10, duration: 200, isPlaying: true, audioEngine, readPlaybackPosition: () => position });
+  try {
+    const view = render(<MemoryRouter><Player /></MemoryRouter>);
+    const progress = screen.getByRole("slider", { name: "Song progress" });
+    expect(progress.valueAsNumber).toBe(5);
+    advance(10.75);
+    expect(progress.valueAsNumber).toBe(5);
+    advance(11.25);
+    expect(progress.valueAsNumber).toBeCloseTo(5.625);
+    expect(schedule).not.toHaveBeenCalled();
+
+    act(() => setDesktopForeground(false));
+    expect(listeners.size).toBe(0);
+    advance(20);
+    expect(progress.valueAsNumber).toBeCloseTo(5.625);
+    act(() => setDesktopForeground(true));
+    expect(progress.valueAsNumber).toBe(10);
+    view.unmount();
+    expect(listeners.size).toBe(0);
+  } finally {
+    delete window.__MUSICDECK_DESKTOP__;
+    setDesktopForeground(null);
+    schedule.mockRestore();
+  }
+});
+
 test("audio quality sits beside the song title and devices sit beside Queue with Cast inside the centred dialog", () => {
   usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" } });
   const cast = { supported: true, allowed: true, available: false, connected: false, device: "", loading: false, error: "", volume: null,

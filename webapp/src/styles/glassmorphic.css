@@ -74,6 +74,13 @@
   .track-context-menu > .playlist-menu { background: transparent; }
 }
 
+:root[data-desktop-app="true"] :is(.glass-dropdown, .playlist-menu, .playlist-options-menu, .account-menu, .admin-profile-menu, .search-dropdown) {
+  background: var(--glass-menu-solid);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-desktop-app="true"] .track-context-menu > .playlist-menu { background: transparent; }
+
 @media (prefers-reduced-motion: reduce) {
   .glass-dropdown :is(button, a) { transition: none; }
 }

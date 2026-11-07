@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { startVisualPolling } from "../../services/visualActivity";
 import { useAuth } from "../../context/AuthContext";
 import { usePlayer } from "../../context/PlayerContext";
 import { getPartyState, controlPlaylistParty, requestPartyTrack, type PartyState, type PartyRequest } from "../../api/playlistCollaboration";
@@ -25,10 +26,10 @@ function PartyPanel({ playlistId, canManage, selectedTracks, ownerId }: { playli
       .catch(reason => { if (!active.signal.aborted) setError(reason instanceof Error ? reason.message : "Could not check party requests."); });
   }, [playlistId]);
   useEffect(() => {
-    alive.current = true; refresh(); const timer = window.setInterval(refresh, 10_000);
+    alive.current = true; const stopPolling = startVisualPolling(refresh, 10_000);
     try { const ids: unknown = JSON.parse(sessionStorage.getItem(`musicdeck:party-added:${ownerId}`) || "[]");
       if (Array.isArray(ids)) queued.current = new Set(ids.filter((id): id is string => typeof id === "string")); } catch { /* Start with no local acknowledgements. */ }
-    return () => { alive.current = false; window.clearInterval(timer); loadRequest.current?.abort(); action.current?.abort(); };
+    return () => { alive.current = false; stopPolling(); loadRequest.current?.abort(); action.current?.abort(); };
   }, [refresh, ownerId]);
   const operate = async (work: (signal: AbortSignal) => Promise<void>) => {
     if (action.current) return; const active = new AbortController(); action.current = active; setBusy(true); setError(""); setNotice("");

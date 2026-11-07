@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RemoteCommand, RemoteDevice, RemotePlaybackSnapshot, RemotePlayerAdapter, RemoteSessionValue } from "../types/remoteSession";
 import { isMediaResumeContext } from "../services/mediaSessions";
+import { getVisualActivity, subscribeVisualActivity } from "../services/visualActivity";
 
 function deviceKind(): RemoteDevice["device_type"] {
   if (/iPad|Tablet/i.test(navigator.userAgent)) return "tablet";
@@ -225,7 +226,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       };
     };
     connect();
-    const heartbeat = window.setInterval(() => {
+    const publishState = () => {
       if (socket.current?.readyState !== WebSocket.OPEN) return;
       const state = adapterRef.current.state();
       const claim = state.playing && !lastPlaying && !prepared.current;
@@ -234,9 +235,22 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (serialized === lastState && !claim) return;
       lastState = serialized;
       try { send({ type: "STATE", state, claim }); } catch (failure) { fail(failure); }
-    }, 500);
+    };
+    let heartbeat: number | undefined;
+    let interval = 0;
+    const updateHeartbeat = () => {
+      // The socket still carries commands and transfers while backgrounded.
+      const nextInterval = getVisualActivity() ? 500 : 2000;
+      if (interval === nextInterval) return;
+      window.clearInterval(heartbeat);
+      heartbeat = window.setInterval(publishState, nextInterval);
+      if (interval && nextInterval < interval) publishState();
+      interval = nextInterval;
+    };
+    const unsubscribeVisibility = subscribeVisualActivity(updateHeartbeat);
+    updateHeartbeat();
     return () => {
-      closed = true; window.clearTimeout(reconnect); window.clearInterval(heartbeat);
+      closed = true; window.clearTimeout(reconnect); window.clearInterval(heartbeat); unsubscribeVisibility();
       cancelPreparation(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
       for (const operation of operations.values()) {
         window.clearTimeout(operation.timer); operation.reject(new Error("Remote session closed"));

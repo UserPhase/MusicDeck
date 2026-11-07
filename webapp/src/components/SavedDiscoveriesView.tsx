@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { startVisualPolling } from "../services/visualActivity";
 import { Link } from "react-router-dom";
 import { savedDiscoveryItem, useSavedDiscoveries, type SavedDiscovery } from "../hooks/useSavedDiscoveries";
 import { externalActionKey, externalActions, useExternalAction } from "../services/externalActions";
@@ -142,11 +143,8 @@ export default function SavedDiscoveriesView() {
     setImporting(false);
     setSelected(new Set());
     setNotice("");
-    void refresh();
-    const timer = window.setInterval(() => {
-      if (document.visibilityState !== "hidden") void refresh();
-    }, 5000);
-    return () => { generation.current += 1; window.clearInterval(timer); };
+    const stopPolling = startVisualPolling(refresh, 5000);
+    return () => { generation.current += 1; stopPolling(); };
   }, [enabled, refresh]);
 
   useEffect(() => {

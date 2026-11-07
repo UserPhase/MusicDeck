@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getVisualActivity, startVisualPolling } from "../../services/visualActivity";
 import { useAuth } from "../../context/AuthContext";
 import { usePrivacy } from "../../context/PrivacyContext";
 import { useOnlineStatus } from "../OfflineStatusBanner";
@@ -39,12 +40,11 @@ function ScrobbleAccountPanel({ owner, privacyAllowed, online }: { owner: string
   }, [owner]);
   useEffect(() => {
     mounted.current = true;
-    void refresh();
-    const interval = window.setInterval(() => { void refresh(); }, 15_000);
-    const changed = () => { void refresh(); };
-    window.addEventListener("online", changed); window.addEventListener("focus", changed); document.addEventListener("visibilitychange", changed);
+    const stopPolling = startVisualPolling(refresh, 15_000, { refreshOnWindowFocus: true });
+    const changed = () => { if (getVisualActivity()) void refresh(); };
+    window.addEventListener("online", changed);
     return () => { mounted.current = false; request.current?.abort(); request.current = null; operation.current?.abort();
-      window.clearInterval(interval); window.removeEventListener("online", changed); window.removeEventListener("focus", changed); document.removeEventListener("visibilitychange", changed); };
+      stopPolling(); window.removeEventListener("online", changed); };
   }, [refresh]);
   async function run(provider: ScrobbleProvider, action: "connect" | "authorize" | "test" | "retry" | "disconnect") {
     if (operation.current) return;

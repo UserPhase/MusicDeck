@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useVisualActivity } from "../../hooks/useVisualActivity";
 import { request } from "../../api/musicdeck";
 import "../../styles/sonic-extension.css";
 
@@ -22,8 +23,9 @@ export default function SonicExtensionView() {
   const [refreshError, setRefreshError] = useState("");
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
+  const visualActive = useVisualActivity();
   useEffect(() => {
-    if (busy) return;
+    if (busy || !visualActive) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     async function refresh() {
@@ -41,7 +43,7 @@ export default function SonicExtensionView() {
     }
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [busy]);
+  }, [busy, visualActive]);
 
   async function mutate(method: "PUT" | "POST", body: Settings | { action: "start" | "pause" | "resume" | "cancel" }) {
     if (lock.current) return;

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { clearTaskHistory, controlTask, setTaskPriority, taskStreamUrl } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
+import { useVisualActivity } from "./useVisualActivity";
 
 export type TaskState = "QUEUED" | "PROCESSING" | "PAUSED" | "FINISHED" | "FAILED" | "CANCELLED";
 export interface ActivityTask {
@@ -194,7 +195,7 @@ export function createTaskStreamStore() {
       return () => { unsubscribe(); if (!listeners.size) rowListeners.delete(id); };
     },
     getTask: (id: string) => tasks.get(id),
-    start: () => {
+    start: ({ keepSnapshot = false } = {}) => {
       running = true;
       epoch++;
       setConnection("connecting");
@@ -206,6 +207,7 @@ export function createTaskStreamStore() {
         clearTimeout(retry);
         clearTimeout(flushTimer);
         flushTimer = undefined;
+        if (keepSnapshot) return;
         tasks.clear();
         revisions.clear();
         pending.clear();
@@ -234,10 +236,11 @@ export type TaskStreamStore = ReturnType<typeof createTaskStreamStore>;
 
 export default function useTaskStream(): TaskStreamStore {
   const auth: unknown = useAuth();
+  const visualActive = useVisualActivity();
   const session = object(auth) && object(auth.session) ? auth.session : null;
   const userId = session?.role === "admin" && typeof session.id === "string" ? session.id : undefined;
   const store = useMemo(createTaskStreamStore, [userId]);
-  useEffect(() => userId ? store.start() : undefined, [store, userId]);
+  useEffect(() => userId && visualActive ? store.start({ keepSnapshot: true }) : undefined, [store, userId, visualActive]);
   return store;
 }
 

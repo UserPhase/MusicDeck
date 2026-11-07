@@ -1,4 +1,5 @@
 import { ComponentProps, memo, ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useVisualActivity } from "../hooks/useVisualActivity";
 import { createPortal } from "react-dom";
 import type { CSSProperties, DragEvent, MouseEvent } from "react";
 import TrackRow, { isTrackControl } from "./TrackRow";
@@ -69,6 +70,7 @@ function VirtualizedTrackList({
   onQueue, onDownload, showDateAdded, searchTokens,
 }: VirtualizedTrackListProps) {
   const scope = useTrackActionScope();
+  const visualActive = useVisualActivity();
   const editingDisabled = editingDisabledProp || Boolean(scope?.disabled);
   const selection = suppliedSelection || scope?.selection;
   const ref = useRef<HTMLDivElement>(null);
@@ -94,6 +96,10 @@ function VirtualizedTrackList({
     stopDrag();
   }, [dataKey, editingDisabled]);
   useEffect(() => {
+    if (!visualActive) {
+      stopDrag();
+      return;
+    }
     if (!drag || !ref.current) return undefined;
     const parent = findScrollParent(ref.current);
     let frame = 0;
@@ -116,7 +122,7 @@ function VirtualizedTrackList({
     const end = () => stopDrag();
     document.addEventListener("dragend", end);
     return () => { cancelAnimationFrame(frame); document.removeEventListener("dragend", end); };
-  }, [drag]);
+  }, [drag, visualActive]);
   function beginDrag(event: DragEvent) {
     if (!onReorder || editingDisabled || event.defaultPrevented || !(event.target instanceof Element)) return;
     const row = event.target.closest<HTMLElement>('.track[draggable="true"]');

@@ -9,6 +9,7 @@ import {
 } from "../api/musicdeck";
 import { useArtistBiography } from "../hooks/useArtistBiography";
 import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
+import { isDesktopRuntime } from "../services/desktop/desktopRuntime";
 
 import {
   usePlayer,
@@ -27,8 +28,10 @@ import PrivateListeningBadge from "./player/PrivateListeningBadge";
 
 function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
   const [lyricsResult, setLyricsResult] = useState(null);
+  const player = usePlayer();
   const { currentSong, currentTime = 0, duration = 0, queue = [], queueIndex = -1,
-    audioEngine, isRemotePlayback, playbackStatus, seekToSeconds } = usePlayer();
+    audioEngine, isRemotePlayback, playbackStatus, seekToSeconds } = player;
+  const interpolateLyrics = !isDesktopRuntime();
   const readPosition = useCallback(() => audioEngine.getPosition(), [audioEngine]);
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 512);
   const nextTrack = queue[queueIndex + 1] || null;
@@ -89,8 +92,8 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
 
             <LyricsView trackId={String(trackId ?? "")} title={songTitle || "Unknown title"} artist={songArtist}
               artwork={coverUrl} lyrics={result?.lyrics ?? null} loading={Boolean(trackId && !result)}
-              error={result?.error} currentTime={Number(currentTime)} seekToSeconds={seekToSeconds}
-              readPosition={audioEngine && !isRemotePlayback && ["PLAYING", "TRANSITIONING"].includes(playbackStatus)
+              error={result?.error} currentTime={Number(currentTime)} positionSource={player} seekToSeconds={seekToSeconds}
+              readPosition={interpolateLyrics && audioEngine && !isRemotePlayback && ["PLAYING", "TRANSITIONING"].includes(playbackStatus)
                 ? readPosition : undefined} />
 
             <section className="right-sidebar-metadata-section" aria-labelledby="now-playing-artist-title">

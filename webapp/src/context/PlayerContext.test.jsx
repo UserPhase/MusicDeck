@@ -453,6 +453,45 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
+test("desktop time updates keep the exact audio position without rerendering player context consumers", async () => {
+  window.__MUSICDECK_DESKTOP__ = true;
+  let now = performance.now();
+  const clock = jest.spyOn(performance, "now").mockImplementation(() => now);
+  const rendered = jest.fn();
+  function PlaybackProbe() {
+    rendered(usePlayer());
+    return null;
+  }
+  try {
+    const { container, unmount } = renderPlayer({ children: <><PlayerHarness /><PlaybackProbe /></> });
+    await playerReady();
+    fireEvent.click(screen.getByText("album-start"));
+    await waitFor(() => expect(activeAudio(container).getAttribute("src")).toBeTruthy());
+    const audio = activeAudio(container);
+    startDeckPlaying(audio, 200, 10);
+    fireEvent.durationChange(audio);
+    await waitFor(() => expect(rendered.mock.lastCall[0].duration).toBe(200));
+    await waitFor(async () => expect((await savedQueue()).currentTrackId).toBe("song-1"));
+
+    const before = rendered.mock.calls.length;
+    for (const position of [10.25, 10.5, 11.25]) {
+      audio.currentTime = position;
+      fireEvent.timeUpdate(audio);
+    }
+    expect(rendered.mock.calls).toHaveLength(before);
+    expect(rendered.mock.lastCall[0].readPlaybackPosition()).toBe(11.25);
+
+    now += 5100;
+    audio.currentTime = 12.125;
+    fireEvent.timeUpdate(audio);
+    await waitFor(async () => expect((await savedQueue()).playbackProgressSeconds).toBe(12.125));
+    unmount();
+  } finally {
+    clock.mockRestore();
+    delete window.__MUSICDECK_DESKTOP__;
+  }
+});
+
 test("smart shuffle excludes account recency without interrupting the current track and keeps backward history order", async () => {
   const { container } = renderPlayer({
     recentHistory: [{ ...songs[1], playedAt: new Date().toISOString() }],

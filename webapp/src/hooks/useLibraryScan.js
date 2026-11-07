@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import { useVisualActivity } from "./useVisualActivity";
 
 export default function useLibraryScan({ getScan, startScan, disabled, parameters }) {
   const [scan, setScan] = useState(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
   const mounted = useRef(true);
+  const visualActive = useVisualActivity();
   const active = ["discovering", "running"].includes(scan?.status);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
+    if (!visualActive) return;
     const controller = new AbortController();
     let timer;
     async function refresh() {
@@ -25,7 +28,7 @@ export default function useLibraryScan({ getScan, startScan, disabled, parameter
     }
     refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [getScan, scan?.id]);
+  }, [getScan, scan?.id, visualActive]);
   async function start() {
     if (disabled || starting || active) return;
     setStarting(true); setError("");

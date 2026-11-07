@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { startVisualPolling } from "../services/visualActivity";
 import { inspectAudioStream } from "../api/musicdeck";
 import type { PlaybackEngine } from "../services/audio/PlaybackEngine";
 
@@ -54,9 +55,9 @@ export function useStreamQualityDetails({
       } finally { controller = null; }
     };
     setState({ key, source: null, output: null, delivery: null, loading: Boolean(inspectionId), error: "", pipeline: engine?.getAudioDiagnostics() ?? null });
-    void update();
-    const interval = window.setInterval(() => { if (!document.hidden) void update(); }, 2000);
-    return () => { cancelled = true; controller?.abort(); window.clearInterval(interval); };
+    if (!trackId) return;
+    const stopPolling = startVisualPolling(update, 2000);
+    return () => { cancelled = true; controller?.abort(); stopPolling(); };
   }, [engine, key, userId, trackId, inspectionId]);
   const current = state.key === key ? state : { source: null, output: null, delivery: null, pipeline: null, loading: Boolean(inspectionId), error: "" };
   return { ...current, serverNormalized, preview,

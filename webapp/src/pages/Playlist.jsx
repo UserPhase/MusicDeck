@@ -1,4 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useState, useRef } from "react";
+import { startVisualPolling } from "../services/visualActivity";
 import { normalizePlaylistSearch, playlistTrackSearchText } from "../utils/playlistSearch";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate } from "react-router-dom";
@@ -140,9 +141,8 @@ function Playlist() {
         if (active && !polling.signal.aborted && /permission|access denied/i.test(failure.message)) { setError("Playlist access changed. Ask the owner to share it again."); setPlaylist(null); }
       }
     };
-    const timer = window.setInterval(check, 5000);
-    window.addEventListener("focus", check);
-    return () => { active = false; controller?.abort(); window.clearInterval(timer); window.removeEventListener("focus", check); };
+    const stopPolling = startVisualPolling(check, 5000, { immediate: false, refreshOnWindowFocus: true });
+    return () => { active = false; controller?.abort(); stopPolling(); };
   }, [id]);
 
   const [

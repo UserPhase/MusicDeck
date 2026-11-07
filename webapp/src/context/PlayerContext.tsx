@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { getVisualActivity, startVisualPolling } from "../services/visualActivity";
 import type { ReactNode } from "react";
 import { PlayerItemStateProvider } from "./PlayerItemState";
 import { RemoteSessionContext } from "./RemoteSessionContext";
@@ -133,7 +134,9 @@ export interface PlayerContextValue {
   /** Fine-grained queue status: PLAYING, PAUSED, BUFFERING, STALLED or TRANSITIONING. */
   playbackStatus: PlaybackStatus;
   isBuffering: boolean;
+  /** The last explicit desktop position or the latest sample for browser and remote playback. */
   currentTime: number;
+  playbackPositionKey?: string;
   readPlaybackPosition?: () => number;
   duration: number;
   queue: Song[];
@@ -519,8 +522,16 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     setActiveSidebarState((current) => normalizeSidebar(typeof next === "function" ? next(current) : next));
   }, []);
 
-  const [currentTime, setCurrentTime] = useState(0);
+  const desktop = isDesktopRuntime();
+  const [currentTime, setTimeState] = useState(0);
+  const currentTimeRef = useRef(0);
+  const setCurrentTime = useCallback((position: number) => {
+    currentTimeRef.current = position;
+    setTimeState(position);
+  }, []);
   const [duration, setDuration] = useState(0);
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
   const [audioDurationInfo, setAudioDurationInfo] = useState<{ entryId: string; audioDuration: number } | null>(null);
   const [isShuffleEnabled, setIsShuffleEnabled] = useState(false);
   const [shuffleMode, setShuffleMode] = useState<ShuffleMode>(() => {
@@ -633,7 +644,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     crossfadeSeconds: crossfadeDuration,
     volume: perceptualVolumeToGain(volume),
     createAudioElement,
-    ...(isDesktopRuntime() ? { audioContext: null } : {}),
+    ...(desktop ? { audioContext: null } : {}),
   });
   const engineRef = useRef<PlaybackEngine | null>(engine);
   engineRef.current = engine;
@@ -788,8 +799,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const isPlaying = queueState.status !== "PAUSED";
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
-  const currentTimeRef = useRef(currentTime);
-  currentTimeRef.current = currentTime;
   const isPreview = Boolean(currentEntry && songSource(currentEntry.track).previewUrl);
   const isPreviewRef = useRef(isPreview);
   isPreviewRef.current = isPreview;
@@ -1153,8 +1162,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           clock.emit("timeupdate");
         }
         if (key !== currentKey()) return;
-        setCurrentTime(position);
-        if (total > 0) setDuration(total);
+        if (desktop && !engine.isRemoteOutput) currentTimeRef.current = position;
+        else setCurrentTime(position);
+        if (total > 0 && total !== durationRef.current) setDuration(total);
       }),
       engine.on("stateChange", ({ key, state }) => {
         const type = STATE_CLOCK_EVENTS[state];
@@ -1195,7 +1205,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       }),
     ];
     return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
-  }, [engine, continueAfterQueueEnd, recordShufflePlay]);
+  }, [desktop, engine, continueAfterQueueEnd, recordShufflePlay, setCurrentTime]);
 
   // Engine errors surface once per new message; any new load clears the previous one.
   const messageLoadRef = useRef(0);
@@ -1666,6 +1676,18 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   });
   const queuePersistenceRef = useRef(persistedQueue); queuePersistenceRef.current = persistedQueue;
   useEffect(() => {
+    if (!desktop || !engine || !localQueueOwner || !persistedQueue.ready) return;
+    const checkpointInterval = 5000;
+    let nextCheckpoint = performance.now() + checkpointInterval;
+    return engine.on("timeUpdate", ({ key }) => {
+      if (key !== currentEntryOf(stateRef.current)?.entryId || !isPlayingRef.current) return;
+      const now = performance.now();
+      if (now < nextCheckpoint) return;
+      nextCheckpoint = now + checkpointInterval;
+      void queuePersistenceRef.current.flush().catch(() => undefined);
+    });
+  }, [desktop, engine, localQueueOwner, persistedQueue.ready]);
+  useEffect(() => {
     const owner = isAuthenticated ? sessionId : null;
     queueSyncClient.activate(owner); queueSyncClient.bind(() => queuePersistenceRef.current.flush());
     return () => { queueSyncClient.bind(null); queueSyncClient.activate(null); };
@@ -1964,7 +1986,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     } catch (error) {
       console.error("Could not clear recently played:", error);
     }
-  }, [abortNormalization, cancelRestoreResume, setActiveSidebar]);
+  }, [abortNormalization, cancelRestoreResume, setActiveSidebar, setCurrentTime]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -2001,18 +2023,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     }
 
     void loadLikedSongs();
-    void loadRecentlyPlayed();
     const refreshRecent = () => {
-      void loadRecentlyPlayed();
+      if (getVisualActivity()) void loadRecentlyPlayed();
     };
     window.addEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, refreshRecent);
-    window.addEventListener("focus", refreshRecent);
-    const refresh = window.setInterval(refreshRecent, 60_000);
+    const stopPolling = startVisualPolling(refreshRecent, 60_000, { refreshOnWindowFocus: true });
     return () => {
       cancelled = true;
       window.removeEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, refreshRecent);
-      window.removeEventListener("focus", refreshRecent);
-      window.clearInterval(refresh);
+      stopPolling();
     };
   }, [isAuthenticated, authIsLoading, sessionId, localQueueOwner, resetPlayer]);
 
@@ -2434,6 +2453,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     playbackStatus: remotePlayer ? remotePlayer.playing ? "PLAYING" : "PAUSED" : queueState.status,
     isBuffering: !remotePlayer && (queueState.status === "BUFFERING" || queueState.status === "STALLED"),
     currentTime: remotePlayer ? remotePlayer.position_ms / 1000 : currentTime,
+    playbackPositionKey: positionKey,
     readPlaybackPosition: remotePlayer || castRendering ? undefined : readPlaybackPosition,
     duration: remotePlayer ? remotePlayer.duration_ms / 1000 : duration,
     queue: remotePlayer ? [] : queue,

@@ -541,7 +541,8 @@ function Settings() {
           </div>
 
           {player.audioEngine && <Suspense fallback={<p role="status">Loading equalizer…</p>}>
-            <EqualizerSettings engine={player.audioEngine} local={!player.isCasting && !player.isRemotePlayback} />
+            <EqualizerSettings engine={player.audioEngine} local={!player.isCasting && !player.isRemotePlayback}
+              playing={player.isPlaying && !player.isBuffering} />
           </Suspense>}
 
           <article className="settings-row settings-row-featured">
