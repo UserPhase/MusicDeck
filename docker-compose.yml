@@ -12,9 +12,9 @@
 #   docker compose up -d
 #
 # Images are prebuilt and published to GHCR, so no local build context,
-# ./server directory, or ./webapp directory is required. The MusicDeck server
-# image already contains Node.js, Python, FFmpeg, and spotDL — you do not
-# install any of those on the host.
+# ./server-rust directory, or ./webapp directory is required. The MusicDeck server
+# image already contains the compiled Rust binary, Python, FFmpeg, and spotDL —
+# you do not install any of those on the host.
 #
 # Exactly ONE music backend runs, selected by MUSIC_BACKEND in .env
 # (navidrome or jellyfin). The unused backend is never started.
@@ -42,7 +42,7 @@ services:
     image: ${MUSICDECK_IMAGE_SERVER:-ghcr.io/userphase/musicdeck-server}:${MUSICDECK_VERSION:-sha-752688b}
     container_name: musicdeck-server
     environment:
-      NODE_ENV: production
+      RUST_LOG: ${RUST_LOG:-info}
       # Bind on all interfaces inside the container so LAN traffic proxied
       # in by musicdeck-web can reach it. This is an internal container
       # address, not a host-exposed port.
@@ -112,7 +112,7 @@ services:
       - "4534"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "gosu", "musicdeck", "node", "-e", "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "gosu", "musicdeck", "curl", "-fsS", "http://127.0.0.1:4534/api/health"]
       interval: 30s
       timeout: 5s
       retries: 5

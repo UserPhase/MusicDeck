@@ -4,11 +4,13 @@
   "private": true,
   "description": "Root convenience scripts for running the MusicDeck webapp and server together during local development.",
   "scripts": {
-    "start": "concurrently -n server,webapp -c blue,green \"npm run dev --prefix server\" \"npm start --prefix webapp\"",
+    "start": "cargo build --manifest-path server-rust/Cargo.toml --bin musicdeck-server && concurrently -n server,webapp -c blue,green \"cargo run --manifest-path server-rust/Cargo.toml --bin musicdeck-server\" \"npm start --prefix webapp\"",
     "dev": "npm run start",
-    "install:all": "npm install --prefix server && npm install --prefix webapp",
-    "build": "npm run build --prefix server && npm run build --prefix webapp",
-    "test": "npm test --prefix server && npm test --prefix webapp",
+    "install:all": "npm install --prefix webapp",
+    "build": "cargo build --release --manifest-path server-rust/Cargo.toml --bins && npm run build --prefix webapp",
+    "test": "cargo test --manifest-path server-rust/Cargo.toml && npm test --prefix webapp",
+    "db:init": "cargo run --release --manifest-path server-rust/Cargo.toml --bin init_db --",
+    "library:shrink": "cargo run --release --manifest-path server-rust/Cargo.toml --bin shrink_library --",
     "test:acceptance": "playwright test",
     "test:acceptance:types": "node server/node_modules/typescript/bin/tsc -p tests/acceptance/tsconfig.json"
   },

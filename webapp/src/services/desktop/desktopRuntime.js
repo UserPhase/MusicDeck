@@ -1,3 +1,5 @@
+import { setDesktopForeground } from "../visualActivity";
+
 export const DEFAULT_DESKTOP_SERVER_URL = "http://localhost:4534";
 export const DEFAULT_DESKTOP_UPDATE_MANIFEST_URL =
   "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/latest.json";
@@ -579,6 +581,35 @@ export function installDesktopRuntime() {
   }
 
   document.documentElement.dataset.desktopApp = "true";
+  let disposed = false;
+  let focusVersion = 0;
+  let unlistenFocus;
+  const updateFocus = (focused) => {
+    if (disposed) return;
+    focusVersion++;
+    setDesktopForeground(focused);
+  };
+  const onFocus = () => updateFocus(true);
+  const onBlur = () => updateFocus(false);
+  window.addEventListener("focus", onFocus);
+  window.addEventListener("blur", onBlur);
+  updateFocus(document.hasFocus());
+  try {
+    const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+    if (appWindow) {
+      Promise.resolve(appWindow.onFocusChanged(({ payload }) => updateFocus(payload)))
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else unlistenFocus = unlisten;
+        }).catch(() => {});
+      const initialVersion = focusVersion;
+      Promise.resolve(appWindow.isFocused()).then((focused) => {
+        if (focusVersion === initialVersion) updateFocus(focused);
+      }).catch(() => {});
+    }
+  } catch {
+    // DOM focus events also support older desktop shells.
+  }
 
   if (!fetchInterceptorInstalled && typeof window.fetch === "function") {
     originalFetch = window.fetch.bind(window);
@@ -688,6 +719,11 @@ export function installDesktopRuntime() {
     .catch(() => {});
 
   return () => {
+    disposed = true;
+    window.removeEventListener("focus", onFocus);
+    window.removeEventListener("blur", onBlur);
+    unlistenFocus?.();
+    setDesktopForeground(null);
     if (fetchInterceptorInstalled && originalFetch) {
       window.fetch = originalFetch;
       fetchInterceptorInstalled = false;

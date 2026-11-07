@@ -8,6 +8,18 @@ a { color: inherit; }
 .ambient-background-blob { position: absolute; width: min(64vw, 1120px); height: min(76vw, 1240px); border-radius: 50%; background: var(--ambient-blob); filter: blur(150px); opacity: .19; transform: scale(1.5); will-change: transform; }
 .ambient-background-blob-top { top: -22%; right: -16%; }
 .ambient-background-blob-bottom { bottom: -44%; left: -24%; opacity: .14; }
+
+/* Stop visual work while a desktop window is unfocused or a tab is hidden. */
+:root[data-visual-active="false"] *,
+:root[data-visual-active="false"] *::before,
+:root[data-visual-active="false"] *::after {
+  animation-play-state: paused !important;
+  transition: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+:root[data-visual-active="false"] :is(.ambient-background, .lyrics-reader-backdrop) { display: none; }
+
 .sidebar { position: fixed; left: var(--frame); top: 80px; bottom: calc(var(--player-height) + var(--frame)); width: var(--sidebar-width); box-sizing: border-box; display: flex; flex-direction: column; overflow-y: auto; z-index: 10; padding: var(--space-3) var(--space-2) var(--space-4); background: var(--sidebar-surface); border: 1px solid var(--panel-border); border-radius: 16px; box-shadow: var(--panel-shadow); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); scrollbar-width: thin; scrollbar-color: rgb(var(--tint-rgb) / 10%) transparent; }
 .nav-section { margin: 0 0 var(--space-4); }
 .nav-section-heading { display: flex; align-items: center; justify-content: space-between; padding-right: var(--space-1); }

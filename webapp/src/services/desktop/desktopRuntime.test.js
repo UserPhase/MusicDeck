@@ -49,6 +49,32 @@ describe("desktopRuntime", () => {
     expect(isDesktopRuntime()).toBe(true);
   });
 
+  test("tracks native window focus, ignores a stale initial response, and cleans up its listener", async () => {
+    let onFocusChanged;
+    let resolveFocused;
+    const unlisten = jest.fn();
+    window.__TAURI__ = {
+      window: { getCurrentWindow: () => ({
+        onFocusChanged: handler => { onFocusChanged = handler; return Promise.resolve(unlisten); },
+        isFocused: () => new Promise(resolve => { resolveFocused = resolve; }),
+      }) },
+    };
+    const cleanup = installDesktopRuntime();
+    try {
+      onFocusChanged({ payload: false });
+      resolveFocused(true);
+      await Promise.resolve();
+      expect(document.documentElement.dataset.visualActive).toBe("false");
+      onFocusChanged({ payload: true });
+      expect(document.documentElement.dataset.visualActive).toBe("true");
+    } finally {
+      cleanup();
+    }
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    onFocusChanged({ payload: false });
+    expect(document.documentElement.dataset.visualActive).toBe("true");
+  });
+
   test("normalizes valid server URLs, bare LAN IPs, and rejects invalid ones", () => {
     expect(normalizeDesktopServerUrl("  http://192.168.1.50:8080/  ")).toBe(
       "http://192.168.1.50:8080"

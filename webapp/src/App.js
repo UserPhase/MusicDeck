@@ -374,7 +374,7 @@ function AppContent() {
         <Route path="/login" element={<Login />} />
         <Route path="/playlist-share" element={<Login redirectTo="/playlist-share" />} />
         <Route path="/downloads" element={<><DownloadsView /><Player /></>} />
-        <Route path="*" element={<Navigate to={navigator.onLine === false || offlineDownloadEngine.getOwner() ? "/downloads" : "/login"} replace />} />
+        <Route path="*" element={<Navigate to={navigator.onLine === false ? "/downloads" : "/login"} replace />} />
       </Routes>
     );
   }

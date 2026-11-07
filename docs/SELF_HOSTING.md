@@ -195,7 +195,7 @@ Images are published to GHCR by the repository's
 - `ghcr.io/userphase/musicdeck-web`
 
 Developers who want to build from source instead use `docker-compose.dev.yml`
-(see "Local development" below), which needs `server/Dockerfile`,
+(see "Local development" below), which needs `server-rust/Dockerfile`,
 `webapp/Dockerfile`, and `webapp/nginx.conf` from a source checkout.
 
 ## First Startup
@@ -403,7 +403,7 @@ recommended; explicit HTTP LAN mode is supported only on trusted networks.
 
 ### musicdeck-server
 
-Runs the compiled TypeScript MusicDeck API server.
+Runs the compiled Rust MusicDeck API server (`musicdeck-server`).
 
 - Image: `ghcr.io/userphase/musicdeck-server`
 - Internal port: `4534` — never published to the host; only reachable from
@@ -417,8 +417,9 @@ Runs the compiled TypeScript MusicDeck API server.
   playlist ownership — all isolated per user (see "Multi-User Accounts")
 - Reads the selected backend's credentials from environment variables
 - Bundles the full acquisition runtime so the host needs nothing installed:
-  Node.js 24, Python 3, FFmpeg/ffprobe, Deno, and spotDL (in a dedicated
-  virtualenv at `/opt/spotdl`). Automatic spotDL/yt-dlp/ytmusicapi updates are
+  Rust release binaries (`musicdeck-server`, `init_db`, `shrink_library`),
+  Python 3, FFmpeg/ffprobe, Deno, and spotDL (in a dedicated virtualenv at
+  `/opt/venv` aliased at `/opt/spotdl`). Automatic spotDL/yt-dlp/ytmusicapi updates are
   opt-in (`SPOTDL_AUTO_UPDATE=1`). The default (`0`) keeps startup reproducible
   by using the image-pinned versions unless you explicitly request a refresh.
 
@@ -748,9 +749,8 @@ docker compose -f docker-compose.dev.yml up -d --build
 Run services directly while developing:
 
 ```powershell
-cd server
-npm install
-npm run dev
+cd server-rust
+cargo run --bin musicdeck-server
 ```
 
 ```powershell
@@ -762,7 +762,7 @@ npm start
 React development uses `http://localhost:3000` and proxies `/api/*` to `http://localhost:4534`.
 
 Note: the Docker image bundles Python, FFmpeg, Deno, and spotDL, but a bare
-`npm run dev` on the host does not. To exercise the acquisition/downloader
+`cargo run` on the host does not. To exercise the acquisition/downloader
 pipeline locally you must install `python3`, `ffmpeg`, `deno`, and `spotdl` yourself,
 or develop against the containerized stack
 (`docker compose -f docker-compose.dev.yml up -d --build`).
@@ -811,10 +811,10 @@ this is UTC unless you set `TZ` (for example `TZ=Europe/Amsterdam`) on the
 
 Common startup issues:
 
-- `unable to prepare context: path ".../server" not found`: you are using a
+- `unable to prepare context: path ".../server-rust" not found`: you are using a
   build-based compose file without a source checkout. Production installs must
   use `docker-compose.yml` (prebuilt GHCR images); `docker-compose.dev.yml` is
-  the only file that builds from `./server` and `./webapp`.
+  the only file that builds from `./server-rust` and `./webapp`.
 - `MUSICDECK_SESSION_SECRET must be set`: set a non-default secret in `.env`.
 - `MUSIC_BACKEND must be "navidrome" or "jellyfin"`: fix the typo in `.env`.
 - Both Navidrome and Jellyfin containers start, or the wrong one does: make

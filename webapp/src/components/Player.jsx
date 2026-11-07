@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef } from "react";
+import { useVisualActivity } from "../hooks/useVisualActivity";
 import PlayerAudioTools from "./player/PlayerAudioTools";
 import TrackArtistLinks from "./TrackArtistLinks";
 
@@ -108,17 +109,19 @@ function Player({
   const progressInput = useRef(null);
   const lastAudibleVolume = useRef(0.5);
   const isMuted = volume === 0;
+  const visualActive = useVisualActivity();
   const muteLabel = isMuted ? "Unmute" : "Mute";
-  const animateProgress = Boolean(currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
+  const animateProgress = Boolean(visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
 
   useLayoutEffect(() => {
     if (volume > 0) lastAudibleVolume.current = volume;
   }, [volume]);
 
   useLayoutEffect(() => {
+    if (!visualActive) return;
     const position = currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
     paintProgress(progressInput.current, progressPercent(position, duration));
-  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition]);
+  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive]);
 
   // Repaint only the scrubber between media events so the rest of the UI stays idle.
   useLayoutEffect(() => {

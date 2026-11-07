@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { EQ_LIMITS, filterUsesGain, webAudioFilterQ, type ParametricBand } from "../../services/audio/EqualizerEngine";
+import { useVisualActivity } from "../../hooks/useVisualActivity";
 
 const { min: minHz, max: maxHz } = EQ_LIMITS.frequency;
 const frequencySpan = Math.log(maxHz / minHz);
@@ -54,7 +55,9 @@ type BandPosition = Pick<ParametricBand, "frequency" | "gain">;
 
 function Spectrum({ getAnalyser }: { getAnalyser(): AnalyserNode | null }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const visualActive = useVisualActivity();
   useEffect(() => {
+    if (!visualActive) return;
     const canvas = ref.current;
     const analyser = getAnalyser();
     if (!canvas || !analyser) return;
@@ -86,7 +89,7 @@ function Spectrum({ getAnalyser }: { getAnalyser(): AnalyserNode | null }) {
     };
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
-  }, [getAnalyser]);
+  }, [getAnalyser, visualActive]);
   return <canvas ref={ref} className="eq-spectrum" aria-hidden="true" />;
 }
 

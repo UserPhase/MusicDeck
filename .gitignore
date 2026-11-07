@@ -4,17 +4,15 @@ node_modules/
 
 # === Environment / secrets ===
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
-**/.env
-!**/.env.example
 
 # === Build output ===
 build/
 dist/
 **/build/
 **/dist/
+/server-rust/target/
 
 # === Local runtime data (SQLite DB, downloaded music, temp acquisitions) ===
 data/
@@ -22,7 +20,15 @@ data/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-music/
+*.sqlite-journal
+/music/
+/server/music/
+/server-rust/music/
+/extensions/
+/server-rust/extensions/
+/navidrome-data/
+/jellyfin-config/
+/jellyfin-cache/
 
 # === Test artifacts (temp dirs, coverage, reports created by test runs) ===
 **/test/tmp-test-*/

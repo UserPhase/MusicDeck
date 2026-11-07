@@ -1,6 +1,6 @@
 # MusicDeck — LOCAL DEVELOPMENT compose (builds from source)
 #
-# This file builds the images from the ./server and ./webapp directories in
+# This file builds the images from the ./server-rust and ./webapp directories in
 # this repository, so it REQUIRES a full source checkout. Use it while
 # developing MusicDeck:
 #
@@ -31,10 +31,10 @@ services:
 
   musicdeck-server:
     build:
-      context: ./server
+      context: ./server-rust
     container_name: musicdeck-server
     environment:
-      NODE_ENV: production
+      RUST_LOG: ${RUST_LOG:-info}
       # Bind on all interfaces inside the container so LAN traffic proxied
       # in by musicdeck-web can reach it. This is an internal container
       # address, not a host-exposed port.
@@ -106,7 +106,7 @@ services:
       - "4534"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "gosu", "musicdeck", "node", "-e", "fetch('http://127.0.0.1:4534/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "gosu", "musicdeck", "curl", "-fsS", "http://127.0.0.1:4534/api/health"]
       interval: 30s
       timeout: 5s
       retries: 5

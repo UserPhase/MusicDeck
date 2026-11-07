@@ -7,6 +7,7 @@ import {
 } from "../../hooks/useLyricsOffset";
 import FullScreenLyricsModal from "./FullScreenLyricsModal";
 import "../../styles/lyrics-view.css";
+import { useVisualActivity } from "../../hooks/useVisualActivity";
 
 export type LyricsData = {
   syncedLyrics?: unknown;
@@ -49,13 +50,14 @@ function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, l
   error?: string;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
+  const visualActive = useVisualActivity();
   const lastScroll = useRef(-Infinity);
   const [live, setLive] = useState<{ lines: readonly LyricLine[]; offsetMs: number; index: number }>();
   const active = readPosition && live?.lines === lines && live.offsetMs === offsetMs
     ? live.index : activeLyricIndex(lines, currentTime * 1000, offsetMs);
 
   useEffect(() => {
-    if (!readPosition || !lines.length) return;
+    if (!visualActive || !readPosition || !lines.length) return;
     let frame = 0;
     let previous = -2;
     const tick = () => {
@@ -68,9 +70,10 @@ function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, l
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [readPosition, lines, offsetMs]);
+  }, [readPosition, lines, offsetMs, visualActive]);
 
   const center = useCallback((behavior: ScrollBehavior) => {
+    if (!visualActive) return;
     const container = scroller.current;
     const line = container?.querySelector<HTMLElement>('[aria-current="true"]');
     if (!container || !line) return;
@@ -79,7 +82,7 @@ function LyricLines({ lines, offsetMs, currentTime, readPosition, seek, plain, l
       - (container.clientHeight - lineRect.height) / 2;
     if (typeof container.scrollTo === "function") container.scrollTo({ top: Math.max(0, top), behavior });
     else container.scrollTop = Math.max(0, top);
-  }, []);
+  }, [visualActive]);
 
   const timed = lines.length > 0;
   useEffect(() => {

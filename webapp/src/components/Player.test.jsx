@@ -1,10 +1,11 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Player from "./Player";
 import { usePlayer } from "../context/PlayerContext";
 import { RemoteSessionContext } from "../context/RemoteSessionContext";
 import { CastContext } from "../context/CastContext";
+import { setDesktopForeground } from "../services/visualActivity";
 
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: jest.fn(),
@@ -98,6 +99,40 @@ test("the main player toggles shuffle without showing a shuffle-mode dropdown", 
   expect(toggleShuffle).toHaveBeenCalledTimes(1);
   expect(changeShuffleMode).not.toHaveBeenCalled();
   expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+});
+
+test("stops visual progress updates in the background and catches up on focus without pausing audio", () => {
+  const schedule = jest.spyOn(window, "requestAnimationFrame").mockReturnValue(17);
+  const cancel = jest.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+  const readPlaybackPosition = jest.fn(() => 10);
+  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" },
+    currentTime: 10, duration: 200, isPlaying: true, readPlaybackPosition });
+  const togglePlay = usePlayer().togglePlay;
+  try {
+    const view = render(<MemoryRouter><Player /></MemoryRouter>);
+    expect(schedule).toHaveBeenCalledTimes(1);
+    const progress = screen.getByRole("slider", { name: "Song progress" });
+    expect(progress.valueAsNumber).toBe(5);
+    act(() => setDesktopForeground(false));
+    expect(cancel).toHaveBeenCalledWith(17);
+    schedule.mockClear();
+    readPlaybackPosition.mockClear();
+    usePlayer.mockReturnValue({ ...usePlayer(), currentTime: 40 });
+    view.rerender(<MemoryRouter><Player /></MemoryRouter>);
+    expect(schedule).not.toHaveBeenCalled();
+    expect(readPlaybackPosition).not.toHaveBeenCalled();
+    expect(progress.valueAsNumber).toBe(5);
+    readPlaybackPosition.mockReturnValue(40);
+    act(() => setDesktopForeground(true));
+    expect(progress.valueAsNumber).toBe(20);
+    expect(schedule).toHaveBeenCalledTimes(1);
+    expect(togglePlay).not.toHaveBeenCalled();
+    view.unmount();
+  } finally {
+    setDesktopForeground(null);
+    schedule.mockRestore();
+    cancel.mockRestore();
+  }
 });
 
 test("audio quality sits beside the song title and devices sit beside Queue with Cast inside the centred dialog", () => {
