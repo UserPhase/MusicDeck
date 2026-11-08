@@ -1,5 +1,6 @@
 import "fake-indexeddb/auto";
 import { clearLocalQueue, readLocalQueue, writeLocalQueue } from "../services/storage/QueueDatabase";
+import { queueSyncClient } from "../services/QueueSyncClient";
 import { rememberDownloadOwner } from "../services/storage/offlineIdentity";
 global.structuredClone = require("vm").runInThisContext("structuredClone");
 import {
@@ -38,11 +39,13 @@ import {
   getListeningConfig,
   saveMediaCheckpoint,
   getListeningTrack,
+  request,
 } from "../api/musicdeck";
 
 
 jest.mock("../api/musicdeck", () => ({
   getCurrentSession: jest.fn(),
+  request: jest.fn(),
   getRecentlyPlayed: jest.fn(),
   getAutoplayTracks: jest.fn(),
   RECOMMENDATION_FEEDBACK_CHANGED_EVENT: "musicdeck:recommendation-feedback-changed",
@@ -443,6 +446,7 @@ beforeEach(async () => {
   localStorage.clear();
   sessionStorage.clear();
   jest.clearAllMocks();
+  request.mockResolvedValue({ sessions: [], namedQueues: [], saved: true, contentId: "fixture-content" });
   global.fetch = jest.fn(async (url) => ({
     ok: true,
     json: async () => String(url).includes('/api/v1/taste-profile') ? ({ privateListening: false, revision: 0, resetBefore: null, providerHistoryDisabled: false, excludedPlaylistIds: [], excludedTrackIds: [] }) : ({ results: [] }),
@@ -713,6 +717,39 @@ test("rehydrates the queue and progress without starting audio until Play", asyn
   Object.defineProperty(container.querySelector("audio"), "duration", { configurable: true, value: 180 });
   fireEvent.loadedMetadata(container.querySelector("audio"));
   expect(container.querySelector("audio").currentTime).toBeCloseTo(42);
+});
+
+test("shows the latest account queue automatically and starts it only when Play is pressed", async () => {
+  let checkpoint = { index: 1, position: 102.25, repeatOne: false, shuffle: false, shuffleSeed: null,
+    shuffleMode: "standard", albumAware: false, volume: .65, wasPlaying: true, context: null, capturedAt: Date.now() };
+  const content = { version: 2, entries: songs.map((track, index) => ({ entryId: `desk-${index}`, track: { ...track, duration: 200 } })) };
+  request.mockImplementation(async (url, options) => {
+    if (url.endsWith("/queue-session") && options?.method !== "PUT") return {
+      sessions: [{ deviceId: "desk", deviceName: "Desktop", contentId: "shared-content", checkpoint,
+        sequence: 1, updatedAt: checkpoint.capturedAt, trackCount: 3 }], namedQueues: [],
+    };
+    if (url.endsWith("/content/shared-content")) return content;
+    return { saved: true, contentId: "local-content" };
+  });
+  const { container } = renderPlayer();
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
+  expect(screen.getByTestId("current-time")).toHaveTextContent("102.25");
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("false");
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  expect(request.mock.calls.some(([url, options]) => url.endsWith("/queue-session") && options?.method === "PUT")).toBe(false);
+
+  checkpoint = { ...checkpoint, position: 106.5, capturedAt: checkpoint.capturedAt + 100 };
+  await act(async () => { await queueSyncClient.refresh(); });
+  expect(screen.getByTestId("current-time")).toHaveTextContent("106.5");
+  expect(request.mock.calls.filter(([url]) => url.endsWith("/content/shared-content"))).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+  await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1));
+  const audio = activeAudio(container);
+  expect(audio).toHaveAttribute("src", "/stream/song-2");
+  Object.defineProperty(audio, "duration", { configurable: true, value: 200 });
+  fireEvent.loadedMetadata(audio);
+  expect(audio.currentTime).toBeCloseTo(106.5);
 });
 
 test("restores the remembered account's local queue when the server cannot authenticate offline", async () => {
@@ -2399,8 +2436,13 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
 
 test("remote now-playing and transport controls reflect the selected device without echoing target commands", async () => {
   let adapter;
-  const active = { device_id: "desk", device_name: "Desk", device_type: "computer", is_active_player: true, can_receive: true,
+  const active = { device_id: "desk", queue_device_id: "desk-queue", device_name: "Desk", device_type: "computer", is_active_player: true, can_receive: true,
     current_track: { id: "remote-song", title: "Remote set" }, position_ms: 42125, duration_ms: 600000, playing: true, volume: .8 };
+  const checkpoint = { index: 0, position: 42, repeatOne: false, shuffle: false, shuffleSeed: null,
+    shuffleMode: "standard", albumAware: false, volume: .8, wasPlaying: true, context: null, capturedAt: Date.now() };
+  request.mockImplementation(async (url) => url.endsWith("/content/desk-content")
+    ? { version: 2, entries: [active.current_track, ...songs.slice(0, 2)].map((track, index) => ({ entryId: `desk-${index}`, track })) }
+    : { sessions: [{ deviceId: "desk-queue", contentId: "desk-content", checkpoint, trackCount: 3 }], namedQueues: [] });
   const command = jest.fn(async () => {});
   const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
     adapter = player;
@@ -2413,6 +2455,9 @@ test("remote now-playing and transport controls reflect the selected device with
     expect(screen.getByTestId("current-song")).toHaveTextContent("remote-song");
     expect(screen.getByTestId("current-time")).toHaveTextContent("42.125");
     expect(screen.getByTestId("volume")).toHaveTextContent("0.8");
+    await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("remote-song,song-1,song-2"));
+    fireEvent.click(screen.getByText("move-later"));
+    expect(command).toHaveBeenCalledWith({ type: "MOVE_QUEUE_ENTRY", entry_id: "desk-1", target_id: "desk-2" });
     fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
     expect(command).toHaveBeenCalledWith({ type: "PAUSE" });
     expect(adapter.state().current_track).toBe(null);

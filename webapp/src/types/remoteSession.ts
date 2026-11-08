@@ -1,16 +1,22 @@
 import type { MediaResumeContext } from "../services/mediaSessions";
+import type { PersistedQueueTrack } from "../services/storage/QueueDatabase";
 
 export type RemoteCommand =
   | { type: "PLAY" } | { type: "PAUSE" }
   | { type: "SKIP"; direction: "next" | "previous" }
   | { type: "SEEK"; position_ms: number }
-  | { type: "SET_VOLUME"; volume: number };
+  | { type: "SET_VOLUME"; volume: number }
+  | { type: "TOGGLE_SHUFFLE" | "TOGGLE_REPEAT" }
+  | { type: "PLAY_QUEUE_ENTRY"; entry_id: string }
+  | { type: "MOVE_QUEUE_ENTRY"; entry_id: string; target_id: string }
+  | { type: "ENQUEUE"; tracks: PersistedQueueTrack[]; next: boolean; dedupe: boolean };
 export interface RemotePlayerState {
   current_track: { id: string; title: string } | null;
   position_ms: number; duration_ms: number; playing: boolean; volume: number;
 }
 export interface RemoteDevice extends RemotePlayerState {
   device_id: string; device_name: string; device_type: "computer" | "phone" | "tablet" | "web";
+  queue_device_id?: string | null;
   is_active_player: boolean; can_receive: boolean;
 }
 export interface RemotePlaybackSnapshot {

@@ -49,8 +49,11 @@ import { useAuth } from "./AuthContext";
 import { tasteProfileStore, TASTE_CHANGED } from "../services/TasteProfileStore";
 import { DEFAULT_ACCENT_COLOR, normalizeAccentColor } from "../utils/accentColors";
 import { trustedPreviewUrl } from "../utils/previewPlayback";
-import { queueSyncClient } from "../services/QueueSyncClient";
+import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
+import type { AccountQueueSource } from "../services/QueueSyncClient";
+import { newestPeerQueue, useAccountQueue } from "../hooks/useAccountQueue";
 import type { QueueCheckpoint, QueueContent } from "../services/storage/QueueDatabase";
+import { sanitizeQueueTrack } from "../services/storage/QueueDatabase";
 import { createListeningTracker } from "../utils/listeningTracker";
 import { gainToPerceptualVolume, perceptualVolumeToGain } from "../utils/volume";
 import { isShuffleMode, smartShuffle, SMART_SHUFFLE_WINDOW_MS } from "../utils/shuffle";
@@ -121,6 +124,7 @@ export { CROSSFADE_MAX_SECONDS, CROSSFADE_MIN_SECONDS, DEFAULT_CROSSFADE_SECONDS
 export interface PlayerContextValue {
   flushQueuePersistence: () => Promise<unknown>;
   restoreSavedQueue: (content: QueueContent, checkpoint: QueueCheckpoint) => void;
+  accountQueueSource?: AccountQueueSource;
   queuePersistenceError: string;
   currentSong: Song | null;
   activeSidebar: Sidebar;
@@ -963,7 +967,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   /** Position for an entry that was selected without loading (a restored, paused queue). */
   const cuedPositionRef = useRef<{ trackId: string; seconds: number } | null>(null);
 
+  const automaticallyResuming = useRef(false);
   const cancelRestoreResume = useCallback(() => {
+    automaticallyResuming.current = false;
     resumeListenerCleanupRef.current?.();
     resumeListenerCleanupRef.current = null;
     restoreRef.current = null;
@@ -971,9 +977,14 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }, []);
 
   const attemptRestoredPlaybackRef = useRef<(restore: RestoreRequest) => void>(() => undefined);
+  const restoredCheckpointTime = useRef(0);
+  const remotePlayingElsewhere = useRef(false);
+  const suppressedRestoreRevision = useRef<number | null>(null);
+  const followingAccountQueue = useRef(false);
   attemptRestoredPlaybackRef.current = (restore: RestoreRequest) => {
     const activeEngine = engineRef.current;
     if (!activeEngine || restoreRef.current !== restore) return;
+    automaticallyResuming.current = true;
     restore.blocked = false;
     // Called synchronously from click/keydown handlers so user activation is kept.
     activeEngine.play().catch(() => undefined).then(() => {
@@ -1030,7 +1041,27 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     const restore = restoreRef.current;
     if (restore && !restore.attempted && String(entry.track.id) === restore.trackId) {
       restore.attempted = true;
-      attemptRestoredPlaybackRef.current(restore);
+      const owner = queueSyncClient.getSnapshot().owner;
+      let checked = false;
+      const resume = () => {
+        if (checked || !mountedRef.current || restoreRef.current !== restore) return;
+        checked = true;
+        const account = queueSyncClient.getSnapshot();
+        const peer = account.owner === owner && owner ? newestPeerQueue(account.sessions, queueDeviceId()) : undefined;
+        if (remotePlayingElsewhere.current || (peer && peer.checkpoint.capturedAt > restoredCheckpointTime.current)) {
+          suppressedRestoreRevision.current = stateRef.current.revision;
+          followingAccountQueue.current = true;
+          cancelRestoreResume();
+        } else attemptRestoredPlaybackRef.current(restore);
+      };
+      if (!owner || navigator.onLine === false) resume();
+      else {
+        const timeout = window.setTimeout(resume, 2000);
+        void queueSyncClient.refresh().then(() => {
+          window.clearTimeout(timeout);
+          resume();
+        });
+      }
     }
   };
 
@@ -1665,6 +1696,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     getCheckpoint: () => queueCheckpointRef.current(), onError: setQueuePersistenceError, onReady: setHydratedQueueUserId,
     onRestore: saved => {
       const checkpoint = saved.head.checkpoint, song = saved.content.entries[checkpoint.index]?.track as Song | undefined;
+      suppressedRestoreRevision.current = null;
+      restoredCheckpointTime.current = checkpoint.capturedAt;
       applyQueuePreferences(checkpoint);
       if (song && checkpoint.wasPlaying && !unplayableReasonFor(song)) {
         restoreRef.current = { trackId: String(song.id), attempted: false, blocked: false }; setRestorePending(true);
@@ -1689,13 +1722,25 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }, [desktop, engine, localQueueOwner, persistedQueue.ready]);
   useEffect(() => {
     const owner = isAuthenticated ? sessionId : null;
-    queueSyncClient.activate(owner); queueSyncClient.bind(() => queuePersistenceRef.current.flush());
+    queueSyncClient.activate(owner);
+    queueSyncClient.bind(() => queuePersistenceRef.current.flush(), () => !followingAccountQueue.current);
     return () => { queueSyncClient.bind(null); queueSyncClient.activate(null); };
   }, [isAuthenticated, sessionId]);
   useEffect(() => {
     if (!isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
-    if (!isPlaying) void queueSyncClient.sync().catch(() => undefined);
-  }, [isAuthenticated, sessionId, hydratedQueueUserId, isPlaying, restorePending]);
+    void queueSyncClient.sync({ ifChanged: true }).catch(() => undefined);
+  }, [isAuthenticated, sessionId, hydratedQueueUserId, isPlaying, restorePending, currentEntryId, isShuffleEnabled, queueState.repeatOne]);
+  useEffect(() => {
+    if (!engine || !isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
+    let nextSync = performance.now() + 10_000;
+    return engine.on("timeUpdate", ({ key }) => {
+      if (!isPlayingRef.current || key !== currentEntryOf(stateRef.current)?.entryId) return;
+      const now = performance.now();
+      if (now < nextSync) return;
+      nextSync = now + 10_000;
+      void queueSyncClient.sync({ ifChanged: true }).catch(() => undefined);
+    });
+  }, [engine, isAuthenticated, sessionId, hydratedQueueUserId, restorePending]);
   useEffect(() => {
     if (!localQueueOwner || hydratedQueueUserId !== localQueueOwner) return;
     const flush = () => {
@@ -2100,7 +2145,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
 
   async function playSong(song: Song) {
     if (!song) return;
-    if (sameSongId(song, currentSong)) {
+    if (pausedAccountQueue && sameSongId(song, accountSong)) {
+      takeAccountQueue(accountIndex, true);
+      return;
+    }
+    if (!remotePlayingElsewhere.current && !pausedAccountQueue && sameSongId(song, currentSong)) {
       togglePlay();
       return;
     }
@@ -2124,14 +2173,20 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
 
   function addToQueue(song: Song) {
     if (!song) return;
+    if (remotePlayer) { void enqueueOnActiveDevice([song], false, true); return; }
+    if (pausedAccountQueue) takeAccountQueue();
     storeRef.current.append([song], { dedupe: true });
   }
 
   function queueTracks(tracks: Song[]) {
+    if (remotePlayer) { void enqueueOnActiveDevice(tracks, false, false); return; }
+    if (pausedAccountQueue) takeAccountQueue();
     storeRef.current.append(tracks);
   }
 
   function playTracksNext(tracks: Song[]) {
+    if (remotePlayer) { void enqueueOnActiveDevice(tracks, true, false); return; }
+    if (pausedAccountQueue) takeAccountQueue();
     storeRef.current.injectNextMany(tracks);
   }
 
@@ -2220,23 +2275,30 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     storeRef.current.jumpToIndex(state.currentIndex - 1);
   }
 
-  function toggleShuffle() {
+  function toggleShuffleForQueue(entryCount: number, index: number) {
     const enable = !shuffleEnabledRef.current;
     shuffleEnabledRef.current = enable;
     setIsShuffleEnabled(enable);
     if (!enable) return;
-    const state = stateRef.current;
     if (shuffleModeRef.current === "smart") storeRef.current.smartShuffleUpcoming(smartShuffleOptionsRef.current());
-    else storeRef.current.shuffleUpcoming(randomValues(state.entries.length - state.currentIndex - 2));
+    else storeRef.current.shuffleUpcoming(randomValues(entryCount - index - 2));
   }
 
-  function toggleLoop() {
-    const enabled = !stateRef.current.repeatOne;
+  function toggleShuffle() {
+    const state = stateRef.current;
+    toggleShuffleForQueue(state.entries.length, state.currentIndex);
+  }
+
+  function setRepeatOne(enabled: boolean) {
     if (enabled) {
       loopPlaylistRef.current = null;
       setLoopPlaylistId(null);
     }
     storeRef.current.setRepeatOne(enabled);
+  }
+
+  function toggleLoop() {
+    setRepeatOne(!stateRef.current.repeatOne);
   }
 
   function togglePlaylistLoop(playlistId: string) {
@@ -2266,6 +2328,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       cuedPositionRef.current = { trackId: String(entry.track.id), seconds: target };
     }
     setCurrentTime(target);
+    queueSyncClient.checkpointChanged();
   }
 
   // ------------------------------------------------------------ render
@@ -2312,6 +2375,24 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       if (activeEngine.isRemoteOutput) throw new Error("Control this receiver from its Google Cast sender, or stop Cast before using device control.");
       if (command.type === "SET_VOLUME") { changeVolume(command.volume); return; }
       if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
+      if (command.type === "TOGGLE_SHUFFLE") { toggleShuffle(); return; }
+      if (command.type === "TOGGLE_REPEAT") { toggleLoop(); return; }
+      if (command.type === "ENQUEUE") {
+        const tracks = command.tracks.map(sanitizeQueueTrack) as Song[];
+        if (command.next) storeRef.current.injectNextMany(tracks);
+        else storeRef.current.append(tracks, { dedupe: command.dedupe });
+        return;
+      }
+      if (command.type === "MOVE_QUEUE_ENTRY" || command.type === "PLAY_QUEUE_ENTRY") {
+        const state = stateRef.current;
+        const index = state.entries.findIndex(entry => entry.entryId === command.entry_id);
+        if (index < 0) throw new Error("The active queue changed. Try again after it syncs.");
+        if (command.type === "PLAY_QUEUE_ENTRY") { await playQueueSong(index); return; }
+        const target = state.entries.findIndex(entry => entry.entryId === command.target_id);
+        if (index <= state.currentIndex || target <= state.currentIndex) throw new Error("Only upcoming tracks can be moved.");
+        moveQueueItem(index, target);
+        return;
+      }
       if (command.type === "PAUSE") activeEngine.pause();
       else if (command.type === "PLAY") {
         if (!engineHasLoaded(currentEntryId)) throw new Error("Press Play on the player device once to load its restored queue");
@@ -2319,7 +2400,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         if (activeEngine.getSnapshot().state !== "playing") throw new Error(PLAYBACK_BLOCKED_MESSAGE);
       } else if (command.type === "SKIP") {
         if (command.direction === "next") await nextSong(); else await previousSong();
-      } else {
+      } else if (command.type === "SEEK") {
         const total = activeEngine.getSnapshot().duration;
         if (total <= 0) throw new Error("The active stream is not seekable yet");
         seekToSeconds(Math.min(total, command.position_ms / 1000));
@@ -2412,11 +2493,57 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       setPlaybackMessage(failure instanceof Error ? failure.message : "Remote playback command failed");
     }
   };
+  async function enqueueOnActiveDevice(tracks: Song[], next: boolean, dedupe: boolean) {
+    if (!tracks.length) return;
+    if (tracks.length > 1000) { setPlaybackMessage("Add up to 1,000 tracks at a time to the active device."); return; }
+    await controlRemote({ type: "ENQUEUE", tracks: tracks.map(sanitizeQueueTrack), next, dedupe });
+  }
   // Restoring a saved queue prepares this device without interrupting the household's active player.
   const remotePlayer = remote.isRemote && !preferLocalQueue ? remote.activeDevice : null;
   const remoteTrack = remotePlayer?.current_track;
-
   const castRendering = cast.connected || Boolean(engine?.isRemoteOutput);
+  remotePlayingElsewhere.current = Boolean(remote.isRemote);
+  useEffect(() => {
+    if (remote.activeDevice?.device_id === remote.deviceId) {
+      automaticallyResuming.current = false;
+      setPreferLocalQueue(false);
+    } else if (remote.isRemote && (restoreRef.current || automaticallyResuming.current)) {
+      suppressedRestoreRevision.current = stateRef.current.revision;
+      followingAccountQueue.current = true;
+      cancelRestoreResume();
+      engineRef.current?.pause();
+    }
+  }, [cancelRestoreResume, remote.activeDevice?.device_id, remote.deviceId, remote.isRemote]);
+
+  const localHead = persistedQueue.getHead();
+  const suppressedRestore = suppressedRestoreRevision.current === queueState.revision;
+  const accountQueue = useAccountQueue({
+    owner: isAuthenticated && hydratedQueueUserId === sessionId ? sessionId : null,
+    localCapturedAt: suppressedRestore ? restoredCheckpointTime.current : localHead?.checkpoint.capturedAt ?? 0,
+    followPaused: !isPlaying && !castRendering && !restorePending && !preferLocalQueue && (!entries.length || Boolean(localHead)),
+    activeDevice: remotePlayer,
+    status: remote.status,
+  });
+  followingAccountQueue.current = !isPlaying && Boolean(remotePlayer || accountQueue || suppressedRestore);
+  const accountTracks = useMemo(() => accountQueue?.content.entries.map(entry => entry.track as Song), [accountQueue?.content]);
+  const accountIndex = accountQueue?.checkpoint.index ?? -1;
+  const accountSong = accountTracks?.[accountIndex];
+  const pausedAccountQueue = remotePlayer ? null : accountQueue;
+  const queueOccurrenceAt = (index: number) => accountQueue?.content.entries[index]?.entryId;
+  const takeAccountQueue = (index = accountIndex, autoplay = false, position?: number) => {
+    if (!pausedAccountQueue || index < 0 || index >= pausedAccountQueue.content.entries.length) return;
+    const { content, checkpoint } = pausedAccountQueue;
+    const startAt = position ?? (index === checkpoint.index ? checkpoint.position : 0);
+    cancelRestoreResume();
+    engineRef.current?.pause();
+    listeningSessionRef.current?.finish();
+    applyQueuePreferences(checkpoint);
+    cuedPositionRef.current = autoplay ? null : { trackId: content.entries[index].track.id, seconds: startAt };
+    storeRef.current.hydrate(content.entries as QueueEntry<Song>[], index, {
+      autoplay, startAt, deferLoad: !autoplay, shuffleSeed: checkpoint.shuffleSeed,
+    });
+  };
+
   const sleepAlbumKeys = useMemo(() => {
     const track = entries[currentIndex]?.track;
     const marker = track?.albumPlaybackId;
@@ -2440,8 +2567,10 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     sleepAlbumKeys,
     flushQueuePersistence: persistedQueue.flush,
     restoreSavedQueue,
+    accountQueueSource: accountQueue ? { contentId: accountQueue.contentId, checkpoint: accountQueue.checkpoint } : undefined,
     queuePersistenceError,
-    currentSong: remotePlayer ? remoteTrack ? { id: remoteTrack.id, title: remoteTrack.title, source: { kind: "library" } } : null : currentSong,
+    currentSong: remotePlayer ? accountSong ?? (remoteTrack ? { id: remoteTrack.id, title: remoteTrack.title, source: { kind: "library" } } : null)
+      : accountQueue ? accountSong ?? null : currentSong,
     activeSidebar,
     setActiveSidebar,
     autoOpenSidebar,
@@ -2452,31 +2581,31 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     isCasting: castRendering,
     playbackStatus: remotePlayer ? remotePlayer.playing ? "PLAYING" : "PAUSED" : queueState.status,
     isBuffering: !remotePlayer && (queueState.status === "BUFFERING" || queueState.status === "STALLED"),
-    currentTime: remotePlayer ? remotePlayer.position_ms / 1000 : currentTime,
+    currentTime: remotePlayer ? remotePlayer.position_ms / 1000 : accountQueue?.checkpoint.position ?? currentTime,
     playbackPositionKey: positionKey,
-    readPlaybackPosition: remotePlayer || castRendering ? undefined : readPlaybackPosition,
-    duration: remotePlayer ? remotePlayer.duration_ms / 1000 : duration,
-    queue: remotePlayer ? [] : queue,
-    queueIndex: remotePlayer ? -1 : currentIndex,
+    readPlaybackPosition: remotePlayer || castRendering || accountQueue ? undefined : readPlaybackPosition,
+    duration: remotePlayer ? remotePlayer.duration_ms / 1000 : accountQueue ? songDurationHint(accountSong) ?? 0 : duration,
+    queue: accountTracks ?? (remotePlayer ? [] : queue),
+    queueIndex: accountQueue ? accountIndex : remotePlayer ? -1 : currentIndex,
     recentlyPlayed,
     // QueueSidebar calls this play history; it is the same recently-played list.
     playHistory: recentlyPlayed,
     likedSongIds,
-    isCurrentSongLiked: remotePlayer?.current_track ? likedSongIds.has(remotePlayer.current_track.id) : Boolean(currentSong && likedSongIds.has(String(currentSong.id))),
-    playbackContext: remotePlayer ? null : playbackContext,
-    isAlbumAware,
+    isCurrentSongLiked: remoteTrack ? likedSongIds.has(remoteTrack.id) : accountSong ? likedSongIds.has(String(accountSong.id)) : Boolean(currentSong && likedSongIds.has(String(currentSong.id))),
+    playbackContext: accountQueue ? accountQueue.checkpoint.context : remotePlayer ? null : playbackContext,
+    isAlbumAware: accountQueue?.checkpoint.albumAware ?? isAlbumAware,
     changeAlbumAware,
     isPreview: !remotePlayer && isPreview,
-    isShuffleEnabled: !remotePlayer && isShuffleEnabled,
-    shuffleMode,
+    isShuffleEnabled: accountQueue?.checkpoint.shuffle ?? (!remotePlayer && isShuffleEnabled),
+    shuffleMode: accountQueue?.checkpoint.shuffleMode ?? shuffleMode,
     changeShuffleMode,
-    isLooping: !remotePlayer && queueState.repeatOne,
+    isLooping: accountQueue?.checkpoint.repeatOne ?? (!remotePlayer && queueState.repeatOne),
     previewDurationSeconds: !remotePlayer && isPreview ? PREVIEW_DURATION_SECONDS : null,
     playbackUnavailable: !remotePlayer && playbackUnavailable,
     playbackMessage: remotePlayer ? remote.error : playbackMessage,
     // Retained for existing layouts; loudness analysis never blocks playback.
     isPreparingPlayback: false,
-    volume: remotePlayer ? remotePlayer.volume : castRendering && cast.volume !== null ? gainToPerceptualVolume(cast.volume) : volume,
+    volume: remotePlayer ? remotePlayer.volume : castRendering && cast.volume !== null ? gainToPerceptualVolume(cast.volume) : accountQueue?.checkpoint.volume ?? volume,
     transitionMode,
     crossfadeDuration,
     streamQuality,
@@ -2497,25 +2626,41 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     playContext,
     playQueue,
     resumeMedia,
-    playQueueSong,
-    moveQueueItem,
-    nextSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "next" }) : nextSong,
-    previousSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "previous" }) : previousSong,
-    toggleShuffle,
-    toggleLoop,
+    playQueueSong: remotePlayer ? async (index) => {
+      const entry_id = queueOccurrenceAt(index);
+      if (entry_id) await controlRemote({ type: "PLAY_QUEUE_ENTRY", entry_id });
+    } : pausedAccountQueue ? async (index) => takeAccountQueue(index, true) : playQueueSong,
+    moveQueueItem: remotePlayer ? (from, to) => {
+      const entry_id = queueOccurrenceAt(from), target_id = queueOccurrenceAt(to);
+      if (entry_id && target_id) void controlRemote({ type: "MOVE_QUEUE_ENTRY", entry_id, target_id });
+    } : pausedAccountQueue ? (from, to) => { takeAccountQueue(); moveQueueItem(from, to); } : moveQueueItem,
+    nextSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "next" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex + 1) : nextSong,
+    previousSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "previous" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex - 1) : previousSong,
+    toggleShuffle: remotePlayer ? () => controlRemote({ type: "TOGGLE_SHUFFLE" }) : pausedAccountQueue ? () => {
+      takeAccountQueue();
+      toggleShuffleForQueue(pausedAccountQueue.content.entries.length, accountIndex);
+    } : toggleShuffle,
+    toggleLoop: remotePlayer ? () => controlRemote({ type: "TOGGLE_REPEAT" }) : pausedAccountQueue ? () => {
+      takeAccountQueue();
+      setRepeatOne(!pausedAccountQueue.checkpoint.repeatOne);
+    } : toggleLoop,
     loopPlaylistId,
     togglePlaylistLoop,
-    togglePlay: remotePlayer ? () => controlRemote({ type: remotePlayer.playing ? "PAUSE" : "PLAY" }) : togglePlay,
-    toggleLike: remoteTrack ? () => toggleLikeSong({ id: remoteTrack.id, title: remoteTrack.title }) : toggleLike,
+    togglePlay: remotePlayer ? () => controlRemote({ type: remotePlayer.playing ? "PAUSE" : "PLAY" }) : pausedAccountQueue ? () => takeAccountQueue(accountIndex, true) : togglePlay,
+    toggleLike: remoteTrack ? () => toggleLikeSong({ id: remoteTrack.id, title: remoteTrack.title }) : accountSong ? () => toggleLikeSong(accountSong) : toggleLike,
     toggleLikeSong,
     setTrackFavorite,
-    seek: remotePlayer ? (percent) => controlRemote({ type: "SEEK", position_ms: percent / 100 * remotePlayer.duration_ms }) : seek,
+    seek: remotePlayer ? (percent) => controlRemote({ type: "SEEK", position_ms: percent / 100 * remotePlayer.duration_ms })
+      : pausedAccountQueue ? (percent) => takeAccountQueue(accountIndex, false, percent / 100 * (songDurationHint(accountSong) ?? 0)) : seek,
     seekToSeconds: remotePlayer ? (seconds) => {
       if (Number.isFinite(seconds)) void controlRemote({
         type: "SEEK", position_ms: Math.min(remotePlayer.duration_ms, Math.max(0, Math.round(seconds * 1000))),
       });
+    } : pausedAccountQueue ? (seconds) => {
+      if (Number.isFinite(seconds)) takeAccountQueue(accountIndex, false, Math.max(0, seconds));
     } : seekToSeconds,
-    changeVolume: remotePlayer ? (value) => controlRemote({ type: "SET_VOLUME", volume: value }) : changeVolume,
+    changeVolume: remotePlayer ? (value) => controlRemote({ type: "SET_VOLUME", volume: value })
+      : pausedAccountQueue ? (value) => { takeAccountQueue(); changeVolume(value); } : changeVolume,
     changeTransitionMode,
     changeCrossfadeDuration,
     changeStreamQuality,

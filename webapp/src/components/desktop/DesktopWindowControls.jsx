@@ -72,9 +72,8 @@ function DesktopWindowControls({ floating = false }) {
   return (
     <div
       className="desktop-floating-titlebar"
-      data-tauri-drag-region=""
-      onMouseDown={handleDesktopTitlebarMouseDown}
-      onDoubleClick={handleDesktopTitlebarDoubleClick}
+      onMouseDownCapture={handleDesktopTitlebarMouseDown}
+      onDoubleClickCapture={handleDesktopTitlebarDoubleClick}
     >
       {controls}
     </div>

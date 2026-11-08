@@ -60,10 +60,8 @@ import OfflineStatusBanner from "./components/OfflineStatusBanner";
 import DownloadsView from "./views/DownloadsView";
 import NewReleasesView from "./views/NewReleasesView";
 import { PartyHostBridge } from "./components/playlists/PlaylistPartyPanel";
-import { QueueResumePrompt } from "./components/queues/QueueManager";
 import PlaylistUndoShortcuts from "./components/playlists/PlaylistUndoShortcuts";
 import useAutoDownloadSync from "./hooks/useAutoDownloadSync";
-import { offlineDownloadEngine } from "./services/storage/OfflineDownloadEngine";
 import useGlobalHotkeys from "./hooks/useGlobalHotkeys";
 import DesktopServerModal from "./components/desktop/DesktopServerModal";
 import DesktopUpdateBanner from "./components/desktop/DesktopUpdateBanner";
@@ -278,7 +276,6 @@ function AuthenticatedApp() {
     <>
       {!isAdminRoute && <AmbientBackground />}
       <PartyHostBridge />
-      <QueueResumePrompt />
       <CustomCssStyle />
       <CustomCssResetButton />
       {downloadSync.error && <p className="downloads-notice" role="status">{downloadSync.error}</p>}

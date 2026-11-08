@@ -33,7 +33,6 @@ import { useViewStateValue } from "../hooks/useViewStateStore";
 import {
   handleDesktopTitlebarDoubleClick,
   handleDesktopTitlebarMouseDown,
-  isDesktopRuntime,
 } from "../services/desktop/desktopRuntime";
 
 // Primary destinations for header-navigation layouts (YouTube Music, SoundCloud).
@@ -363,9 +362,8 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
     <header
       className={`topbar${playerSlot ? " topbar--player" : ""}${showPrimaryNav ? " topbar--topnav" : ""}`}
-      data-tauri-drag-region={isDesktopRuntime() ? "" : undefined}
-      onMouseDown={handleDesktopTitlebarMouseDown}
-      onDoubleClick={handleDesktopTitlebarDoubleClick}
+      onMouseDownCapture={handleDesktopTitlebarMouseDown}
+      onDoubleClickCapture={handleDesktopTitlebarDoubleClick}
     >
 
 

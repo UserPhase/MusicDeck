@@ -22,8 +22,10 @@ function Manager({ ownerId }: { ownerId: string }) {
   const save = async (kind: "named" | "playlist") => {
     const title = name.trim(); if (!title) { setError("Give this queue a name first."); return; }
     if (!operation.current || operation.current.name !== title || operation.current.kind !== kind) operation.current = { name: title, kind, id: newQueueOperationId() };
-    if (kind === "named") await queueSyncClient.saveNamed(title, operation.current.id);
-    else { const result = await queueSyncClient.savePlaylist(title, operation.current.id); if (alive.current) setPlaylistId(result.playlistId); window.dispatchEvent(new Event("playlistsChanged")); }
+    const args = [title, operation.current.id] as const;
+    const source = player.accountQueueSource;
+    if (kind === "named") await (source ? queueSyncClient.saveNamed(...args, source) : queueSyncClient.saveNamed(...args));
+    else { const result = await (source ? queueSyncClient.savePlaylist(...args, source) : queueSyncClient.savePlaylist(...args)); if (alive.current) setPlaylistId(result.playlistId); window.dispatchEvent(new Event("playlistsChanged")); }
     if (alive.current) { setNotice(kind === "named" ? "Named queue saved." : "Every queued occurrence was saved to a new playlist."); operation.current = null; }
   };
   const restore = async (row: NamedQueueSummary | QueueSessionSummary) => {
@@ -49,27 +51,4 @@ function Manager({ ownerId }: { ownerId: string }) {
     {state.owner === ownerId && state.error && <p role="status" className="queue-manager-error">{state.error} <button type="button" onClick={() => void queueSyncClient.refresh()}>Refresh</button></p>}
     {notice && <p role="status">{notice}</p>}
   </details>;
-}
-export function QueueResumePrompt() {
-  const owner = useAuth()?.session?.id;
-  return owner ? <ResumePrompt key={owner} owner={owner} /> : null;
-}
-function ResumePrompt({ owner }: { owner: string }) {
-  const player = usePlayer(), state = useQueueSync();
-  const [dismissed, setDismissed] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState("");
-  const latest = useRef(owner); latest.current = owner;
-  useEffect(() => { latest.current = owner; return () => { latest.current = ""; }; }, [owner]);
-  const remote = owner && state.owner === owner ? state.sessions.find(row => row.deviceId !== queueDeviceId() && row.trackCount > 0) : null;
-  const token = remote ? `${owner}:${remote.deviceId}:${remote.updatedAt}` : "";
-  if (!remote || !player || (player.isPlaying && !player.isRemotePlayback) || dismissed === token) return null;
-  return <aside className="queue-resume-prompt" aria-label="Resume queue on this device"><div><strong>Resume playback queue from {remote.deviceName}?</strong>
-    <p>{remote.trackCount.toLocaleString()} tracks, ready at {Math.floor(remote.checkpoint.position)} seconds. Restores paused.</p></div>
-    <button type="button" disabled={busy} onClick={async () => {
-      if (busy) return; setBusy(true); setError(""); const account = owner;
-      try { const saved = await queueSyncClient.load(remote.contentId, remote.checkpoint); if (latest.current === account) { player.restoreSavedQueue(saved.content, saved.checkpoint); setDismissed(token); } }
-      catch (reason) { if (latest.current === account) setError(message(reason)); }
-      finally { if (latest.current === account) setBusy(false); }
-    }}>{busy ? "Restoring…" : "Restore queue"}</button><button type="button" disabled={busy} onClick={() => setDismissed(token)}>Not now</button>
-    {error && <p role="alert">{error}</p>}
-  </aside>;
 }

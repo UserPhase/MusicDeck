@@ -1,9 +1,10 @@
 import { useSyncExternalStore } from "react";
 import { request } from "../api/musicdeck";
-import { readLocalQueue, markQueueSynced, QUEUE_LOCAL_CHANGED, decodeQueueContent, validateCheckpoint,
+import { readLocalQueue, markQueueSynced, QUEUE_LOCAL_CHANGED, decodeQueueContent, validateCheckpoint, sameQueueCheckpoint,
   type QueueCheckpoint, type QueueHead, type LocalQueue, type QueueContent } from "./storage/QueueDatabase";
 export interface QueueSessionSummary { deviceId: string; deviceName: string; contentId: string; checkpoint: QueueCheckpoint; sequence: number; updatedAt: number; trackCount: number }
 export interface NamedQueueSummary { id: string; name: string; contentId: string; checkpoint: QueueCheckpoint; revision: number; updatedAt: number; trackCount: number }
+export interface AccountQueueSource { contentId: string; checkpoint: QueueCheckpoint }
 interface Snapshot { owner: string | null; sessions: QueueSessionSummary[]; named: NamedQueueSummary[]; error: string; syncing: boolean }
 const BASE = "/api/v1/user/queue-session";
 let fallbackDevice = "";
@@ -20,37 +21,63 @@ export class QueueSyncClient {
   private state: Snapshot = { owner: null, sessions: [], named: [], error: "", syncing: false };
   private listeners = new Set<() => void>(); private epoch = 0; private controllers = new Set<AbortController>();
   private syncFlight: Promise<void> | null = null; private latestSynced: QueueHead | null = null;
+  private refreshFlight: Promise<void> | null = null;
+  private refreshAgain = false;
   private syncAgain = false;
   private timer: ReturnType<typeof setTimeout> | null = null; private retry = 0;
   private flushLocal: (() => Promise<QueueHead | null>) | null = null;
+  private canPublish = () => true;
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private publish(patch: Partial<Snapshot>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
   activate(owner: string | null) {
     if (this.state.owner === owner) return;
     this.epoch++; this.controllers.forEach(c => c.abort()); this.controllers.clear(); this.syncFlight = null; this.latestSynced = null; this.retry = 0; this.syncAgain = false;
+    this.refreshFlight = null; this.refreshAgain = false;
     if (this.timer) clearTimeout(this.timer); this.timer = null;
     window.removeEventListener(QUEUE_LOCAL_CHANGED, this.changed); window.removeEventListener("online", this.online);
     this.publish({ owner, sessions: [], named: [], error: "", syncing: false });
     if (owner) { window.addEventListener(QUEUE_LOCAL_CHANGED, this.changed); window.addEventListener("online", this.online); void this.refresh(); }
   }
-  bind(flush: (() => Promise<QueueHead | null>) | null) { this.flushLocal = flush; }
+  bind(flush: (() => Promise<QueueHead | null>) | null, canPublish = () => true) {
+    this.flushLocal = flush;
+    this.canPublish = canPublish;
+  }
+  checkpointChanged() { if (this.state.owner && this.canPublish()) this.scheduleSync(); }
   private changed = (event: Event) => { const detail = (event as CustomEvent<{ owner: string }>).detail; if (detail?.owner === this.state.owner) this.scheduleSync(); };
   private online = () => { this.retry = 0; this.scheduleSync(); void this.refresh(); };
-  private scheduleSync() { if (this.syncFlight) { this.syncAgain = true; return; } if (this.timer) clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; void this.sync().catch(() => undefined); }, Math.min(60_000, 400 * 2 ** this.retry)); }
+  private scheduleSync() { if (this.syncFlight) { this.syncAgain = true; return; } if (this.timer) clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; void this.sync({ ifChanged: true }).catch(() => undefined); }, Math.min(60_000, 400 * 2 ** this.retry)); }
   private async call<T>(path: string, options: RequestInit = {}): Promise<T> {
     const owner = this.state.owner, version = this.epoch;
     if (!owner) throw new Error("Sign in to manage saved queues.");
     const controller = new AbortController(); this.controllers.add(controller); const timer = setTimeout(() => controller.abort(), 30_000);
+    const abort = () => controller.abort();
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
     try { const value = await request(`${BASE}${path}`, { ...options, signal: controller.signal });
       if (version !== this.epoch || owner !== this.state.owner) throw new Error("Your signed-in account changed."); return value as T;
-    } finally { clearTimeout(timer); this.controllers.delete(controller); }
+    } finally { clearTimeout(timer); this.controllers.delete(controller); options.signal?.removeEventListener("abort", abort); }
   }
-  async refresh() {
+  invalidate() {
+    if (this.refreshFlight) this.refreshAgain = true;
+    else void this.refresh();
+  }
+  refresh(): Promise<void> {
+    if (this.refreshFlight) return this.refreshFlight;
+    if (!this.state.owner) return Promise.resolve();
     const version = this.epoch;
-    try { const data = await this.call<{ sessions: QueueSessionSummary[]; namedQueues: NamedQueueSummary[] }>("");
-      if (version === this.epoch) this.publish({ sessions: data.sessions, named: data.namedQueues });
-    } catch (error) { if (version === this.epoch) this.publish({ error: error instanceof Error ? error.message : "Could not load saved queues." }); }
+    const operation = (async () => {
+      try { const data = await this.call<{ sessions: QueueSessionSummary[]; namedQueues: NamedQueueSummary[] }>("");
+        if (version === this.epoch) this.publish({ sessions: Array.isArray(data.sessions) ? data.sessions : [], named: Array.isArray(data.namedQueues) ? data.namedQueues : [] });
+      } catch (error) { if (version === this.epoch) this.publish({ error: error instanceof Error ? error.message : "Could not load saved queues." }); }
+    })();
+    this.refreshFlight = operation;
+    void operation.finally(() => {
+      if (this.refreshFlight !== operation) return;
+      this.refreshFlight = null;
+      if (this.refreshAgain) { this.refreshAgain = false; void this.refresh(); }
+    });
+    return operation;
   }
   private async upload(local: LocalQueue): Promise<string> {
     if (local.head.serverContentId) return local.head.serverContentId;
@@ -67,15 +94,16 @@ export class QueueSyncClient {
       throw error;
     }
   }
-  async sync(): Promise<void> {
+  async sync({ ifChanged = false } = {}): Promise<void> {
     if (this.syncFlight) return this.syncFlight;
     const owner = this.state.owner, version = this.epoch;
-    if (!owner) return;
+    if (!owner || !this.canPublish()) return;
     const operation = (async () => {
       this.publish({ syncing: true });
       try {
-        await this.flushLocal?.(); const local = await readLocalQueue(owner); if (!local || version !== this.epoch) return;
-        const contentId = await this.upload(local); if (version !== this.epoch) return;
+        await this.flushLocal?.(); const local = await readLocalQueue(owner); if (!local || version !== this.epoch || !this.canPublish()) return;
+        const contentId = await this.upload(local); if (version !== this.epoch || !this.canPublish()) return;
+        if (ifChanged && this.latestSynced?.serverContentId === contentId && sameQueueCheckpoint(this.latestSynced.checkpoint, local.head.checkpoint)) return;
         const sequence = Math.max(local.head.sequence, (this.state.sessions.find(row => row.deviceId === queueDeviceId())?.sequence ?? 0) + 1, (this.latestSynced?.sequence ?? 0) + 1);
         const result = await this.referencing(local, () => this.call<{ saved: boolean; sequence: number }>("", { method: "PUT", body: JSON.stringify({ ownerId: owner, deviceId: queueDeviceId(), deviceName: queueDeviceName(), contentId,
           checkpoint: local.head.checkpoint, sequence }) }));
@@ -100,7 +128,8 @@ export class QueueSyncClient {
   /** Exit requests contain only an already-uploaded content reference and a small checkpoint. */
   exitCheckpoint(checkpoint: QueueCheckpoint, currentHead: QueueHead | null) {
     const synced = this.latestSynced, owner = this.state.owner;
-    if (!owner || !synced?.serverContentId || !currentHead || synced.contentKey !== currentHead.contentKey || synced.owner !== owner) return;
+    if (!this.canPublish() || !owner || !synced?.serverContentId || !currentHead || synced.contentKey !== currentHead.contentKey || synced.owner !== owner) return;
+    if (sameQueueCheckpoint(synced.checkpoint, checkpoint)) return;
     void fetch(BASE, { method: "PUT", credentials: "include", keepalive: true, headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ownerId: owner, deviceId: queueDeviceId(), deviceName: queueDeviceName(), contentId: synced.serverContentId, checkpoint,
         sequence: Math.max(synced.sequence, currentHead.sequence) + 1 }) }).catch(() => undefined);
@@ -112,18 +141,27 @@ export class QueueSyncClient {
     if (!local?.content.entries.length) throw new Error("Add tracks to your queue before saving it.");
     return { local, contentId: await this.upload(local) };
   }
-  async saveNamed(name: string, operationId: string) {
+  async saveNamed(name: string, operationId: string, source?: AccountQueueSource) {
+    if (source) {
+      const result = await this.call<{ id: string }>("/named", { method: "POST", body: JSON.stringify({ ownerId: this.state.owner, ...source, name, operationId }) });
+      await this.refresh(); return result;
+    }
     const { local, contentId } = await this.current();
     const result = await this.referencing(local, () => this.call<{ id: string }>("/named", { method: "POST", body: JSON.stringify({ ownerId: local.head.owner, name, contentId, checkpoint: local.head.checkpoint, operationId }) }));
     await this.refresh(); return result;
   }
-  async savePlaylist(name: string, operationId: string) {
+  async savePlaylist(name: string, operationId: string, source?: AccountQueueSource) {
+    if (source) return this.call<{ playlistId: string }>("/playlist", { method: "POST", body: JSON.stringify({ ownerId: this.state.owner, contentId: source.contentId, name, operationId }) });
     const { local, contentId } = await this.current();
     return this.referencing(local, () => this.call<{ playlistId: string }>("/playlist", { method: "POST", body: JSON.stringify({ ownerId: local.head.owner, name, contentId, operationId }) }));
   }
   async load(contentId: string, checkpoint: QueueCheckpoint): Promise<{ content: QueueContent; checkpoint: QueueCheckpoint }> {
-    const raw = await this.call<QueueContent>(`/content/${encodeURIComponent(contentId)}`), content = decodeQueueContent(JSON.stringify(raw));
+    const content = await this.loadContent(contentId);
     return { content, checkpoint: validateCheckpoint(checkpoint, content.entries.length) };
+  }
+  async loadContent(contentId: string, signal?: AbortSignal): Promise<QueueContent> {
+    const raw = await this.call<QueueContent>(`/content/${encodeURIComponent(contentId)}`, { signal });
+    return decodeQueueContent(JSON.stringify(raw));
   }
   async removeNamed(row: NamedQueueSummary) { await this.call(`/named/${encodeURIComponent(row.id)}`, { method: "DELETE", body: JSON.stringify({ ownerId: this.state.owner, revision: row.revision }) }); await this.refresh(); }
   async removeDevice(deviceId: string) { await this.call("", { method: "DELETE", body: JSON.stringify({ ownerId: this.state.owner, deviceId }) }); await this.refresh(); }

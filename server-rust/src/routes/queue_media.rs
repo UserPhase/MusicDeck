@@ -452,11 +452,12 @@ async fn put_queue_session_handler(
         )
         .await
     {
-        Ok((saved, sequence)) => Json(json!({
-            "saved": saved,
-            "sequence": sequence,
-        }))
-        .into_response(),
+        Ok((saved, sequence)) => {
+            if saved {
+                state.remote_hub().queue_changed(&auth.user.id, &body.device_id);
+            }
+            Json(json!({ "saved": saved, "sequence": sequence })).into_response()
+        }
         Err(err) => map_queue_error(err),
     }
 }
@@ -495,7 +496,10 @@ async fn delete_queue_session_handler(
     let service = state.queue_sync_service(db.clone());
 
     match service.remove_session(&auth.user.id, &body.device_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.remote_hub().queue_changed(&auth.user.id, &body.device_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => map_queue_error(err),
     }
 }

@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import QueueManager, { QueueResumePrompt } from "./QueueManager";
+import QueueManager from "./QueueManager";
 import { queueSyncClient, newQueueOperationId } from "../../services/QueueSyncClient";
 let mockOwner = "alice", mockState: any, mockPlayer: any;
 jest.mock("../../context/AuthContext", () => ({ useAuth: () => ({ session: { id: mockOwner } }) }));
@@ -22,25 +22,4 @@ test("save-as-playlist validates a name, reports failures and retries with the s
   expect(await screen.findByRole("alert")).toHaveTextContent("Network lost"); fireEvent.click(screen.getByText("Save Queue as Playlist"));
   expect(await screen.findByRole("link", { name: /Open saved playlist/ })).toHaveAttribute("href", "/playlist/playlist-1");
   expect(save.mock.calls).toEqual([["Late night", "stable-operation"], ["Late night", "stable-operation"]]);
-});
-test("remote playback requires an explicit restore click and passes its full checkpoint", async () => {
-  const saved = { content: { version: 2, entries: [{ entryId: "q1", track: { id: "track" } }] }, checkpoint: { index: 0, position: 42.875 } };
-  (queueSyncClient.load as jest.Mock).mockResolvedValue(saved);
-  render(<QueueResumePrompt />); expect(screen.getByText("Resume playback queue from Desktop?")).toBeVisible(); expect(queueSyncClient.load).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByText("Restore queue")); await waitFor(() => expect(mockPlayer.restoreSavedQueue).toHaveBeenCalledWith(saved.content, saved.checkpoint));
-  expect(screen.queryByLabelText("Resume queue on this device")).not.toBeInTheDocument();
-});
-test("changing accounts during restore ignores the old result and resets busy/error state", async () => {
-  let finish!: (value: unknown) => void; (queueSyncClient.load as jest.Mock).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-  const { rerender } = render(<QueueResumePrompt />); fireEvent.click(screen.getByText("Restore queue"));
-  mockOwner = "bob"; mockState = { ...mockState, owner: "bob" }; rerender(<QueueResumePrompt />);
-  expect(screen.getByText("Restore queue")).toBeEnabled(); finish({ content: {}, checkpoint: {} });
-  await waitFor(() => expect(mockPlayer.restoreSavedQueue).not.toHaveBeenCalled());
-});
-test("the handoff prompt stays available for a remote player while local playback keeps it hidden", () => {
-  mockPlayer.isPlaying = true; mockPlayer.isRemotePlayback = true;
-  const { rerender } = render(<QueueResumePrompt />);
-  expect(screen.getByText("Resume playback queue from Desktop?")).toBeVisible();
-  mockPlayer.isRemotePlayback = false; rerender(<QueueResumePrompt />);
-  expect(screen.queryByLabelText("Resume queue on this device")).not.toBeInTheDocument();
 });

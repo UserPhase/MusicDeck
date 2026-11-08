@@ -8,7 +8,6 @@ import DesktopWindowControls from "../desktop/DesktopWindowControls";
 import {
   handleDesktopTitlebarDoubleClick,
   handleDesktopTitlebarMouseDown,
-  isDesktopRuntime,
 } from "../../services/desktop/desktopRuntime";
 import UserAvatar from "../UserAvatar";
 
@@ -22,9 +21,8 @@ function AdminTopBar() {
   return (
     <header
       className="admin-topbar"
-      data-tauri-drag-region={isDesktopRuntime() ? "" : undefined}
-      onMouseDown={handleDesktopTitlebarMouseDown}
-      onDoubleClick={handleDesktopTitlebarDoubleClick}
+      onMouseDownCapture={handleDesktopTitlebarMouseDown}
+      onDoubleClickCapture={handleDesktopTitlebarDoubleClick}
     >
       <Link to="/admin" className="admin-topbar-brand">
         {appName} <span>Admin</span>

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RemoteCommand, RemoteDevice, RemotePlaybackSnapshot, RemotePlayerAdapter, RemoteSessionValue } from "../types/remoteSession";
 import { isMediaResumeContext } from "../services/mediaSessions";
 import { getVisualActivity, subscribeVisualActivity } from "../services/visualActivity";
+import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
+import { DESKTOP_CONFIG_CHANGED_EVENT, resolveRemoteSocketUrl } from "../services/desktop/desktopRuntime";
 
 function deviceKind(): RemoteDevice["device_type"] {
   if (/iPad|Tablet/i.test(navigator.userAgent)) return "tablet";
@@ -48,7 +50,14 @@ function snapshot(value: unknown): value is RemotePlaybackSnapshot {
 }
 function remoteCommand(value: unknown): value is RemoteCommand {
   if (!object(value)) return false;
+  const occurrence = (id: unknown) => typeof id === "string" && id.length > 0 && id.length <= 160;
   return value.type === "PLAY" || value.type === "PAUSE" ||
+    value.type === "TOGGLE_SHUFFLE" || value.type === "TOGGLE_REPEAT" ||
+    (value.type === "PLAY_QUEUE_ENTRY" && occurrence(value.entry_id)) ||
+    (value.type === "MOVE_QUEUE_ENTRY" && occurrence(value.entry_id) && occurrence(value.target_id)) ||
+    (value.type === "ENQUEUE" && typeof value.next === "boolean" && typeof value.dedupe === "boolean" &&
+      Array.isArray(value.tracks) && value.tracks.length > 0 && value.tracks.length <= 1000 &&
+      value.tracks.every(track => object(track) && typeof track.id === "string" && track.id.length > 0 && track.id.length <= 1024)) ||
     (value.type === "SKIP" && (value.direction === "next" || value.direction === "previous")) ||
     (value.type === "SEEK" && typeof value.position_ms === "number" && Number.isFinite(value.position_ms) && value.position_ms >= 0) ||
     (value.type === "SET_VOLUME" && typeof value.volume === "number" && value.volume >= 0 && value.volume <= 1);
@@ -77,6 +86,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     ws.send(encoded);
   }, []);
   const registration = useCallback(() => send({ type: "REGISTER", device_id: deviceId, device_name: metadata.current.name,
+    queue_device_id: queueDeviceId(),
     device_type: deviceKind(), can_receive: metadata.current.enabled, state: adapterRef.current.state() }), [deviceId, send]);
   const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object): Promise<void> => new Promise((resolve, reject) => {
     const requestId = identity();
@@ -122,6 +132,10 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       }
     };
     const handle = async (message: Record<string, unknown>) => {
+      if (message.type === "QUEUE_CHANGED") {
+        if (queueSyncClient.getSnapshot().owner === userId) queueSyncClient.invalidate();
+        return;
+      }
       if (message.type === "DEVICES") {
         if (!Array.isArray(message.devices) || !message.devices.every(device)) throw new Error("Invalid remote device registry");
         setDevices(message.devices); return;
@@ -193,7 +207,11 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     const connect = () => {
       if (closed) return;
       setStatus(attempt ? "reconnecting" : "connecting");
-      const url = new URL("/api/v1/remote", window.location.href); url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const url = resolveRemoteSocketUrl();
+      if (!url) {
+        reconnect = window.setTimeout(connect, 1000);
+        return;
+      }
       const ws = new WebSocket(url); socket.current = ws;
       ws.onopen = () => {
         if (closed) { ws.close(); return; }
@@ -226,6 +244,12 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       };
     };
     connect();
+    const reconnectForServerChange = () => {
+      window.clearTimeout(reconnect);
+      if (socket.current) socket.current.close(1000, "Server connection changed");
+      else connect();
+    };
+    window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
     const publishState = () => {
       if (socket.current?.readyState !== WebSocket.OPEN) return;
       const state = adapterRef.current.state();
@@ -251,6 +275,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     updateHeartbeat();
     return () => {
       closed = true; window.clearTimeout(reconnect); window.clearInterval(heartbeat); unsubscribeVisibility();
+      window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
       cancelPreparation(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
       for (const operation of operations.values()) {
         window.clearTimeout(operation.timer); operation.reject(new Error("Remote session closed"));

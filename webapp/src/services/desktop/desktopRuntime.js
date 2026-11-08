@@ -16,6 +16,7 @@ export const DESKTOP_UPDATE_STATUS_EVENT = "musicdeck:desktop-update-status";
 let fetchInterceptorInstalled = false;
 let originalFetch = null;
 let activeDesktopProxyUrl = null;
+let remoteProxyUrl = null;
 let runtimeSyncPromise = null;
 
 function isBinaryOrStreamApiPath(path) {
@@ -236,6 +237,14 @@ export function resolveDesktopApiUrl(pathOrUrl) {
   return `${serverUrl}${pathOrUrl}`;
 }
 
+export function resolveRemoteSocketUrl() {
+  const base = isDesktopRuntime() ? remoteProxyUrl : window.location.href;
+  if (!base) return null;
+  const url = new URL("/api/v1/remote", base);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
+
 export async function saveDesktopConfig({ serverUrl, closeToTray, autoCheckUpdates } = {}) {
   const nextServerUrl =
     serverUrl !== undefined ? normalizeDesktopServerUrl(serverUrl) : getDesktopServerUrl();
@@ -433,6 +442,8 @@ const INTERACTIVE_TITLEBAR_SELECTOR = [
   "[role='button']",
   "[role='menuitem']",
   "[role='listbox']",
+  "[role='slider']",
+  "[contenteditable]:not([contenteditable='false'])",
   "[data-no-drag='true']",
   ".search-dropdown",
   ".account-menu",
@@ -446,12 +457,19 @@ export function isInteractiveTitlebarTarget(target) {
 
 export function handleDesktopTitlebarMouseDown(event) {
   if (!isDesktopRuntime() || event.button !== 0 || event.detail > 1) return;
+  if (event.currentTarget && !event.currentTarget.contains(event.target)) return;
   if (isInteractiveTitlebarTarget(event.target)) return;
-  void performDesktopWindowAction("start-dragging");
+  const nativeWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+  if (typeof nativeWindow?.startDragging === "function") {
+    void nativeWindow.startDragging().catch(() => performDesktopWindowAction("start-dragging"));
+  } else {
+    void performDesktopWindowAction("start-dragging");
+  }
 }
 
 export function handleDesktopTitlebarDoubleClick(event) {
   if (!isDesktopRuntime()) return;
+  if (event.currentTarget && !event.currentTarget.contains(event.target)) return;
   if (isInteractiveTitlebarTarget(event.target)) return;
   void performDesktopWindowAction("toggle-maximize");
 }
@@ -675,6 +693,7 @@ export function installDesktopRuntime() {
       if (!config || typeof config !== "object") return;
       if (typeof config.proxyUrl === "string" && config.proxyUrl.trim()) {
         activeDesktopProxyUrl = config.proxyUrl.trim().replace(/\/+$/, "");
+        remoteProxyUrl = activeDesktopProxyUrl;
         try {
           localStorage.setItem(DESKTOP_PROXY_URL_KEY, activeDesktopProxyUrl);
         } catch {
@@ -730,6 +749,7 @@ export function installDesktopRuntime() {
       originalFetch = null;
     }
     activeDesktopProxyUrl = null;
+    remoteProxyUrl = null;
     runtimeSyncPromise = null;
     delete document.documentElement.dataset.desktopApp;
   };

@@ -132,6 +132,44 @@ pub enum RemoteCommand {
         /// Target volume level.
         volume: f64,
     },
+    /// Toggle shuffle on the active device.
+    ToggleShuffle,
+    /// Toggle repeat-one on the active device.
+    ToggleRepeat,
+    /// Play a specific occurrence in the active queue.
+    PlayQueueEntry { entry_id: String },
+    /// Reorder the active queue using occurrence identities.
+    MoveQueueEntry { entry_id: String, target_id: String },
+    /// Add tracks to the active queue.
+    Enqueue {
+        tracks: Vec<Value>,
+        next: bool,
+        dedupe: bool,
+    },
+}
+
+impl RemoteCommand {
+    fn valid_queue_command(&self) -> bool {
+        let valid_id = |id: &str| !id.is_empty() && id.len() <= 160;
+        match self {
+            Self::PlayQueueEntry { entry_id } => valid_id(entry_id),
+            Self::MoveQueueEntry {
+                entry_id,
+                target_id,
+            } => valid_id(entry_id) && valid_id(target_id),
+            Self::Enqueue { tracks, .. } => {
+                !tracks.is_empty()
+                    && tracks.len() <= 1000
+                    && tracks.iter().all(|track| {
+                        track
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+                    })
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Queue entry inside a [`TransferQueueState`].
@@ -233,6 +271,9 @@ pub enum RemoteClientMessage {
     Register {
         /// Stable device ID (`1..=160` chars).
         device_id: String,
+        /// Persistent queue identity for clients that follow account queue changes.
+        #[serde(default)]
+        queue_device_id: Option<String>,
         /// Human-readable device name (`1..=80` trimmed chars).
         device_name: String,
         /// Device form factor.
@@ -337,6 +378,7 @@ struct ConnectedClient {
     #[allow(dead_code)]
     session_id: String,
     device_id: Option<String>,
+    queue_device_id: Option<String>,
     device_name: String,
     device_type: RemoteDeviceType,
     can_receive: bool,
@@ -418,6 +460,7 @@ impl RemoteControlHub {
                 user_id: user_id.to_owned(),
                 session_id: session_id.to_owned(),
                 device_id: None,
+                queue_device_id: None,
                 device_name: String::new(),
                 device_type: RemoteDeviceType::Web,
                 can_receive: false,
@@ -475,6 +518,7 @@ impl RemoteControlHub {
         match message {
             RemoteClientMessage::Register {
                 device_id,
+                queue_device_id,
                 device_name,
                 device_type,
                 can_receive,
@@ -483,6 +527,7 @@ impl RemoteControlHub {
                 let clean_name = device_name.trim().to_owned();
                 if device_id.is_empty()
                     || device_id.len() > 160
+                    || queue_device_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 300)
                     || clean_name.is_empty()
                     || clean_name.chars().count() > 80
                 {
@@ -522,6 +567,7 @@ impl RemoteControlHub {
                 let has_track = state.current_track.is_some();
                 if let Some(client) = guard.clients.get_mut(conn_id) {
                     client.device_id = Some(device_id);
+                    client.queue_device_id = queue_device_id;
                     client.device_name = clean_name;
                     client.device_type = device_type;
                     client.can_receive = can_receive;
@@ -582,6 +628,10 @@ impl RemoteControlHub {
                         target_id,
                         command,
                     } => {
+                        if !command.valid_queue_command() {
+                            Self::send_error_locked(&guard, conn_id, "Invalid queue command", Some(&request_id));
+                            return;
+                        }
                         if guard.transfers_by_user.contains_key(&user_id) {
                             Self::send_error_locked(
                                 &guard,
@@ -1135,6 +1185,32 @@ impl RemoteControlHub {
         Self::broadcast_devices_locked(guard, &user_id);
     }
 
+    /// Notifies other queue-aware devices that a committed account snapshot changed.
+    pub fn queue_changed(&self, user_id: &str, device_id: &str) {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shared_device = guard
+            .clients
+            .values()
+            .filter(|client| {
+                client.user_id == user_id && client.queue_device_id.as_deref() == Some(device_id)
+            })
+            .take(2)
+            .count()
+            == 2;
+        for client in guard.clients.values().filter(|client| {
+            client.user_id == user_id
+                && client
+                    .queue_device_id
+                    .as_deref()
+                    .is_some_and(|id| id != device_id || shared_device)
+        }) {
+            let _ = client.tx.try_send(json!({ "type": "QUEUE_CHANGED" }));
+        }
+    }
+
     fn broadcast_devices_locked(guard: &HubState, user_id: &str) {
         let active_conn = guard.active_player_by_user.get(user_id).map(String::as_str);
         let peers: Vec<&ConnectedClient> = guard
@@ -1148,6 +1224,7 @@ impl RemoteControlHub {
             .map(|c| {
                 json!({
                     "device_id": c.device_id,
+                    "queue_device_id": c.queue_device_id,
                     "device_name": c.device_name,
                     "device_type": c.device_type,
                     "is_active_player": active_conn == Some(c.conn_id.as_str()),
@@ -1196,5 +1273,41 @@ impl RemoteControlHub {
         if let Some(client) = guard.clients.get(conn_id) {
             let _ = client.tx.try_send(payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_notifications_only_reach_other_queue_aware_clients_on_the_account() {
+        let hub = RemoteControlHub::new();
+        let register = |user: &str, device: &str, queue_device_id: Option<&str>| {
+            let (id, receiver) = hub.connect_client(user, "fixture-session", 0).unwrap();
+            let message = serde_json::from_value(json!({
+                "type": "REGISTER", "device_id": device, "queue_device_id": queue_device_id,
+                "device_name": device, "device_type": "computer", "can_receive": false,
+                "state": { "current_track": null, "position_ms": 0, "duration_ms": 0, "playing": false, "volume": 1 }
+            })).unwrap();
+            hub.handle_message(&id, message);
+            receiver
+        };
+        let mut source = register("alice", "desktop", Some("desktop-queue"));
+        let mut follower = register("alice", "phone", Some("phone-queue"));
+        let mut legacy = register("alice", "legacy", None);
+        let mut outsider = register("bob", "tablet", Some("tablet-queue"));
+        for receiver in [&mut source, &mut follower, &mut legacy, &mut outsider] {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        hub.queue_changed("alice", "desktop-queue");
+        assert_eq!(
+            follower.try_recv().unwrap(),
+            json!({"type": "QUEUE_CHANGED"})
+        );
+        assert!(source.try_recv().is_err());
+        assert!(legacy.try_recv().is_err());
+        assert!(outsider.try_recv().is_err());
     }
 }

@@ -10,6 +10,15 @@ export interface QueueCheckpoint {
   context: { type: string; id: string; name: string; coverArt: string | null } | null; capturedAt: number;
 }
 export interface QueueContent { version: 2; entries: PersistedQueueEntry[] }
+
+export function sameQueueCheckpoint(first: QueueCheckpoint, second: QueueCheckpoint): boolean {
+  return Object.keys(first).every(key => {
+    const field = key as keyof QueueCheckpoint;
+    if (field === "capturedAt") return true;
+    return field === "context" ? JSON.stringify(first.context) === JSON.stringify(second.context)
+      : first[field] === second[field];
+  });
+}
 export interface QueueHead { owner: string; contentKey: string; checkpoint: QueueCheckpoint; sequence: number; updatedAt: number; serverContentId?: string }
 export interface LocalQueue { content: QueueContent; head: QueueHead; serialized: string; timing: { ioMs: number; decodeMs: number } }
 const DATABASE = "musicdeck-queues", VERSION = 1;
@@ -144,6 +153,7 @@ export async function writeQueueCheckpoint(owner: string, contentKey: string, ch
   const db = await openQueueDatabase(), tx = db.transaction("heads", "readwrite"), done = finished(tx), store = tx.objectStore("heads");
   const head = await result(store.get(owner)) as QueueHead | undefined;
   if (!head || head.contentKey !== contentKey || checkpoint.capturedAt < head.checkpoint.capturedAt) { await done; return null; }
+  if (sameQueueCheckpoint(head.checkpoint, checkpoint)) { await done; return head; }
   const next = { ...head, checkpoint, sequence: head.sequence + 1, updatedAt: Date.now() }; store.put(next); await done; return next;
 }
 export async function markQueueSynced(owner: string, contentKey: string, serverContentId: string | undefined): Promise<void> {

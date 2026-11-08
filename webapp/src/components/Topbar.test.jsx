@@ -38,6 +38,28 @@ function renderTopbar(user) {
   );
 }
 
+test("desktop title bar drags from nested header space while controls stay interactive", () => {
+  const startDragging = jest.fn(async () => {});
+  const invoke = jest.fn(async () => {});
+  window.__TAURI__ = { core: { invoke }, window: { getCurrentWindow: () => ({ startDragging }) } };
+  try {
+    const view = renderTopbar({ username: "sam", displayName: "Sam", role: "user" });
+    const center = view.container.querySelector(".topbar-center");
+    center.addEventListener("mousedown", event => event.stopPropagation());
+    fireEvent.mouseDown(center, { button: 0, detail: 1 });
+    fireEvent.mouseDown(view.container.querySelector(".topbar-brand-group"), { button: 0, detail: 1 });
+    fireEvent.mouseDown(screen.getByRole("textbox"), { button: 0, detail: 1 });
+    fireEvent.mouseDown(screen.getByRole("link", { name: "Home" }), { button: 0, detail: 1 });
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Minimize window" }), { button: 0, detail: 1 });
+    expect(startDragging).toHaveBeenCalledTimes(2);
+    expect(invoke).not.toHaveBeenCalled();
+    fireEvent.doubleClick(center, { button: 0 });
+    expect(invoke).toHaveBeenCalledWith("desktop_window_action", { action: "toggle-maximize" });
+  } finally {
+    delete window.__TAURI__;
+  }
+});
+
 test("shows a minimized playlist import in the header and reopens it", () => {
   const openProgress = jest.fn();
   useAuth.mockReturnValue({ session: { username: "sam", displayName: "Sam", role: "user" }, signOut: jest.fn() });

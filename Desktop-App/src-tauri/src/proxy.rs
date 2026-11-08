@@ -99,6 +99,8 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
 
     let mut content_length: usize = 0;
     let mut request_origin: Option<String> = None;
+    let mut websocket_upgrade = false;
+    let mut websocket_headers = Vec::new();
     let mut forwarded_headers: Vec<(String, String)> = Vec::new();
 
     for line in lines {
@@ -113,6 +115,13 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
                 content_length = value.parse::<usize>().unwrap_or(0);
             } else if lower == "origin" && !value.is_empty() && value != "null" {
                 request_origin = Some(value.to_string());
+            } else if lower == "upgrade" {
+                websocket_upgrade = value.eq_ignore_ascii_case("websocket");
+            } else if matches!(
+                lower.as_str(),
+                "sec-websocket-key" | "sec-websocket-version"
+            ) {
+                websocket_headers.push((key.to_string(), value.to_string()));
             } else if matches!(
                 lower.as_str(),
                 "content-type"
@@ -129,6 +138,19 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
 
     let cors_origin = request_origin.as_deref().unwrap_or("*");
+
+    if websocket_upgrade
+        && (!method_str.eq_ignore_ascii_case("GET")
+            || path_and_query != "/api/v1/remote"
+            || !is_desktop_websocket_origin(request_origin.as_deref())
+            || content_length != 0
+            || buf.len() != header_end)
+    {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
 
     if method_str.eq_ignore_ascii_case("OPTIONS") {
         let preflight = format!(
@@ -189,6 +211,15 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         for (k, v) in &forwarded_headers {
             req_builder = req_builder.header(k, v);
         }
+        if websocket_upgrade {
+            req_builder = req_builder
+                .version(reqwest::Version::HTTP_11)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket");
+            for (key, value) in &websocket_headers {
+                req_builder = req_builder.header(key, value);
+            }
+        }
 
         if let Some(ref token) = cookie_token {
             if !token.is_empty() {
@@ -232,6 +263,23 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         let _ = stream.flush().await;
         return;
     };
+
+    if websocket_upgrade && resp.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS {
+        let Some(accept) = resp
+            .headers()
+            .get("sec-websocket-accept")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return;
+        };
+        let response = format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+        if let Ok(mut upgraded) = resp.upgrade().await {
+            if stream.write_all(response.as_bytes()).await.is_ok() {
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upgraded).await;
+            }
+        }
+        return;
+    }
 
     // If an alternate port (e.g. :8080 instead of :4534) succeeded, persist it automatically.
     if active_base_url != configured_url {
@@ -300,6 +348,72 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
+}
+
+fn is_desktop_websocket_origin(origin: Option<&str>) -> bool {
+    matches!(
+        origin,
+        Some("http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost")
+    ) || (cfg!(debug_assertions) && origin == Some("http://localhost:3000"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn read_head(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            bytes.push(stream.read_u8().await.unwrap());
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_socket_tunnels_the_session_only_for_the_desktop_origin() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy.local_addr().unwrap();
+            let server_url = format!("http://{}", upstream.local_addr().unwrap());
+            let shared = Arc::new(ProxySharedState {
+                config: Arc::new(Mutex::new(DesktopConfig { server_url: server_url.clone(), ..Default::default() })),
+                ephemeral_cookie: Arc::new(Mutex::new(Some("fixture-session".into()))),
+                config_dir: std::env::temp_dir(),
+                client: reqwest::Client::new(),
+            });
+            let proxy_task = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = proxy.accept().await.unwrap();
+                    handle_proxy_connection(stream, shared.clone()).await;
+                }
+            });
+            let request = |origin: &str| format!("GET /api/v1/remote HTTP/1.1\r\nHost: {proxy_addr}\r\nOrigin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+            let mut rejected = TcpStream::connect(proxy_addr).await.unwrap();
+            rejected.write_all(request("https://outside.example").as_bytes()).await.unwrap();
+            assert!(read_head(&mut rejected).await.starts_with("HTTP/1.1 403"));
+
+            let mut desktop = TcpStream::connect(proxy_addr).await.unwrap();
+            desktop.write_all(request("http://tauri.localhost").as_bytes()).await.unwrap();
+            let (mut server, _) = upstream.accept().await.unwrap();
+            let headers = read_head(&mut server).await.to_ascii_lowercase();
+            assert!(headers.starts_with("get /api/v1/remote http/1.1\r\n"));
+            assert!(headers.contains(&format!("origin: {server_url}\r\n")));
+            assert!(headers.contains("cookie: musicdeck_session=fixture-session\r\n"));
+            server.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n").await.unwrap();
+            assert!(read_head(&mut desktop).await.starts_with("HTTP/1.1 101"));
+            desktop.write_all(b"ping").await.unwrap();
+            let mut payload = [0; 4];
+            server.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            server.write_all(b"pong").await.unwrap();
+            desktop.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"pong");
+            drop(server);
+            drop(desktop);
+            proxy_task.await.unwrap();
+        }).await.unwrap();
+    }
 }
 
 fn bind_proxy_listener() -> Option<std::net::TcpListener> {

@@ -113,7 +113,7 @@ function QueueSidebar({ isOpen, onClose }: { isOpen: boolean; onClose(): void })
   const windowed = useVirtualWindow(itemsRef, isOpen && virtual ? tracks.length : 0, 48, false, `${activeTab}:${isOpen}`);
   const first = virtual ? windowed.start : 0, end = virtual ? windowed.end : tracks.length;
   if (!isOpen) return null;
-  const emptyMessage = isQueueTab ? isRemotePlayback ? "The queue is on the active playback device. Transfer playback here to view or edit it." : "Your queue is empty." : "Nothing played yet.";
+  const emptyMessage = isQueueTab ? isRemotePlayback && !queue.length ? "Waiting for the active device’s queue." : "No tracks up next." : "Nothing played yet.";
   const sectionTitle = isQueueTab ? "Up next" : "Recently played";
 
   return (
