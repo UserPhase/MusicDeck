@@ -20,12 +20,18 @@ a { color: inherit; }
 }
 :root[data-visual-active="false"] :is(.ambient-background, .lyrics-reader-backdrop) { display: none; }
 
+:root:not([data-theme="light"]) :is(.main, .sidebar, .sidebar-panel, .right-sidebar, .queue-sidebar) {
+  border-color: rgb(255 255 255 / 5%);
+}
+
 /* Keep the desktop shell inexpensive to composite during playback. */
 :root[data-desktop-app="true"] :is(.ambient-background, .lyrics-reader-backdrop) { display: none; }
 :root[data-desktop-app="true"] :is(.topbar, .sidebar, .main, .sidebar-panel, .right-sidebar, .queue-sidebar, .player, .now-playing-next-queue, .activity-panel) {
-  background-color: color-mix(in srgb, var(--bg-app) 96%, var(--text));
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
+}
+:root[data-desktop-app="true"][data-theme="light"] :is(.sidebar, .sidebar-panel, .right-sidebar, .queue-sidebar, .now-playing-next-queue, .activity-panel) {
+  background-color: color-mix(in srgb, var(--bg-app) 96%, var(--text));
 }
 :root[data-desktop-app="true"] :is(.nav-drawer-scrim, .audio-inspector-backdrop, .remote-device-backdrop, .mix-builder-backdrop, .command-palette-backdrop, .playlist-modal-backdrop, .playlist-details-backdrop, .server-delete-backdrop) {
   backdrop-filter: none;

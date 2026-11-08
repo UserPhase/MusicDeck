@@ -5,6 +5,7 @@
 .homebutton:hover { border-color: var(--border-hover); }
 .topbar-end { justify-self: end; display: flex; align-items: center; gap: 10px; }
 .profile { position: relative; justify-self: end; display: flex; align-items: center; gap: 10px; padding: 5px 12px 5px 6px; background: var(--control-surface); border: 1px solid transparent; border-radius: 22px; color: var(--text-secondary); }
+:root:not([data-theme="light"]) .topbar-end > .profile { background: transparent; }
 .desktop-window-controls { display: inline-flex; align-items: center; gap: 2px; margin-left: 4px; -webkit-app-region: no-drag; }
 .desktop-window-btn { width: 36px; height: 32px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 6px; background: transparent; color: var(--text-secondary); cursor: pointer; transition: background 0.14s ease, color 0.14s ease; }
 .desktop-window-btn:hover { background: rgba(var(--tint-rgb, 255, 255, 255), 0.1); color: var(--text); }

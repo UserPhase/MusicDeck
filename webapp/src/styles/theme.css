@@ -1,15 +1,85 @@
 /*
  * Theme layer. Most colors adapt through tokens.css; this file holds the
- * remaining light-theme exceptions (one-off tints tuned for dark surfaces)
- * and the cross-fade used while switching themes.
+ * remaining theme-specific treatments and the cross-fade used while switching
+ * themes.
  */
+
+:root:not([data-theme="light"]) .sidebar :is([aria-labelledby="library-navigation"], .playlists-section) {
+  --nav-item-text: rgb(255 255 255 / 67%);
+}
+:root:not([data-theme="light"]) .sidebar .playlists-section :is(
+  .folder-toggle, .folder-playlist-meta, .folder-tree-empty,
+  .folder-playlist:not(.is-current) > .folder-tree-row .folder-playlist-name
+) { color: var(--nav-item-text); }
+:root:not([data-theme="light"]) .sidebar .playlists-section .folder-tree-row:hover {
+  --nav-item-text: var(--nav-hover-text);
+}
 
 :root:not([data-theme="light"]) .nav-icon-playlist-placeholder { color: currentColor; }
 :root:not([data-theme="light"]) .add-playlist { color: var(--nav-item-text); }
 :root:not([data-theme="light"]) .add-playlist:hover { color: var(--nav-hover-text); }
 :root:not([data-theme="light"]) .add-playlist-icon { color: var(--nav-item-text); }
 :root:not([data-theme="light"]) .add-playlist-icon:hover { color: var(--nav-hover-text); }
-:root:not([data-theme="light"]) .nav-loading { color: var(--nav-section-text); }
+:root:not([data-theme="light"]) :is(
+  .nav-loading, .home-section-state, .queue-sidebar-empty, .right-sidebar-empty
+) { color: var(--text-tertiary); }
+
+/* Raised surfaces use secondary ink for readable hints and empty states. */
+:root:not([data-theme="light"]) :is(
+  .playlist-modal-intro, .playlist-modal-option > span:nth-last-child(2),
+  .playlist-modal-option-arrow
+) { color: var(--text-secondary); }
+:root:not([data-theme="light"]) .command-palette-input-wrap input::placeholder { opacity: 1; }
+:root:not([data-theme="light"]) .playlist-modal-form :is(input, textarea)::placeholder {
+  color: var(--text-tertiary);
+  opacity: 1;
+}
+:root:not([data-theme="light"]) .playlist-modal-option { background-color: transparent; }
+:root:not([data-theme="light"]) .playlist-modal-option:is(:hover, :focus-visible) {
+  background: var(--nav-hover);
+}
+:root:not([data-theme="light"]) .playlist-modal-option:is(:hover, :focus-visible) > :is(
+  span:nth-last-child(2), .playlist-modal-option-arrow
+) { color: var(--nav-hover-text); }
+
+:root:not([data-theme="light"]) :is(
+  .sidebar-panel-header h2, .right-sidebar-section-heading h3, .now-playing-next-header h3,
+  .track.is-current-track .track-title, .right-sidebar-track.current .right-sidebar-track-title,
+  .widget-track.is-current .widget-track-title, .now-playing-next-track .queue-sidebar-track-title,
+  .topbar-page-icon[aria-current="page"]
+) { color: var(--text); }
+
+:root:not([data-theme="light"]) .nav-item:not(.active):focus-visible {
+  background-color: var(--nav-hover);
+  color: var(--nav-hover-text);
+}
+
+:root:not([data-theme="light"]) :is(
+  .track, .queue-sidebar-track:not([data-dragging]), .right-sidebar-track:not(.current),
+  .widget-track, .search-dropdown-song
+):is(:hover, :focus-within) { background-color: var(--nav-hover); }
+
+:root:not([data-theme="light"]) :is(
+  .track, .queue-sidebar-track, .right-sidebar-track, .widget-track, .search-dropdown-song
+):is(:hover, :focus-within) :is(
+  .track-artist, .track-album, .track-duration, .track-artist-link, .track-album-link,
+  .queue-sidebar-track-artist, .queue-sidebar-track-duration, .queue-sidebar-track-index, .queue-sidebar-track-reason,
+  .right-sidebar-track-artist, .right-sidebar-track-duration, .widget-track-artist, .search-dropdown-artist
+) { color: var(--nav-hover-text); }
+
+@media (prefers-reduced-motion: no-preference) {
+  :root:not([data-theme="light"]) :is(
+    .track, .queue-sidebar-track:not(.queue-sidebar-track-sortable), .right-sidebar-track,
+    .widget-track, .search-dropdown-song
+  ) { transition: color 150ms ease, background-color 150ms ease; }
+  :root:not([data-theme="light"]) :is(
+    .track-artist-link, .track-album-link, .track-duration, .queue-sidebar-track-artist,
+    .queue-sidebar-track-duration, .queue-sidebar-track-index, .queue-sidebar-track-reason, .right-sidebar-track-artist,
+    .right-sidebar-track-duration, .widget-track-artist, .search-dropdown-artist,
+    .playlist-modal-option > :is(span:nth-last-child(2), .playlist-modal-option-arrow),
+    .sidebar .playlists-section :is(.folder-toggle, .folder-playlist-name, .folder-playlist-meta)
+  ) { transition: color 150ms ease; }
+}
 
 /* Softer physical depth on light surfaces. */
 :root[data-theme="light"] {
