@@ -201,3 +201,15 @@ test("audio quality sits beside the song title and devices sit beside Queue with
   expect(within(dialog).getByRole("button", { name: "Cast to a speaker" })).toBeInTheDocument();
   expect(cast.connect).not.toHaveBeenCalled();
 });
+
+test("the mobile player exposes the device picker beside Now Playing", () => {
+  const cast = { supported: true, allowed: true, available: false, connected: false, device: "", loading: false, error: "", volume: null,
+    connect: jest.fn(), disconnect: jest.fn() };
+  const { container } = render(<MemoryRouter><CastContext.Provider value={cast}>
+    <Player mobile />
+  </CastContext.Provider></MemoryRouter>);
+  const picker = screen.getByRole("button", { name: "Choose playback device" });
+  expect(container.querySelector(".player-audio-tools-mobile")).toContainElement(picker);
+  fireEvent.click(picker);
+  expect(screen.getByRole("dialog", { name: "Choose where it plays." })).toBeInTheDocument();
+});

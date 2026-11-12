@@ -1,12 +1,18 @@
 use super::*;
 use crate::auth::SESSION_COOKIE;
-use crate::config::AppConfig;
+use crate::catalog::{LibraryItemType, SourceRef};
+use crate::config::{AppConfig, NavidromeConfig};
 use crate::db::run_migrations;
+use crate::providers::{NavidromeClient, RegisteredProvider};
+use crate::routes::playlists::playlist_routes;
 use axum::body::Body;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use http::Request;
 use http_body_util::BodyExt;
 use sqlx::Row;
+use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Duration as Timeout;
 use tower::ServiceExt;
 
@@ -53,19 +59,33 @@ fn playback_event(seconds: f64, finished: bool) -> Value {
 }
 
 async fn report(state: &AppState, session: &str, event: &Value) -> (StatusCode, Value) {
-    let response = music_routes()
+    json_response(request(state, session, "POST", "/api/listening-events", Some(event)).await).await
+}
+
+async fn request(
+    state: &AppState,
+    session: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Response {
+    music_routes()
+        .merge(playlist_routes())
         .with_state(state.clone())
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/api/listening-events")
+                .method(method)
+                .uri(path)
                 .header("content-type", "application/json")
                 .header("cookie", format!("{SESSION_COOKIE}={session}"))
-                .body(Body::from(event.to_string()))
+                .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
                 .expect("request"),
         )
         .await
-        .expect("response");
+        .expect("response")
+}
+
+async fn json_response(response: Response) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = response
         .into_body()
@@ -77,6 +97,236 @@ async fn report(state: &AppState, session: &str, event: &Value) -> (StatusCode, 
         status,
         serde_json::from_slice(&bytes).expect("JSON response"),
     )
+}
+
+fn fixture_cover(color: u8) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([color, 80, 150, 255]));
+    let mut bytes = Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode fixture cover");
+    bytes.into_inner()
+}
+
+async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind library fixture");
+    let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+    sqlx::query(
+        "INSERT INTO backend_connections (id, type, name, config_json, enabled, created_at, updated_at)
+         VALUES ('fixture-library', 'navidrome', 'Fixture', '{}', 1, '2026-01-01', '2026-01-01')",
+    )
+    .execute(db.inner())
+    .await
+    .expect("store fixture connection");
+    let provider = NavidromeClient::new(NavidromeConfig {
+        url,
+        username: String::from("fixture"),
+        password: String::from("fixture"),
+    })
+    .expect("create fixture provider");
+    state.providers().replace_all(vec![RegisteredProvider {
+        connection_id: String::from("fixture-library"),
+        provider_type: String::from("navidrome"),
+        name: String::from("Fixture"),
+        enabled: true,
+        provider: Arc::new(provider),
+    }]);
+
+    tokio::spawn(async move {
+        let router = Router::new()
+            .route(
+                "/rest/getSong.view",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    let id = &params["id"];
+                    Json(json!({"subsonic-response": {"status": "ok", "song": {
+                        "id": id, "title": format!("Song {id}"), "artist": "Fixture Artist",
+                        "album": "Fixture Album", "duration": 205, "coverArt": id
+                    }}}))
+                }),
+            )
+            .route(
+                "/rest/getCoverArt.view",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    let color = params["id"].parse().expect("fixture cover ID");
+                    (
+                        [(http::header::CONTENT_TYPE, "image/png")],
+                        fixture_cover(color),
+                    )
+                }),
+            );
+        axum::serve(listener, router)
+            .await
+            .expect("serve fixture library");
+    })
+}
+
+#[tokio::test]
+async fn recently_played_returns_track_details_for_recorded_and_legacy_plays() {
+    let (db, state, session) = playback_state(false).await;
+    let provider = add_fixture_library(&db, &state).await;
+    let legacy_id = LibraryService::new(db.clone(), None)
+        .ensure_id(
+            LibraryItemType::Track,
+            &SourceRef {
+                connection_id: String::from("fixture-library"),
+                provider_item_id: String::from("1"),
+            },
+            None,
+        )
+        .await
+        .expect("map legacy song");
+    let legacy_time = (Utc::now() - Duration::days(1)).to_rfc3339();
+    add_recently_played(
+        &db,
+        "listener",
+        &legacy_id,
+        Some(&legacy_time),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("store legacy song");
+    let mut event = playback_event(180.0, true);
+    event["track"]["coverArt"] = json!("mdart_fixture");
+    assert_eq!(report(&state, &session, &event).await.0, StatusCode::OK);
+    let latest_play = Utc::now().to_rfc3339();
+    add_recently_played(
+        &db,
+        "listener",
+        "track-1",
+        Some(&latest_play),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("store duplicate play");
+    add_recently_played(&db, "listener", "private-song", None, true, None, None)
+        .await
+        .expect("store private play");
+
+    let (status, result) = json_response(
+        request(
+            &state,
+            &session,
+            "GET",
+            "/api/recently-played?tasteOnly=1",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let tracks = result["tracks"].as_array().expect("recent tracks");
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0]["id"], "track-1");
+    assert_eq!(tracks[0]["title"], "Roygbiv");
+    assert_eq!(tracks[0]["artist"], "Boards of Canada");
+    assert_eq!(tracks[0]["coverArt"], "mdart_fixture");
+    assert_eq!(tracks[0]["duration"], 180.0);
+    assert_eq!(tracks[0]["playedAt"], latest_play);
+    assert_eq!(tracks[1]["trackId"], legacy_id);
+    assert_eq!(tracks[1]["title"], "Song 1");
+    assert_eq!(tracks[1]["artistName"], "Fixture Artist");
+    assert_eq!(tracks[1]["durationSeconds"], 205);
+    assert!(tracks[1]["artworkId"].is_string());
+    assert_eq!(tracks[1]["playedAt"], legacy_time);
+    provider.abort();
+}
+
+#[tokio::test]
+async fn playlist_artwork_uses_the_first_four_tracks_and_keeps_custom_covers() {
+    let (db, state, session) = playback_state(false).await;
+    let provider = add_fixture_library(&db, &state).await;
+    let (status, result) = json_response(
+        request(
+            &state,
+            &session,
+            "POST",
+            "/api/playlists",
+            Some(&json!({"name": "Fixture playlist"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    let id = result["playlist"]["id"].as_str().expect("playlist ID");
+    let (status, result) = json_response(
+        request(
+            &state,
+            &session,
+            "POST",
+            &format!("/api/v1/playlists/{id}/tracks/batch"),
+            Some(&json!({"action": "add", "trackIds": ["3", "1", "4", "2", "5"]})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let token = result["playlist"]["artworkId"]
+        .as_str()
+        .expect("artwork ID");
+    let response = request(
+        &state,
+        &session,
+        "GET",
+        &format!("/api/artwork/{token}?size=64"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[http::header::CONTENT_TYPE],
+        "image/svg+xml"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("read collage")
+        .to_bytes();
+    let svg = std::str::from_utf8(&body).expect("SVG document");
+    let expected = [3, 1, 4, 2].map(|color| {
+        format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(fixture_cover(color))
+        )
+    });
+    let tiles: Vec<_> = svg
+        .split("href=\"")
+        .skip(1)
+        .map(|tile| tile.split('"').next().unwrap())
+        .collect();
+    assert_eq!(tiles, expected);
+
+    let custom = fixture_cover(99);
+    crate::playlists::PlaylistArtworkService::new(db)
+        .set_custom(id, &custom, "image/png")
+        .await
+        .expect("store custom cover");
+    let response = request(
+        &state,
+        &session,
+        "GET",
+        &format!("/api/playlists/{id}/artwork"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[http::header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("read custom artwork")
+            .to_bytes(),
+        custom
+    );
+    provider.abort();
 }
 
 async fn queue_count(db: &DbPool) -> i64 {

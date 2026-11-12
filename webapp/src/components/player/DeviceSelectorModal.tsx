@@ -20,7 +20,8 @@ function DeviceRow({ device, current, disabled, onTransfer, onVolume }: {
   return <li className={`remote-device${device.is_active_player ? " is-active" : ""}`}>
     <div className="remote-device-symbol" aria-hidden="true">{device.device_type === "computer" ? "PC" : device.device_type === "phone" ? "PH" : "WEB"}</div>
     <div className="remote-device-copy"><strong>{device.device_name}{current ? " / This device" : ""}</strong>
-      <span>{device.is_active_player ? "Active player" : device.can_receive ? "Ready to receive" : "Playback permission needed"}</span>
+      <span>{device.is_active_player ? (device.playing ? "Playing" : device.current_track ? "Paused" : "Selected player")
+        : device.can_receive || current ? "Available" : "Enable playback on this device first"}</span>
       {device.current_track && <small>{device.current_track.title} / {time(device.position_ms)}</small>}
       <label className="remote-device-volume">Volume <output>{Math.round(volume * 100)}%</output>
         <input type="range" min={0} max={1} step={.01} value={volume} disabled={disabled}
@@ -32,9 +33,9 @@ function DeviceRow({ device, current, disabled, onTransfer, onVolume }: {
           onBlur={() => { dragging.current = false; }} />
       </label>
     </div>
-    <button type="button" className="remote-transfer" disabled={disabled || device.is_active_player || !device.can_receive}
+    <button type="button" className="remote-transfer" disabled={disabled || device.is_active_player || (!current && !device.can_receive)}
       onClick={onTransfer} aria-label={`Transfer playback to ${device.device_name}`}>
-      {device.is_active_player ? "Active" : "Play here"}
+      {device.is_active_player ? "Selected" : "Play here"}
     </button>
   </li>;
 }
@@ -77,19 +78,24 @@ export default function DeviceSelectorModal({ onClose }: { onClose(): void }) {
       <header><div><p className="remote-device-eyebrow">MUSICDECK / LISTENING NETWORK</p><h2 id={`${id}-title`}>Choose where it plays.</h2></div>
         <button type="button" ref={close} onClick={onClose} aria-label="Close device selector">Close</button></header>
       <p id={`${id}-description`}>Choose a device signed in to MusicDeck, or connect to a Chromecast, speaker or TV.</p>
-      {remote && <div className="remote-connection" role="status"><span aria-hidden="true" />{remote.status === "connected" ? "Connected / Local network or server relay"
+      {remote && <div className="remote-connection" role="status"><span aria-hidden="true" />{remote.status === "connected" ? "Connected to your account"
         : remote.status === "reconnecting" ? "Reconnecting to device control..." : remote.status === "connecting" ? "Connecting to device control..." : "Device control unavailable"}</div>}
       {remote && <div className="remote-local-settings"><label>Device name<input maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></label>
         <button type="button" disabled={!name.trim()} onClick={() => { remote.rename(name); setNotice("Device name updated for this tab."); }}>Save name</button>
         <button type="button" disabled={remote.enabled || enabling || remote.status !== "connected"} onClick={() => { void enable(); }}>
           {enabling ? "Enabling..." : remote.enabled ? "Playback enabled" : "Enable playback on this device"}</button></div>}
       {!remote?.devices.length ? <p className="remote-empty">No online devices yet. Open MusicDeck on another device using the same account.</p>
-        : <ul className="remote-device-list">{remote.devices.map((device) => <DeviceRow key={device.device_id} device={device}
+        : <ul className="remote-device-list">{[...remote.devices].sort((a, b) => Number(b.is_active_player) - Number(a.is_active_player) ||
+          Number(b.device_id === remote.deviceId) - Number(a.device_id === remote.deviceId) || a.device_name.localeCompare(b.device_name))
+          .map((device) => <DeviceRow key={device.device_id} device={device}
           current={device.device_id === remote.deviceId} disabled={remote.busy || remote.status !== "connected"}
-          onTransfer={() => {
+          onTransfer={async () => {
             setNotice("");
-            void remote.transfer(device.device_id).then(() => setNotice(`Playback transferred to ${device.device_name}.`))
-              .catch((error: unknown) => console.error("Playback transfer failed:", error));
+            try {
+              if (device.device_id === remote.deviceId && !remote.enabled) await remote.enable();
+              await remote.transfer(device.device_id);
+              setNotice(`${device.device_name} is now your playback device.`);
+            } catch (error) { console.error("Playback transfer failed:", error); }
           }}
           onVolume={(volume) => { void remote.command({ type: "SET_VOLUME", volume }, device.device_id)
             .catch((error: unknown) => console.error("Remote volume failed:", error)); }} />)}</ul>}

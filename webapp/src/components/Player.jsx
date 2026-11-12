@@ -118,6 +118,7 @@ function Player({
   onToggleQueueSidebar,
   variant = "bar",
   actions = null,
+  mobile = false,
 }) {
 
   const player = usePlayer();
@@ -286,7 +287,10 @@ function Player({
           </button>
 
         )}
-        <div className="player-audio-tools-mobile"><PlayerAudioTools /></div>
+        {mobile && <div className="player-audio-tools-mobile" role="group" aria-label="Playback devices">
+          <PlayerAudioTools />
+          <DeviceSelectorButton compact />
+        </div>}
 
 
       </div>
@@ -488,10 +492,10 @@ function Player({
         </div>
 
 
-        <div className="player-streaming-controls" role="group" aria-label="Playback devices">
+        {!mobile && <div className="player-streaming-controls" role="group" aria-label="Playback devices">
           <PlayerAudioTools />
           <DeviceSelectorButton compact />
-        </div>
+        </div>}
 
         {/* =============================== */}
         {/* VOLUME */}

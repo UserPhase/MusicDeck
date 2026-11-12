@@ -25,14 +25,18 @@ pub const RECENTLY_PLAYED_RETENTION: i64 = 100;
 /// Rolling window in days (`45`) for recently played queries.
 pub const LISTENING_WINDOW_DAYS: i64 = 45;
 
-/// Deduplicated recently played entry from `recently_played` or `taste_recently_played`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deduplicated play from listening history or the legacy recently played table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecentlyPlayedEntry {
     /// Stable MusicDeck track ID.
     pub track_id: String,
     /// ISO-8601 timestamp of the most recent play.
     pub played_at: String,
+    #[serde(skip)]
+    pub(crate) track_json: Option<String>,
+    #[serde(skip)]
+    pub(crate) duration_seconds: Option<f64>,
 }
 
 /// Computes the ISO-8601 cutoff timestamp for [`LISTENING_WINDOW_DAYS`] ago.
@@ -112,8 +116,7 @@ pub async fn add_recently_played(
     Ok(id)
 }
 
-/// Queries the most recent [`RECENTLY_PLAYED_LIMIT`] (`50`) distinct track plays for `user_id`
-/// within the 45-day window (`taste_only = true` queries the `taste_recently_played` view).
+/// Queries distinct tracks from counted listening events and older recently played rows.
 pub async fn list_recently_played_entries(
     pool: &DbPool,
     user_id: &str,
@@ -124,15 +127,35 @@ pub async fn list_recently_played_entries(
     } else {
         "recently_played"
     };
+    let events = if taste_only {
+        "taste_listening_events"
+    } else {
+        "listening_events"
+    };
     let cutoff = listening_window_start_iso();
     let sql = format!(
         r"
-        SELECT track_id, MAX(played_at) AS played_at
-        FROM {table}
-        WHERE user_id = ? AND played_at >= ?
-        GROUP BY track_id
-        ORDER BY played_at DESC
-        LIMIT ?;
+        WITH plays AS (
+            SELECT track_id, played_at, NULL AS track_json, NULL AS duration_seconds
+            FROM {table}
+            WHERE user_id = ?1 AND played_at >= ?2
+            UNION ALL
+            SELECT track_id, created_at, track_json, duration_seconds
+            FROM {events}
+            WHERE user_id = ?1 AND created_at >= ?2 AND counted = 1
+        ), ranked AS (
+            SELECT *, MAX(played_at) OVER (PARTITION BY track_id) AS latest_played_at,
+            ROW_NUMBER() OVER (
+                PARTITION BY track_id
+                ORDER BY track_json IS NULL, played_at DESC
+            ) AS play_rank
+            FROM plays
+        )
+        SELECT track_id, latest_played_at AS played_at, track_json, duration_seconds
+        FROM ranked
+        WHERE play_rank = 1
+        ORDER BY latest_played_at DESC, track_id
+        LIMIT ?3;
         "
     );
 
@@ -148,6 +171,8 @@ pub async fn list_recently_played_entries(
         out.push(RecentlyPlayedEntry {
             track_id: row.try_get("track_id")?,
             played_at: row.try_get("played_at")?,
+            track_json: row.try_get("track_json")?,
+            duration_seconds: row.try_get("duration_seconds")?,
         });
     }
     Ok(out)

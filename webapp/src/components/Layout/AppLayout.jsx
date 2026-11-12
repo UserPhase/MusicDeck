@@ -121,7 +121,7 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
 
   let player = null;
   if (shell === MOBILE_LAYOUT_SHELL || config.player === "bar") {
-    player = <Player key="player-bar" isQueueSidebarOpen={activeSidebar === "queue"} onToggleQueueSidebar={toggleQueue} />;
+    player = <Player key="player-bar" mobile={isMobile} isQueueSidebarOpen={activeSidebar === "queue"} onToggleQueueSidebar={toggleQueue} />;
   } else if (config.player === "drawer") {
     player = <DrawerPlayerBar key="player-drawer" />;
   }

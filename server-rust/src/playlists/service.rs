@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Acquire, Row};
@@ -30,10 +31,11 @@ use thiserror::Error;
 
 use crate::auth::SessionUser;
 use crate::avatars::avatar_url_for;
-use crate::catalog::{CatalogService, LibraryService, SourceResolver};
+use crate::catalog::{CatalogService, LibraryService, SourceRef, SourceResolver};
 use crate::db::{DbError, DbPool, create_id};
 use crate::playlists::artwork::{
     COLLAGE_TILE_COUNT, PlaylistArtworkMode, PlaylistArtworkService, RenderedArtwork,
+    load_svg_tile, resolve_artwork_size,
 };
 
 /// Sharing visibility mode on `playlists.sharing_mode` (Migration 45).
@@ -389,7 +391,7 @@ impl PlaylistService {
             return Ok(None);
         }
 
-        let items = self.fetch_item_rows(playlist_id).await?;
+        let items = self.fetch_item_rows(playlist_id, -1).await?;
         let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         let tracks = self.hydrate_items(&items).await;
 
@@ -700,7 +702,7 @@ impl PlaylistService {
             return Err(PlaylistError::AccessDenied);
         }
 
-        let items = self.fetch_item_rows(playlist_id).await?;
+        let items = self.fetch_item_rows(playlist_id, -1).await?;
         let mut by_lib_id: HashMap<String, String> = HashMap::new();
         let mut by_prov_id: HashMap<String, String> = HashMap::new();
         for item in &items {
@@ -1050,42 +1052,60 @@ impl PlaylistService {
             }));
         }
 
-        let items = self.fetch_item_rows(playlist_id).await?;
-        let leading: Vec<&RawPlaylistItemRow> = items.iter().take(COLLAGE_TILE_COUNT).collect();
-        if leading.is_empty() {
+        let items = self
+            .fetch_item_rows(playlist_id, COLLAGE_TILE_COUNT as i64)
+            .await?;
+        if items.is_empty() {
             return Ok(None);
         }
 
-        let mut artwork_ids = Vec::new();
-        for item in leading {
-            if item.external_track_json.is_some() {
-                continue;
-            }
-            if let Some(ref lib_id) = item.library_track_id {
-                let candidates = self.resolver.candidate_sources(lib_id, None).await;
-                for candidate in candidates {
-                    if let Ok(Some(track)) = candidate
-                        .provider
-                        .provider
-                        .get_track(&candidate.source.provider_item_id)
-                        .await
-                        && let Ok(stamped) = self
-                            .catalog
-                            .stamp_track(track, &candidate.source.connection_id)
-                            .await
-                        && let Some(art_id) = stamped.item.artwork_id
-                    {
-                        artwork_ids.push(art_id);
-                        break;
+        let edge = resolve_artwork_size(size);
+        let tile_size = if items.len() == 1 {
+            edge
+        } else {
+            edge.div_ceil(2)
+        };
+        let tiles = join_all(
+            items
+                .iter()
+                .filter(|item| item.external_track_json.is_none())
+                .map(|item| async move {
+                    let candidates = if let Some(id) = &item.library_track_id {
+                        self.resolver.candidate_sources(id, None).await
+                    } else {
+                        self.resolver
+                            .candidate_for_source(SourceRef {
+                                connection_id: item.connection_id.clone(),
+                                provider_item_id: item.provider_track_id.clone(),
+                            })
+                            .into_iter()
+                            .collect()
+                    };
+                    for candidate in candidates {
+                        let provider = &candidate.provider.provider;
+                        if let Ok(Some(track)) =
+                            provider.get_track(&candidate.source.provider_item_id).await
+                            && let Some(artwork_id) = track.artwork_id
+                            && let Ok(result) =
+                                provider.fetch_artwork(&artwork_id, Some(tile_size)).await
+                            && result.status.is_success()
+                            && let Some(tile) = load_svg_tile(result.response).await
+                        {
+                            let key = format!("{}:{artwork_id}", candidate.source.connection_id);
+                            return Some((key, tile));
+                        }
                     }
-                }
-            }
-        }
+                    None
+                }),
+        )
+        .await;
+        let (artwork_ids, data_url_tiles): (Vec<_>, Vec<_>) = tiles.into_iter().flatten().unzip();
 
-        Ok(Some(
-            self.artwork
-                .get_or_cache_svg_collage(&artwork_ids, &[], size),
-        ))
+        Ok(Some(self.artwork.get_or_cache_svg_collage(
+            &artwork_ids,
+            &data_url_tiles,
+            size,
+        )))
     }
 
     async fn fetch_playlist_row(
@@ -1103,6 +1123,7 @@ impl PlaylistService {
     async fn fetch_item_rows(
         &self,
         playlist_id: &str,
+        limit: i64,
     ) -> Result<Vec<RawPlaylistItemRow>, PlaylistError> {
         let rows = sqlx::query(
             r"
@@ -1110,10 +1131,12 @@ impl PlaylistService {
             FROM playlist_items i
             LEFT JOIN users u ON u.id = i.added_by_user_id
             WHERE i.playlist_id = ?
-            ORDER BY i.position ASC;
+            ORDER BY i.position ASC
+            LIMIT ?;
             ",
         )
         .bind(playlist_id)
+        .bind(limit)
         .fetch_all(self.db.inner())
         .await?;
 

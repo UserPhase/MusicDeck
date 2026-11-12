@@ -34,6 +34,7 @@ use axum::http::header::RANGE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1558,10 +1559,56 @@ async fn get_recently_played_handler(
     };
 
     let taste_only = params.get("tasteOnly").is_some_and(|v| v == "1");
-    match list_recently_played_entries(db, &auth.user.id, taste_only).await {
-        Ok(entries) => Json(json!({ "tracks": entries })).into_response(),
-        Err(err) => ServerError::Database(err).into_response(),
-    }
+    let entries = match list_recently_played_entries(db, &auth.user.id, taste_only).await {
+        Ok(entries) => entries,
+        Err(err) => return ServerError::Database(err).into_response(),
+    };
+    let catalog = CatalogService::from_pool(db.clone(), state.providers().clone());
+    let tracks = stream::iter(entries)
+        .map(|entry| {
+            let catalog = &catalog;
+            async move {
+                let snapshot = entry
+                    .track_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                let known_title = snapshot["title"].as_str().is_some_and(|title| {
+                    !matches!(title.trim(), "" | "Unknown title" | "Unavailable track")
+                });
+                let known_artist = snapshot["artist"]
+                    .as_str()
+                    .or_else(|| snapshot["artistName"].as_str())
+                    .is_some_and(|artist| !matches!(artist.trim(), "" | "Unknown artist"));
+                let mut track = if known_title && known_artist {
+                    snapshot
+                } else {
+                    catalog
+                        .get_track(&entry.track_id)
+                        .await
+                        .and_then(|track| serde_json::to_value(track).ok())
+                        .unwrap_or(snapshot)
+                };
+                if track["title"]
+                    .as_str()
+                    .is_none_or(|title| matches!(title.trim(), "" | "Unknown title"))
+                {
+                    track["title"] = json!("Unavailable track");
+                }
+                if track["duration"].is_null() && track["durationSeconds"].is_null() {
+                    track["duration"] = json!(entry.duration_seconds);
+                }
+                track["id"] = json!(entry.track_id);
+                track["trackId"] = json!(entry.track_id);
+                track["playedAt"] = json!(entry.played_at);
+                track
+            }
+        })
+        .buffered(4)
+        .collect::<Vec<_>>()
+        .await;
+    Json(json!({ "tracks": tracks })).into_response()
 }
 
 async fn post_recently_played_handler(

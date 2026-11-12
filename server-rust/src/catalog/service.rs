@@ -577,7 +577,9 @@ impl CatalogService {
     pub async fn get_track(&self, track_id: &str) -> Option<Available<Track>> {
         let sources = self.library.get_sources(track_id).await.ok()?;
         for src in sources {
-            let entry = self.registry.get_by_connection_id(&src.connection_id)?;
+            let Some(entry) = self.registry.get_by_connection_id(&src.connection_id) else {
+                continue;
+            };
             if !entry.enabled {
                 continue;
             }

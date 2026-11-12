@@ -1,5 +1,5 @@
 import type { MediaResumeContext } from "../services/mediaSessions";
-import type { PersistedQueueTrack } from "../services/storage/QueueDatabase";
+import type { PersistedQueueTrack, QueueCheckpoint } from "../services/storage/QueueDatabase";
 
 export type RemoteCommand =
   | { type: "PLAY" } | { type: "PAUSE" }
@@ -9,9 +9,10 @@ export type RemoteCommand =
   | { type: "TOGGLE_SHUFFLE" | "TOGGLE_REPEAT" }
   | { type: "PLAY_QUEUE_ENTRY"; entry_id: string }
   | { type: "MOVE_QUEUE_ENTRY"; entry_id: string; target_id: string }
+  | { type: "PLAY_SELECTION"; tracks: PersistedQueueTrack[]; start_index: number; from_here: boolean; context: QueueCheckpoint["context"] }
   | { type: "ENQUEUE"; tracks: PersistedQueueTrack[]; next: boolean; dedupe: boolean };
 export interface RemotePlayerState {
-  current_track: { id: string; title: string } | null;
+  current_track: { id: string; title: string; artist?: string; album?: string; cover_art?: string } | null;
   position_ms: number; duration_ms: number; playing: boolean; volume: number;
 }
 export interface RemoteDevice extends RemotePlayerState {

@@ -104,10 +104,7 @@ impl SourceResolver {
 
         let mut candidates: Vec<CandidateSource> = sources
             .into_iter()
-            .filter_map(|source| {
-                let provider = self.registry.get_by_connection_id(&source.connection_id)?;
-                provider.enabled.then_some(CandidateSource { source, provider })
-            })
+            .filter_map(|source| self.candidate_for_source(source))
             .collect();
 
         candidates.sort_by_key(|c| {
@@ -123,6 +120,14 @@ impl SourceResolver {
         });
 
         candidates
+    }
+
+    /// Resolves a provider-native source without requiring a library mapping.
+    pub(crate) fn candidate_for_source(&self, source: SourceRef) -> Option<CandidateSource> {
+        let provider = self.registry.get_by_connection_id(&source.connection_id)?;
+        provider
+            .enabled
+            .then_some(CandidateSource { source, provider })
     }
 
     /// Returns `true` if at least one enabled provider source is mapped for `library_item_id`.

@@ -57,6 +57,17 @@ test("disconnected, busy and error states disable unsafe actions and remain expl
   expect(value.clearError).toHaveBeenCalledTimes(1);
 });
 
+test("unlocks this phone from the Play here tap before requesting playback", async () => {
+  const value = session({ deviceId: "phone", enabled: false, isRemote: true });
+  value.devices[1].can_receive = false;
+  render(<RemoteSessionContext.Provider value={value}><DeviceSelectorButton /></RemoteSessionContext.Provider>);
+  fireEvent.click(screen.getByRole("button", { name: "Choose playback device" }));
+  fireEvent.click(screen.getByRole("button", { name: "Transfer playback to Phone" }));
+  await waitFor(() => expect(value.transfer).toHaveBeenCalledWith("phone"));
+  expect(value.enable).toHaveBeenCalledTimes(1);
+  expect(jest.mocked(value.enable).mock.invocationCallOrder[0]).toBeLessThan(jest.mocked(value.transfer).mock.invocationCallOrder[0]);
+});
+
 test("Google Cast is grouped in the same device dialog and starts only from an explicit user action", async () => {
   const cast: CastControl = { available: false, connected: false, device: "", loading: false, error: "", volume: null,
     supported: true, allowed: true, connect: jest.fn(async () => {}), disconnect: jest.fn(async () => {}) };

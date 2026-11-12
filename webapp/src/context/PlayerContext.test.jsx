@@ -2437,7 +2437,8 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
 test("remote now-playing and transport controls reflect the selected device without echoing target commands", async () => {
   let adapter;
   const active = { device_id: "desk", queue_device_id: "desk-queue", device_name: "Desk", device_type: "computer", is_active_player: true, can_receive: true,
-    current_track: { id: "remote-song", title: "Remote set" }, position_ms: 42125, duration_ms: 600000, playing: true, volume: .8 };
+    current_track: { id: "remote-song", title: "Remote set", artist: "Remote artist", cover_art: "mdart_remote" },
+    position_ms: 42125, duration_ms: 600000, playing: true, volume: .8 };
   const checkpoint = { index: 0, position: 42, repeatOne: false, shuffle: false, shuffleSeed: null,
     shuffleMode: "standard", albumAware: false, volume: .8, wasPlaying: true, context: null, capturedAt: Date.now() };
   request.mockImplementation(async (url) => url.endsWith("/content/desk-content")
@@ -2449,10 +2450,19 @@ test("remote now-playing and transport controls reflect the selected device with
     return { status: "connected", devices: [active], deviceId: "phone", activeDevice: active, isRemote: true,
       enabled: true, busy: false, error: "", name: "Phone", command, transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
   });
-  const view = renderPlayer();
+  function LocalRestore() {
+    const { currentSong, restoreSavedQueue } = usePlayer();
+    return <>
+      <div data-testid="live-metadata">{currentSong?.artist} / {currentSong?.coverArt}</div>
+      <button onClick={() => restoreSavedQueue({ version: 2, entries: [{ entryId: "local-saved", track: songs[0] }] },
+        { ...checkpoint, wasPlaying: false })}>restore-local-queue</button>
+    </>;
+  }
+  const view = renderPlayer({ children: <><PlayerHarness /><LocalRestore /></> });
   try {
     await playerReady();
     expect(screen.getByTestId("current-song")).toHaveTextContent("remote-song");
+    expect(screen.getByTestId("live-metadata")).toHaveTextContent("Remote artist / mdart_remote");
     expect(screen.getByTestId("current-time")).toHaveTextContent("42.125");
     expect(screen.getByTestId("volume")).toHaveTextContent("0.8");
     await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("remote-song,song-1,song-2"));
@@ -2460,7 +2470,50 @@ test("remote now-playing and transport controls reflect the selected device with
     expect(command).toHaveBeenCalledWith({ type: "MOVE_QUEUE_ENTRY", entry_id: "desk-1", target_id: "desk-2" });
     fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
     expect(command).toHaveBeenCalledWith({ type: "PAUSE" });
+    fireEvent.click(screen.getByRole("button", { name: "direct" }));
+    expect(command).toHaveBeenLastCalledWith({
+      type: "PLAY_SELECTION", tracks: [expect.objectContaining({ id: "song-1" })],
+      start_index: 0, from_here: false, context: null,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "album" }));
+    expect(command).toHaveBeenLastCalledWith({
+      type: "PLAY_SELECTION", tracks: songs.map(song => expect.objectContaining({ id: song.id })),
+      start_index: 1, from_here: false, context: null,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "context-second" }));
+    expect(command).toHaveBeenLastCalledWith({
+      type: "PLAY_SELECTION", tracks: songs.map(song => expect.objectContaining({ id: song.id })),
+      start_index: 1, from_here: true, context: { type: "album", id: "", name: "Album", coverArt: null },
+    });
     expect(adapter.state().current_track).toBe(null);
+    expect(getStreamUrl).not.toHaveBeenCalled();
     expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "restore-local-queue" }));
+    expect(screen.getByTestId("current-song")).toHaveTextContent("remote-song");
+    fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "PAUSE" });
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test("loads a controller's selection on the active player from the requested track", async () => {
+  let adapter;
+  const command = jest.fn();
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return { status: "connected", devices: [], deviceId: "desk", activeDevice: null, isRemote: false,
+      enabled: true, busy: false, error: "", name: "Desk", command, transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
+  });
+  const view = renderPlayer();
+  try {
+    await playerReady();
+    await act(async () => adapter.command({
+      type: "PLAY_SELECTION", tracks: songs, start_index: 1, from_here: true,
+      context: { type: "album", id: "album-1", name: "Album", coverArt: null },
+    }));
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+    expect(screen.getByTestId("queue")).toHaveTextContent("song-2,song-3");
+    expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-2");
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
+    expect(command).not.toHaveBeenCalled();
   } finally { view.unmount(); hook.mockRestore(); }
 });

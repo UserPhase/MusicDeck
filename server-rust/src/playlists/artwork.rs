@@ -110,6 +110,43 @@ pub fn resolve_artwork_size(requested: Option<u32>) -> u32 {
         .unwrap_or(COLLAGE_SIZE)
 }
 
+/// Reads a bounded raster image from a provider for embedding in a collage.
+pub(super) async fn load_svg_tile(mut response: reqwest::Response) -> Option<String> {
+    let mime = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        mime.as_str(),
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+    ) || response
+        .content_length()
+        .is_some_and(|size| size > MAX_TILE_BYTES as u64)
+    {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > MAX_TILE_BYTES - bytes.len() {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    ))
+}
+
 /// Formats an opaque playlist artwork token (`mdplart_<signature>_<playlist_id>`).
 #[must_use]
 pub fn build_playlist_artwork_id(playlist_id: &str, signature: &str) -> String {
@@ -399,7 +436,7 @@ impl PlaylistArtworkService {
         }
 
         let mut sig_parts = Vec::with_capacity(tiles.len() + 1);
-        sig_parts.push("collage");
+        sig_parts.push("collage-v2");
         sig_parts.extend(tiles);
         let sig = signature_of(&sig_parts);
         let artwork_id = build_playlist_artwork_id(playlist_id, &sig);

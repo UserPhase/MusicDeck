@@ -1758,7 +1758,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     const song = content.entries[checkpoint.index]?.track;
     cuedPositionRef.current = song ? { trackId: song.id, seconds: checkpoint.position } : null;
     storeRef.current.hydrate(content.entries as QueueEntry<Song>[], checkpoint.index, { deferLoad: true, shuffleSeed: checkpoint.shuffleSeed });
-    setPlaybackMessage("Queue restored. Press Play when you're ready.");
+    setPlaybackMessage(remotePlayingElsewhere.current
+      ? "Local queue restored. The selected device still controls playback."
+      : "Queue restored. Press Play when you're ready.");
   };
 
   // ------------------------------------------------------------ document preferences
@@ -2126,6 +2128,43 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     storeRef.current.setQueue(items, startIndex, smart ? { smartShuffle: smartShuffleOptionsRef.current(), startAt } : { startAt });
   }
 
+  function startSelection(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, fromHere: boolean) {
+    const allTracks = mediaTracks(tracks, context);
+    const selected = fromHere ? allTracks.slice(startIndex) : allTracks;
+    const index = fromHere ? 0 : startIndex;
+    const ordered = isShuffleEnabled && shuffleModeRef.current === "standard"
+      ? shuffleUpcoming(selected, index, randomValues(selected.length - index - 2))
+      : selected;
+    startQueue(ordered, index, context, isShuffleEnabled && shuffleModeRef.current === "smart");
+  }
+
+  function playOnActiveDevice(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, fromHere = false) {
+    if (!remotePlayer) return null;
+    if (tracks.some(track => track.offlineOnly || songSource(track).source)) {
+      setPlaybackMessage("Choose this device in Devices to play a device-only track or source.");
+      return Promise.resolve();
+    }
+    remote.clearError();
+    return controlRemote({
+      type: "PLAY_SELECTION",
+      tracks: tracks.map(track => {
+        const portableTrack: Song = {
+          ...track,
+          source: { kind: isLibraryPlayable(track) ? "library" : "external", count: track.source?.count ?? 0 },
+        };
+        return sanitizeQueueTrack(portableTrack);
+      }),
+      start_index: startIndex,
+      from_here: fromHere,
+      context: context ? {
+        type: String(context.type ?? "").slice(0, 80),
+        id: String(context.id ?? "").slice(0, 1024),
+        name: String(context.name ?? "").slice(0, 500),
+        coverArt: typeof context.coverArt === "string" ? context.coverArt.slice(0, 2048) : null,
+      } : null,
+    });
+  }
+
   function togglePlay() {
     const activeEngine = engineRef.current;
     const entry = currentEntryOf(stateRef.current);
@@ -2160,6 +2199,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       setPlaybackUnavailable(true);
       return;
     }
+    const remoteSelection = playOnActiveDevice([song], 0, null);
+    if (remoteSelection) return remoteSelection;
     startQueue([song], 0, null);
   }
 
@@ -2192,20 +2233,18 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
 
   async function playContext(tracks: Song[], startIndex = 0, context: PlaybackContextInfo | null = null) {
     if (!Array.isArray(tracks) || tracks.length === 0) return;
-    const safeStart = startIndex >= 0 && startIndex < tracks.length ? startIndex : 0;
-    let contextQueue = mediaTracks(tracks, context).slice(safeStart);
-    if (isShuffleEnabled && shuffleModeRef.current === "standard") contextQueue = shuffleUpcoming(contextQueue, 0, randomValues(contextQueue.length - 2));
-    startQueue(contextQueue, 0, context, isShuffleEnabled && shuffleModeRef.current === "smart");
+    const safeStart = Number.isInteger(startIndex) && startIndex >= 0 && startIndex < tracks.length ? startIndex : 0;
+    const remoteSelection = playOnActiveDevice(tracks, safeStart, context, true);
+    if (remoteSelection) return remoteSelection;
+    startSelection(tracks, safeStart, context, true);
   }
 
   async function playQueue(songs: Song[], startIndex = 0, context: PlaybackContextInfo | null = null) {
     if (!Array.isArray(songs) || songs.length === 0) return;
-    const safeStart = startIndex >= 0 && startIndex < songs.length ? startIndex : 0;
-    const ordered = mediaTracks(songs, context);
-    const nextQueue = isShuffleEnabled && shuffleModeRef.current === "standard"
-      ? shuffleUpcoming(ordered, safeStart, randomValues(songs.length - safeStart - 2))
-      : ordered;
-    startQueue(nextQueue, safeStart, context, isShuffleEnabled && shuffleModeRef.current === "smart");
+    const safeStart = Number.isInteger(startIndex) && startIndex >= 0 && startIndex < songs.length ? startIndex : 0;
+    const remoteSelection = playOnActiveDevice(songs, safeStart, context);
+    if (remoteSelection) return remoteSelection;
+    startSelection(songs, safeStart, context, false);
   }
 
   async function resumeMedia(songs: Song[], index: number, context: PlaybackContextInfo, positionSeconds: number) {
@@ -2363,7 +2402,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }
   const remoteAdapter: RemotePlayerAdapter = {
     state: () => ({
-      current_track: currentSong ? { id: String(currentSong.id), title: String(currentSong.title || "").slice(0, 500) } : null,
+      current_track: currentSong ? {
+        id: String(currentSong.id), title: String(currentSong.title || "").slice(0, 500),
+        artist: String(currentSong.artist || currentSong.artistName || "").slice(0, 500),
+        album: String(currentSong.album || currentSong.albumName || "").slice(0, 500),
+        cover_art: typeof currentSong.coverArt === "string" ? currentSong.coverArt.slice(0, 1000) : undefined,
+      } : null,
       position_ms: Math.max(0, positionOf(currentEntryId) * 1000),
       duration_ms: Math.max(0, duration * 1000), playing: isPlayingRef.current, volume,
     }),
@@ -2374,6 +2418,16 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       if (!activeEngine) throw new Error("The playback engine is not ready");
       if (activeEngine.isRemoteOutput) throw new Error("Control this receiver from its Google Cast sender, or stop Cast before using device control.");
       if (command.type === "SET_VOLUME") { changeVolume(command.volume); return; }
+      if (command.type === "PLAY_SELECTION") {
+        if (remote.isRemote) throw new Error("The active player changed. Try playing the selection again.");
+        const tracks = command.tracks.map(sanitizeQueueTrack);
+        const selected = tracks[command.start_index];
+        if (!selected) throw new Error("The selected track is missing from the queue.");
+        const reason = unplayableReasonFor(selected);
+        if (reason) throw new Error(reason);
+        startSelection(tracks, command.start_index, command.context, command.from_here);
+        return;
+      }
       if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
       if (command.type === "TOGGLE_SHUFFLE") { toggleShuffle(); return; }
       if (command.type === "TOGGLE_REPEAT") { toggleLoop(); return; }
@@ -2395,7 +2449,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       }
       if (command.type === "PAUSE") activeEngine.pause();
       else if (command.type === "PLAY") {
-        if (!engineHasLoaded(currentEntryId)) throw new Error("Press Play on the player device once to load its restored queue");
+        if (!engineHasLoaded(currentEntryId)) { togglePlay(); return; }
         await activeEngine.play();
         if (activeEngine.getSnapshot().state !== "playing") throw new Error(PLAYBACK_BLOCKED_MESSAGE);
       } else if (command.type === "SKIP") {
@@ -2498,8 +2552,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (tracks.length > 1000) { setPlaybackMessage("Add up to 1,000 tracks at a time to the active device."); return; }
     await controlRemote({ type: "ENQUEUE", tracks: tracks.map(sanitizeQueueTrack), next, dedupe });
   }
-  // Restoring a saved queue prepares this device without interrupting the household's active player.
-  const remotePlayer = remote.isRemote && !preferLocalQueue ? remote.activeDevice : null;
+  // A local saved queue stays cued while another device owns account playback.
+  const remotePlayer = remote.isRemote ? remote.activeDevice : null;
   const remoteTrack = remotePlayer?.current_track;
   const castRendering = cast.connected || Boolean(engine?.isRemoteOutput);
   remotePlayingElsewhere.current = Boolean(remote.isRemote);
@@ -2569,7 +2623,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     restoreSavedQueue,
     accountQueueSource: accountQueue ? { contentId: accountQueue.contentId, checkpoint: accountQueue.checkpoint } : undefined,
     queuePersistenceError,
-    currentSong: remotePlayer ? accountSong ?? (remoteTrack ? { id: remoteTrack.id, title: remoteTrack.title, source: { kind: "library" } } : null)
+    currentSong: remotePlayer ? (remoteTrack ? {
+      ...accountSong, id: remoteTrack.id, title: remoteTrack.title || accountSong?.title,
+      artist: remoteTrack.artist || accountSong?.artist, album: remoteTrack.album || accountSong?.album,
+      coverArt: remoteTrack.cover_art || accountSong?.coverArt, source: accountSong?.source ?? { kind: "library" },
+    } : null)
       : accountQueue ? accountSong ?? null : currentSong,
     activeSidebar,
     setActiveSidebar,
@@ -2602,7 +2660,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     isLooping: accountQueue?.checkpoint.repeatOne ?? (!remotePlayer && queueState.repeatOne),
     previewDurationSeconds: !remotePlayer && isPreview ? PREVIEW_DURATION_SECONDS : null,
     playbackUnavailable: !remotePlayer && playbackUnavailable,
-    playbackMessage: remotePlayer ? remote.error : playbackMessage,
+    playbackMessage: remotePlayer ? remote.error || playbackMessage : playbackMessage,
     // Retained for existing layouts; loudness analysis never blocks playback.
     isPreparingPlayback: false,
     volume: remotePlayer ? remotePlayer.volume : castRendering && cast.volume !== null ? gainToPerceptualVolume(cast.volume) : accountQueue?.checkpoint.volume ?? volume,
@@ -2678,7 +2736,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   useBrowserMediaSession(value);
 
   return (
-    <RemoteSessionContext.Provider value={{ ...remote, isRemote: remote.isRemote && !preferLocalQueue,
+    <RemoteSessionContext.Provider value={{ ...remote,
       transfer: async targetId => { await remote.transfer(targetId); setPreferLocalQueue(false); } }}>
     <CastContext.Provider value={{ ...cast, connect: async () => {
       if (remote.isRemote) throw new Error("Select this device in Devices before starting Google Cast.");

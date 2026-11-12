@@ -12,7 +12,7 @@ use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUp
 use axum::extract::{Query, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, ORIGIN, RANGE, REFERRER_POLICY,
+    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, HOST, ORIGIN, RANGE, REFERRER_POLICY,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -25,7 +25,7 @@ use crate::auth::{AuthenticatedUser, extract_session_cookie};
 use crate::cast::{CastError, CastTicketRequest};
 use crate::catalog::{LibraryItemType, LibraryService, SourceResolver};
 use crate::error::{ApiErrorBody, ApiErrorEnvelope, ServerError};
-use crate::remote::{REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage};
+use crate::remote::{REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage, RemoteControlHub};
 use crate::services::privacy::{PrivacyCategory, PrivacyError};
 use crate::state::AppState;
 use crate::streaming::{proxy_upstream_stream, send_error_response};
@@ -54,6 +54,19 @@ pub fn remote_and_cast_routes() -> Router<AppState> {
 // `/api/v1/remote` WebSocket Upgrade & Session Loop
 // ============================================================================
 
+// Axum drops the upgrade callback if the client disconnects before upgrading.
+// Keep the slot owned by that callback and then by the live socket task.
+struct RemoteConnection {
+    hub: RemoteControlHub,
+    id: String,
+}
+
+impl Drop for RemoteConnection {
+    fn drop(&mut self) {
+        self.hub.disconnect_client(&self.id);
+    }
+}
+
 async fn remote_ws_or_426_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -68,13 +81,14 @@ async fn remote_ws_or_426_handler(
         );
     };
 
-    // Validate `Origin` against `[config.public_url, config.cors_origin]`
+    // Same-origin clients may use a different hostname or LAN address for this server.
     let origin = headers
         .get(ORIGIN)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if !is_allowed_remote_origin(
         origin,
+        headers.get(HOST).and_then(|value| value.to_str().ok()),
         &state.config().network.public_url,
         state.config().cors_origin(),
     ) {
@@ -98,33 +112,59 @@ async fn remote_ws_or_426_handler(
         Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
     };
 
+    let connection = RemoteConnection { hub, id: conn_id };
     ws.max_message_size(1024 * 1024).on_upgrade(move |socket| {
-        drive_remote_websocket(socket, hub, store, conn_id, user.id, session_id, rx)
+        drive_remote_websocket(socket, connection, store, user.id, session_id, rx)
     })
 }
 
-fn is_allowed_remote_origin(origin: &str, public_url: &str, cors_origin: &str) -> bool {
+fn is_allowed_remote_origin(
+    origin: &str,
+    host: Option<&str>,
+    public_url: &str,
+    cors_origin: &str,
+) -> bool {
     let Ok(parsed_origin) = Url::parse(origin) else {
         return false;
     };
-    [public_url, cors_origin].iter().any(|allowed| {
-        Url::parse(allowed).is_ok_and(|u| {
-            u.scheme() == parsed_origin.scheme()
-                && u.host_str() == parsed_origin.host_str()
-                && u.port_or_known_default() == parsed_origin.port_or_known_default()
-        })
+    if !matches!(parsed_origin.scheme(), "http" | "https")
+        || parsed_origin.path() != "/"
+        || parsed_origin.query().is_some()
+        || parsed_origin.fragment().is_some()
+        || !parsed_origin.username().is_empty()
+        || parsed_origin.password().is_some()
+    {
+        return false;
+    }
+    let public_url = Url::parse(public_url).ok();
+    let cors_origin = Url::parse(cors_origin).ok();
+    if [public_url.as_ref(), cors_origin.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|allowed| allowed.origin() == parsed_origin.origin())
+    {
+        return true;
+    }
+    // Host is the authority the browser connected to. Forwarded host/proto headers
+    // cannot expand the origin allowlist. Match the configured public scheme too.
+    host.zip(public_url.as_ref()).is_some_and(|(host, public)| {
+        public.scheme() == parsed_origin.scheme()
+            && host.parse::<http::uri::Authority>().is_ok()
+            && !host.contains('@')
+            && Url::parse(&format!("{}://{host}", public.scheme()))
+                .is_ok_and(|target| target.origin() == parsed_origin.origin())
     })
 }
 
 async fn drive_remote_websocket(
     mut socket: WebSocket,
-    hub: crate::remote::RemoteControlHub,
+    connection: RemoteConnection,
     store: crate::auth::SessionStore,
-    conn_id: String,
     user_id: String,
     session_id: String,
     mut outbound_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) {
+    let RemoteConnection { hub, id: conn_id } = &connection;
     let reg_deadline = tokio::time::sleep(Duration::from_millis(REGISTRATION_TIMEOUT_MS));
     tokio::pin!(reg_deadline);
     let mut reg_checked = false;
@@ -133,10 +173,18 @@ async fn drive_remote_websocket(
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let transfer_deadline = hub.transfer_deadline(conn_id);
         tokio::select! {
+            () = async {
+                if let Some(deadline) = transfer_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => hub.expire_transfer(conn_id, tokio::time::Instant::now()),
             () = &mut reg_deadline, if !reg_checked => {
                 reg_checked = true;
-                if !hub.is_registered(&conn_id) {
+                if !hub.is_registered(conn_id) {
                     let _ = socket.send(WsMessage::Close(Some(CloseFrame {
                         code: 4000,
                         reason: "Registration timeout".into(),
@@ -180,7 +228,7 @@ async fn drive_remote_websocket(
                     }
                     WsMessage::Pong(_) => {}
                     WsMessage::Binary(_) => {
-                        if !hub.consume_rate_token(&conn_id, current_epoch_ms()) {
+                        if !hub.consume_rate_token(conn_id, current_epoch_ms()) {
                             let _ = socket.send(WsMessage::Close(Some(CloseFrame {
                                 code: 4008,
                                 reason: "Remote command rate exceeded".into(),
@@ -191,7 +239,7 @@ async fn drive_remote_websocket(
                         let _ = socket.send(WsMessage::Text(err_json.into())).await;
                     }
                     WsMessage::Text(text) => {
-                        if !hub.consume_rate_token(&conn_id, current_epoch_ms()) {
+                        if !hub.consume_rate_token(conn_id, current_epoch_ms()) {
                             let _ = socket.send(WsMessage::Close(Some(CloseFrame {
                                 code: 4008,
                                 reason: "Remote command rate exceeded".into(),
@@ -211,14 +259,62 @@ async fn drive_remote_websocket(
                             continue;
                         };
 
-                        hub.handle_message(&conn_id, parsed_msg);
+                        hub.handle_message(conn_id, parsed_msg);
                     }
                 }
             }
         }
     }
+}
 
-    hub.disconnect_client(&conn_id);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::MAX_CLIENTS_PER_USER;
+
+    #[test]
+    fn allows_the_lan_authority_and_configured_origins_without_accepting_cross_origin_requests() {
+        let public = "http://musicdeck.lan:8080";
+        let cors = "http://localhost:3000";
+        let host = Some("192.168.2.38:8080");
+        assert!(is_allowed_remote_origin(
+            "http://192.168.2.38:8080",
+            host,
+            public,
+            cors
+        ));
+        assert!(is_allowed_remote_origin(public, host, public, cors));
+        assert!(is_allowed_remote_origin(cors, host, public, cors));
+        for origin in [
+            "https://192.168.2.38:8080",
+            "http://192.168.2.38",
+            "http://unrelated.test:8080",
+            "null",
+        ] {
+            assert!(
+                !is_allowed_remote_origin(origin, host, public, cors),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_upgrade_releases_its_connection_slot() {
+        let hub = RemoteControlHub::new();
+        for _ in 0..=MAX_CLIENTS_PER_USER {
+            let (id, receiver) = hub.connect_client("user", "session", 0).unwrap();
+            let connection = RemoteConnection {
+                hub: hub.clone(),
+                id,
+            };
+            let upgrade_callback = move |_: WebSocket| async move {
+                drop(connection);
+                drop(receiver);
+            };
+            drop(upgrade_callback);
+        }
+        assert!(hub.connect_client("user", "session", 0).is_ok());
+    }
 }
 
 // ============================================================================

@@ -3,12 +3,17 @@ import type { RemoteCommand, RemoteDevice, RemotePlaybackSnapshot, RemotePlayerA
 import { isMediaResumeContext } from "../services/mediaSessions";
 import { getVisualActivity, subscribeVisualActivity } from "../services/visualActivity";
 import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
-import { DESKTOP_CONFIG_CHANGED_EVENT, resolveRemoteSocketUrl } from "../services/desktop/desktopRuntime";
+import { DESKTOP_CONFIG_CHANGED_EVENT, isDesktopRuntime, resolveRemoteSocketUrl } from "../services/desktop/desktopRuntime";
 
 function deviceKind(): RemoteDevice["device_type"] {
   if (/iPad|Tablet/i.test(navigator.userAgent)) return "tablet";
   if (/Mobi|iPhone|Android/i.test(navigator.userAgent)) return "phone";
   return "computer";
+}
+function defaultDeviceName(): string {
+  if (isDesktopRuntime()) return "MusicDeck Desktop";
+  const kind = deviceKind();
+  return kind === "phone" ? "Phone" : kind === "tablet" ? "Tablet" : "Computer Browser";
 }
 let identitySequence = 0;
 function identity(): string {
@@ -51,26 +56,33 @@ function snapshot(value: unknown): value is RemotePlaybackSnapshot {
 function remoteCommand(value: unknown): value is RemoteCommand {
   if (!object(value)) return false;
   const occurrence = (id: unknown) => typeof id === "string" && id.length > 0 && id.length <= 160;
+  const tracks = (items: unknown): items is unknown[] => Array.isArray(items) && items.length > 0 && items.length <= 1000 &&
+    items.every(track => object(track) && typeof track.id === "string" && track.id.length > 0 && track.id.length <= 1024);
+  const context = value.context;
   return value.type === "PLAY" || value.type === "PAUSE" ||
     value.type === "TOGGLE_SHUFFLE" || value.type === "TOGGLE_REPEAT" ||
     (value.type === "PLAY_QUEUE_ENTRY" && occurrence(value.entry_id)) ||
     (value.type === "MOVE_QUEUE_ENTRY" && occurrence(value.entry_id) && occurrence(value.target_id)) ||
-    (value.type === "ENQUEUE" && typeof value.next === "boolean" && typeof value.dedupe === "boolean" &&
-      Array.isArray(value.tracks) && value.tracks.length > 0 && value.tracks.length <= 1000 &&
-      value.tracks.every(track => object(track) && typeof track.id === "string" && track.id.length > 0 && track.id.length <= 1024)) ||
+    (value.type === "ENQUEUE" && typeof value.next === "boolean" && typeof value.dedupe === "boolean" && tracks(value.tracks)) ||
+    (value.type === "PLAY_SELECTION" && tracks(value.tracks) && typeof value.from_here === "boolean" &&
+      typeof value.start_index === "number" && Number.isInteger(value.start_index) &&
+      value.start_index >= 0 && value.start_index < value.tracks.length &&
+      (context === null || (object(context) && typeof context.type === "string" && typeof context.id === "string" &&
+        typeof context.name === "string" && (context.coverArt === null || typeof context.coverArt === "string")))) ||
     (value.type === "SKIP" && (value.direction === "next" || value.direction === "previous")) ||
     (value.type === "SEEK" && typeof value.position_ms === "number" && Number.isFinite(value.position_ms) && value.position_ms >= 0) ||
     (value.type === "SET_VOLUME" && typeof value.volume === "number" && value.volume >= 0 && value.volume <= 1);
 }
 export function useRemoteSession(userId: string | null, adapter: RemotePlayerAdapter): RemoteSessionValue {
   const [deviceId] = useState(identity);
-  const [name, setName] = useState(() => `This ${deviceKind() === "computer" ? "Computer" : deviceKind() === "phone" ? "Phone" : "Web Player"}`);
+  const [name, setName] = useState(defaultDeviceName);
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState<RemoteSessionValue["status"]>("unavailable");
   const [devices, setDevices] = useState<RemoteDevice[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
+  const publish = useRef<(() => void) | null>(null);
   const adapterRef = useRef(adapter); adapterRef.current = adapter;
   const metadata = useRef({ name, enabled }); metadata.current = { name, enabled };
   const pending = useRef(new Map<string, { resolve(): void; reject(error: Error): void; timer: number }>());
@@ -85,9 +97,12 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     if (new Blob([encoded]).size > 1024 * 1024) throw new Error("This queue is too large to transfer. Use a smaller library queue.");
     ws.send(encoded);
   }, []);
-  const registration = useCallback(() => send({ type: "REGISTER", device_id: deviceId, device_name: metadata.current.name,
-    queue_device_id: queueDeviceId(),
-    device_type: deviceKind(), can_receive: metadata.current.enabled, state: adapterRef.current.state() }), [deviceId, send]);
+  const registration = useCallback(() => {
+    const state = adapterRef.current.state();
+    send({ type: "REGISTER", device_id: deviceId, device_name: metadata.current.name, queue_device_id: queueDeviceId(),
+      device_type: deviceKind(), can_receive: metadata.current.enabled, state });
+    return state;
+  }, [deviceId, send]);
   const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object): Promise<void> => new Promise((resolve, reject) => {
     const requestId = identity();
     const timer = window.setTimeout(() => {
@@ -149,10 +164,15 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (message.type === "DEACTIVATE") { adapterRef.current.pause(); return; }
       if (message.type === "EXECUTE" && typeof message.requestId === "string" && remoteCommand(message.command)) {
         const requestId = message.requestId, command = message.command;
+        const commandSocket = socket.current;
         commandChain = commandChain.then(async () => {
-          if (closed || socket.current?.readyState !== WebSocket.OPEN) return;
-          try { await adapterRef.current.command(command); send({ type: "COMMAND_RESULT", requestId, ok: true }); }
+          if (closed || socket.current !== commandSocket || commandSocket?.readyState !== WebSocket.OPEN) return;
+          try {
+            await adapterRef.current.command(command);
+            if (socket.current === commandSocket) send({ type: "COMMAND_RESULT", requestId, ok: true });
+          }
           catch (failure) {
+            if (socket.current !== commandSocket) return;
             fail(failure); send({ type: "COMMAND_RESULT", requestId, ok: false, message: failure instanceof Error ? failure.message : "Player command failed" });
           }
         }).catch(fail);
@@ -215,8 +235,13 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       const ws = new WebSocket(url); socket.current = ws;
       ws.onopen = () => {
         if (closed) { ws.close(); return; }
-        attempt = 0; setStatus("connected"); lastState = ""; lastPlaying = false;
-        try { registration(); } catch (failure) { fail(failure); ws.close(); }
+        if (socket.current !== ws) return;
+        attempt = 0; setStatus("connected"); setError("");
+        try {
+          const state = registration();
+          lastPlaying = state.playing;
+          lastState = JSON.stringify(state);
+        } catch (failure) { fail(failure); ws.close(); }
       };
       ws.onmessage = (event) => {
         if (closed || socket.current !== ws) return;
@@ -226,7 +251,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
           void handle(message).catch(fail);
         } catch (failure) { fail(failure); }
       };
-      ws.onerror = () => { if (!closed) setError("Device control connection failed. Reconnecting automatically."); };
+      ws.onerror = () => {
+        if (!closed && socket.current === ws) setError("Device control connection failed. Reconnecting automatically.");
+      };
       ws.onclose = (event) => {
         if (closed || socket.current !== ws) return;
         socket.current = null;
@@ -254,12 +281,15 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (socket.current?.readyState !== WebSocket.OPEN) return;
       const state = adapterRef.current.state();
       const claim = state.playing && !lastPlaying && !prepared.current;
-      if (!prepared.current) lastPlaying = state.playing;
       const serialized = JSON.stringify(state);
       if (serialized === lastState && !claim) return;
-      lastState = serialized;
-      try { send({ type: "STATE", state, claim }); } catch (failure) { fail(failure); }
+      try {
+        send({ type: "STATE", state, claim });
+        lastState = serialized;
+        if (!prepared.current) lastPlaying = state.playing;
+      } catch (failure) { fail(failure); }
     };
+    publish.current = publishState;
     let heartbeat: number | undefined;
     let interval = 0;
     const updateHeartbeat = () => {
@@ -275,6 +305,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     updateHeartbeat();
     return () => {
       closed = true; window.clearTimeout(reconnect); window.clearInterval(heartbeat); unsubscribeVisibility();
+      publish.current = null;
       window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
       cancelPreparation(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
       for (const operation of operations.values()) {
@@ -290,7 +321,11 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   }, [userId, deviceId, registration, send]);
   useEffect(() => {
     if (socket.current?.readyState === WebSocket.OPEN) registration();
-  }, [name, enabled, registration]);
+  }, [name, registration]);
+  const { current_track, playing, volume, duration_ms } = adapter.state();
+  // Track and transport changes are immediate. Position samples use the throttled heartbeat.
+  const transportKey = JSON.stringify([current_track, playing, volume, duration_ms]);
+  useEffect(() => { publish.current?.(); }, [transportKey]);
   const command = useCallback(async (command: RemoteCommand, targetId?: string) => {
     try {
       if (command.type !== "SEEK" && command.type !== "SET_VOLUME") { await request("COMMAND", { command, targetId }); return; }
@@ -319,9 +354,14 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   }, [request]);
   const enable = useCallback(async () => {
     setError("");
-    try { await adapterRef.current.enable(); setEnabled(true); }
+    try {
+      await adapterRef.current.enable();
+      metadata.current.enabled = true;
+      setEnabled(true);
+      if (socket.current?.readyState === WebSocket.OPEN) registration();
+    }
     catch (failure) { setError(failure instanceof Error ? failure.message : "Could not enable playback"); throw failure; }
-  }, []);
+  }, [registration]);
   const activeDevice = devices.find((item) => item.is_active_player) ?? null;
   return { status, deviceId, devices, activeDevice, isRemote: Boolean(activeDevice && activeDevice.device_id !== deviceId), enabled, busy, error, name,
     enable, command, transfer, rename: (next) => { const value = next.trim(); if (value && value.length <= 80) setName(value); },

@@ -58,7 +58,9 @@ test("registers same-origin cookies-only control, publishes explicit playback cl
   expect(result.current.status).toBe("connected");
   // A late close from an old transport must not tear down the replacement.
   act(() => ws.onclose?.({ code: 1006, reason: "" }));
+  act(() => ws.onerror?.());
   expect(result.current.status).toBe("connected");
+  expect(result.current.error).toBe("");
   unmount(); expect(next.readyState).toBe(3);
 });
 
@@ -83,6 +85,19 @@ test("reduces background state traffic while keeping the same remote socket open
     unmount();
     setDesktopForeground(null);
   }
+});
+test("publishes track and pause changes immediately without waking the position timer", () => {
+  const player = adapter();
+  const { rerender } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const state = { ...initial, playing: true, current_track: { id: "two", title: "Live", artist: "DJ" } };
+  player.state.mockReturnValue(state);
+  rerender();
+  expect(ws.sent.at(-1)).toEqual({ type: "STATE", state, claim: true });
+  player.state.mockReturnValue({ ...state, playing: false });
+  rerender();
+  expect(ws.sent.at(-1)).toEqual({ type: "STATE", state: { ...state, playing: false }, claim: false });
 });
 test("coalesces 500 continuous seeks into one latest-value command in an 80 ms window", async () => {
   const { result } = renderHook(() => useRemoteSession("user", adapter()));
