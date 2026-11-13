@@ -30,13 +30,13 @@
 //!      sends `TRANSFER_COMPLETE` to both peers, sends `TRANSFER_RESULT { requestId, ok: true }` to `controller`,
 //!      and broadcasts updated `DEVICES`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -46,8 +46,10 @@ pub const REMOTE_WS_PATH: &str = "/api/v1/remote";
 /// Maximum concurrent remote WebSocket connections per user account (`16`).
 pub const MAX_CLIENTS_PER_USER: usize = 16;
 
-/// Maximum pending unacknowledged commands per controller (`64`).
-pub const MAX_PENDING_COMMANDS_PER_CONTROLLER: usize = 64;
+/// Maximum pending unacknowledged commands per account (`64`).
+pub const MAX_PENDING_COMMANDS_PER_ACCOUNT: usize = 64;
+/// Legacy name for the pending command limit.
+pub const MAX_PENDING_COMMANDS_PER_CONTROLLER: usize = MAX_PENDING_COMMANDS_PER_ACCOUNT;
 
 /// Registration deadline (`10,000` ms) before an unregistered socket is closed (`4000`).
 pub const REGISTRATION_TIMEOUT_MS: u64 = 10_000;
@@ -120,6 +122,17 @@ impl Default for RemotePlaybackState {
     }
 }
 
+impl RemotePlaybackState {
+    fn validate(&self) -> bool {
+        (0.0..=604_800_000.0).contains(&self.position_ms)
+            && (0.0..=604_800_000.0).contains(&self.duration_ms)
+            && (0.0..=1.0).contains(&self.volume)
+            && self.current_track.as_ref().is_none_or(|track| {
+                !track.id.is_empty() && track.id.len() <= 1024 && track.title.chars().count() <= 500
+            })
+    }
+}
+
 /// Remote transport command payload (`commandSchema`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -158,6 +171,8 @@ pub enum RemoteCommand {
         from_here: bool,
         context: Option<RemoteSelectionContext>,
     },
+    /// Play one selected track. Routed through the same queue path as PLAY_SELECTION.
+    PlayTrack { track: Value },
     /// Add tracks to the active queue.
     Enqueue {
         tracks: Vec<Value>,
@@ -191,6 +206,8 @@ impl RemoteCommand {
                 })
         };
         match self {
+            Self::Seek { position_ms } => (0.0..=604_800_000.0).contains(position_ms),
+            Self::SetVolume { volume } => (0.0..=1.0).contains(volume),
             Self::PlayQueueEntry { entry_id } => valid_id(entry_id),
             Self::MoveQueueEntry {
                 entry_id,
@@ -269,6 +286,22 @@ pub struct TransferQueueState {
     pub context: Option<Value>,
 }
 
+/// Authoritative account state. Queue entries retain occurrence IDs for duplicate tracks.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaybackState {
+    pub device_id: Option<String>,
+    pub track: Option<RemoteTrackSummary>,
+    pub position_ms: f64,
+    pub duration_ms: f64,
+    pub is_playing: bool,
+    pub volume: f32,
+    pub updated_at: u64,
+    pub revision: u64,
+    // Sent separately on initialization and on queue changes.
+    #[serde(skip)]
+    pub queue: Option<Arc<TransferQueueState>>,
+}
+
 /// Full playback & queue snapshot exchanged during the 4-stage transfer handshake (`snapshotSchema`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -330,13 +363,22 @@ pub enum RemoteClientMessage {
         can_receive: bool,
         /// Initial playback state.
         state: RemotePlaybackState,
+        /// Opts into account state frames. Older clients still receive DEVICES.
+        #[serde(default)]
+        live_sync: bool,
     },
-    /// Report updated playback state (and optionally claim active player status).
+    /// Report updated playback state and optionally select this player if no device is active.
     State {
         /// Current playback state.
         state: RemotePlaybackState,
-        /// If `true`, claims active player ownership for the user account.
-        claim: bool,
+        /// Legacy client hint. Ownership now follows reported playback only when no player is selected.
+        #[serde(default, rename = "claim")]
+        _claim: bool,
+        /// Latest queue when it changes. Omission preserves the previous queue.
+        #[serde(default)]
+        queue: Option<TransferQueueState>,
+        #[serde(default)]
+        clear_queue: bool,
     },
     /// Dispatch a remote transport command to `target_id` (or the current active player).
     Command {
@@ -358,6 +400,8 @@ pub enum RemoteClientMessage {
         ok: bool,
         /// Optional error/diagnostic message.
         message: Option<String>,
+        #[serde(default)]
+        state: Option<RemotePlaybackState>,
     },
     /// Initiate a 4-stage playback transfer to `target_id` (Stage 1 trigger).
     TransferPlayback {
@@ -395,6 +439,8 @@ pub enum RemoteClientMessage {
         /// Active transfer ID.
         #[serde(rename = "transferId")]
         transfer_id: String,
+        #[serde(default)]
+        queue: Option<TransferQueueState>,
     },
     /// Abort an in-flight transfer due to a client-side error.
     TransferFailed {
@@ -431,16 +477,22 @@ struct ConnectedClient {
     device_type: RemoteDeviceType,
     can_receive: bool,
     state: RemotePlaybackState,
+    live_sync: bool,
+    queue: Option<Arc<TransferQueueState>>,
     tx: mpsc::Sender<Value>,
+    disconnected: watch::Sender<bool>,
     tokens: f64,
     last_refill_ms: u64,
 }
 
 #[derive(Debug)]
 struct PendingCommand {
+    id: String,
     controller_conn_id: String,
     target_conn_id: String,
     client_request_id: String,
+    command: RemoteCommand,
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -459,7 +511,8 @@ struct ActiveTransfer {
 struct HubState {
     clients: HashMap<String, ConnectedClient>,
     active_player_by_user: HashMap<String, String>,
-    commands: HashMap<String, PendingCommand>,
+    playback_by_user: HashMap<String, PlaybackState>,
+    commands: HashMap<String, VecDeque<PendingCommand>>,
     transfers_by_user: HashMap<String, ActiveTransfer>,
 }
 
@@ -514,7 +567,10 @@ impl RemoteControlHub {
                 device_type: RemoteDeviceType::Web,
                 can_receive: false,
                 state: RemotePlaybackState::default(),
+                live_sync: false,
+                queue: None,
                 tx,
+                disconnected: watch::channel(false).0,
                 tokens: 120.0,
                 last_refill_ms: now_ms,
             },
@@ -534,6 +590,14 @@ impl RemoteControlHub {
             .clients
             .get(conn_id)
             .is_some_and(|c| c.device_id.is_some())
+    }
+
+    pub(crate) fn disconnect_signal(&self, conn_id: &str) -> Option<watch::Receiver<bool>> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(guard.clients.get(conn_id)?.disconnected.subscribe())
     }
 
     /// Consumes 1 rate-limit token from `conn_id`, returning `false` if the client exceeded
@@ -572,6 +636,7 @@ impl RemoteControlHub {
                 device_type,
                 can_receive,
                 mut state,
+                live_sync,
             } => {
                 let clean_name = device_name.trim().to_owned();
                 if device_id.is_empty()
@@ -579,6 +644,7 @@ impl RemoteControlHub {
                     || queue_device_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 300)
                     || clean_name.is_empty()
                     || clean_name.chars().count() > 80
+                    || !state.validate()
                 {
                     Self::send_error_locked(&guard, conn_id, "Invalid remote message", None);
                     return;
@@ -613,18 +679,22 @@ impl RemoteControlHub {
                     Self::remove_client_locked(&mut guard, &dup_id);
                 }
 
-                let has_track = state.current_track.is_some();
+                let is_playing = state.playing && state.current_track.is_some();
                 if state.playing
                     && guard
                         .active_player_by_user
                         .get(&user_id)
                         .is_some_and(|active| active != conn_id)
-                    && !guard.transfers_by_user.contains_key(&user_id)
+                    && !Self::is_starting_transfer_target(&guard, &user_id, conn_id)
                 {
                     // A reconnecting player follows the device that still owns playback.
                     state.playing = false;
                     Self::send_frame_locked(&guard, conn_id, json!({ "type": "DEACTIVATE" }));
                 }
+                let initialize = guard
+                    .clients
+                    .get(conn_id)
+                    .is_some_and(|c| live_sync && !c.live_sync);
                 if let Some(client) = guard.clients.get_mut(conn_id) {
                     client.device_id = Some(device_id);
                     client.queue_device_id = queue_device_id;
@@ -632,15 +702,17 @@ impl RemoteControlHub {
                     client.device_type = device_type;
                     client.can_receive = can_receive;
                     client.state = state;
+                    client.live_sync = live_sync;
                 }
 
-                if !guard.active_player_by_user.contains_key(&user_id) && has_track {
+                if !guard.active_player_by_user.contains_key(&user_id) && is_playing {
                     guard
                         .active_player_by_user
                         .insert(user_id.clone(), conn_id.to_owned());
                 }
 
                 Self::broadcast_devices_locked(&guard, &user_id);
+                Self::sync_playback_locked(&mut guard, &user_id, initialize.then_some(conn_id));
             }
             other => {
                 if !guard
@@ -654,42 +726,42 @@ impl RemoteControlHub {
 
                 match other {
                     RemoteClientMessage::Register { .. } => {}
-                    RemoteClientMessage::State { state, claim } => {
-                        let has_track = state.current_track.is_some();
-                        if let Some(client) = guard.clients.get_mut(conn_id) {
-                            client.state = state;
-                        }
-
-                        if claim && has_track && !guard.transfers_by_user.contains_key(&user_id) {
-                            if let Some(old_active) = guard.active_player_by_user.get(&user_id)
-                                && old_active != conn_id
-                            {
-                                Self::send_frame_locked(
-                                    &guard,
-                                    old_active,
-                                    json!({ "type": "DEACTIVATE" }),
-                                );
-                            }
-                            guard
-                                .active_player_by_user
-                                .insert(user_id.clone(), conn_id.to_owned());
-                        }
-
-                        if !guard.active_player_by_user.contains_key(&user_id) && has_track {
-                            guard
-                                .active_player_by_user
-                                .insert(user_id.clone(), conn_id.to_owned());
-                        }
-
-                        Self::broadcast_devices_locked(&guard, &user_id);
+                    RemoteClientMessage::State {
+                        state,
+                        queue,
+                        clear_queue,
+                        ..
+                    } => {
+                        Self::update_player_locked(
+                            &mut guard,
+                            conn_id,
+                            &user_id,
+                            state,
+                            queue,
+                            clear_queue,
+                        );
                     }
                     RemoteClientMessage::Command {
                         request_id,
                         target_id,
                         command,
                     } => {
+                        let command = match command {
+                            RemoteCommand::PlayTrack { track } => RemoteCommand::PlaySelection {
+                                tracks: vec![track],
+                                start_index: 0,
+                                from_here: false,
+                                context: None,
+                            },
+                            command => command,
+                        };
                         if !command.valid_queue_command() {
-                            Self::send_error_locked(&guard, conn_id, "Invalid queue command", Some(&request_id));
+                            Self::send_error_locked(
+                                &guard,
+                                conn_id,
+                                "Invalid playback command",
+                                Some(&request_id),
+                            );
                             return;
                         }
                         if guard.transfers_by_user.contains_key(&user_id) {
@@ -737,50 +809,41 @@ impl RemoteControlHub {
                             return;
                         }
 
-                        let pending_for_controller = guard
-                            .commands
-                            .values()
-                            .filter(|cmd| cmd.controller_conn_id == conn_id)
-                            .count();
-                        if pending_for_controller >= MAX_PENDING_COMMANDS_PER_CONTROLLER {
+                        let commands = guard.commands.entry(user_id.clone()).or_default();
+                        if commands.len() >= MAX_PENDING_COMMANDS_PER_ACCOUNT {
                             Self::send_error_locked(
                                 &guard,
                                 conn_id,
-                                "Too many pending commands",
+                                "Too many pending account commands",
                                 Some(&request_id),
                             );
                             return;
                         }
-
-                        let cmd_id = Uuid::new_v4().to_string();
-                        guard.commands.insert(
-                            cmd_id.clone(),
-                            PendingCommand {
-                                controller_conn_id: conn_id.to_owned(),
-                                target_conn_id: target_conn.clone(),
-                                client_request_id: request_id,
-                            },
-                        );
-
-                        Self::send_frame_locked(
-                            &guard,
-                            &target_conn,
-                            json!({
-                                "type": "EXECUTE",
-                                "requestId": cmd_id,
-                                "command": command,
-                            }),
-                        );
+                        commands.push_back(PendingCommand {
+                            id: Uuid::new_v4().to_string(),
+                            controller_conn_id: conn_id.to_owned(),
+                            target_conn_id: target_conn,
+                            client_request_id: request_id,
+                            command,
+                            deadline: None,
+                        });
+                        Self::dispatch_command_locked(&mut guard, &user_id);
                     }
                     RemoteClientMessage::CommandResult {
                         request_id,
                         ok,
                         message,
+                        state,
                     } => {
                         let is_valid_target = guard
                             .commands
-                            .get(&request_id)
-                            .is_some_and(|cmd| cmd.target_conn_id == conn_id);
+                            .get(&user_id)
+                            .and_then(VecDeque::front)
+                            .is_some_and(|cmd| {
+                                cmd.id == request_id
+                                    && cmd.target_conn_id == conn_id
+                                    && cmd.deadline.is_some()
+                            });
                         if !is_valid_target {
                             Self::send_error_locked(
                                 &guard,
@@ -790,7 +853,17 @@ impl RemoteControlHub {
                             );
                             return;
                         }
-                        if let Some(cmd) = guard.commands.remove(&request_id) {
+                        if let Some(cmd) = guard
+                            .commands
+                            .get_mut(&user_id)
+                            .and_then(VecDeque::pop_front)
+                        {
+                            let ok = ok && state.as_ref().is_none_or(RemotePlaybackState::validate);
+                            if ok && let Some(state) = state {
+                                Self::update_player_locked(
+                                    &mut guard, conn_id, &user_id, state, None, false,
+                                );
+                            }
                             Self::send_frame_locked(
                                 &guard,
                                 &cmd.controller_conn_id,
@@ -801,17 +874,23 @@ impl RemoteControlHub {
                                     "message": message,
                                 }),
                             );
+                            Self::dispatch_command_locked(&mut guard, &user_id);
                         }
                     }
                     RemoteClientMessage::TransferPlayback {
                         request_id,
                         target_id,
                     } => {
-                        if guard.transfers_by_user.contains_key(&user_id) {
+                        if guard.transfers_by_user.contains_key(&user_id)
+                            || guard
+                                .commands
+                                .get(&user_id)
+                                .is_some_and(|commands| !commands.is_empty())
+                        {
                             Self::send_error_locked(
                                 &guard,
                                 conn_id,
-                                "A playback transfer is already in progress",
+                                "Wait for the current playback command or transfer to finish",
                                 Some(&request_id),
                             );
                             return;
@@ -853,6 +932,7 @@ impl RemoteControlHub {
                                 .active_player_by_user
                                 .insert(user_id.clone(), target_conn);
                             Self::broadcast_devices_locked(&guard, &user_id);
+                            Self::sync_playback_locked(&mut guard, &user_id, None);
                             Self::send_frame_locked(
                                 &guard,
                                 conn_id,
@@ -911,17 +991,100 @@ impl RemoteControlHub {
         Self::remove_client_locked(&mut guard, conn_id);
     }
 
-    pub(crate) fn transfer_deadline(&self, conn_id: &str) -> Option<Instant> {
+    fn update_player_locked(
+        guard: &mut HubState,
+        conn_id: &str,
+        user_id: &str,
+        mut state: RemotePlaybackState,
+        queue: Option<TransferQueueState>,
+        clear_queue: bool,
+    ) {
+        if !state.validate() {
+            Self::send_error_locked(guard, conn_id, "Invalid playback state", None);
+            return;
+        }
+        let is_playing = state.playing && state.current_track.is_some();
+        // During handoff, the target starts before the server commits ownership.
+        if state.playing
+            && guard
+                .active_player_by_user
+                .get(user_id)
+                .is_some_and(|active| active != conn_id)
+            && !Self::is_starting_transfer_target(guard, user_id, conn_id)
+        {
+            state.playing = false;
+            Self::send_frame_locked(guard, conn_id, json!({ "type": "DEACTIVATE" }));
+        }
+        if let Some(client) = guard.clients.get_mut(conn_id) {
+            if let Some(queue) = queue.filter(Self::valid_live_queue) {
+                client.queue = Some(Arc::new(queue));
+            } else if clear_queue {
+                client.queue = None;
+            }
+            client.state = state;
+        }
+
+        if !guard.active_player_by_user.contains_key(user_id) && is_playing {
+            guard
+                .active_player_by_user
+                .insert(user_id.to_owned(), conn_id.to_owned());
+        }
+
+        Self::broadcast_devices_locked(guard, user_id);
+        Self::sync_playback_locked(guard, user_id, None);
+    }
+
+    fn dispatch_command_locked(guard: &mut HubState, user_id: &str) {
+        let Some(cmd) = guard
+            .commands
+            .get_mut(user_id)
+            .and_then(VecDeque::front_mut)
+        else {
+            guard.commands.remove(user_id);
+            return;
+        };
+        if cmd.deadline.is_some() {
+            return;
+        }
+        cmd.deadline = Some(Instant::now() + Duration::from_millis(COMMAND_TIMEOUT_MS));
+        let target = cmd.target_conn_id.clone();
+        let payload = json!({ "type": "EXECUTE", "requestId": cmd.id, "command": cmd.command });
+        Self::send_frame_locked(guard, &target, payload);
+    }
+
+    fn is_starting_transfer_target(guard: &HubState, user_id: &str, conn_id: &str) -> bool {
+        guard
+            .transfers_by_user
+            .get(user_id)
+            .is_some_and(|transfer| {
+                transfer.target_conn_id == conn_id && transfer.stage == TransferStage::Start
+            })
+    }
+
+    pub(crate) fn operation_deadline(&self, conn_id: &str) -> Option<Instant> {
         let guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let user_id = &guard.clients.get(conn_id)?.user_id;
-        let transfer = guard.transfers_by_user.get(user_id)?;
-        (transfer.controller_conn_id == conn_id).then_some(transfer.deadline)
+        guard
+            .transfers_by_user
+            .get(user_id)
+            .filter(|transfer| transfer.controller_conn_id == conn_id)
+            .map(|transfer| transfer.deadline)
+            .into_iter()
+            .chain(
+                guard
+                    .commands
+                    .get(user_id)
+                    .and_then(VecDeque::front)
+                    .filter(|cmd| cmd.target_conn_id == conn_id)
+                    .and_then(|cmd| cmd.deadline),
+            )
+            .min()
     }
 
-    pub(crate) fn expire_transfer(&self, conn_id: &str, now: Instant) {
+    pub(crate) fn expire_operations(&self, conn_id: &str, now: Instant) {
         let mut guard = self
             .state
             .lock()
@@ -946,6 +1109,19 @@ impl RemoteControlHub {
                 resume_source,
             );
         }
+        if guard
+            .commands
+            .get(&user_id)
+            .and_then(VecDeque::front)
+            .is_some_and(|cmd| {
+                cmd.target_conn_id == conn_id
+                    && cmd.deadline.is_some_and(|deadline| deadline <= now)
+            })
+            && let Some(client) = guard.clients.get(conn_id)
+        {
+            // Reconnect the target so queued commands cannot continue after a timeout.
+            client.disconnected.send_replace(true);
+        }
     }
 
     fn handle_transfer_step_locked(
@@ -958,7 +1134,7 @@ impl RemoteControlHub {
             RemoteClientMessage::Snapshot { transfer_id, .. }
             | RemoteClientMessage::Ready { transfer_id }
             | RemoteClientMessage::SourcePaused { transfer_id, .. }
-            | RemoteClientMessage::Started { transfer_id }
+            | RemoteClientMessage::Started { transfer_id, .. }
             | RemoteClientMessage::TransferFailed { transfer_id, .. } => transfer_id.as_str(),
             _ => return,
         };
@@ -1109,7 +1285,7 @@ impl RemoteControlHub {
                     }
                 }
             }
-            RemoteClientMessage::Started { .. } => {
+            RemoteClientMessage::Started { queue, .. } => {
                 let can_complete = guard.transfers_by_user.get(user_id).is_some_and(|t| {
                     conn_id == t.target_conn_id
                         && t.stage == TransferStage::Start
@@ -1162,6 +1338,8 @@ impl RemoteControlHub {
                         playing: snapshot.playing,
                         volume: snapshot.volume,
                     };
+                    // The receiving device reports its own queue with its local occurrence IDs.
+                    tgt.queue = queue.filter(Self::valid_live_queue).map(Arc::new);
                 }
 
                 Self::send_frame_locked(
@@ -1190,6 +1368,7 @@ impl RemoteControlHub {
                     }),
                 );
                 Self::broadcast_devices_locked(guard, user_id);
+                Self::sync_playback_locked(guard, user_id, None);
             }
             _ => {}
         }
@@ -1251,50 +1430,61 @@ impl RemoteControlHub {
             return;
         };
         let user_id = removed.user_id;
+        removed.disconnected.send_replace(true);
 
-        if guard.transfers_by_user.get(&user_id).is_some_and(|t| {
-            t.source_conn_id == conn_id
-                || t.target_conn_id == conn_id
-                || t.controller_conn_id == conn_id
-        }) {
+        if let Some(transfer) = guard.transfers_by_user.get(&user_id)
+            && (transfer.source_conn_id == conn_id
+                || transfer.target_conn_id == conn_id
+                || transfer.controller_conn_id == conn_id)
+        {
+            let resume_source = transfer.source_conn_id != conn_id
+                && matches!(transfer.stage, TransferStage::Pause | TransferStage::Start);
             Self::abort_transfer_locked(
                 guard,
                 &user_id,
-                "A participating device disconnected. Playback may need to be resumed manually.",
-                false,
+                "A participating device disconnected",
+                resume_source,
             );
         }
 
-        let affected_cmds: Vec<(String, String, String)> = guard
-            .commands
-            .iter()
-            .filter(|(_, cmd)| cmd.controller_conn_id == conn_id || cmd.target_conn_id == conn_id)
-            .map(|(cid, cmd)| {
-                (
-                    cid.clone(),
-                    cmd.controller_conn_id.clone(),
-                    cmd.client_request_id.clone(),
-                )
-            })
-            .collect();
-
-        for (cid, controller_conn, req_id) in affected_cmds {
-            guard.commands.remove(&cid);
-            if controller_conn != conn_id {
-                Self::send_error_locked(
-                    guard,
-                    &controller_conn,
-                    "The player disconnected",
-                    Some(&req_id),
-                );
-            }
+        let mut lost_targets = Vec::new();
+        if let Some(commands) = guard.commands.get_mut(&user_id) {
+            commands.retain(|cmd| {
+                if cmd.target_conn_id == conn_id {
+                    lost_targets.push((
+                        cmd.controller_conn_id.clone(),
+                        cmd.client_request_id.clone(),
+                    ));
+                    return false;
+                }
+                // A controller may close after its command was sent. Keep its place
+                // until the target acknowledges it so subsequent commands stay ordered.
+                cmd.controller_conn_id != conn_id || cmd.deadline.is_some()
+            });
         }
+        for (controller, request) in lost_targets {
+            Self::send_error_locked(
+                guard,
+                &controller,
+                "The player disconnected",
+                Some(&request),
+            );
+        }
+        Self::dispatch_command_locked(guard, &user_id);
 
         if guard.active_player_by_user.get(&user_id).map(String::as_str) == Some(conn_id) {
             guard.active_player_by_user.remove(&user_id);
         }
 
         Self::broadcast_devices_locked(guard, &user_id);
+        Self::sync_playback_locked(guard, &user_id, None);
+        if !guard
+            .clients
+            .values()
+            .any(|client| client.user_id == user_id)
+        {
+            guard.playback_by_user.remove(&user_id);
+        }
     }
 
     /// Notifies other queue-aware devices that a committed account snapshot changed.
@@ -1320,6 +1510,102 @@ impl RemoteControlHub {
                     .is_some_and(|id| id != device_id || shared_device)
         }) {
             let _ = client.tx.try_send(json!({ "type": "QUEUE_CHANGED" }));
+        }
+    }
+
+    fn valid_live_queue(queue: &TransferQueueState) -> bool {
+        if queue.entries.len() > 5000
+            || (!queue.entries.is_empty() && queue.index >= queue.entries.len())
+        {
+            return false;
+        }
+        let mut ids = std::collections::HashSet::with_capacity(queue.entries.len());
+        queue.entries.iter().all(|entry| {
+            !entry.occurrence_id.is_empty()
+                && entry.occurrence_id.len() <= 160
+                && ids.insert(&entry.occurrence_id)
+                && !entry.track_id.is_empty()
+                && entry.track_id.len() <= 1024
+                && (0.0..=604_800.0).contains(&entry.duration)
+        })
+    }
+
+    fn sync_playback_locked(guard: &mut HubState, user_id: &str, initialize: Option<&str>) {
+        let player = guard
+            .active_player_by_user
+            .get(user_id)
+            .and_then(|id| guard.clients.get(id));
+        let state = player.map(|client| &client.state);
+        let current_id = state
+            .and_then(|state| state.current_track.as_ref())
+            .map(|track| track.id.as_str());
+        let queue = player
+            .and_then(|client| client.queue.clone())
+            .filter(|queue| queue.entries.get(queue.index).map(|entry| entry.track_id.as_str()) == current_id);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let previous = guard.playback_by_user.get(user_id);
+        let queue_changed = previous.is_none_or(|old| match (&old.queue, &queue) {
+            (Some(old), Some(next)) => !Arc::ptr_eq(old, next) && old != next,
+            (None, None) => false,
+            _ => true,
+        });
+        let device_id = player.and_then(|client| client.device_id.clone());
+        let track = state.and_then(|state| state.current_track.clone());
+        let position_ms = state.map_or(0.0, |state| state.position_ms);
+        let duration_ms = state.map_or(0.0, |state| state.duration_ms);
+        let is_playing = state.is_some_and(|state| state.playing);
+        let volume = state.map_or(1.0, |state| state.volume as f32);
+        let changed = queue_changed
+            || previous.is_none_or(|old| {
+                old.device_id != device_id
+                    || old.track != track
+                    || old.position_ms != position_ms
+                    || old.duration_ms != duration_ms
+                    || old.is_playing != is_playing
+                    || old.volume != volume
+            });
+        if changed {
+            let revision = previous.map_or(1, |old| old.revision + 1);
+            guard.playback_by_user.insert(
+                user_id.to_owned(),
+                PlaybackState {
+                    device_id,
+                    track,
+                    position_ms,
+                    duration_ms,
+                    is_playing,
+                    volume,
+                    updated_at: now,
+                    revision,
+                    queue,
+                },
+            );
+        }
+        let playback = &guard.playback_by_user[user_id];
+        if let Some(conn_id) = initialize {
+            Self::send_frame_locked(
+                guard,
+                conn_id,
+                json!({
+                    "type": "INITIAL_STATE", "state": playback, "server_time": now,
+                    "queue": playback.queue.as_deref(),
+                }),
+            );
+        }
+        if changed {
+            let mut payload =
+                json!({ "type": "STATE_SYNC", "state": playback, "server_time": now });
+            if queue_changed {
+                payload["queue"] = json!(playback.queue.as_deref());
+            }
+            for client in guard.clients.values().filter(|c| {
+                c.user_id == user_id && c.live_sync && Some(c.conn_id.as_str()) != initialize
+            }) {
+                Self::send_to_client(client, payload.clone());
+            }
         }
     }
 
@@ -1356,7 +1642,7 @@ impl RemoteControlHub {
         });
 
         for peer in peers {
-            let _ = peer.tx.try_send(payload.clone());
+            Self::send_to_client(peer, payload.clone());
         }
     }
 
@@ -1383,7 +1669,13 @@ impl RemoteControlHub {
 
     fn send_frame_locked(guard: &HubState, conn_id: &str, payload: Value) {
         if let Some(client) = guard.clients.get(conn_id) {
-            let _ = client.tx.try_send(payload);
+            Self::send_to_client(client, payload);
+        }
+    }
+
+    fn send_to_client(client: &ConnectedClient, payload: Value) {
+        if client.tx.try_send(payload).is_err() {
+            client.disconnected.send_replace(true);
         }
     }
 }
@@ -1391,6 +1683,153 @@ impl RemoteControlHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_state_is_account_scoped_and_commands_commit_in_arrival_order() {
+        let hub = RemoteControlHub::new();
+        let register = |user: &str, device: &str| {
+            let (conn, rx) = hub.connect_client(user, device, 0).unwrap();
+            hub.handle_message(
+                &conn,
+                serde_json::from_value(json!({
+                    "type": "REGISTER", "device_id": device, "device_name": device,
+                    "device_type": "computer", "can_receive": true, "live_sync": true,
+                    "state": RemotePlaybackState::default()
+                }))
+                .unwrap(),
+            );
+            (conn, rx)
+        };
+        let send =
+            |conn: &str, frame| hub.handle_message(conn, serde_json::from_value(frame).unwrap());
+        let receive = |rx: &mut mpsc::Receiver<Value>, kind: &str| loop {
+            let frame = rx.try_recv().unwrap();
+            if frame["type"] == kind {
+                break frame;
+            }
+        };
+        let (desktop, mut audio) = register("alice", "desktop");
+        let (phone, mut controller) = register("alice", "phone");
+        let (_, mut outsider) = register("bob", "other");
+        assert!(receive(&mut outsider, "INITIAL_STATE")["state"]["device_id"].is_null());
+        assert!(receive(&mut controller, "INITIAL_STATE")["state"]["device_id"].is_null());
+        let state = |track_id, position_ms, playing| {
+            json!({
+                "current_track": { "id": track_id, "title": "Song" },
+                "position_ms": position_ms, "duration_ms": 60000, "playing": playing, "volume": 0.5,
+            })
+        };
+        let queue = json!({
+            "entries": [
+                { "occurrenceId": "entry", "trackId": "one", "title": "Song", "artist": "", "album": "", "duration": 60.0 },
+                { "occurrenceId": "next", "trackId": "two", "title": "Song", "artist": "", "album": "", "duration": 60.0 },
+            ],
+            "index": 0, "repeatOne": false, "shuffle": false, "shuffleMode": "standard",
+            "shuffleSeed": null, "albumAware": false, "context": null,
+        });
+        send(
+            &desktop,
+            json!({ "type": "STATE", "state": state("one", 1000, true), "queue": queue }),
+        );
+        let first = receive(&mut controller, "STATE_SYNC");
+        assert_eq!(first["state"]["device_id"], "desktop");
+        assert_eq!(first["queue"], queue);
+        assert!(outsider.try_recv().is_err());
+
+        send(
+            &phone,
+            json!({ "type": "COMMAND", "requestId": "skip", "command": { "type": "SKIP", "direction": "next" } }),
+        );
+        send(
+            &desktop,
+            json!({ "type": "COMMAND", "requestId": "pause", "command": { "type": "PAUSE" } }),
+        );
+        let skip = receive(&mut audio, "EXECUTE");
+        assert_eq!(skip["command"]["type"], "SKIP");
+        assert!(audio.try_recv().is_err());
+        let mut next_queue = queue.clone();
+        next_queue["index"] = json!(1);
+        send(
+            &desktop,
+            json!({ "type": "STATE", "state": state("two", 0, true), "queue": next_queue }),
+        );
+        send(
+            &desktop,
+            json!({ "type": "COMMAND_RESULT", "requestId": skip["requestId"], "ok": true, "state": state("two", 0, true) }),
+        );
+        let second = receive(&mut controller, "STATE_SYNC");
+        assert_eq!(second["state"]["track"]["id"], "two");
+        assert_eq!(second["queue"], next_queue);
+        assert_eq!(receive(&mut audio, "STATE_SYNC")["state"], second["state"]);
+        let pause = receive(&mut audio, "EXECUTE");
+        assert_eq!(pause["command"]["type"], "PAUSE");
+        send(
+            &desktop,
+            json!({ "type": "COMMAND_RESULT", "requestId": pause["requestId"], "ok": true, "state": state("two", 0, false) }),
+        );
+        let paused = receive(&mut controller, "STATE_SYNC");
+        assert_eq!(paused["state"]["is_playing"], false);
+        assert_eq!(paused["state"]["track"]["id"], "two");
+        assert_eq!(receive(&mut audio, "STATE_SYNC")["state"], paused["state"]);
+        assert!(paused["state"]["revision"].as_u64() > first["state"]["revision"].as_u64());
+        let (_, mut rejoined) = register("alice", "rejoined");
+        let initial = receive(&mut rejoined, "INITIAL_STATE");
+        assert_eq!(initial["state"], paused["state"]);
+        assert_eq!(initial["queue"], next_queue);
+    }
+
+    #[test]
+    fn a_browser_restoring_its_queue_cannot_take_over_from_the_playing_desktop() {
+        let hub = RemoteControlHub::new();
+        let (desktop, mut desktop_rx) = hub.connect_client("alice", "desktop", 0).unwrap();
+        let (browser, mut browser_rx) = hub.connect_client("alice", "browser", 0).unwrap();
+        let state = |id: &str, playing: bool| {
+            json!({
+                "current_track": { "id": id, "title": id },
+                "position_ms": 0, "duration_ms": 180000, "playing": playing, "volume": 1,
+            })
+        };
+        let send = |conn: &str, payload| {
+            hub.handle_message(conn, serde_json::from_value(payload).unwrap())
+        };
+        let register = |conn: &str, device: &str, playback| {
+            send(
+                conn,
+                json!({
+                    "type": "REGISTER", "device_id": device, "device_name": device,
+                    "device_type": "computer", "can_receive": true, "state": playback,
+                }),
+            )
+        };
+        register(&browser, "browser", state("old song", false));
+        assert_eq!(
+            browser_rx.try_recv().unwrap()["devices"][0]["is_active_player"],
+            false
+        );
+
+        register(&desktop, "desktop", state("first desktop song", true));
+        while browser_rx.try_recv().is_ok() {}
+        while desktop_rx.try_recv().is_ok() {}
+
+        send(
+            &browser,
+            json!({ "type": "STATE", "state": state("old song", true), "claim": true }),
+        );
+        assert_eq!(browser_rx.try_recv().unwrap()["type"], "DEACTIVATE");
+        assert_eq!(desktop_rx.try_recv().unwrap()["type"], "DEVICES");
+
+        send(
+            &desktop,
+            json!({ "type": "STATE", "state": state("next desktop song", true) }),
+        );
+        assert_eq!(desktop_rx.try_recv().unwrap()["type"], "DEVICES");
+        hub.disconnect_client(&browser);
+        let remaining = &desktop_rx.try_recv().unwrap()["devices"][0];
+        assert_eq!(remaining["device_id"], "desktop");
+        assert_eq!(remaining["is_active_player"], true);
+        assert_eq!(remaining["playing"], true);
+        assert_eq!(remaining["current_track"]["id"], "next desktop song");
+    }
 
     #[test]
     fn picks_an_idle_output_and_hands_off_the_live_track_only_after_the_target_starts() {
@@ -1469,7 +1908,7 @@ mod tests {
 
         choose("phone");
         let stalled = receive(&mut desktop_rx, "REQUEST_SNAPSHOT");
-        hub.expire_transfer(&phone, hub.transfer_deadline(&phone).unwrap());
+        hub.expire_operations(&phone, hub.operation_deadline(&phone).unwrap());
         assert_eq!(receive(&mut phone_rx, "TRANSFER_RESULT")["ok"], false);
         choose("phone");
         let transfer_id = receive(&mut desktop_rx, "REQUEST_SNAPSHOT")["transferId"].clone();
@@ -1531,7 +1970,17 @@ mod tests {
             hub.handle_message(&id, message);
             (id, receiver)
         };
-        let (_active, mut player) = register("desktop", json!({"id": "old", "title": "Old track"}));
+        let (active, mut player) = register("desktop", json!({"id": "old", "title": "Old track"}));
+        hub.handle_message(
+            &active,
+            serde_json::from_value(json!({
+                "type": "STATE", "state": {
+                    "current_track": {"id": "old", "title": "Old track"},
+                    "position_ms": 0, "duration_ms": 0, "playing": true, "volume": 1
+                }
+            }))
+            .unwrap(),
+        );
         let (controller, mut browser) = register("browser", Value::Null);
         while player.try_recv().is_ok() {}
         while browser.try_recv().is_ok() {}

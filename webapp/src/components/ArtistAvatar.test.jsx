@@ -1,6 +1,7 @@
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import ArtistAvatar, { artistInitials } from "./ArtistAvatar";
 import { getArtistPortrait, getCoverUrl, getMusicBrainzArtistPortrait } from "../api/musicdeck";
+import { DESKTOP_SERVER_URL_KEY } from "../services/desktop/desktopRuntime";
 
 jest.mock("../api/musicdeck", () => ({
   getArtistPortrait: jest.fn(),
@@ -74,6 +75,22 @@ test("caches a successfully loaded portrait by artist ID for the next mount", as
   const second = render(<ArtistAvatar artist={artist} />);
   expect(second.container.querySelector("img")).toHaveAttribute("src", "/api/artwork/external/verified");
   expect(getArtistPortrait).toHaveBeenCalledTimes(1);
+});
+
+test("loads both local and external portrait paths from the configured desktop server", async () => {
+  window.__MUSICDECK_DESKTOP__ = true;
+  localStorage.setItem(DESKTOP_SERVER_URL_KEY, "http://192.168.1.25:8080");
+  getArtistPortrait.mockResolvedValue({ url: "/api/artwork/mdart_portrait", source: "native", kind: "artist" });
+  try {
+    const { container } = render(<>
+      <ArtistAvatar artist={{ id: "local-queen", name: "Queen" }} />
+      <ArtistAvatar artist={{ id: "deezer_7", name: "Muse", imageUrl: "/api/artwork/external/extart_7" }} />
+    </>);
+    await waitFor(() => expect(Array.from(container.querySelectorAll("img"), image => image.src)).toEqual([
+      "http://192.168.1.25:8080/api/artwork/mdart_portrait",
+      "http://192.168.1.25:8080/api/artwork/external/extart_7",
+    ]));
+  } finally { delete window.__MUSICDECK_DESKTOP__; }
 });
 
 test("retries the next source on image errors and keeps initials visible after all failures", async () => {

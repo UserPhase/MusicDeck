@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { getArtistPortrait, getCoverUrl, getMusicBrainzArtistPortrait } from "../api/musicdeck";
 import { usePrivacy } from "../context/PrivacyContext";
+import { resolveDesktopApiUrl } from "../services/desktop/desktopRuntime";
 
 const pendingPortraits = new Map();
 const AVATAR_CACHE_MS = 4 * 60_000;
@@ -208,7 +209,7 @@ export default function ArtistAvatar({ artist, className = "", allowAlbumTileFal
     <span ref={avatar} className={`artist-avatar ${className}`} aria-hidden="true">
       <ArtistAvatarFallback artistId={artistId} name={name} />
       {portrait && (canArtwork || (portrait.source === "native" && portrait.url.startsWith("/"))) && <img key={portrait.url} className={`artist-avatar-photo${loaded ? " is-loaded" : ""}`}
-        src={portrait.url} alt="" decoding="async" onLoad={() => {
+        src={resolveDesktopApiUrl(portrait.url)} alt="" decoding="async" onLoad={() => {
           setLoaded(true);
           saveCachedPortrait(artistId, name, portrait);
         }}

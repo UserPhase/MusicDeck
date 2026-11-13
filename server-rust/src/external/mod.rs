@@ -1,6 +1,7 @@
 //! # External Metadata, Lyrics, Discovery Charts & Saved Discoveries (`external`)
 
 pub mod adapters;
+pub(crate) mod artist_portrait;
 pub mod composite;
 pub mod discovery;
 pub mod lyrics;

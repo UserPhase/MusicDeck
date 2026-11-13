@@ -6,6 +6,7 @@ import { useVisualActivity } from "./useVisualActivity";
 export type PlaybackPositionSource = {
   currentTime?: number;
   isPlaying?: boolean;
+  isRemotePlayback?: boolean;
   playbackPositionKey?: string;
   audioEngine?: PlaybackEngine | null;
   readPlaybackPosition?: () => number;
@@ -13,16 +14,17 @@ export type PlaybackPositionSource = {
 
 /** Sample the desktop's local audio clock without updating the shared player context. */
 export function usePlaybackDisplayPosition(
-  { currentTime = 0, isPlaying, playbackPositionKey, audioEngine, readPlaybackPosition }: PlaybackPositionSource,
+  { currentTime = 0, isPlaying, isRemotePlayback, playbackPositionKey, audioEngine, readPlaybackPosition }: PlaybackPositionSource,
   enabled = true,
   resolution = 1,
 ): number {
   const visualActive = useVisualActivity();
-  const desktopClock = isDesktopRuntime() && audioEngine && readPlaybackPosition;
+  const desktopClock = !isRemotePlayback && isDesktopRuntime() && audioEngine && readPlaybackPosition;
+  const remoteClock = isRemotePlayback && readPlaybackPosition;
   const [position, setPosition] = useState(currentTime);
 
   useLayoutEffect(() => {
-    if (!desktopClock || !audioEngine || !readPlaybackPosition || !enabled || !visualActive) return;
+    if ((!desktopClock && !remoteClock) || !readPlaybackPosition || !enabled || !visualActive) return;
     let bucket = -1;
     const sample = (seconds: number) => {
       if (!Number.isFinite(seconds)) return;
@@ -32,8 +34,18 @@ export function usePlaybackDisplayPosition(
       setPosition(seconds);
     };
     sample(readPlaybackPosition());
-    return audioEngine.on("timeUpdate", ({ position }) => sample(position));
-  }, [audioEngine, currentTime, desktopClock, enabled, isPlaying, playbackPositionKey, readPlaybackPosition, resolution, visualActive]);
+    if (remoteClock) {
+      if (!isPlaying) return;
+      let frame: number;
+      const tick = () => {
+        sample(remoteClock());
+        frame = requestAnimationFrame(tick);
+      };
+      frame = requestAnimationFrame(tick);
+      return () => cancelAnimationFrame(frame);
+    }
+    return audioEngine?.on("timeUpdate", ({ position }) => sample(position));
+  }, [audioEngine, currentTime, desktopClock, remoteClock, enabled, isPlaying, playbackPositionKey, readPlaybackPosition, resolution, visualActive]);
 
-  return desktopClock ? position : currentTime;
+  return desktopClock || remoteClock ? position : currentTime;
 }

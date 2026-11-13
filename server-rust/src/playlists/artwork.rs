@@ -24,7 +24,7 @@ use image::imageops::{FilterType, overlay};
 use image::{ImageFormat, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 
 use crate::db::{DbError, DbPool};
 use crate::playlists::PlaylistError;
@@ -73,6 +73,44 @@ pub struct PlaylistArtworkDescriptor {
     pub artwork_url: Option<String>,
     /// Resolution mode (`custom` or `collage`).
     pub artwork_mode: Option<PlaylistArtworkMode>,
+}
+
+pub(crate) async fn describe_on_conn(
+    conn: &mut SqliteConnection,
+    playlist_id: &str,
+) -> Result<PlaylistArtworkDescriptor, DbError> {
+    let custom_updated_at = sqlx::query_scalar::<_, String>(
+        "SELECT updated_at FROM playlist_artwork WHERE playlist_id = ?",
+    )
+    .bind(playlist_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    let (signature, mode) = if let Some(updated_at) = custom_updated_at {
+        (signature_of(&["custom", &updated_at]), PlaylistArtworkMode::Custom)
+    } else {
+        let refs = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(library_track_id, connection_id || ':' || provider_track_id)
+             FROM playlist_items WHERE playlist_id = ? ORDER BY position LIMIT ?",
+        )
+        .bind(playlist_id)
+        .bind(COLLAGE_TILE_COUNT as i64)
+        .fetch_all(conn)
+        .await?;
+        if refs.is_empty() {
+            return Ok(PlaylistArtworkDescriptor::default());
+        }
+        let mut parts = vec!["collage-v2"];
+        parts.extend(refs.iter().map(String::as_str));
+        (signature_of(&parts), PlaylistArtworkMode::Collage)
+    };
+
+    let artwork_id = build_playlist_artwork_id(playlist_id, &signature);
+    Ok(PlaylistArtworkDescriptor {
+        artwork_url: Some(format!("/api/artwork/{}", urlencoding::encode(&artwork_id))),
+        artwork_id: Some(artwork_id),
+        artwork_mode: Some(mode),
+    })
 }
 
 /// Rendered binary artwork payload ready for HTTP delivery.
@@ -409,43 +447,10 @@ impl PlaylistArtworkService {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Computes the [`PlaylistArtworkDescriptor`] (`artworkId`, `artworkUrl`, `artworkMode`)
-    /// for `playlist_id` given its leading track references.
-    pub async fn describe(
-        &self,
-        playlist_id: &str,
-        leading_track_refs: &[String],
-    ) -> Result<PlaylistArtworkDescriptor, DbError> {
-        if let Some(custom) = self.get_custom(playlist_id).await? {
-            let sig = signature_of(&["custom", &custom.updated_at]);
-            let artwork_id = build_playlist_artwork_id(playlist_id, &sig);
-            return Ok(PlaylistArtworkDescriptor {
-                artwork_url: Some(format!("/api/artwork/{}", urlencoding::encode(&artwork_id))),
-                artwork_id: Some(artwork_id),
-                artwork_mode: Some(PlaylistArtworkMode::Custom),
-            });
-        }
-
-        let tiles: Vec<&str> = leading_track_refs
-            .iter()
-            .take(COLLAGE_TILE_COUNT)
-            .map(String::as_str)
-            .collect();
-        if tiles.is_empty() {
-            return Ok(PlaylistArtworkDescriptor::default());
-        }
-
-        let mut sig_parts = Vec::with_capacity(tiles.len() + 1);
-        sig_parts.push("collage-v2");
-        sig_parts.extend(tiles);
-        let sig = signature_of(&sig_parts);
-        let artwork_id = build_playlist_artwork_id(playlist_id, &sig);
-
-        Ok(PlaylistArtworkDescriptor {
-            artwork_url: Some(format!("/api/artwork/{}", urlencoding::encode(&artwork_id))),
-            artwork_id: Some(artwork_id),
-            artwork_mode: Some(PlaylistArtworkMode::Collage),
-        })
+    /// Reads the cover reference for `playlist_id` without fetching or rendering the image.
+    pub async fn describe(&self, playlist_id: &str) -> Result<PlaylistArtworkDescriptor, DbError> {
+        let mut conn = self.db.inner().acquire().await?;
+        describe_on_conn(&mut conn, playlist_id).await
     }
 
     /// Retrieves a cached collage or stores a newly rendered collage in the bounded 64-slot cache.

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { RemoteSessionContext } from "../../context/RemoteSessionContext";
 import type { RemoteSessionValue } from "../../types/remoteSession";
 import DeviceSelectorButton from "./DeviceSelectorButton";
@@ -57,15 +57,22 @@ test("disconnected, busy and error states disable unsafe actions and remain expl
   expect(value.clearError).toHaveBeenCalledTimes(1);
 });
 
-test("unlocks this phone from the Play here tap before requesting playback", async () => {
-  const value = session({ deviceId: "phone", enabled: false, isRemote: true });
+test("unlocks this phone once from Play here before requesting playback", async () => {
+  let finishEnabling!: () => void;
+  const enable = jest.fn(() => new Promise<void>(resolve => { finishEnabling = resolve; }));
+  const value = session({ deviceId: "phone", enabled: false, isRemote: true, enable });
   value.devices[1].can_receive = false;
   render(<RemoteSessionContext.Provider value={value}><DeviceSelectorButton /></RemoteSessionContext.Provider>);
   fireEvent.click(screen.getByRole("button", { name: "Choose playback device" }));
-  fireEvent.click(screen.getByRole("button", { name: "Transfer playback to Phone" }));
-  await waitFor(() => expect(value.transfer).toHaveBeenCalledWith("phone"));
-  expect(value.enable).toHaveBeenCalledTimes(1);
-  expect(jest.mocked(value.enable).mock.invocationCallOrder[0]).toBeLessThan(jest.mocked(value.transfer).mock.invocationCallOrder[0]);
+  const playHere = screen.getByRole("button", { name: "Transfer playback to Phone" });
+  fireEvent.click(playHere);
+  expect(playHere).toBeDisabled();
+  fireEvent.click(playHere);
+  expect(enable).toHaveBeenCalledTimes(1);
+  expect(value.transfer).not.toHaveBeenCalled();
+  await act(async () => finishEnabling());
+  expect(value.transfer).toHaveBeenCalledTimes(1);
+  expect(value.transfer).toHaveBeenCalledWith("phone");
 });
 
 test("Google Cast is grouped in the same device dialog and starts only from an explicit user action", async () => {

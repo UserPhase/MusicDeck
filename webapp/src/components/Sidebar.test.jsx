@@ -155,6 +155,23 @@ test("sidebar playlist entries render the resolved playlist artwork", async () =
   );
 });
 
+test("the folder tree supplies playlist covers when the separate playlist list has no artwork", async () => {
+  const originalFetch = global.fetch;
+  const playlists = [
+    { id: "mdpl_1", name: "Evening Drive", artworkId: "mdplart_collage_mdpl_1" },
+    { id: "mdpl_2", name: "Focus", artworkId: "mdplart_custom_mdpl_2" },
+    { id: "mdpl_3", name: "New playlist", artworkId: null },
+  ];
+  global.fetch = jest.fn(async () => ({ ok: true, json: async () => ({ revision: 0, playlists, folders: [] }) }));
+  try {
+    renderSidebar([{ id: "mdpl_3", name: "New playlist", coverArt: "mdplart_stale_mdpl_3" }]);
+    expect(await screen.findByAltText("Evening Drive cover")).toHaveAttribute("src", "/api/artwork/mdplart_collage_mdpl_1?size=64");
+    expect(screen.getByAltText("Focus cover")).toHaveAttribute("src", "/api/artwork/mdplart_custom_mdpl_2?size=64");
+    expect(screen.getByRole("link", { name: "New playlist" })).toBeInTheDocument();
+    expect(screen.queryByAltText("New playlist cover")).not.toBeInTheDocument();
+  } finally { global.fetch = originalFetch; }
+});
+
 test("sidebar navigation exposes section labels and synchronized active item icons", async () => {
   const { container } = renderSidebar([
     { id: "mdpl_1", name: "Evening Drive", coverArt: null, coverMode: null },

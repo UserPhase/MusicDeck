@@ -472,16 +472,11 @@ async fn resolve_external_artist_detail(
     }
 }
 
-async fn resolve_local_artist_snapshot(
+async fn local_artist_sources(
     state: &AppState,
     pool: &DbPool,
     artist_id: &str,
-) -> Option<(
-    crate::catalog::Available<crate::providers::Artist>,
-    Vec<crate::catalog::Available<crate::providers::Album>>,
-    Vec<crate::catalog::Available<crate::providers::Track>>,
-)> {
-    let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+) -> Vec<(crate::providers::RegisteredProvider, String)> {
     let resolver = crate::catalog::SourceResolver::new(
         state.providers().clone(),
         crate::catalog::LibraryService::new(pool.clone(), None),
@@ -494,15 +489,28 @@ async fn resolve_local_artist_snapshot(
         .map(|c| (c.provider, c.source.provider_item_id))
         .collect();
 
-    if targets.is_empty() {
+    if targets.is_empty() && !artist_id.starts_with("md_") {
         for p in state.providers().list() {
             if p.enabled {
                 targets.push((p, artist_id.to_owned()));
             }
         }
     }
+    targets
+}
 
-    for (prov, prov_artist_id) in targets {
+async fn resolve_local_artist_snapshot(
+    state: &AppState,
+    pool: &DbPool,
+    artist_id: &str,
+) -> Option<(
+    crate::catalog::Available<crate::providers::Artist>,
+    Vec<crate::catalog::Available<crate::providers::Album>>,
+    Vec<crate::catalog::Available<crate::providers::Track>>,
+)> {
+    let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+
+    for (prov, prov_artist_id) in local_artist_sources(state, pool, artist_id).await {
         let (artist_res, albums_res, top_res) = tokio::join!(
             prov.provider.get_artist(&prov_artist_id, false),
             prov.provider.get_artist_albums(&prov_artist_id),
@@ -859,76 +867,174 @@ async fn get_artist_portrait_handler(
     let Some(pool) = state.db() else {
         return with_no_store(Json(serde_json::json!({ "imageUrl": null })).into_response());
     };
-    let Some((stamped_artist, local_albums, _)) =
-        resolve_local_artist_snapshot(&state, pool, &artist_id).await
-    else {
-        return send_error_response(StatusCode::NOT_FOUND, "Artist not found", "NOT_FOUND");
-    };
-
     let skip_native = params.get("skipNative").map(String::as_str) == Some("1");
     let skip_deezer = params.get("skipDeezer").map(String::as_str) == Some("1");
-
-    if !skip_native {
-        if let Some(ref art_url) = stamped_artist.item.artwork_url {
-            let is_album_cover = local_albums
-                .iter()
-                .any(|a| a.item.artwork_url.as_ref() == Some(art_url));
-            if !is_album_cover && art_url.starts_with("/api/artwork/mdart_") {
-                return with_no_store(
-                    Json(serde_json::json!({
-                        "imageUrl": art_url,
-                        "imageSource": "native",
-                        "imageKind": "artist",
-                    }))
-                    .into_response(),
-                );
+    let artwork_allowed = artist_external_artwork_allowed(&state, &auth);
+    let resolver = crate::catalog::LibraryService::new(pool.clone(), None);
+    for (provider, id) in local_artist_sources(&state, pool, &artist_id).await {
+        // Top tracks can trigger external work in Navidrome. A portrait only needs
+        // the artist record and its local albums to rule out an album cover.
+        let (artist, albums) = tokio::join!(
+            provider.provider.get_artist(&id, artwork_allowed && !skip_native),
+            provider.provider.get_artist_albums(&id),
+        );
+        let Ok(Some(artist)) = artist else { continue };
+        let albums = albums.unwrap_or_default();
+        if !skip_native {
+            if let Some(art_id) = artist.artwork_id.as_deref().filter(|art_id| {
+                !albums.iter().any(|album| album.artwork_id.as_deref() == Some(*art_id))
+            }) && let Ok(id) = resolver.ensure_artwork_id(&crate::catalog::SourceRef {
+                connection_id: provider.connection_id,
+                provider_item_id: art_id.to_owned(),
+            }).await {
+                return artist_portrait(crate::providers::format_artwork_url(Some(&id)), "native", "artist");
+            }
+            if let Some(url) = artist.image_url.filter(|url| {
+                artwork_allowed && url.starts_with("https://") &&
+                    !albums.iter().any(|album| album.artwork_url.as_ref() == Some(url))
+            }) {
+                return artist_portrait(Some(url), "native", "artist");
             }
         }
-    }
-
-    let artwork_allowed = (auth.user.is_admin() || auth.user.external_search_enabled)
-        && state
-            .privacy()
-            .is_external_allowed(crate::services::privacy::ExternalCategory::Artwork);
-    if !artwork_allowed || skip_deezer {
-        return with_no_store(Json(serde_json::json!({ "imageUrl": null })).into_response());
-    }
-
-    let deezer = crate::external::DeezerAdapter::new(state.artwork_tokens().clone(), 5);
-    let target_key = crate::catalog::normalize_music_text(Some(&stamped_artist.item.name));
-    if let Ok(candidates) =
-        crate::external::ExternalProvider::search_artists(&deezer, &stamped_artist.item.name).await
-    {
-        if let Some(matched) = candidates
-            .into_iter()
-            .find(|c| crate::catalog::normalize_music_text(Some(&c.title)) == target_key)
-        {
-            if let Some(art) = matched.artwork {
-                return with_no_store(
-                    Json(serde_json::json!({
-                        "imageUrl": art.url,
-                        "imageSource": "deezer",
-                        "imageKind": "artist",
-                    }))
-                    .into_response(),
-                );
+        if artwork_allowed {
+            if !skip_deezer && let Some(url) = deezer_artist_portrait(&state, &artist.name, &albums).await {
+                return artist_portrait(Some(url), "deezer", "artist");
+            }
+            if let Some(url) = itunes_artist_tile(&state, &artist.name, &albums).await {
+                return artist_portrait(Some(url), "itunes", "artist-tile-fallback");
             }
         }
+        return artist_portrait(None, "native", "artist");
     }
+    send_error_response(StatusCode::NOT_FOUND, "Artist not found", "NOT_FOUND")
+}
 
-    with_no_store(Json(serde_json::json!({ "imageUrl": null })).into_response())
+fn artist_external_artwork_allowed(state: &AppState, auth: &AuthenticatedUser) -> bool {
+    (auth.user.is_admin() || auth.user.external_search_enabled)
+        && state.privacy().is_external_allowed(crate::services::privacy::ExternalCategory::Artwork)
+}
+
+fn artist_portrait(url: Option<String>, source: &str, kind: &str) -> Response {
+    with_no_store(Json(json!({
+        "imageSource": url.as_ref().map(|_| source),
+        "imageKind": url.as_ref().map(|_| kind),
+        "imageUrl": url,
+    })).into_response())
+}
+
+fn exact_artist_candidates(
+    candidates: Vec<crate::external::ExternalSearchItem>, name: &str,
+) -> impl Iterator<Item = crate::external::ExternalSearchItem> {
+    let name = crate::catalog::normalize_music_text(Some(name));
+    candidates.into_iter().filter(move |candidate| {
+        !name.is_empty() && crate::catalog::normalize_music_text(Some(&candidate.title)) == name
+    })
+}
+
+fn matching_artist_albums<'a>(detail: &'a serde_json::Value, albums: &[crate::providers::Album]) -> impl Iterator<Item = &'a serde_json::Value> {
+    let album_key = |title: &str| (
+        crate::catalog::normalize_music_text(Some(title)),
+        crate::catalog::version_signature(Some(title)),
+    );
+    let local_titles: std::collections::HashSet<_> = albums.iter().map(|album| album_key(&album.name)).collect();
+    detail.get("albums").and_then(serde_json::Value::as_array).into_iter().flatten()
+        .filter(move |album| album.get("title").and_then(serde_json::Value::as_str)
+            .is_some_and(|title| local_titles.contains(&album_key(title))))
+}
+
+async fn deezer_artist_portrait(state: &AppState, name: &str, albums: &[crate::providers::Album]) -> Option<String> {
+    use crate::external::ExternalProvider as _;
+    let deezer = crate::external::DeezerAdapter::new(state.artwork_tokens().clone(), 8);
+    let mut candidates: Vec<_> = exact_artist_candidates(deezer.search_artists(name).await.ok()?, name).collect();
+    let unique = candidates.len() == 1;
+    candidates.truncate(3);
+    let mut best_match = None;
+    let mut best_score = 0;
+    for candidate in candidates {
+        let Some(artwork) = candidate.artwork else { continue };
+        let Some(url) = state.artwork_tokens().resolve(&artwork.id).and_then(|url| url::Url::parse(&url).ok()) else { continue };
+        if !url.path().starts_with("/images/artist/") || url.path().contains("2a96cbd8b46e442fc41c2b86b821562f") {
+            continue;
+        }
+        if unique { return Some(artwork.url); }
+        if albums.is_empty() { return None }
+        let Some(detail) = deezer.get_artist(&candidate.id).await else { continue };
+        let score = matching_artist_albums(&detail, albums).count();
+        if score > best_score {
+            best_score = score;
+            best_match = Some(artwork.url);
+        } else if score == best_score {
+            best_match = None;
+        }
+    }
+    best_match
+}
+
+async fn itunes_artist_tile(state: &AppState, name: &str, albums: &[crate::providers::Album]) -> Option<String> {
+    use crate::external::ExternalProvider as _;
+    if albums.is_empty() { return None }
+    let itunes = crate::external::ItunesAdapter::new(state.artwork_tokens().clone(), 8);
+    let mut candidates = exact_artist_candidates(itunes.search_artists(name).await.ok()?, name);
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() { return None }
+    let detail = itunes.get_artist(&candidate.id).await?;
+    matching_artist_albums(&detail, albums).find_map(|album| {
+        album.get("artworkUrl").and_then(serde_json::Value::as_str).map(str::to_owned)
+    })
 }
 
 async fn get_artist_portrait_mb_handler(
-    _auth: AuthenticatedUser,
-    Path(_artist_id): Path<String>,
+    State(state): State<AppState>,
+    auth: AuthenticatedUser,
+    Path(artist_id): Path<String>,
 ) -> Response {
-    Json(serde_json::json!({ "imageUrl": null })).into_response()
+    use crate::external::artist_portrait::{resolve_musicbrainz_portrait, valid_commons_image};
+    let missing = || artist_portrait(None, "musicbrainz", "artist");
+    if !artist_external_artwork_allowed(&state, &auth)
+        || artist_id.starts_with("external_") || artist_id.starts_with("extdetail_")
+    {
+        return missing();
+    }
+    let Some(pool) = state.db() else { return missing() };
+    for (provider, id) in local_artist_sources(&state, pool, &artist_id).await {
+        let Ok(Some(artist)) = provider.provider.get_artist(&id, false).await else { continue };
+        let key = format!("artist_avatar_mb:{artist_id}");
+        let cached = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+            .bind(&key).fetch_optional(pool.inner()).await.ok().flatten()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+        if let Some(url) = cached.as_ref().filter(|entry| entry["name"].as_str() == Some(&artist.name))
+            .and_then(|entry| entry["url"].as_str()).filter(|url| valid_commons_image(url))
+        {
+            return artist_portrait(Some(url.to_owned()), "musicbrainz", "artist");
+        }
+        let url = tokio::time::timeout(std::time::Duration::from_secs(12), resolve_musicbrainz_portrait(&artist))
+            .await.ok().flatten();
+        if let Some(url) = &url {
+            let result = sqlx::query(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            ).bind(&key).bind(json!({ "url": url, "name": artist.name }).to_string()).execute(pool.inner()).await;
+            if let Err(error) = result { tracing::warn!(%error, "Could not cache artist portrait"); }
+        }
+        return artist_portrait(url, "musicbrainz", "artist");
+    }
+    send_error_response(StatusCode::NOT_FOUND, "Artist not found", "NOT_FOUND")
 }
 
 async fn post_artist_portrait_purge_handler(
-    _auth: AuthenticatedUser,
-    Path(_artist_id): Path<String>,
-) -> Response {
-    Json(serde_json::json!({ "ok": true })).into_response()
+    State(state): State<AppState>,
+    auth: AuthenticatedUser,
+    Path(artist_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    if !auth.user.is_admin() {
+        return Err(ServerError::Forbidden("Admin access required".into()));
+    }
+    let pool = require_db(&state)?;
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(format!("artist_avatar_mb:{artist_id}")).execute(pool.inner()).await
+        .map_err(|error| {
+            tracing::error!(%error, "Could not clear artist portrait cache");
+            ServerError::Internal("Could not clear artist portrait cache".into())
+        })?;
+    Ok(Json(json!({ "ok": true, "purged": true, "artistId": artist_id })))
 }

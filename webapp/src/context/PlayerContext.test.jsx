@@ -423,13 +423,15 @@ function renderPlayer({
   );
   HTMLMediaElement.prototype.pause = jest.fn();
 
-  return render(
+  const tree = (content) => (
     <AuthProvider>
       <PlayerProvider>
-        {children}
+        {content}
       </PlayerProvider>
     </AuthProvider>
   );
+  const view = render(tree(children));
+  return { ...view, rerenderPlayer: (content = children) => view.rerender(tree(content)) };
 }
 
 
@@ -446,6 +448,12 @@ beforeEach(async () => {
   localStorage.clear();
   sessionStorage.clear();
   jest.clearAllMocks();
+  // Most player tests model a registered, standalone device. Remote tests override the registry.
+  jest.spyOn(remoteSessionModule, "useRemoteSession").mockReturnValue({
+    status: "connected", devices: [], deviceId: "local", activeDevice: null, isRemote: false,
+    enabled: false, busy: false, error: "", name: "Local",
+    command: jest.fn(async () => {}), transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn(),
+  });
   request.mockResolvedValue({ sessions: [], namedQueues: [], saved: true, contentId: "fixture-content" });
   global.fetch = jest.fn(async (url) => ({
     ok: true,
@@ -781,6 +789,37 @@ test("resumes a previously playing track after restoring its media position", as
   expect(audio.currentTime).toBeCloseTo(42.75);
   await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
   await waitFor(async () => expect((await savedQueue()).wasPlaying).toBe(true));
+});
+
+test("waits for the device list before resuming a saved browser queue", async () => {
+  localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({
+    currentSong: songs[1], queue: songs, queueIndex: 1,
+    currentTime: 42.75, wasPlaying: true,
+  })));
+  const connection = {
+    status: "connecting", deviceId: "browser", devices: [], activeDevice: null, isRemote: false,
+    enabled: false, busy: false, error: "", name: "Browser",
+    command: jest.fn(async () => {}), transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn(),
+  };
+  const remote = jest.spyOn(remoteSessionModule, "useRemoteSession").mockReturnValue(connection);
+  const { container, rerenderPlayer } = renderPlayer();
+  const audio = container.querySelector("audio");
+  await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-2"));
+  Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
+  await act(async () => { fireEvent.loadedMetadata(audio); });
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+
+  const desktop = {
+    device_id: "desk", device_name: "MusicDeck Desktop", device_type: "computer", is_active_player: true,
+    can_receive: true, current_track: { id: "desktop-song", title: "Desktop song" },
+    position_ms: 1000, duration_ms: 180000, playing: true, volume: .8,
+  };
+  remote.mockReturnValue({ ...connection, status: "connected", devices: [desktop], activeDevice: desktop, isRemote: true });
+  rerenderPlayer(<PlayerHarness />);
+  expect(screen.getByTestId("current-song")).toHaveTextContent("desktop-song");
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+  expect(connection.command).toHaveBeenCalledWith({ type: "PAUSE" });
 });
 
 test.each(["click", "keydown"])("retries browser-blocked restore on the first %s", async (interaction) => {
@@ -2515,5 +2554,42 @@ test("loads a controller's selection on the active player from the requested tra
     expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-2");
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
     expect(command).not.toHaveBeenCalled();
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test("the selected desktop sends local pause and skip through the hub before applying them", async () => {
+  let adapter;
+  const command = jest.fn(async () => {});
+  const active = { device_id: "desk", device_name: "Desk", device_type: "computer", is_active_player: true,
+    can_receive: true, current_track: null, position_ms: 0, duration_ms: 0, playing: false, volume: 1 };
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return { status: "connected", devices: [active], deviceId: "desk", activeDevice: active, isRemote: false,
+      enabled: true, ordersCommands: true, busy: false, error: "", name: "Desk", command, transfer: jest.fn(),
+      enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
+  });
+  const view = renderPlayer();
+  try {
+    await playerReady();
+    fireEvent.click(screen.getByRole("button", { name: "album-start" }));
+    expect(command).toHaveBeenLastCalledWith(expect.objectContaining({ type: "PLAY_SELECTION", start_index: 0 }));
+    expect(getStreamUrl).not.toHaveBeenCalled();
+    await act(async () => adapter.command(command.mock.lastCall[0]));
+    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1"));
+    const audio = activeAudio(view.container);
+    startDeckPlaying(audio, 200, 10);
+    fireEvent.playing(audio);
+    await waitFor(() => expect(adapter.state().playing).toBe(true));
+
+    fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "PAUSE" });
+    expect(adapter.state().playing).toBe(true);
+    await act(async () => adapter.command({ type: "SKIP", direction: "next" }));
+    await act(async () => adapter.command({ type: "PAUSE" }));
+    expect(adapter.state().current_track.id).toBe("song-2");
+    expect(adapter.state().playing).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "next" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "SKIP", direction: "next" });
+    expect(adapter.state().current_track.id).toBe("song-2");
   } finally { view.unmount(); hook.mockRestore(); }
 });

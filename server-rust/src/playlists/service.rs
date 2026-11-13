@@ -1256,8 +1256,7 @@ impl PlaylistService {
         item_ids: Option<Vec<String>>,
         permissions: Option<PlaylistPermissions>,
     ) -> Result<PlaylistRecord, PlaylistError> {
-        let leading_refs = self.collage_track_refs(&row.id).await?;
-        let art_desc = self.artwork.describe(&row.id, &leading_refs).await?;
+        let art_desc = self.artwork.describe(&row.id).await?;
 
         let song_count = if let Some(ref ids) = item_ids {
             ids.len()
@@ -1295,28 +1294,6 @@ impl PlaylistService {
             item_ids,
             tracks,
         })
-    }
-
-    async fn collage_track_refs(&self, playlist_id: &str) -> Result<Vec<String>, PlaylistError> {
-        let rows = sqlx::query(
-            r"
-            SELECT COALESCE(library_track_id, connection_id || ':' || provider_track_id) AS ref
-            FROM playlist_items
-            WHERE playlist_id = ?
-            ORDER BY position ASC
-            LIMIT ?;
-            ",
-        )
-        .bind(playlist_id)
-        .bind(i64::try_from(COLLAGE_TILE_COUNT).unwrap_or(4))
-        .fetch_all(self.db.inner())
-        .await?;
-
-        let mut refs = Vec::with_capacity(rows.len());
-        for row in rows {
-            refs.push(row.try_get("ref")?);
-        }
-        Ok(refs)
     }
 
     async fn primary_connection_id(&self) -> Result<Option<String>, PlaylistError> {

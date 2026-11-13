@@ -10,6 +10,7 @@ import Login, {
 } from "../../pages/Login";
 import {
   checkDesktopServerConnection,
+  DESKTOP_UPDATE_STATUS_EVENT,
   DEFAULT_DESKTOP_SERVER_URL,
   DESKTOP_SERVER_URL_KEY,
   getDesktopServerUrl,
@@ -366,7 +367,8 @@ describe("desktopRuntime", () => {
     expect(getDesktopServerUrl()).toBe("http://192.168.1.99:8080");
   });
 
-  test("checks for desktop updates on startup and triggers one-click install", async () => {
+  test("starts a one-click update, reports download progress and allows retry on failure", async () => {
+    let rejectInstall;
     const invokeMock = jest.fn((cmd) => {
       if (cmd === "desktop_check_for_updates") {
         return Promise.resolve({
@@ -381,7 +383,7 @@ describe("desktopRuntime", () => {
         });
       }
       if (cmd === "desktop_install_update") {
-        return Promise.resolve(null);
+        return new Promise((resolve, reject) => { rejectInstall = reject; });
       }
       return Promise.resolve(null);
     });
@@ -405,6 +407,26 @@ describe("desktopRuntime", () => {
         sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       });
     });
+    const progress = screen.getByRole("progressbar", { name: "Update download progress" });
+    expect(progress).not.toHaveAttribute("value");
+    expect(screen.getByRole("button", { name: "Downloading..." })).toBeDisabled();
+
+    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, {
+      detail: { stage: "downloading", downloadedBytes: 512, totalBytes: 1024 },
+    }));
+    expect(progress).toHaveAttribute("value", "50");
+    expect(screen.getByText("Downloading update (50%)")).toBeInTheDocument();
+
+    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, { detail: { stage: "verifying" } }));
+    expect(progress).toHaveAttribute("value", "100");
+    expect(screen.getByRole("button", { name: "Verifying..." })).toBeDisabled();
+
+    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, { detail: { stage: "installing" } }));
+    expect(screen.getByRole("button", { name: "Restarting..." })).toBeDisabled();
+
+    rejectInstall("Failed to launch update installer");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Failed to launch update installer");
+    expect(screen.getByRole("button", { name: /Update & Restart/i })).toBeEnabled();
   });
 
   test("shows Server Connection controls on Login only when running in desktop mode", async () => {

@@ -56,18 +56,18 @@ function progressPercent(position, duration) {
 }
 
 function PlayerProgress({ player }) {
-  const { currentSong, isPlaying, isBuffering, duration, seek, readPlaybackPosition } = player;
+  const { currentSong, isPlaying, isBuffering, isRemotePlayback, duration, seek, readPlaybackPosition } = player;
   const currentTime = usePlaybackDisplayPosition(player);
   const progressInput = useRef(null);
   const visualActive = useVisualActivity();
   const desktop = isDesktopRuntime();
-  const animateProgress = Boolean(!desktop && visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
+  const animateProgress = Boolean((!desktop || isRemotePlayback) && visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
 
   useLayoutEffect(() => {
     if (!visualActive) return;
-    const position = !desktop && currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
+    const position = (!desktop || isRemotePlayback) && currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
     paintProgress(progressInput.current, progressPercent(position, duration));
-  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive, desktop]);
+  }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive, desktop, isRemotePlayback]);
 
   // Repaint only the scrubber between media events so the rest of the UI stays idle.
   useLayoutEffect(() => {

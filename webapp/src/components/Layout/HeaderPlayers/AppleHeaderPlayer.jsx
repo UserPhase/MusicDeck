@@ -10,7 +10,7 @@ import DeviceSelectorButton from "../../player/DeviceSelectorButton";
 
 function HeaderScrubber({ player }) {
   const { currentSong, duration, seek } = player;
-  const currentTime = usePlaybackDisplayPosition(player);
+  const currentTime = usePlaybackDisplayPosition(player, true, player.isRemotePlayback ? 1 / 30 : 1);
   const progress = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   return (
     <div className="header-player-scrubber">

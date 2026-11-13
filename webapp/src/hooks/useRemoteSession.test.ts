@@ -55,6 +55,8 @@ test("registers same-origin cookies-only control, publishes explicit playback cl
   expect(FakeSocket.instances).toHaveLength(2);
   const next = FakeSocket.instances[1];
   act(() => next.open());
+  expect(result.current.status).not.toBe("connected");
+  await receive(next, { type: "DEVICES", devices: [] });
   expect(result.current.status).toBe("connected");
   // A late close from an old transport must not tear down the replacement.
   act(() => ws.onclose?.({ code: 1006, reason: "" }));
@@ -114,6 +116,26 @@ test("coalesces 500 continuous seeks into one latest-value command in an 80 ms w
   expect(sent[0].command).toEqual({ type: "SEEK", position_ms: 499.125 });
   await receive(ws, { type: "COMMAND_RESULT", requestId: sent[0].requestId, ok: true });
   await expect(Promise.all(commands)).resolves.toHaveLength(500);
+});
+test("uses the server snapshot clock, ignores older revisions, and clears the clock on disconnect", async () => {
+  const { result } = renderHook(() => useRemoteSession("user", adapter()));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const now = Date.now();
+  const state = { device_id: "desk", track: initial.current_track, position_ms: 10000,
+    duration_ms: 600000, volume: .6, updated_at: now - 2000, is_playing: true, revision: 3 };
+  await receive(ws, { type: "INITIAL_STATE", state, server_time: now, queue: snapshot.queueState });
+  expect(result.current.readPosition?.()).toBeCloseTo(12);
+  act(() => jest.advanceTimersByTime(500));
+  expect(result.current.readPosition?.()).toBeCloseTo(12.5);
+  await receive(ws, { type: "STATE_SYNC", state: { ...state, revision: 2, position_ms: 0 }, server_time: Date.now() });
+  expect(result.current.playback?.revision).toBe(3);
+  await receive(ws, { type: "STATE_SYNC", state: { ...state, revision: 4, position_ms: 12500, is_playing: false }, server_time: Date.now() });
+  act(() => jest.advanceTimersByTime(500));
+  expect(result.current.readPosition?.()).toBeCloseTo(12.5);
+  expect(result.current.playback?.queue).toEqual(snapshot.queueState);
+  act(() => ws.close(1006));
+  expect(result.current.playback).toBeNull();
 });
 test("requires an explicit target gesture and preserves exact preparation/start payloads", async () => {
   const player = adapter();

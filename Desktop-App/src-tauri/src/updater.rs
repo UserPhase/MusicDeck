@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tempfile::TempPath;
+use tokio::io::AsyncWriteExt;
 
 pub const DEFAULT_UPDATE_MANIFEST_URL: &str =
     "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/latest.json";
@@ -76,35 +78,42 @@ pub fn is_update_available(
     false
 }
 
-pub fn validate_installer_url(url: &str) -> Result<String, String> {
-    let trimmed = url.trim();
-    if !trimmed.starts_with("https://") {
+pub fn validate_installer_url(url: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(url.trim()).map_err(|_| "Invalid update installer URL")?;
+    if url.scheme() != "https" {
         return Err("Update installer URL must use HTTPS".to_string());
     }
 
-    let without_scheme = trimmed.strip_prefix("https://").unwrap_or("");
-    let host = without_scheme.split('/').next().unwrap_or("").to_ascii_lowercase();
-    let allowed_host = host == "github.com"
-        || host.ends_with(".github.com")
-        || host.ends_with(".githubusercontent.com");
+    let allowed_host = url.host_str().is_some_and(|host| {
+        host == "github.com"
+            || host.ends_with(".github.com")
+            || host.ends_with(".githubusercontent.com")
+    });
 
-    if !allowed_host {
+    if !allowed_host || !url.username().is_empty() || url.password().is_some() {
         return Err("Update installer must be hosted on GitHub Releases".to_string());
     }
 
-    let path_part = without_scheme.split('?').next().unwrap_or("");
-    if !path_part.ends_with(".exe") && !path_part.ends_with(".msi") {
+    if !url.path().ends_with(".exe") && !url.path().ends_with(".msi") {
         return Err("Update installer URL must point to a .exe or .msi package".to_string());
     }
 
-    Ok(trimmed.to_string())
+    Ok(url)
 }
 
-pub fn compute_sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "stage",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum UpdateStatus {
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    Verifying,
+    Installing,
 }
 
 pub async fn check_for_updates(manifest_url: Option<&str>) -> UpdateCheckResponse {
@@ -208,16 +217,27 @@ pub async fn check_for_updates(manifest_url: Option<&str>) -> UpdateCheckRespons
 pub async fn download_and_verify_installer(
     installer_url: &str,
     expected_sha256: Option<&str>,
-) -> Result<PathBuf, String> {
+    report: impl Fn(UpdateStatus),
+) -> Result<TempPath, String> {
     let validated_url = validate_installer_url(installer_url)?;
+    let expected = expected_sha256
+        .map(str::trim)
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("The update is missing a valid SHA-256 checksum")?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
+        .https_only(true)
         .user_agent(format!("MusicDeck-Desktop/{CURRENT_VERSION}"))
         .build()
         .map_err(|err| format!("Failed to initialize download client: {err}"))?;
 
-    let response = client
-        .get(&validated_url)
+    let extension = if validated_url.path().ends_with(".msi") {
+        ".msi"
+    } else {
+        ".exe"
+    };
+    let mut response = client
+        .get(validated_url)
         .send()
         .await
         .map_err(|err| format!("Failed to download update installer: {err}"))?;
@@ -229,50 +249,81 @@ pub async fn download_and_verify_installer(
         ));
     }
 
-    let bytes = response
-        .bytes()
+    let (file, installer_path) = tempfile::Builder::new()
+        .prefix("MusicDeck-Update-")
+        .suffix(extension)
+        .tempfile()
+        .map_err(|err| format!("Failed to create temporary update file: {err}"))?
+        .into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut hasher = Sha256::new();
+    let total_bytes = response.content_length().filter(|total| *total > 0);
+    let mut downloaded_bytes = 0;
+    let mut last_report = Instant::now();
+    report(UpdateStatus::Downloading {
+        downloaded_bytes,
+        total_bytes,
+    });
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|err| format!("Failed to read installer payload: {err}"))?;
-
-    if let Some(expected) = expected_sha256.map(str::trim).filter(|s| !s.is_empty()) {
-        let actual = compute_sha256_hex(&bytes);
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err("Downloaded installer failed SHA-256 integrity verification".to_string());
+        .map_err(|err| format!("Failed to read installer payload: {err}"))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| format!("Failed to save update installer: {err}"))?;
+        hasher.update(&chunk);
+        downloaded_bytes += chunk.len() as u64;
+        if last_report.elapsed() >= Duration::from_millis(100) {
+            report(UpdateStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+            });
+            last_report = Instant::now();
         }
     }
+    file.flush()
+        .await
+        .map_err(|err| format!("Failed to save update installer: {err}"))?;
+    drop(file);
 
-    let extension = if validated_url.split('?').next().unwrap_or("").ends_with(".msi") {
-        "msi"
-    } else {
-        "exe"
-    };
-    let target_path = std::env::temp_dir().join(format!("MusicDeck-Update-Setup.{extension}"));
-    fs::write(&target_path, &bytes)
-        .map_err(|err| format!("Failed to save update installer to disk: {err}"))?;
-
-    Ok(target_path)
-}
-
-pub fn launch_installer(installer_path: &Path) -> Result<(), String> {
-    let ext = installer_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("exe")
-        .to_ascii_lowercase();
-
-    if ext == "msi" {
-        Command::new("msiexec")
-            .arg("/i")
-            .arg(installer_path)
-            .arg("/passive")
-            .spawn()
-            .map_err(|err| format!("Failed to launch MSI update installer: {err}"))?;
-    } else {
-        Command::new(installer_path)
-            .spawn()
-            .map_err(|err| format!("Failed to launch update installer: {err}"))?;
+    report(UpdateStatus::Verifying);
+    let actual = format!("{:x}", hasher.finalize());
+    if downloaded_bytes == 0 || !actual.eq_ignore_ascii_case(expected) {
+        return Err("Downloaded installer failed SHA-256 integrity verification".to_string());
     }
 
+    Ok(installer_path)
+}
+
+fn installer_command(installer_path: &Path) -> Command {
+    if installer_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("msi"))
+    {
+        let mut command = Command::new("msiexec.exe");
+        command
+            .arg("/i")
+            .arg(installer_path)
+            .args(["/passive", "/norestart", "AUTOLAUNCHAPP=1"]);
+        command
+    } else {
+        let mut command = Command::new(installer_path);
+        // Tauri's NSIS installer shows progress, upgrades in place and relaunches on success.
+        command.args(["/P", "/UPDATE", "/R"]);
+        command
+    }
+}
+
+pub fn launch_installer(installer_path: TempPath) -> Result<(), String> {
+    // Keep the verified package available to the installer after MusicDeck exits.
+    let installer_path = installer_path
+        .keep()
+        .map_err(|err| format!("Failed to prepare verified installer: {err}"))?;
+    if let Err(err) = installer_command(&installer_path).spawn() {
+        let _ = fs::remove_file(installer_path);
+        return Err(format!("Failed to launch update installer: {err}"));
+    }
     Ok(())
 }
 
@@ -307,5 +358,39 @@ mod tests {
         .is_ok());
         assert!(validate_installer_url("http://github.com/UserPhase/MusicDeck/setup.exe").is_err());
         assert!(validate_installer_url("https://evil.example.com/setup.exe").is_err());
+        assert!(validate_installer_url("https://user@github.com/setup.exe").is_err());
+    }
+
+    #[test]
+    fn reports_byte_counts_in_the_update_event() {
+        let status = UpdateStatus::Downloading {
+            downloaded_bytes: 512,
+            total_bytes: Some(1024),
+        };
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({
+                "stage": "downloading", "downloadedBytes": 512, "totalBytes": 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn starts_windows_installers_with_progress_and_relaunch() {
+        let nsis = Path::new("MusicDeck Update.exe");
+        let command = installer_command(nsis);
+        assert_eq!(command.get_program(), nsis.as_os_str());
+        assert!(command.get_args().eq(["/P", "/UPDATE", "/R"]));
+
+        let msi = Path::new("MusicDeck Update.msi");
+        let command = installer_command(msi);
+        assert_eq!(command.get_program(), "msiexec.exe");
+        assert!(command.get_args().eq([
+            "/i",
+            "MusicDeck Update.msi",
+            "/passive",
+            "/norestart",
+            "AUTOLAUNCHAPP=1",
+        ]));
     }
 }

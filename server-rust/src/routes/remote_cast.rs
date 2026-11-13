@@ -156,6 +156,38 @@ fn is_allowed_remote_origin(
     })
 }
 
+const REMOTE_PING_INTERVAL: Duration = Duration::from_secs(15);
+const REMOTE_PONG_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct RemoteHeartbeat {
+    ping_id: u64,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl RemoteHeartbeat {
+    fn sent_ping(&mut self, now: tokio::time::Instant) {
+        self.ping_id = self.ping_id.wrapping_add(1);
+        self.deadline = Some(now + REMOTE_PONG_TIMEOUT);
+    }
+
+    fn accept_pong(&mut self, data: &[u8], now: tokio::time::Instant) {
+        if self.deadline.is_some_and(|deadline| now < deadline)
+            && data == self.ping_id.to_be_bytes()
+        {
+            self.deadline = None;
+        }
+    }
+}
+
+async fn send_remote_frame(socket: &mut WebSocket, frame: WsMessage) -> bool {
+    matches!(
+        tokio::time::timeout(REMOTE_WRITE_TIMEOUT, socket.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn drive_remote_websocket(
     mut socket: WebSocket,
     connection: RemoteConnection,
@@ -165,27 +197,45 @@ async fn drive_remote_websocket(
     mut outbound_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) {
     let RemoteConnection { hub, id: conn_id } = &connection;
+    let Some(mut disconnected) = hub.disconnect_signal(conn_id) else {
+        return;
+    };
     let reg_deadline = tokio::time::sleep(Duration::from_millis(REGISTRATION_TIMEOUT_MS));
     tokio::pin!(reg_deadline);
     let mut reg_checked = false;
 
-    let mut ping_ticker = tokio::time::interval(Duration::from_secs(15));
+    let mut ping_ticker = tokio::time::interval(REMOTE_PING_INTERVAL);
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat = RemoteHeartbeat::default();
 
     loop {
-        let transfer_deadline = hub.transfer_deadline(conn_id);
+        let pong_deadline = heartbeat.deadline;
+        if *disconnected.borrow()
+            || pong_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            break;
+        }
+        let operation_deadline = hub.operation_deadline(conn_id);
         tokio::select! {
+            _ = disconnected.changed() => break,
             () = async {
-                if let Some(deadline) = transfer_deadline {
+                if let Some(deadline) = pong_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => hub.expire_transfer(conn_id, tokio::time::Instant::now()),
+            } => break,
+            () = async {
+                if let Some(deadline) = operation_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => hub.expire_operations(conn_id, tokio::time::Instant::now()),
             () = &mut reg_deadline, if !reg_checked => {
                 reg_checked = true;
                 if !hub.is_registered(conn_id) {
-                    let _ = socket.send(WsMessage::Close(Some(CloseFrame {
+                    send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
                         code: 4000,
                         reason: "Registration timeout".into(),
                     }))).await;
@@ -193,26 +243,30 @@ async fn drive_remote_websocket(
                 }
             }
             _ = ping_ticker.tick() => {
-                let valid = store
-                    .get_session_user_by_id(&session_id)
-                    .await
+                // Do not let a stalled session lookup keep an unreachable device online.
+                let Ok(session) = tokio::time::timeout(
+                    REMOTE_PONG_TIMEOUT, store.get_session_user_by_id(&session_id)
+                ).await else { break };
+                let valid = session
                     .ok()
                     .flatten()
                     .is_some_and(|u| u.id == user_id);
                 if !valid {
-                    let _ = socket.send(WsMessage::Close(Some(CloseFrame {
+                    send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
                         code: 4001,
                         reason: "Session expired".into(),
                     }))).await;
                     break;
                 }
-                if socket.send(WsMessage::Ping(Vec::new())).await.is_err() {
+                if heartbeat.deadline.is_some() { break; }
+                heartbeat.sent_ping(tokio::time::Instant::now());
+                if !send_remote_frame(&mut socket, WsMessage::Ping(heartbeat.ping_id.to_be_bytes().to_vec())).await {
                     break;
                 }
             }
             Some(payload) = outbound_rx.recv() => {
                 if let Ok(text) = serde_json::to_string(&payload)
-                    && socket.send(WsMessage::Text(text)).await.is_err()
+                    && !send_remote_frame(&mut socket, WsMessage::Text(text)).await
                 {
                     break;
                 }
@@ -224,23 +278,23 @@ async fn drive_remote_websocket(
                 match msg {
                     WsMessage::Close(_) => break,
                     WsMessage::Ping(data) => {
-                        let _ = socket.send(WsMessage::Pong(data)).await;
+                        if !send_remote_frame(&mut socket, WsMessage::Pong(data)).await { break; }
                     }
-                    WsMessage::Pong(_) => {}
+                    WsMessage::Pong(data) => heartbeat.accept_pong(&data, tokio::time::Instant::now()),
                     WsMessage::Binary(_) => {
                         if !hub.consume_rate_token(conn_id, current_epoch_ms()) {
-                            let _ = socket.send(WsMessage::Close(Some(CloseFrame {
+                            send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
                                 code: 4008,
                                 reason: "Remote command rate exceeded".into(),
                             }))).await;
                             break;
                         }
                         let err_json = r#"{"type":"ERROR","message":"Binary messages are not supported"}"#;
-                        let _ = socket.send(WsMessage::Text(err_json.into())).await;
+                        if !send_remote_frame(&mut socket, WsMessage::Text(err_json.into())).await { break; }
                     }
                     WsMessage::Text(text) => {
                         if !hub.consume_rate_token(conn_id, current_epoch_ms()) {
-                            let _ = socket.send(WsMessage::Close(Some(CloseFrame {
+                            send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
                                 code: 4008,
                                 reason: "Remote command rate exceeded".into(),
                             }))).await;
@@ -249,13 +303,13 @@ async fn drive_remote_websocket(
 
                         let Ok(raw_val) = serde_json::from_str::<serde_json::Value>(&text) else {
                             let err_json = r#"{"type":"ERROR","message":"Malformed remote JSON"}"#;
-                            let _ = socket.send(WsMessage::Text(err_json.into())).await;
+                            if !send_remote_frame(&mut socket, WsMessage::Text(err_json.into())).await { break; }
                             continue;
                         };
 
                         let Ok(parsed_msg) = serde_json::from_value::<RemoteClientMessage>(raw_val) else {
                             let err_json = r#"{"type":"ERROR","message":"Invalid remote message"}"#;
-                            let _ = socket.send(WsMessage::Text(err_json.into())).await;
+                            if !send_remote_frame(&mut socket, WsMessage::Text(err_json.into())).await { break; }
                             continue;
                         };
 
@@ -271,6 +325,24 @@ async fn drive_remote_websocket(
 mod tests {
     use super::*;
     use crate::remote::MAX_CLIENTS_PER_USER;
+
+    #[test]
+    fn heartbeat_requires_the_current_pong_before_its_deadline() {
+        let now = tokio::time::Instant::now();
+        let mut heartbeat = RemoteHeartbeat::default();
+        heartbeat.sent_ping(now);
+        let first_ping = heartbeat.ping_id.to_be_bytes();
+        heartbeat.accept_pong(&first_ping, now + Duration::from_secs(1));
+        assert_eq!(heartbeat.deadline, None);
+
+        let next_ping = now + REMOTE_PING_INTERVAL;
+        heartbeat.sent_ping(next_ping);
+        let deadline = next_ping + REMOTE_PONG_TIMEOUT;
+        heartbeat.accept_pong(&first_ping, next_ping + Duration::from_secs(1));
+        assert_eq!(heartbeat.deadline, Some(deadline));
+        heartbeat.accept_pong(&heartbeat.ping_id.to_be_bytes(), deadline);
+        assert_eq!(heartbeat.deadline, Some(deadline));
+    }
 
     #[test]
     fn allows_the_lan_authority_and_configured_origins_without_accepting_cross_origin_requests() {

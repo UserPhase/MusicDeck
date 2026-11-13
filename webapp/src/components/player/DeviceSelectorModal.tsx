@@ -48,6 +48,8 @@ export default function DeviceSelectorModal({ onClose }: { onClose(): void }) {
   const closeHandler = useRef(onClose); closeHandler.current = onClose;
   const [name, setName] = useState(remote?.name || "");
   const [enabling, setEnabling] = useState(false);
+  const [handoffPending, setHandoffPending] = useState(false);
+  const handingOff = useRef(false);
   const [notice, setNotice] = useState("");
   useEffect(() => {
     const previous = document.activeElement;
@@ -67,11 +69,23 @@ export default function DeviceSelectorModal({ onClose }: { onClose(): void }) {
     };
   }, []);
   const enable = async () => {
-    if (!remote || enabling) return;
+    if (!remote || enabling || handingOff.current) return;
     setEnabling(true); setNotice("");
     try { await remote.enable(); setNotice("This device can now receive playback while this tab remains open."); }
     catch (error) { console.error("Could not enable remote playback:", error); }
     finally { setEnabling(false); }
+  };
+  const transfer = async (device: RemoteDevice) => {
+    if (!remote || handingOff.current || enabling || remote.busy || remote.status !== "connected") return;
+    handingOff.current = true;
+    setHandoffPending(true);
+    setNotice("");
+    try {
+      if (device.device_id === remote.deviceId && !remote.enabled) await remote.enable();
+      await remote.transfer(device.device_id);
+      setNotice(`${device.device_name} is now your playback device.`);
+    } catch (error) { console.error("Playback transfer failed:", error); }
+    finally { handingOff.current = false; setHandoffPending(false); }
   };
   return createPortal(<div className="remote-device-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <div className="remote-device-dialog" role="dialog" aria-modal="true" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`} ref={dialog}>
@@ -82,21 +96,14 @@ export default function DeviceSelectorModal({ onClose }: { onClose(): void }) {
         : remote.status === "reconnecting" ? "Reconnecting to device control..." : remote.status === "connecting" ? "Connecting to device control..." : "Device control unavailable"}</div>}
       {remote && <div className="remote-local-settings"><label>Device name<input maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></label>
         <button type="button" disabled={!name.trim()} onClick={() => { remote.rename(name); setNotice("Device name updated for this tab."); }}>Save name</button>
-        <button type="button" disabled={remote.enabled || enabling || remote.status !== "connected"} onClick={() => { void enable(); }}>
+        <button type="button" disabled={remote.enabled || enabling || handoffPending || remote.busy || remote.status !== "connected"} onClick={() => { void enable(); }}>
           {enabling ? "Enabling..." : remote.enabled ? "Playback enabled" : "Enable playback on this device"}</button></div>}
       {!remote?.devices.length ? <p className="remote-empty">No online devices yet. Open MusicDeck on another device using the same account.</p>
         : <ul className="remote-device-list">{[...remote.devices].sort((a, b) => Number(b.is_active_player) - Number(a.is_active_player) ||
           Number(b.device_id === remote.deviceId) - Number(a.device_id === remote.deviceId) || a.device_name.localeCompare(b.device_name))
           .map((device) => <DeviceRow key={device.device_id} device={device}
-          current={device.device_id === remote.deviceId} disabled={remote.busy || remote.status !== "connected"}
-          onTransfer={async () => {
-            setNotice("");
-            try {
-              if (device.device_id === remote.deviceId && !remote.enabled) await remote.enable();
-              await remote.transfer(device.device_id);
-              setNotice(`${device.device_name} is now your playback device.`);
-            } catch (error) { console.error("Playback transfer failed:", error); }
-          }}
+          current={device.device_id === remote.deviceId} disabled={enabling || handoffPending || remote.busy || remote.status !== "connected"}
+          onTransfer={() => { void transfer(device); }}
           onVolume={(volume) => { void remote.command({ type: "SET_VOLUME", volume }, device.device_id)
             .catch((error: unknown) => console.error("Remote volume failed:", error)); }} />)}</ul>}
       {cast && <section className="remote-cast-section" aria-labelledby={`${id}-cast-title`}>
@@ -104,6 +111,7 @@ export default function DeviceSelectorModal({ onClose }: { onClose(): void }) {
         <CastButton variant="device" />
       </section>}
       {remote?.busy && <p role="status">Preparing the target player. Your current device continues until it is ready...</p>}
+      {handoffPending && !remote?.busy && <p role="status">Starting playback transfer...</p>}
       {notice && <p role="status">{notice}</p>}
       {remote?.error && <div className="remote-error" role="alert">{remote.error}
         <button type="button" onClick={remote.clearError}>Dismiss</button></div>}

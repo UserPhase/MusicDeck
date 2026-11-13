@@ -71,6 +71,8 @@ async fn request(
 ) -> Response {
     music_routes()
         .merge(playlist_routes())
+        .merge(crate::routes::playlist_collaboration::playlist_collaboration_routes())
+        .merge(crate::routes::external_discovery::external_discovery_routes())
         .with_state(state.clone())
         .oneshot(
             Request::builder()
@@ -137,6 +139,25 @@ async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::Join
     tokio::spawn(async move {
         let router = Router::new()
             .route(
+                "/rest/getArtist.view",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    let id = &params["id"];
+                    let mut artist = json!({"id": id, "name": "Fixture Artist", "album": []});
+                    if id == "local-portrait" {
+                        artist["coverArt"] = json!("5");
+                    }
+                    Json(json!({"subsonic-response": {"status": "ok", "artist": artist}}))
+                }),
+            )
+            .route(
+                "/rest/getArtistInfo2.view",
+                get(|| async {
+                    Json(json!({"subsonic-response": {"status": "ok", "artistInfo2": {
+                        "mediumImageUrl": "https://fixture.example/artist/fixture.jpg"
+                    }}}))
+                }),
+            )
+            .route(
                 "/rest/getSong.view",
                 get(|Query(params): Query<HashMap<String, String>>| async move {
                     let id = &params["id"];
@@ -160,6 +181,53 @@ async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::Join
             .await
             .expect("serve fixture library");
     })
+}
+
+#[tokio::test]
+async fn artist_portraits_use_the_library_and_respect_local_only_mode() {
+    for local_only in [false, true] {
+        let (db, state, session) = playback_state(local_only).await;
+        let provider = add_fixture_library(&db, &state).await;
+        for native_id in ["local-portrait", "extended-portrait"] {
+            let artist_id = LibraryService::new(db.clone(), None).ensure_id(
+                LibraryItemType::Artist,
+                &SourceRef { connection_id: "fixture-library".into(), provider_item_id: native_id.into() },
+                None,
+            ).await.expect("map artist");
+            let path = format!("/api/artists/{artist_id}/portrait");
+            let (status, body) = json_response(request(&state, &session, "GET", &path, None).await).await;
+            assert_eq!(status, StatusCode::OK);
+            if native_id == "local-portrait" {
+                let url = body["imageUrl"].as_str().expect("local portrait URL");
+                assert!(url.starts_with("/api/artwork/mdart_"));
+                assert_eq!(body["imageKind"], "artist");
+                let image = request(&state, &session, "GET", url, None).await;
+                assert_eq!(image.status(), StatusCode::OK);
+                let bytes = image.into_body().collect().await.expect("image body").to_bytes();
+                assert_eq!(bytes.as_ref(), fixture_cover(5));
+            } else if local_only {
+                assert!(body["imageUrl"].is_null());
+            } else {
+                assert_eq!(body["imageUrl"], "https://fixture.example/artist/fixture.jpg");
+            }
+            if native_id == "extended-portrait" {
+                let cached_url = "https://upload.wikimedia.org/wikipedia/commons/a/ab/fixture.jpg";
+                sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
+                    .bind(format!("artist_avatar_mb:{artist_id}"))
+                    .bind(json!({"name": "Fixture Artist", "url": cached_url}).to_string())
+                    .execute(db.inner()).await.expect("cache fixture portrait");
+                let (status, body) = json_response(request(&state, &session, "GET", &format!("{path}/musicbrainz"), None).await).await;
+                assert_eq!(status, StatusCode::OK);
+                if local_only {
+                    assert!(body["imageUrl"].is_null());
+                } else {
+                    assert_eq!(body["imageUrl"], cached_url);
+                    assert_eq!(body["imageSource"], "musicbrainz");
+                }
+            }
+        }
+        provider.abort();
+    }
 }
 
 #[tokio::test]
@@ -269,6 +337,13 @@ async fn playlist_artwork_uses_the_first_four_tracks_and_keeps_custom_covers() {
     let token = result["playlist"]["artworkId"]
         .as_str()
         .expect("artwork ID");
+    let (status, tree) = json_response(
+        request(&state, &session, "GET", "/api/v1/playlist-organization", None).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tree["playlists"][0]["id"], id);
+    assert_eq!(tree["playlists"][0]["artworkId"], token);
     let response = request(
         &state,
         &session,
@@ -307,11 +382,18 @@ async fn playlist_artwork_uses_the_first_four_tracks_and_keeps_custom_covers() {
         .set_custom(id, &custom, "image/png")
         .await
         .expect("store custom cover");
+    let (status, tree) = json_response(
+        request(&state, &session, "GET", "/api/v1/playlist-organization", None).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let custom_token = tree["playlists"][0]["artworkId"].as_str().expect("custom cover ID");
+    assert_ne!(custom_token, token);
     let response = request(
         &state,
         &session,
         "GET",
-        &format!("/api/playlists/{id}/artwork"),
+        &format!("/api/artwork/{custom_token}?size=64"),
         None,
     )
     .await;

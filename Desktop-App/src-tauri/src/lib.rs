@@ -18,6 +18,7 @@ use tauri::{
 };
 use updater::{
     check_for_updates, download_and_verify_installer, launch_installer, UpdateCheckResponse,
+    UpdateStatus,
 };
 
 pub struct DesktopState {
@@ -25,6 +26,7 @@ pub struct DesktopState {
     pub ephemeral_cookie: Arc<Mutex<Option<String>>>,
     pub proxy_url: Option<String>,
     pub quitting: AtomicBool,
+    update_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,33 +442,21 @@ async fn desktop_install_update(
     installer_url: String,
     sha256: Option<String>,
 ) -> Result<(), String> {
-    let _ = app.emit(
-        "desktop://update-status",
-        serde_json::json!({ "stage": "downloading" }),
-    );
+    let _update = state
+        .update_lock
+        .try_lock()
+        .map_err(|_| "An update is already in progress")?;
+    if state.quitting.load(Ordering::SeqCst) {
+        return Err("MusicDeck is already closing".to_string());
+    }
+    let report = |status| {
+        let _ = app.emit("desktop://update-status", status);
+    };
+    let installer_path =
+        download_and_verify_installer(&installer_url, sha256.as_deref(), report).await?;
 
-    let installer_path = download_and_verify_installer(&installer_url, sha256.as_deref())
-        .await
-        .map_err(|err| {
-            let _ = app.emit(
-                "desktop://update-status",
-                serde_json::json!({ "stage": "error", "error": err }),
-            );
-            err
-        })?;
-
-    let _ = app.emit(
-        "desktop://update-status",
-        serde_json::json!({ "stage": "installing" }),
-    );
-
-    launch_installer(&installer_path).map_err(|err| {
-        let _ = app.emit(
-            "desktop://update-status",
-            serde_json::json!({ "stage": "error", "error": err }),
-        );
-        err
-    })?;
+    report(UpdateStatus::Installing);
+    launch_installer(installer_path)?;
 
     state.quitting.store(true, Ordering::SeqCst);
     app.exit(0);
@@ -589,6 +579,7 @@ pub fn run() {
                 ephemeral_cookie: shared_cookie,
                 proxy_url,
                 quitting: AtomicBool::new(false),
+                update_lock: tokio::sync::Mutex::new(()),
             });
 
             setup_system_tray(app.handle())?;

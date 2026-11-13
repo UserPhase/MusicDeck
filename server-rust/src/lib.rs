@@ -1001,7 +1001,7 @@ pub use queue::{
     QueueEntry, QueueShuffleMode, QueueState, QueueSyncError, QueueSyncService, SyncPayload,
 };
 pub use remote::{
-    COMMAND_TIMEOUT_MS, MAX_CLIENTS_PER_USER, MAX_PENDING_COMMANDS_PER_CONTROLLER,
+    COMMAND_TIMEOUT_MS, MAX_CLIENTS_PER_USER, MAX_PENDING_COMMANDS_PER_CONTROLLER, PlaybackState,
     REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage, RemoteCommand, RemoteControlHub,
     RemoteDeviceType, RemotePlaybackState, RemoteTrackSummary, TRANSFER_TIMEOUT_MS,
     TransferQueueEntry, TransferQueueState, TransferSnapshot, TransferStage,

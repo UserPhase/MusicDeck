@@ -32,6 +32,7 @@ use thiserror::Error;
 use crate::auth::SessionUser;
 use crate::catalog::LibraryService;
 use crate::db::{DbError, DbPool, create_id};
+use crate::playlists::artwork::describe_on_conn;
 use crate::playlists::collaboration::service::{CollaborationError, PlaylistCollaborationService};
 
 /// Retention duration (`30` days in milliseconds) for soft-deleted playlists in Trash.
@@ -71,6 +72,8 @@ pub struct PlaylistTreeItem {
     pub id: String,
     /// Playlist name.
     pub name: String,
+    /// Shared artwork reference for the custom cover or the first four tracks.
+    pub artwork_id: Option<String>,
     /// Owner user ID.
     pub owner_user_id: Option<String>,
     /// Last updated timestamp.
@@ -1169,9 +1172,12 @@ impl PlaylistOrganizationService {
 
         let mut playlists = Vec::with_capacity(playlist_rows.len());
         for row in playlist_rows {
+            let id: String = row.try_get("id")?;
+            let artwork_id = describe_on_conn(conn, &id).await?.artwork_id;
             playlists.push(PlaylistTreeItem {
-                id: row.try_get("id")?,
+                id,
                 name: row.try_get("name")?,
+                artwork_id,
                 owner_user_id: row.try_get("owner_user_id")?,
                 updated_at: row.try_get("updated_at")?,
                 created_at: row.try_get("created_at")?,

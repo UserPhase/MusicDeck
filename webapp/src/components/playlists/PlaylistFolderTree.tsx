@@ -11,7 +11,7 @@ import { normalizePlaylistSearch } from "../../utils/playlistSearch";
 import "../../styles/playlist-organization.css";
 
 interface Folder { id: string; name: string; parent_folder_id: string | null; user_id: string; pinned: boolean; position: number }
-interface Playlist { id: string; name: string; folderId?: string | null; ownerUserId?: string | null; pinned?: boolean; position?: number; pinPosition?: number | null; createdAt?: string; creator?: string | null }
+interface Playlist { id: string; name: string; artworkId?: string | null; coverArt?: string | null; folderId?: string | null; ownerUserId?: string | null; pinned?: boolean; position?: number; pinPosition?: number | null; createdAt?: string; creator?: string | null }
 interface Tree { revision: number; folders: Folder[]; playlists: Playlist[] }
 interface Trash { id: string; name: string; deletedAt: string; revision: number; trackCount: number }
 type Operation = { kind: "createFolder"; name: string; parentId: string | null } | { kind: "deleteFolder"; id: string }
@@ -311,6 +311,8 @@ export default function PlaylistFolderTree({ playlists: fallback = [], onAddPlay
   };
   const renderPlaylist = (playlist: Playlist) => {
     const parent = playlist.folderId ?? null;
+    const coverArt = playlist.artworkId !== undefined ? playlist.artworkId
+      : playlist.coverArt ?? artworkByPlaylist.get(playlist.id)?.coverArt;
     const key = `playlist:${playlist.id}`; visible.push({ key, id: playlist.id, kind: "playlist", parent });
     const href = `/playlist/${encodeURIComponent(playlist.id)}`, selected = location.pathname === href;
     return <li key={key} id={`${prefix}-${key}`} role="treeitem" aria-selected={active === key} data-tree-key={key} className={`folder-playlist${selected ? " is-current" : ""}`}
@@ -318,7 +320,7 @@ export default function PlaylistFolderTree({ playlists: fallback = [], onAddPlay
       onContextMenu={event => { if (data && !busy) { event.preventDefault(); event.stopPropagation(); setActive(key); setMenu(key); } }}>
       <div className="folder-tree-row" data-sidebar-drop={dropMarker?.id === playlist.id ? dropMarker.edge : undefined}
         draggable={!busy} onDragStart={event => onDragStart(event, "playlist", playlist.id)} onDragEnd={finishDrag}>
-        <span className="folder-tree-symbol"><PlaylistCover playlist={{ ...artworkByPlaylist.get(playlist.id), ...playlist }} size={64} placeholderClassName="nav-icon-playlist-placeholder" /></span>
+        <span className="folder-tree-symbol"><PlaylistCover playlist={{ name: playlist.name, coverArt }} size={64} placeholderClassName="nav-icon-playlist-placeholder" /></span>
         <Link to={href} ref={menu === key ? playlistActionsAnchor : undefined} draggable={false} tabIndex={-1} aria-current={selected ? "page" : undefined} aria-label={playlist.name} title={playlist.name} onClick={() => setActive(key)}>
           <span className="folder-playlist-name"><PlaylistSearchHighlight text={playlist.name} tokens={tokens} /></span>
           <span className="folder-playlist-meta">{playlist.pinned && <svg role="img" aria-label="Pinned playlist" viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="m16 3 5 5-2 1-3 3v4l-1 1-4-4-6 6-1-1 6-6-4-4 1-1h4l3-3z" /></svg>}

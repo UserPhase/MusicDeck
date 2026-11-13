@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   checkDesktopUpdates,
   getDesktopAutoCheckUpdates,
@@ -10,12 +10,13 @@ import {
 function DesktopUpdateBanner() {
   const [updateInfo, setUpdateInfo] = useState(null);
   const [manualMessage, setManualMessage] = useState("");
-  const [installStage, setInstallStage] = useState("idle");
+  const [installStatus, setInstallStatus] = useState({ stage: "idle" });
   const [installError, setInstallError] = useState("");
   const [dismissed, setDismissed] = useState(false);
+  const installing = useRef(false);
 
   const runUpdateCheck = useCallback(async (isManual = false) => {
-    if (!isDesktopRuntime()) return;
+    if (!isDesktopRuntime() || installing.current) return;
     if (isManual) {
       setDismissed(false);
       setInstallError("");
@@ -23,6 +24,7 @@ function DesktopUpdateBanner() {
     }
 
     const result = await checkDesktopUpdates();
+    if (installing.current) return;
     if (result.updateAvailable && result.installerUrl) {
       setUpdateInfo(result);
       setManualMessage("");
@@ -52,10 +54,10 @@ function DesktopUpdateBanner() {
         void runUpdateCheck(true);
       },
       onUpdateStatus: (payload) => {
-        if (payload?.stage === "downloading" || payload?.stage === "installing") {
-          setInstallStage(payload.stage);
+        if (["downloading", "verifying", "installing"].includes(payload?.stage)) {
+          setInstallStatus(payload);
         } else if (payload?.stage === "error") {
-          setInstallStage("idle");
+          setInstallStatus({ stage: "idle" });
           setInstallError(payload.error || "Update installation failed.");
         }
       },
@@ -63,24 +65,30 @@ function DesktopUpdateBanner() {
   }, [runUpdateCheck]);
 
   async function handleInstallUpdate() {
-    if (!updateInfo?.installerUrl) return;
+    if (!updateInfo?.installerUrl || installing.current) return;
+    installing.current = true;
     setInstallError("");
-    setInstallStage("downloading");
+    setInstallStatus({ stage: "downloading" });
     try {
       await installDesktopUpdate({
         installerUrl: updateInfo.installerUrl,
         sha256: updateInfo.sha256,
       });
     } catch (err) {
-      setInstallStage("idle");
-      setInstallError(err?.message || "Failed to install update.");
+      installing.current = false;
+      setInstallStatus({ stage: "idle" });
+      setInstallError(typeof err === "string" ? err : err?.message || "Failed to install update.");
     }
   }
 
   if (!isDesktopRuntime() || dismissed) return null;
   if (!updateInfo && !manualMessage && !installError) return null;
 
-  const isInstalling = installStage === "downloading" || installStage === "installing";
+  const { stage: installStage, downloadedBytes, totalBytes } = installStatus;
+  const isInstalling = installStage !== "idle";
+  const downloadPercent = installStage === "downloading" && Number.isFinite(downloadedBytes) && totalBytes > 0
+    ? Math.min(100, Math.floor(downloadedBytes / totalBytes * 100))
+    : undefined;
 
   return (
     <div
@@ -130,11 +138,21 @@ function DesktopUpdateBanner() {
           </div>
           <span style={{ color: "var(--text-secondary, #9ca3af)", fontSize: "0.82rem" }}>
             {installStage === "downloading"
-              ? "Downloading and verifying update package..."
+              ? `Downloading update${downloadPercent === undefined ? "..." : ` (${downloadPercent}%)`}`
+              : installStage === "verifying"
+              ? "Verifying the downloaded update..."
               : installStage === "installing"
-              ? "Launching installer and restarting MusicDeck..."
+              ? "Installing update and restarting MusicDeck..."
               : updateInfo.notes || "A newer version of MusicDeck Desktop is ready to install."}
           </span>
+          {(installStage === "downloading" || installStage === "verifying") && (
+            <progress
+              aria-label="Update download progress"
+              max={100}
+              value={installStage === "verifying" ? 100 : downloadPercent}
+              style={{ width: "100%", accentColor: "var(--accent, #1db954)" }}
+            />
+          )}
           {installError && (
             <span role="alert" style={{ color: "#fca5a5", fontSize: "0.8rem" }}>
               {installError}
@@ -173,6 +191,8 @@ function DesktopUpdateBanner() {
             >
               {installStage === "downloading"
                 ? "Downloading..."
+                : installStage === "verifying"
+                ? "Verifying..."
                 : installStage === "installing"
                 ? "Restarting..."
                 : "Update & Restart"}

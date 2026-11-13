@@ -3,6 +3,7 @@ import type { PersistedQueueTrack, QueueCheckpoint } from "../services/storage/Q
 
 export type RemoteCommand =
   | { type: "PLAY" } | { type: "PAUSE" }
+  | { type: "PLAY_TRACK"; track: PersistedQueueTrack }
   | { type: "SKIP"; direction: "next" | "previous" }
   | { type: "SEEK"; position_ms: number }
   | { type: "SET_VOLUME"; volume: number }
@@ -20,6 +21,17 @@ export interface RemoteDevice extends RemotePlayerState {
   queue_device_id?: string | null;
   is_active_player: boolean; can_receive: boolean;
 }
+export interface PlaybackState {
+  device_id: string | null;
+  track: RemotePlayerState["current_track"];
+  position_ms: number;
+  duration_ms: number;
+  is_playing: boolean;
+  volume: number;
+  updated_at: number;
+  revision: number;
+  queue: RemotePlaybackSnapshot["queueState"] | null;
+}
 export interface RemotePlaybackSnapshot {
   queueState: {
     entries: { occurrenceId: string; trackId: string; title: string; artist: string; album: string; duration: number;
@@ -32,6 +44,7 @@ export interface RemotePlaybackSnapshot {
 }
 export interface RemotePlayerAdapter {
   state(): RemotePlayerState;
+  queue?(): RemotePlaybackSnapshot["queueState"];
   capture(): RemotePlaybackSnapshot;
   command(command: RemoteCommand): Promise<void>;
   prepare(snapshot: RemotePlaybackSnapshot, signal: AbortSignal): Promise<void>;
@@ -44,6 +57,10 @@ export interface RemoteSessionValue {
   deviceId: string;
   devices: RemoteDevice[];
   activeDevice: RemoteDevice | null;
+  playback?: PlaybackState | null;
+  readPosition?: () => number;
+  publishPosition?: () => void;
+  ordersCommands?: boolean;
   isRemote: boolean;
   enabled: boolean;
   busy: boolean;

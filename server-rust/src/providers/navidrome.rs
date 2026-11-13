@@ -380,6 +380,16 @@ impl MusicBackend for NavidromeClient {
         let mut artist = map_subsonic_artist(raw_artist);
 
         if include_artist_info {
+            artist.image_url = raw_artist.get("artistImageUrl").and_then(artist_image_url);
+        }
+        let artwork_is_album_cover = artist.artwork_id.as_ref().is_some_and(|artwork_id| {
+            raw_artist.get("album").and_then(Value::as_array).is_some_and(|albums| {
+                albums.iter().any(|album| album.get("coverArt").and_then(value_to_string).as_ref() == Some(artwork_id))
+            })
+        });
+        if include_artist_info && artist.image_url.is_none()
+            && (artist.artwork_id.is_none() || artwork_is_album_cover)
+        {
             let info_opt = self
                 .request_json(
                     "getArtistInfo2",
@@ -388,36 +398,16 @@ impl MusicBackend for NavidromeClient {
                         ("count", String::from("0")),
                         ("includeNotPresent", String::from("false")),
                     ],
-                    NAVIDROME_REQUEST_TIMEOUT_MS,
+                    3_000,
                 )
                 .await
                 .ok();
 
-            let candidates = [
-                raw_artist.get("artistImageUrl").and_then(Value::as_str),
-                info_opt
-                    .as_ref()
-                    .and_then(|i| i.get("artistInfo2"))
-                    .and_then(|i| i.get("mediumImageUrl"))
-                    .and_then(Value::as_str),
-                info_opt
-                    .as_ref()
-                    .and_then(|i| i.get("artistInfo2"))
-                    .and_then(|i| i.get("largeImageUrl"))
-                    .and_then(Value::as_str),
-                info_opt
-                    .as_ref()
-                    .and_then(|i| i.get("artistInfo2"))
-                    .and_then(|i| i.get("smallImageUrl"))
-                    .and_then(Value::as_str),
-            ];
-
-            artist.image_url = candidates
-                .into_iter()
-                .flatten()
-                .map(str::trim)
-                .find(|url| !url.is_empty() && !url.contains("2a96cbd8b46e442fc41c2b86b821562f"))
-                .map(str::to_owned);
+            if let Some(info) = info_opt.as_ref().and_then(|value| value.get("artistInfo2")) {
+                artist.image_url = ["mediumImageUrl", "largeImageUrl", "smallImageUrl"]
+                    .into_iter()
+                    .find_map(|field| info.get(field).and_then(artist_image_url));
+            }
         }
 
         Ok(Some(artist))
@@ -1371,6 +1361,23 @@ pub fn map_subsonic_album(album: &Value) -> Album {
     }
 }
 
+fn artist_image_url(value: &Value) -> Option<String> {
+    let raw = value.as_str()?.trim();
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let path = url.path().to_ascii_lowercase();
+    if path.contains("/rest/getcoverart") || path.contains("/api/artwork/") ||
+        path.contains("/cover/") || path.contains("/album/") ||
+        path.contains("2a96cbd8b46e442fc41c2b86b821562f") || path.contains("placeholder") ||
+        path.contains("/default-") || path.contains("/default_")
+    {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
 /// Maps a raw Subsonic `artist` JSON value into a MusicDeck [`Artist`].
 #[must_use]
 pub fn map_subsonic_artist(artist: &Value) -> Artist {
@@ -1378,7 +1385,8 @@ pub fn map_subsonic_artist(artist: &Value) -> Artist {
         .get("id")
         .and_then(value_to_string)
         .unwrap_or_default();
-    let artwork_id = artist.get("coverArt").and_then(value_to_string);
+    let artwork_id = artist.get("coverArt").and_then(value_to_string)
+        .filter(|id| !id.trim().is_empty() && !matches!(id.as_str(), "ar-0" | "al-0"));
     let artwork_url = format_artwork_url(artwork_id.as_deref());
 
     let album_count = artist
