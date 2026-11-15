@@ -19,6 +19,8 @@
     "core:window:allow-unminimize",
     "core:window:allow-set-focus",
     "core:window:allow-set-title",
-    "core:tray:default"
+    "core:tray:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

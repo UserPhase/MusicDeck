@@ -115,7 +115,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   const queueDirty = useRef(true);
   const adapterRef = useRef(adapter); adapterRef.current = adapter;
   const metadata = useRef({ name, enabled }); metadata.current = { name, enabled };
-  const pending = useRef(new Map<string, { resolve(): void; reject(error: Error): void; timer: number }>());
+  const pending = useRef(new Map<string, { resolve(): void; reject(error: Error): void; timer: number; deadline: number }>());
+  const clockOffset = useRef<number | null>(null);
+  const timeOrigin = useRef(Number.isFinite(performance.timeOrigin) ? performance.timeOrigin : Date.now() - performance.now());
   const continuous = useRef(new Map<string, { command: RemoteCommand; timer: number; send(): void;
     waiters: Array<{ resolve(): void; reject(error: unknown): void }> }>());
   const prepared = useRef<{ id: string; controller: AbortController; role: "source" | "target"; paused: boolean } | null>(null);
@@ -130,17 +132,20 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   const registration = useCallback(() => {
     const state = adapterRef.current.state();
     send({ type: "REGISTER", device_id: deviceId, device_name: metadata.current.name, queue_device_id: queueDeviceId(),
-      device_type: deviceKind(), can_receive: metadata.current.enabled, state, live_sync: true });
+      device_type: deviceKind(), can_receive: metadata.current.enabled, state, live_sync: true, command_deadlines: true });
     return state;
   }, [deviceId, send]);
   const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object): Promise<void> => new Promise((resolve, reject) => {
     const requestId = identity();
+    const timeout = type === "COMMAND" ? 10_000 : 25_000;
+    const deadline = performance.now() + timeout;
+    const expiresAt = Math.floor(timeOrigin.current + deadline + (clockOffset.current ?? 0));
     const timer = window.setTimeout(() => {
       pending.current.delete(requestId); const failure = new Error("The device did not finish this request. Check both devices before retrying.");
       setError(failure.message); reject(failure);
-    }, type === "COMMAND" ? 10000 : 25000);
-    pending.current.set(requestId, { resolve, reject, timer });
-    try { send({ type, requestId, ...payload }); }
+    }, timeout);
+    pending.current.set(requestId, { resolve, reject, timer, deadline });
+    try { send({ type, requestId, ...(type === "COMMAND" ? { expiresAt } : {}), ...payload }); }
     catch (failure) { window.clearTimeout(timer); pending.current.delete(requestId); reject(failure); }
   }), [send]);
   useEffect(() => {
@@ -149,18 +154,41 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     if (!userId || typeof WebSocket === "undefined") { setStatus("unavailable"); setDevices([]); setPlayback(null); return; }
     let closed = false;
     let reconnect: number | undefined;
+    let handshake: number | undefined;
+    let watchdog: number | undefined;
+    let controlTimeout = 0;
+    let executing: AbortController | null = null;
+    let connectionLifetime = new AbortController();
     let attempt = 0;
     let lastPlaying = false;
     let lastState = "";
-    let lastSentAt = 0;
+    let localPlaying = false;
+    let positionTimer: number | undefined;
+    let retryState = false;
     let liveSync = false;
     let synced: PlaybackState | null = null;
     let reportedQueue: ReturnType<NonNullable<RemotePlayerAdapter["queue"]>> | undefined;
-    let clockOffset = Infinity;
+    let clockSamples: { offset: number; sampledAt: number }[] = [];
+    const observeClock = (serverTime: number) => {
+      const sampledAt = performance.now();
+      const offset = serverTime - (timeOrigin.current + sampledAt);
+      clockSamples = [...clockSamples.filter(sample => sampledAt - sample.sampledAt < 60_000), { offset, sampledAt }].slice(-7);
+      const sorted = clockSamples.map(sample => sample.offset).sort((a, b) => a - b);
+      clockOffset.current = sorted[Math.floor(sorted.length / 2)];
+      return { sampledAt, transit: Math.max(0, Math.min(2000, clockOffset.current - offset)) };
+    };
     const resetPlayback = () => {
+      window.clearTimeout(positionTimer);
+      positionTimer = undefined;
+      localPlaying = false;
+      retryState = false;
       synced = null;
       liveSync = false;
-      clockOffset = Infinity;
+      window.clearTimeout(handshake);
+      window.clearTimeout(watchdog);
+      controlTimeout = 0;
+      clockOffset.current = null;
+      clockSamples = [];
       playbackClock.current.playing = false;
       setPlayback(null);
     };
@@ -177,18 +205,42 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (transfer.role === "target") adapterRef.current.pause();
       prepared.current = null;
     };
+    const stopControlledPlayback = () => {
+      if (connectionLifetime.signal.aborted) return;
+      if (executing || synced?.device_id === deviceId || selectedDevice.current === deviceId || localPlaying) {
+        adapterRef.current.pause();
+      }
+      executing?.abort();
+      connectionLifetime.abort();
+      cancelPreparation();
+    };
+    const armWatchdog = () => {
+      window.clearTimeout(watchdog);
+      if (!controlTimeout) return;
+      watchdog = window.setTimeout(() => {
+        stopControlledPlayback();
+        socket.current?.close(4003, "Device control heartbeat timed out");
+      }, controlTimeout);
+    };
     const settle = (message: Record<string, unknown>) => {
       if (typeof message.requestId !== "string") return;
       const operation = pending.current.get(message.requestId);
       if (!operation) return;
       pending.current.delete(message.requestId); window.clearTimeout(operation.timer);
-      if (message.ok === true) operation.resolve();
+      if (performance.now() >= operation.deadline) {
+        operation.reject(new Error("The device did not finish this request in time."));
+      } else if (message.ok === true) operation.resolve();
       else {
         const failure = new Error(typeof message.message === "string" ? message.message : "Remote request failed");
         fail(failure); operation.reject(failure);
       }
     };
     const handle = async (message: Record<string, unknown>) => {
+      if (message.type === "REMOTE_HEARTBEAT" && typeof message.server_time === "number" && Number.isFinite(message.server_time)) {
+        observeClock(message.server_time);
+        armWatchdog();
+        return;
+      }
       if (message.type === "INITIAL_STATE" || message.type === "STATE_SYNC") {
         const state = message.state;
         const incomingQueue = message.queue;
@@ -197,20 +249,28 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
           throw new Error("Invalid account playback state");
         }
         if (synced && state.revision <= synced.revision) return;
+        const samplingChanged = !liveSync || synced?.device_id !== state.device_id ||
+          synced?.is_playing !== state.is_playing;
         liveSync = true;
         const queue = "queue" in message
           ? incomingQueue ?? null
           : synced?.queue ?? null;
         synced = { ...state, queue };
-        const receivedAt = Date.now();
-        clockOffset = Math.min(clockOffset, receivedAt - message.server_time);
-        const age = Math.max(0, receivedAt - clockOffset - state.updated_at);
-        playbackClock.current = { position: state.position_ms / 1000, sampledAt: performance.now() - age,
+        const { sampledAt, transit } = observeClock(message.server_time);
+        const age = Math.max(0, message.server_time - state.updated_at + transit);
+        playbackClock.current = { position: state.position_ms / 1000, sampledAt: sampledAt - age,
           duration: state.duration_ms / 1000, playing: state.is_playing };
         setPlayback(synced);
         if (message.type === "INITIAL_STATE") {
+          window.clearTimeout(handshake);
+          attempt = 0;
+          setError("");
+          controlTimeout = message.controlTimeoutMs === 25_000 ? 25_000 : 0;
+          armWatchdog();
           setStatus("connected");
           publish.current?.();
+        } else if (samplingChanged) {
+          schedulePositionSample();
         }
         return;
       }
@@ -222,7 +282,11 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         if (!Array.isArray(message.devices) || !message.devices.every(device)) throw new Error("Invalid remote device registry");
         selectedDevice.current = message.devices.find(item => item.is_active_player)?.device_id;
         setDevices(message.devices);
-        setStatus("connected");
+        if (message.live_state_protocol !== true) {
+          window.clearTimeout(handshake);
+          setError("");
+          setStatus("connected");
+        }
         return;
       }
       if (message.type === "ERROR") {
@@ -231,21 +295,51 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         return;
       }
       if (message.type === "COMMAND_RESULT" || message.type === "TRANSFER_RESULT") { settle(message); return; }
-      if (message.type === "DEACTIVATE") { adapterRef.current.pause(); return; }
+      if (message.type === "DEACTIVATE") {
+        executing?.abort();
+        cancelPreparation();
+        adapterRef.current.pause();
+        return;
+      }
       if (message.type === "EXECUTE" && typeof message.requestId === "string" && remoteCommand(message.command)) {
         const requestId = message.requestId, command = message.command;
         const commandSocket = socket.current;
+        const expiresAt = typeof message.expiresAt === "number" ? message.expiresAt : undefined;
+        const serverNow = clockOffset.current === null ? null : timeOrigin.current + performance.now() + clockOffset.current;
+        const budget = Math.min(typeof message.timeoutMs === "number" ? message.timeoutMs : 8000,
+          typeof message.deadlineAt === "number" && serverNow !== null ? message.deadlineAt - serverNow : Infinity);
+        const deadline = performance.now() + budget;
         commandChain = commandChain.then(async () => {
           if (closed || socket.current !== commandSocket || commandSocket?.readyState !== WebSocket.OPEN) return;
+          const remaining = deadline - performance.now();
+          if (!(remaining > 0) || connectionLifetime.signal.aborted) {
+            send({ type: "COMMAND_RESULT", requestId, expiresAt, ok: false, message: "Playback command expired before execution" });
+            return;
+          }
+          const controller = new AbortController();
+          executing = controller;
+          const timeout = window.setTimeout(() => {
+            if (socket.current !== commandSocket || controller.signal.aborted) return;
+            controller.abort();
+            adapterRef.current.pause();
+          }, remaining);
           try {
-            await adapterRef.current.command(command);
-            if (socket.current === commandSocket) {
-              send({ type: "COMMAND_RESULT", requestId, ok: true, state: adapterRef.current.state() });
+            await adapterRef.current.command(command, controller.signal);
+            if (socket.current === commandSocket && !controller.signal.aborted) {
+              if (performance.now() >= deadline) {
+                controller.abort();
+                adapterRef.current.pause();
+              } else {
+                send({ type: "COMMAND_RESULT", requestId, expiresAt, ok: true, state: adapterRef.current.state() });
+              }
             }
           }
           catch (failure) {
-            if (socket.current !== commandSocket) return;
-            fail(failure); send({ type: "COMMAND_RESULT", requestId, ok: false, message: failure instanceof Error ? failure.message : "Player command failed" });
+            if (socket.current !== commandSocket || controller.signal.aborted) return;
+            fail(failure); send({ type: "COMMAND_RESULT", requestId, expiresAt, ok: false, message: failure instanceof Error ? failure.message : "Player command failed" });
+          } finally {
+            window.clearTimeout(timeout);
+            if (executing === controller) executing = null;
           }
         }).catch(fail);
         return;
@@ -280,45 +374,57 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
           send({ type: "TRANSFER_FAILED", transferId, message: failure instanceof Error ? failure.message : "Could not pause the source" });
         }
       } else if (message.type === "START_TRANSFER" && prepared.current?.id === transferId && prepared.current.role === "target" && snapshot(message.snapshot)) {
+        const signal = prepared.current.controller.signal;
         try {
-          await adapterRef.current.start(message.snapshot);
-          if (prepared.current?.id !== transferId) { adapterRef.current.pause(); return; }
+          await adapterRef.current.start(message.snapshot, signal);
+          if (signal.aborted || prepared.current?.id !== transferId) return;
           const queue = adapterRef.current.queue?.();
           send({ type: "STARTED", transferId,
             queue: queue && new Blob([JSON.stringify(queue)]).size < 1000 * 1024 ? queue : undefined });
         } catch (failure) {
+          if (signal.aborted || prepared.current?.id !== transferId) return;
           adapterRef.current.pause(); fail(failure);
+          prepared.current.controller.abort();
           send({ type: "TRANSFER_FAILED", transferId, message: failure instanceof Error ? failure.message : "Target playback failed" });
         }
       } else if (message.type === "ABORT_TRANSFER" && prepared.current?.id === transferId) {
+        const target = prepared.current.role === "target";
         const resume = message.resume === true && prepared.current.role === "source" && prepared.current.paused;
         cancelPreparation();
-        if (resume) await adapterRef.current.command({ type: "PLAY" });
+        if (target) send({ type: "TRANSFER_ROLLED_BACK", transferId });
+        if (resume && !connectionLifetime.signal.aborted) await adapterRef.current.command({ type: "PLAY" }, connectionLifetime.signal);
       } else if (message.type === "TRANSFER_COMPLETE" && prepared.current?.id === transferId) {
+        adapterRef.current.commitTransfer?.(prepared.current.controller.signal);
         prepared.current.controller.abort(); prepared.current = null;
       } else throw new Error("Invalid or stale playback transfer message");
+    };
+    const scheduleReconnect = () => {
+      if (!closed) reconnect = window.setTimeout(connect, Math.min(30000, 500 * 2 ** Math.min(attempt++, 6)) + Math.random() * 200);
     };
     const connect = () => {
       if (closed) return;
       setStatus(attempt ? "reconnecting" : "connecting");
       const url = resolveRemoteSocketUrl();
       if (!url) {
-        reconnect = window.setTimeout(connect, 1000);
+        scheduleReconnect();
         return;
       }
       const ws = new WebSocket(url); socket.current = ws;
       commandChain = Promise.resolve();
+      connectionLifetime = new AbortController();
+      handshake = window.setTimeout(() => {
+        if (socket.current === ws) ws.close(4000, "Device control handshake timed out");
+      }, 12_000);
       ws.onopen = () => {
         if (closed) { ws.close(); return; }
         if (socket.current !== ws) return;
-        attempt = 0; setError("");
         queueDirty.current = true;
         reportedQueue = undefined;
         try {
           const state = registration();
-          lastSentAt = performance.now();
           lastPlaying = state.playing;
           lastState = JSON.stringify(state);
+          publishState();
         } catch (failure) { fail(failure); ws.close(); }
       };
       ws.onmessage = (event) => {
@@ -330,14 +436,17 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         } catch (failure) { fail(failure); }
       };
       ws.onerror = () => {
-        if (!closed && socket.current === ws) setError("Device control connection failed. Reconnecting automatically.");
+        if (!closed && socket.current === ws) {
+          stopControlledPlayback();
+          setError("Device control connection failed. Reconnecting automatically.");
+        }
       };
       ws.onclose = (event) => {
         if (closed || socket.current !== ws) return;
+        stopControlledPlayback();
         socket.current = null;
         selectedDevice.current = undefined;
         resetPlayback();
-        cancelPreparation();
         for (const operation of operations.values()) {
           window.clearTimeout(operation.timer); operation.reject(new Error("Device control disconnected. Check playback before retrying."));
         }
@@ -352,25 +461,32 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         setDevices([]);
         if (event.code === 4001 || event.code === 4009) { setStatus("unavailable"); setError(event.reason || "Remote session ended"); return; }
         setStatus("reconnecting");
-        reconnect = window.setTimeout(connect, Math.min(30000, 500 * 2 ** Math.min(attempt++, 6)) + Math.random() * 200);
+        scheduleReconnect();
       };
     };
-    connect();
     const reconnectForServerChange = () => {
       window.clearTimeout(reconnect);
       if (socket.current) socket.current.close(1000, "Server connection changed");
       else connect();
     };
     window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
+    const pageHidden = () => {
+      stopControlledPlayback();
+      socket.current?.close(1000, "Player view closed");
+    };
+    window.addEventListener("pagehide", pageHidden);
     const publishState = () => {
       if (socket.current?.readyState !== WebSocket.OPEN) return;
       const state = adapterRef.current.state();
+      localPlaying = state.playing;
       const claim = state.playing && !lastPlaying && !prepared.current;
       const serialized = JSON.stringify(state);
       const queue = queueDirty.current ? adapterRef.current.queue?.() : undefined;
       const updatedQueue = queue !== reportedQueue ? queue : undefined;
       if (serialized === lastState && !claim && !updatedQueue) {
         queueDirty.current = false;
+        retryState = false;
+        schedulePositionSample();
         return;
       }
       try {
@@ -381,32 +497,40 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         if (updatedQueue) reportedQueue = updatedQueue;
         queueDirty.current = false;
         lastState = serialized;
-        lastSentAt = performance.now();
+        retryState = false;
         if (!prepared.current) lastPlaying = state.playing;
-      } catch (failure) { fail(failure); }
+      } catch (failure) {
+        retryState = (socket.current?.bufferedAmount ?? 0) > 1024 * 1024;
+        fail(failure);
+      }
+      schedulePositionSample();
     };
     publish.current = publishState;
-    let heartbeat: number | undefined;
-    let interval = 0;
-    const updateHeartbeat = () => {
-      // The socket still carries commands and transfers while backgrounded.
-      const nextInterval = getVisualActivity() ? 500 : 2000;
-      if (interval === nextInterval) return;
-      window.clearInterval(heartbeat);
-      heartbeat = window.setInterval(() => {
-        if (!liveSync || queueDirty.current ||
-            (synced?.device_id === deviceId && synced.is_playing && performance.now() - lastSentAt >= 10_000)) publishState();
-      }, nextInterval);
-      if (interval && nextInterval < interval && (!liveSync || synced?.device_id === deviceId)) publishState();
-      interval = nextInterval;
+    const ownsPlayingOutput = () => localPlaying &&
+      (!liveSync || (synced?.device_id === deviceId && synced.is_playing));
+    const schedulePositionSample = () => {
+      window.clearTimeout(positionTimer);
+      positionTimer = undefined;
+      if (closed || socket.current?.readyState !== WebSocket.OPEN ||
+          (!retryState && !ownsPlayingOutput())) return;
+      const active = getVisualActivity();
+      const delay = retryState || !liveSync
+        ? (active ? 1000 : 5000)
+        : (active ? 10_000 : 20_000);
+      positionTimer = window.setTimeout(publishState, delay);
     };
-    const unsubscribeVisibility = subscribeVisualActivity(updateHeartbeat);
-    updateHeartbeat();
+    // Server WebSocket pings and remote commands are independent of position samples.
+    const unsubscribeVisibility = subscribeVisualActivity(() => {
+      if (getVisualActivity() && ownsPlayingOutput()) publishState();
+      else schedulePositionSample();
+    });
+    connect();
     return () => {
-      closed = true; window.clearTimeout(reconnect); window.clearInterval(heartbeat); unsubscribeVisibility();
+      closed = true; window.clearTimeout(reconnect); unsubscribeVisibility();
       publish.current = null;
       window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
-      cancelPreparation(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
+      window.removeEventListener("pagehide", pageHidden);
+      stopControlledPlayback(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
       for (const operation of operations.values()) {
         window.clearTimeout(operation.timer); operation.reject(new Error("Remote session closed"));
       }
@@ -424,7 +548,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     if (socket.current?.readyState === WebSocket.OPEN) registration();
   }, [name, registration]);
   const { current_track, playing, volume, duration_ms } = adapter.state();
-  // Track and transport changes are immediate. Position samples use the throttled heartbeat.
+  // Track and transport changes are immediate. Only the playing output samples position.
   const transportKey = JSON.stringify([current_track, playing, volume, duration_ms]);
   useEffect(() => { queueDirty.current = true; publish.current?.(); }, [adapter.queue]);
   useEffect(() => { publish.current?.(); }, [transportKey]);

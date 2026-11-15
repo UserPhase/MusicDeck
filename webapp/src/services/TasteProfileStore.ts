@@ -1,3 +1,5 @@
+import { startVisualPolling } from "./visualActivity";
+
 export const TASTE_CHANGED = "musicdeck:taste-profile-changed";
 export interface TastePreferences { privateListening: boolean; revision: number; resetBefore: string | null; providerHistoryDisabled: boolean; excludedPlaylistIds?: string[]; excludedTrackIds?: string[] }
 export interface TasteSnapshot extends TastePreferences { owner: string | null; loaded: boolean; pending: boolean; busy: boolean; error: string }
@@ -8,7 +10,8 @@ class TasteProfileStore {
   private desired: boolean | null = null;
   private requests = new Set<AbortController>();
   private refreshing = false;
-  private timer: ReturnType<typeof setInterval> | null = null;
+  private refreshAfterWrite = false;
+  private stopPolling: (() => void) | undefined;
   getSnapshot = () => this.snapshot;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private publish(patch: Partial<TasteSnapshot>) { this.snapshot = { ...this.snapshot, ...patch }; this.listeners.forEach(listener => listener()); }
@@ -20,8 +23,9 @@ class TasteProfileStore {
   activate(owner: string | null) {
     if (this.snapshot.owner === owner) return;
     this.epoch++; this.requests.forEach(request => request.abort()); this.requests.clear(); this.refreshing = false;
-    if (this.timer) clearInterval(this.timer); this.timer = null;
-    if (typeof window !== "undefined") { window.removeEventListener("online", this.refresh); window.removeEventListener("focus", this.refresh); window.removeEventListener("storage", this.storageChanged); }
+    this.refreshAfterWrite = false;
+    this.stopPolling?.(); this.stopPolling = undefined;
+    if (typeof window !== "undefined") { window.removeEventListener("online", this.refresh); window.removeEventListener("storage", this.storageChanged); }
     this.desired = null;
     let cached: Partial<TasteSnapshot> & { desired?: boolean | null } = {};
     if (owner) try { cached = JSON.parse(localStorage.getItem(`musicdeck:taste:${owner}`) || "{}"); } catch { cached = {}; }
@@ -33,8 +37,11 @@ class TasteProfileStore {
       excludedPlaylistIds: Array.isArray(cached.excludedPlaylistIds) ? cached.excludedPlaylistIds.filter(id => typeof id === "string") : [],
       excludedTrackIds: Array.isArray(cached.excludedTrackIds) ? cached.excludedTrackIds.filter(id => typeof id === "string") : [] });
     if (owner && typeof window !== "undefined") {
-      window.addEventListener("online", this.refresh); window.addEventListener("focus", this.refresh); window.addEventListener("storage", this.storageChanged);
-      this.timer = setInterval(this.refresh, 15_000); void this.refresh();
+      window.addEventListener("online", this.refresh); window.addEventListener("storage", this.storageChanged);
+      this.stopPolling = startVisualPolling(this.refresh, 30_000, {
+        immediate: false, refreshOnWindowFocus: true, backgroundIntervalMs: 90_000,
+      });
+      void this.refresh();
     }
   }
   private storageChanged = (event: StorageEvent) => { if (event.key === `musicdeck:taste:${this.snapshot.owner}`) {
@@ -71,13 +78,21 @@ class TasteProfileStore {
       const changed = state.revision !== this.snapshot.revision || !this.snapshot.loaded;
       this.publish({ ...state, privateListening: this.desired === true || state.privateListening, loaded: true, pending: this.desired !== null, error: "" }); this.persist(); if (changed) this.changed();
     } catch (error) { if (epoch === this.epoch) this.publish({ error: error instanceof Error ? error.message : "Could not sync taste preferences. Private listening remains protected." }); }
-    finally { if (epoch === this.epoch) this.refreshing = false; }
+    finally {
+      if (epoch === this.epoch) {
+        this.refreshing = false;
+        const followUp = this.refreshAfterWrite && this.desired !== null;
+        this.refreshAfterWrite = false;
+        if (followUp) void this.refresh();
+      }
+    }
   };
   setPrivate = async (enabled: boolean) => {
     if (!this.snapshot.owner) throw new Error("Sign in to change private listening.");
     this.desired = enabled;
     // Starting privacy is immediate. Ending it requires a server acknowledgement.
     this.publish({ privateListening: enabled || this.snapshot.privateListening, pending: true, error: "" }); this.persist(); this.changed();
+    if (this.refreshing) this.refreshAfterWrite = true;
     await this.refresh();
   };
   request = async <T>(path: string, body?: Record<string, unknown>): Promise<T> => {

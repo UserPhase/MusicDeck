@@ -30,23 +30,27 @@ export function subscribeVisualActivity(listener: () => void): () => void {
   };
 }
 
-/** Run UI refreshes only in the foreground and refresh promptly after returning. */
+/** Refresh promptly on return, with an optional slower cadence for background work. */
 export function startVisualPolling(
   refresh: () => void,
   intervalMs: number,
-  { immediate = true, refreshOnWindowFocus = false }: { immediate?: boolean; refreshOnWindowFocus?: boolean } = {},
+  { immediate = true, refreshOnWindowFocus = false, backgroundIntervalMs }: {
+    immediate?: boolean;
+    refreshOnWindowFocus?: boolean;
+    backgroundIntervalMs?: number;
+  } = {},
 ): () => void {
   let timer: number | undefined;
-  let first = true;
+  let previousActivity: boolean | undefined;
   const sync = () => {
-    if (!getVisualActivity()) {
-      window.clearInterval(timer);
-      timer = undefined;
-    } else if (timer === undefined) {
-      timer = window.setInterval(refresh, intervalMs);
-      if (immediate || !first) refresh();
-    }
-    first = false;
+    const active = getVisualActivity();
+    if (active === previousActivity) return;
+    const shouldRefresh = active && (immediate || previousActivity !== undefined);
+    previousActivity = active;
+    window.clearInterval(timer);
+    const interval = active ? intervalMs : backgroundIntervalMs;
+    timer = interval === undefined ? undefined : window.setInterval(refresh, interval);
+    if (shouldRefresh) refresh();
   };
   const unsubscribe = subscribeVisualActivity(sync);
   sync();

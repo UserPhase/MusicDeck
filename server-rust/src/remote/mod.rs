@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -56,6 +56,15 @@ pub const REGISTRATION_TIMEOUT_MS: u64 = 10_000;
 
 /// Command acknowledgement timeout (`8,000` ms).
 pub const COMMAND_TIMEOUT_MS: u64 = 8_000;
+const COMMAND_LIFETIME_MS: u64 = 10_000;
+const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// 4-stage playback transfer handshake timeout (`20,000` ms).
 pub const TRANSFER_TIMEOUT_MS: u64 = 20_000;
@@ -366,6 +375,8 @@ pub enum RemoteClientMessage {
         /// Opts into account state frames. Older clients still receive DEVICES.
         #[serde(default)]
         live_sync: bool,
+        #[serde(default)]
+        command_deadlines: bool,
     },
     /// Report updated playback state and optionally select this player if no device is active.
     State {
@@ -388,6 +399,8 @@ pub enum RemoteClientMessage {
         /// Optional explicit target device ID.
         #[serde(rename = "targetId")]
         target_id: Option<String>,
+        #[serde(default, rename = "expiresAt")]
+        expires_at: Option<u64>,
         /// Command payload.
         command: RemoteCommand,
     },
@@ -396,6 +409,8 @@ pub enum RemoteClientMessage {
         /// Command correlation ID assigned by the hub.
         #[serde(rename = "requestId")]
         request_id: String,
+        #[serde(default, rename = "expiresAt")]
+        expires_at: Option<u64>,
         /// Whether execution succeeded.
         ok: bool,
         /// Optional error/diagnostic message.
@@ -450,6 +465,10 @@ pub enum RemoteClientMessage {
         /// Failure reason (`<= 500` chars).
         message: String,
     },
+    TransferRolledBack {
+        #[serde(rename = "transferId")]
+        transfer_id: String,
+    },
 }
 
 /// Stage of an in-flight 4-stage playback transfer handshake.
@@ -463,6 +482,7 @@ pub enum TransferStage {
     Pause,
     /// Waiting for `STARTED` from `target`.
     Start,
+    Rollback,
 }
 
 #[derive(Debug)]
@@ -478,9 +498,11 @@ struct ConnectedClient {
     can_receive: bool,
     state: RemotePlaybackState,
     live_sync: bool,
+    command_deadlines: bool,
     queue: Option<Arc<TransferQueueState>>,
     tx: mpsc::Sender<Value>,
     disconnected: watch::Sender<bool>,
+    deadline_changed: Arc<Notify>,
     tokens: f64,
     last_refill_ms: u64,
 }
@@ -492,6 +514,8 @@ struct PendingCommand {
     target_conn_id: String,
     client_request_id: String,
     command: RemoteCommand,
+    expires: Instant,
+    expires_at: u64,
     deadline: Option<Instant>,
 }
 
@@ -505,6 +529,7 @@ struct ActiveTransfer {
     stage: TransferStage,
     snapshot: Option<TransferSnapshot>,
     deadline: Instant,
+    failure: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -568,9 +593,11 @@ impl RemoteControlHub {
                 can_receive: false,
                 state: RemotePlaybackState::default(),
                 live_sync: false,
+                command_deadlines: false,
                 queue: None,
                 tx,
                 disconnected: watch::channel(false).0,
+                deadline_changed: Arc::new(Notify::new()),
                 tokens: 120.0,
                 last_refill_ms: now_ms,
             },
@@ -600,6 +627,25 @@ impl RemoteControlHub {
         Some(guard.clients.get(conn_id)?.disconnected.subscribe())
     }
 
+    pub(crate) fn deadline_signal(&self, conn_id: &str) -> Option<Arc<Notify>> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(Arc::clone(&guard.clients.get(conn_id)?.deadline_changed))
+    }
+
+    pub(crate) fn supports_control_watchdog(&self, conn_id: &str) -> bool {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .clients
+            .get(conn_id)
+            .is_some_and(|client| client.command_deadlines)
+    }
+
     /// Consumes 1 rate-limit token from `conn_id`, returning `false` if the client exceeded
     /// its token bucket (`120` burst, `60`/sec refill).
     pub fn consume_rate_token(&self, conn_id: &str, now_ms: u64) -> bool {
@@ -624,7 +670,10 @@ impl RemoteControlHub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let Some(user_id) = guard.clients.get(conn_id).map(|c| c.user_id.clone()) else {
+        let Some(user_id) = guard.clients.get(conn_id)
+            .filter(|client| !*client.disconnected.borrow())
+            .map(|client| client.user_id.clone())
+        else {
             return;
         };
 
@@ -637,11 +686,14 @@ impl RemoteControlHub {
                 can_receive,
                 mut state,
                 live_sync,
+                command_deadlines,
             } => {
                 let clean_name = device_name.trim().to_owned();
                 if device_id.is_empty()
                     || device_id.len() > 160
-                    || queue_device_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 300)
+                    || queue_device_id
+                        .as_ref()
+                        .is_some_and(|id| id.is_empty() || id.len() > 300)
                     || clean_name.is_empty()
                     || clean_name.chars().count() > 80
                     || !state.validate()
@@ -703,6 +755,7 @@ impl RemoteControlHub {
                     client.can_receive = can_receive;
                     client.state = state;
                     client.live_sync = live_sync;
+                    client.command_deadlines = command_deadlines;
                 }
 
                 if !guard.active_player_by_user.contains_key(&user_id) && is_playing {
@@ -744,8 +797,22 @@ impl RemoteControlHub {
                     RemoteClientMessage::Command {
                         request_id,
                         target_id,
+                        expires_at,
                         command,
                     } => {
+                        let now_ms = epoch_ms();
+                        let expires_at = expires_at
+                            .unwrap_or(now_ms + COMMAND_LIFETIME_MS)
+                            .min(now_ms + COMMAND_LIFETIME_MS);
+                        if expires_at <= now_ms {
+                            Self::send_error_locked(
+                                &guard,
+                                conn_id,
+                                "Playback command expired",
+                                Some(&request_id),
+                            );
+                            return;
+                        }
                         let command = match command {
                             RemoteCommand::PlayTrack { track } => RemoteCommand::PlaySelection {
                                 tracks: vec![track],
@@ -825,32 +892,50 @@ impl RemoteControlHub {
                             target_conn_id: target_conn,
                             client_request_id: request_id,
                             command,
+                            expires: Instant::now() + Duration::from_millis(expires_at - now_ms),
+                            expires_at,
                             deadline: None,
                         });
                         Self::dispatch_command_locked(&mut guard, &user_id);
                     }
                     RemoteClientMessage::CommandResult {
                         request_id,
+                        expires_at,
                         ok,
                         message,
                         state,
                     } => {
-                        let is_valid_target = guard
+                        let command = guard
                             .commands
                             .get(&user_id)
                             .and_then(VecDeque::front)
-                            .is_some_and(|cmd| {
+                            .filter(|cmd| {
                                 cmd.id == request_id
                                     && cmd.target_conn_id == conn_id
                                     && cmd.deadline.is_some()
                             });
-                        if !is_valid_target {
+                        let target_uses_deadlines = guard
+                            .clients
+                            .get(conn_id)
+                            .is_some_and(|c| c.command_deadlines);
+                        let Some(command) = command.filter(|cmd| {
+                            expires_at == Some(cmd.expires_at)
+                                || (!target_uses_deadlines && expires_at.is_none())
+                        }) else {
                             Self::send_error_locked(
                                 &guard,
                                 conn_id,
                                 "Unknown command acknowledgement",
                                 None,
                             );
+                            return;
+                        };
+                        if command.expires_at <= epoch_ms()
+                            || command
+                                .deadline
+                                .is_some_and(|deadline| deadline <= Instant::now())
+                        {
+                            Self::expire_command_locked(&guard, command);
                             return;
                         }
                         if let Some(cmd) = guard
@@ -954,6 +1039,7 @@ impl RemoteControlHub {
                                 target_conn_id: target_conn,
                                 stage: TransferStage::Snapshot,
                                 snapshot: None,
+                                failure: None,
                                 deadline: Instant::now()
                                     + Duration::from_millis(TRANSFER_TIMEOUT_MS),
                             },
@@ -1035,21 +1121,73 @@ impl RemoteControlHub {
     }
 
     fn dispatch_command_locked(guard: &mut HubState, user_id: &str) {
-        let Some(cmd) = guard
-            .commands
-            .get_mut(user_id)
-            .and_then(VecDeque::front_mut)
-        else {
-            guard.commands.remove(user_id);
-            return;
-        };
-        if cmd.deadline.is_some() {
+        loop {
+            let Some(cmd) = guard.commands.get(user_id).and_then(VecDeque::front) else {
+                guard.commands.remove(user_id);
+                return;
+            };
+            let now = Instant::now();
+            let now_ms = epoch_ms();
+            if let Some(deadline) = cmd.deadline {
+                if deadline <= now || cmd.expires_at <= now_ms {
+                    Self::expire_command_locked(guard, cmd);
+                }
+                return;
+            }
+            if cmd.expires <= now || cmd.expires_at <= now_ms {
+                let expired = guard
+                    .commands
+                    .get_mut(user_id)
+                    .unwrap()
+                    .pop_front()
+                    .unwrap();
+                Self::send_error_locked(
+                    guard,
+                    &expired.controller_conn_id,
+                    "Playback command expired in the queue",
+                    Some(&expired.client_request_id),
+                );
+                continue;
+            }
+            let cmd = guard
+                .commands
+                .get_mut(user_id)
+                .unwrap()
+                .front_mut()
+                .unwrap();
+            let budget = cmd
+                .expires
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(
+                    (cmd.expires_at - now_ms).min(COMMAND_TIMEOUT_MS),
+                ));
+            cmd.deadline = Some(now + budget);
+            let target = cmd.target_conn_id.clone();
+            let payload = json!({
+                "type": "EXECUTE", "requestId": cmd.id, "command": cmd.command,
+                "expiresAt": cmd.expires_at, "deadlineAt": now_ms + budget.as_millis() as u64,
+                "timeoutMs": budget.as_millis() as u64,
+            });
+            if let Some(client) = guard.clients.get(&target) {
+                client.deadline_changed.notify_one();
+            }
+            Self::send_frame_locked(guard, &target, payload);
             return;
         }
-        cmd.deadline = Some(Instant::now() + Duration::from_millis(COMMAND_TIMEOUT_MS));
-        let target = cmd.target_conn_id.clone();
-        let payload = json!({ "type": "EXECUTE", "requestId": cmd.id, "command": cmd.command });
-        Self::send_frame_locked(guard, &target, payload);
+    }
+
+    fn expire_command_locked(guard: &HubState, command: &PendingCommand) {
+        if let Some(target) = guard.clients.get(&command.target_conn_id) {
+            if target.disconnected.send_replace(true) {
+                return;
+            }
+        }
+        Self::send_error_locked(
+            guard,
+            &command.controller_conn_id,
+            "Playback command expired during execution",
+            Some(&command.client_request_id),
+        );
     }
 
     fn is_starting_transfer_target(guard: &HubState, user_id: &str, conn_id: &str) -> bool {
@@ -1070,7 +1208,7 @@ impl RemoteControlHub {
         guard
             .transfers_by_user
             .get(user_id)
-            .filter(|transfer| transfer.controller_conn_id == conn_id)
+            .filter(|transfer| Self::transfer_deadline_owner(transfer) == conn_id)
             .map(|transfer| transfer.deadline)
             .into_iter()
             .chain(
@@ -1082,6 +1220,14 @@ impl RemoteControlHub {
                     .and_then(|cmd| cmd.deadline),
             )
             .min()
+    }
+
+    fn transfer_deadline_owner(transfer: &ActiveTransfer) -> &str {
+        if transfer.stage == TransferStage::Rollback {
+            &transfer.source_conn_id
+        } else {
+            &transfer.controller_conn_id
+        }
     }
 
     pub(crate) fn expire_operations(&self, conn_id: &str, now: Instant) {
@@ -1097,7 +1243,7 @@ impl RemoteControlHub {
             return;
         };
         if let Some(transfer) = guard.transfers_by_user.get(&user_id)
-            && transfer.controller_conn_id == conn_id
+            && Self::transfer_deadline_owner(transfer) == conn_id
             && transfer.deadline <= now
         {
             let resume_source =
@@ -1109,18 +1255,16 @@ impl RemoteControlHub {
                 resume_source,
             );
         }
-        if guard
+        if let Some(command) = guard
             .commands
             .get(&user_id)
             .and_then(VecDeque::front)
-            .is_some_and(|cmd| {
+            .filter(|cmd| {
                 cmd.target_conn_id == conn_id
                     && cmd.deadline.is_some_and(|deadline| deadline <= now)
             })
-            && let Some(client) = guard.clients.get(conn_id)
         {
-            // Reconnect the target so queued commands cannot continue after a timeout.
-            client.disconnected.send_replace(true);
+            Self::expire_command_locked(&guard, command);
         }
     }
 
@@ -1135,7 +1279,8 @@ impl RemoteControlHub {
             | RemoteClientMessage::Ready { transfer_id }
             | RemoteClientMessage::SourcePaused { transfer_id, .. }
             | RemoteClientMessage::Started { transfer_id, .. }
-            | RemoteClientMessage::TransferFailed { transfer_id, .. } => transfer_id.as_str(),
+            | RemoteClientMessage::TransferFailed { transfer_id, .. }
+            | RemoteClientMessage::TransferRolledBack { transfer_id } => transfer_id.as_str(),
             _ => return,
         };
 
@@ -1148,13 +1293,33 @@ impl RemoteControlHub {
             Self::send_error_locked(guard, conn_id, "Stale playback transfer", None);
             return;
         }
+        let transfer = guard.transfers_by_user.get(user_id).unwrap();
+        if transfer.deadline <= Instant::now() {
+            let resume = matches!(transfer.stage, TransferStage::Pause | TransferStage::Start);
+            Self::abort_transfer_locked(guard, user_id, "Playback transfer timed out", resume);
+            return;
+        }
+        if transfer.stage == TransferStage::Rollback {
+            if matches!(message, RemoteClientMessage::TransferRolledBack { .. })
+                && conn_id == transfer.target_conn_id
+            {
+                let transfer = guard.transfers_by_user.remove(user_id).unwrap();
+                let detail = transfer
+                    .failure
+                    .as_deref()
+                    .unwrap_or("Playback transfer cancelled");
+                Self::finish_transfer_abort(guard, &transfer, detail, true);
+            }
+            return;
+        }
 
         match message {
             RemoteClientMessage::TransferFailed { message: msg, .. } => {
                 let (is_participant, resume_source) = {
                     let t = guard.transfers_by_user.get(user_id).unwrap();
                     let part = conn_id == t.source_conn_id || conn_id == t.target_conn_id;
-                    let resume = conn_id == t.target_conn_id && t.stage == TransferStage::Start;
+                    let resume = conn_id == t.target_conn_id
+                        && matches!(t.stage, TransferStage::Pause | TransferStage::Start);
                     (part, resume)
                 };
                 if !is_participant {
@@ -1257,6 +1422,11 @@ impl RemoteControlHub {
 
                 match step {
                     Some(Ok((target_conn, tid))) => {
+                        if let Some(source) = guard.clients.get_mut(conn_id) {
+                            source.state.playing = false;
+                        }
+                        Self::broadcast_devices_locked(guard, user_id);
+                        Self::sync_playback_locked(guard, user_id, None);
                         Self::send_frame_locked(
                             guard,
                             &target_conn,
@@ -1380,34 +1550,57 @@ impl RemoteControlHub {
         message: &str,
         resume_source: bool,
     ) {
-        let Some(transfer) = guard.transfers_by_user.remove(user_id) else {
+        let Some(mut transfer) = guard.transfers_by_user.remove(user_id) else {
             return;
         };
 
-        let should_resume =
-            resume_source && transfer.snapshot.as_ref().is_some_and(|s| s.playing);
+        let should_resume = resume_source && transfer.snapshot.as_ref().is_some_and(|s| s.playing);
 
-        Self::send_frame_locked(
-            guard,
-            &transfer.target_conn_id,
-            json!({
-                "type": "ABORT_TRANSFER",
-                "transferId": transfer.id,
-            }),
-        );
+        if transfer.stage != TransferStage::Rollback {
+            Self::send_frame_locked(
+                guard,
+                &transfer.target_conn_id,
+                json!({
+                    "type": "ABORT_TRANSFER", "transferId": transfer.id,
+                }),
+            );
+        }
+        if should_resume
+            && transfer.stage != TransferStage::Rollback
+            && guard.clients.contains_key(&transfer.target_conn_id)
+            && let Some(source) = guard.clients.get(&transfer.source_conn_id)
+        {
+            transfer.stage = TransferStage::Rollback;
+            transfer.deadline = Instant::now() + ROLLBACK_TIMEOUT;
+            transfer.failure = Some(message.to_owned());
+            source.deadline_changed.notify_one();
+            guard.transfers_by_user.insert(user_id.to_owned(), transfer);
+            return;
+        }
+        Self::finish_transfer_abort(guard, &transfer, message, false);
+    }
+
+    fn finish_transfer_abort(
+        guard: &HubState,
+        transfer: &ActiveTransfer,
+        message: &str,
+        resume_source: bool,
+    ) {
         Self::send_frame_locked(
             guard,
             &transfer.source_conn_id,
             json!({
                 "type": "ABORT_TRANSFER",
                 "transferId": transfer.id,
-                "resume": should_resume,
+                "resume": resume_source,
             }),
         );
 
         let detail = if !resume_source
-            && matches!(transfer.stage, TransferStage::Pause | TransferStage::Start)
-        {
+            && matches!(
+                transfer.stage,
+                TransferStage::Pause | TransferStage::Start | TransferStage::Rollback
+            ) {
             format!("{message}. Check both devices and resume manually if needed.")
         } else {
             message.to_owned()
@@ -1435,7 +1628,8 @@ impl RemoteControlHub {
         if let Some(transfer) = guard.transfers_by_user.get(&user_id)
             && (transfer.source_conn_id == conn_id
                 || transfer.target_conn_id == conn_id
-                || transfer.controller_conn_id == conn_id)
+                || (transfer.controller_conn_id == conn_id
+                    && transfer.stage != TransferStage::Rollback))
         {
             let resume_source = transfer.source_conn_id != conn_id
                 && matches!(transfer.stage, TransferStage::Pause | TransferStage::Start);
@@ -1472,7 +1666,12 @@ impl RemoteControlHub {
         }
         Self::dispatch_command_locked(guard, &user_id);
 
-        if guard.active_player_by_user.get(&user_id).map(String::as_str) == Some(conn_id) {
+        if guard
+            .active_player_by_user
+            .get(&user_id)
+            .map(String::as_str)
+            == Some(conn_id)
+        {
             guard.active_player_by_user.remove(&user_id);
         }
 
@@ -1541,7 +1740,13 @@ impl RemoteControlHub {
             .map(|track| track.id.as_str());
         let queue = player
             .and_then(|client| client.queue.clone())
-            .filter(|queue| queue.entries.get(queue.index).map(|entry| entry.track_id.as_str()) == current_id);
+            .filter(|queue| {
+                queue
+                    .entries
+                    .get(queue.index)
+                    .map(|entry| entry.track_id.as_str())
+                    == current_id
+            });
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1586,12 +1791,17 @@ impl RemoteControlHub {
         }
         let playback = &guard.playback_by_user[user_id];
         if let Some(conn_id) = initialize {
+            let supports_watchdog = guard
+                .clients
+                .get(conn_id)
+                .is_some_and(|client| client.command_deadlines);
             Self::send_frame_locked(
                 guard,
                 conn_id,
                 json!({
                     "type": "INITIAL_STATE", "state": playback, "server_time": now,
                     "queue": playback.queue.as_deref(),
+                    "controlTimeoutMs": supports_watchdog.then_some(25_000),
                 }),
             );
         }
@@ -1639,6 +1849,7 @@ impl RemoteControlHub {
         let payload = json!({
             "type": "DEVICES",
             "devices": devices,
+            "live_state_protocol": true,
         });
 
         for peer in peers {
@@ -1646,12 +1857,7 @@ impl RemoteControlHub {
         }
     }
 
-    fn send_error_locked(
-        guard: &HubState,
-        conn_id: &str,
-        message: &str,
-        request_id: Option<&str>,
-    ) {
+    fn send_error_locked(guard: &HubState, conn_id: &str, message: &str, request_id: Option<&str>) {
         let mut obj = json!({
             "type": "ERROR",
             "message": message,
@@ -1659,10 +1865,7 @@ impl RemoteControlHub {
         if let Some(req_id) = request_id
             && let Value::Object(ref mut map) = obj
         {
-            map.insert(
-                String::from("requestId"),
-                Value::String(req_id.to_owned()),
-            );
+            map.insert(String::from("requestId"), Value::String(req_id.to_owned()));
         }
         Self::send_frame_locked(guard, conn_id, obj);
     }
@@ -1683,6 +1886,158 @@ impl RemoteControlHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_commands_and_reordered_acknowledgements_cannot_outlive_their_deadlines() {
+        let hub = RemoteControlHub::new();
+        let send =
+            |conn: &str, frame| hub.handle_message(conn, serde_json::from_value(frame).unwrap());
+        let register = |device: &str| {
+            let (conn, rx) = hub.connect_client("alice", device, 0).unwrap();
+            send(
+                &conn,
+                json!({
+                    "type": "REGISTER", "device_id": device, "device_name": device,
+                    "device_type": "computer", "can_receive": true, "command_deadlines": true,
+                    "state": RemotePlaybackState::default(),
+                }),
+            );
+            (conn, rx)
+        };
+        let (desk, mut desk_rx) = register("desk");
+        let (phone, mut phone_rx) = register("phone");
+        send(
+            &desk,
+            json!({ "type": "STATE", "state": {
+                "current_track": { "id": "track", "title": "Track" }, "position_ms": 0.0,
+                "duration_ms": 60_000.0, "playing": true, "volume": 1.0,
+            }}),
+        );
+        let receive = |rx: &mut mpsc::Receiver<Value>, name: &str| loop {
+            let frame = rx.try_recv().unwrap();
+            if frame["type"] == name {
+                break frame;
+            }
+        };
+        let command = |request_id, expires| {
+            send(
+                &phone,
+                json!({
+                    "type": "COMMAND", "requestId": request_id, "expiresAt": expires,
+                    "command": { "type": "PAUSE" },
+                }),
+            )
+        };
+        command("admission-expired", epoch_ms().saturating_sub(1));
+        assert_eq!(
+            receive(&mut phone_rx, "ERROR")["requestId"],
+            "admission-expired"
+        );
+        command("first", epoch_ms() + 10_000);
+        command("queued", epoch_ms() + 10_000);
+        let first = receive(&mut desk_rx, "EXECUTE");
+        {
+            let mut state = hub.state.lock().unwrap();
+            state.commands.get_mut("alice").unwrap()[1].expires = Instant::now();
+        }
+        send(
+            &desk,
+            json!({
+                "type": "COMMAND_RESULT", "requestId": first["requestId"], "expiresAt": 1, "ok": true,
+            }),
+        );
+        assert_eq!(
+            receive(&mut desk_rx, "ERROR")["message"],
+            "Unknown command acknowledgement"
+        );
+        send(
+            &desk,
+            json!({
+                "type": "COMMAND_RESULT", "requestId": first["requestId"],
+                "expiresAt": first["expiresAt"], "ok": true,
+            }),
+        );
+        assert_eq!(
+            receive(&mut phone_rx, "COMMAND_RESULT")["requestId"],
+            "first"
+        );
+        assert_eq!(receive(&mut phone_rx, "ERROR")["requestId"], "queued");
+        assert!(desk_rx.try_recv().is_err());
+
+        command("late", epoch_ms() + 10_000);
+        let late = receive(&mut desk_rx, "EXECUTE");
+        {
+            let mut state = hub.state.lock().unwrap();
+            state.commands.get_mut("alice").unwrap()[0].deadline = Some(Instant::now());
+        }
+        let disconnected = hub.disconnect_signal(&desk).unwrap();
+        send(
+            &desk,
+            json!({
+                "type": "COMMAND_RESULT", "requestId": late["requestId"],
+                "expiresAt": late["expiresAt"], "ok": true,
+            }),
+        );
+        assert_eq!(receive(&mut phone_rx, "ERROR")["requestId"], "late");
+        assert!(*disconnected.borrow());
+    }
+
+    #[test]
+    fn rollback_requires_the_target_confirmation_before_the_source_can_resume() {
+        let hub = RemoteControlHub::new();
+        let (source, mut source_rx) = hub.connect_client("alice", "desk", 0).unwrap();
+        let (target, mut target_rx) = hub.connect_client("alice", "phone", 0).unwrap();
+        let send =
+            |conn: &str, frame| hub.handle_message(conn, serde_json::from_value(frame).unwrap());
+        let register = |conn, device| {
+            send(
+                conn,
+                json!({
+                    "type": "REGISTER", "device_id": device, "device_name": device,
+                    "device_type": "computer", "can_receive": true, "state": RemotePlaybackState::default(),
+                }),
+            )
+        };
+        register(&source, "desk");
+        register(&target, "phone");
+        while source_rx.try_recv().is_ok() {}
+        while target_rx.try_recv().is_ok() {}
+        {
+            let mut state = hub.state.lock().unwrap();
+            state.transfers_by_user.insert("alice".into(), ActiveTransfer {
+                id: "transfer".into(),
+                request_id: "switch".into(),
+                controller_conn_id: source.clone(),
+                source_conn_id: source.clone(),
+                target_conn_id: target.clone(),
+                stage: TransferStage::Start,
+                deadline: Instant::now() + Duration::from_secs(10),
+                failure: None,
+                snapshot: Some(serde_json::from_value(json!({
+                    "trackId": "track", "exactPositionMs": 1000, "volume": 1.0, "playing": true,
+                    "queueState": { "entries": [], "index": 0, "repeatOne": false, "shuffle": false,
+                        "shuffleMode": "standard", "shuffleSeed": null, "albumAware": false, "context": null },
+                })).unwrap()),
+            });
+        }
+        send(
+            &target,
+            json!({ "type": "TRANSFER_FAILED", "transferId": "transfer", "message": "The target failed" }),
+        );
+        assert_eq!(target_rx.try_recv().unwrap()["type"], "ABORT_TRANSFER");
+        assert!(source_rx.try_recv().is_err());
+        send(
+            &source,
+            json!({ "type": "TRANSFER_ROLLED_BACK", "transferId": "transfer" }),
+        );
+        assert!(source_rx.try_recv().is_err());
+        send(
+            &target,
+            json!({ "type": "TRANSFER_ROLLED_BACK", "transferId": "transfer" }),
+        );
+        assert_eq!(source_rx.try_recv().unwrap()["resume"], true);
+        assert_eq!(source_rx.try_recv().unwrap()["ok"], false);
+    }
 
     #[test]
     fn live_state_is_account_scoped_and_commands_commit_in_arrival_order() {

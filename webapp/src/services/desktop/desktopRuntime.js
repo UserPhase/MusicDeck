@@ -1,23 +1,26 @@
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { setDesktopForeground } from "../visualActivity";
 
 export const DEFAULT_DESKTOP_SERVER_URL = "http://localhost:4534";
-export const DEFAULT_DESKTOP_UPDATE_MANIFEST_URL =
-  "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/latest.json";
 export const DESKTOP_SERVER_URL_KEY = "musicdeck.desktop.serverUrl";
-export const DESKTOP_PROXY_URL_KEY = "musicdeck.desktop.proxyUrl";
 export const DESKTOP_CLOSE_TO_TRAY_KEY = "musicdeck.desktop.closeToTray";
 export const DESKTOP_AUTO_UPDATE_KEY = "musicdeck.desktop.autoCheckUpdates";
 export const DESKTOP_CONFIG_CHANGED_EVENT = "musicdeck:desktop-config-changed";
 export const DESKTOP_OPEN_SERVER_MODAL_EVENT = "musicdeck:desktop-open-server-settings";
 export const DESKTOP_MEDIA_CONTROL_EVENT = "musicdeck:desktop-media-control";
 export const DESKTOP_CHECK_UPDATES_EVENT = "musicdeck:desktop-check-for-updates";
-export const DESKTOP_UPDATE_STATUS_EVENT = "musicdeck:desktop-update-status";
 
 let fetchInterceptorInstalled = false;
 let originalFetch = null;
 let activeDesktopProxyUrl = null;
 let remoteProxyUrl = null;
 let runtimeSyncPromise = null;
+let configSaveTail = Promise.resolve();
+
+function isApiPath(path) {
+  return /^\/api(?:\/|\?|$)/.test(path);
+}
 
 function isBinaryOrStreamApiPath(path) {
   if (typeof path !== "string") return false;
@@ -50,9 +53,12 @@ export function normalizeDesktopServerUrl(raw) {
     throw new Error("Server URL must be a string.");
   }
 
-  const trimmed = raw.trim().replace(/\/+$/, "");
+  const trimmed = raw.trim();
   if (!trimmed) {
     throw new Error("Server URL is required.");
+  }
+  if (/[\s\\]/.test(trimmed)) {
+    throw new Error("Server URL cannot contain whitespace or backslashes.");
   }
 
   let candidate = trimmed;
@@ -65,6 +71,8 @@ export function normalizeDesktopServerUrl(raw) {
       : `http://${candidate}`;
   } else if (!/^https?:\/\//i.test(candidate)) {
     throw new Error("Server URL must start with http:// or https://.");
+  } else if (/^https?:\/\/(?:\/|$)/i.test(candidate)) {
+    throw new Error("Enter a valid http:// or https:// MusicDeck server URL.");
   }
 
   let parsed;
@@ -177,14 +185,116 @@ export async function invokeDesktopCommand(command, args = {}) {
   return invoke(command, args);
 }
 
+function desktopApiPath(inputUrl) {
+  const page = new URL(window.location.href);
+  const url = new URL(inputUrl, page);
+  url.hash = "";
+  if (url.protocol === page.protocol && url.host === page.host) {
+    const path = `${url.pathname}${url.search}`;
+    if (isApiPath(path)) return path;
+  }
+  const path = stripDesktopApiOrigin(url.href);
+  return isApiPath(path) ? path : null;
+}
+
+function abortReason(signal) {
+  return signal.reason === undefined
+    ? new DOMException("The operation was aborted.", "AbortError")
+    : signal.reason;
+}
+
+function withAbort(signal, run, cancel) {
+  if (!signal) return run();
+  if (signal.aborted) throw abortReason(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      reject(abortReason(signal));
+      cancel?.();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw abortReason(signal);
+      return run();
+    }).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function invokeDesktopFetch(invoke, request, signal, Channel) {
+  if (!signal) return invoke("desktop_api_fetch", { request });
+  let channel;
+  let ready = false;
+  const cancel = () => {
+    if (ready) void invoke("desktop_cancel_api_fetch", { id: channel.id }).catch(() => {});
+  };
+  return withAbort(signal, () => {
+    // Tauri may schedule the cancel command before the fetch command starts.
+    // Wait for registration before sending the native cancellation.
+    channel = new Channel(() => {
+      ready = true;
+      if (signal.aborted) cancel();
+    });
+    return invoke("desktop_api_fetch", { request: { ...request, cancelChannel: channel } });
+  }, cancel);
+}
+
+async function fetchDesktopApi(fetch, input, init) {
+  const isRequest = typeof Request !== "undefined" && input instanceof Request;
+  const inputUrl = isRequest ? input.url : String(input);
+  const path = desktopApiPath(inputUrl);
+  if (!path) return fetch(input, init);
+
+  const request = isRequest ? new Request(input, init) : null;
+  const signal = request?.signal ?? init?.signal;
+  if (signal?.aborted) throw abortReason(signal);
+  const method = request?.method ?? init?.method ?? "GET";
+  const headers = new Headers(request?.headers ?? init?.headers);
+  const hasRequestBody = request && !/^(GET|HEAD)$/.test(method) && request.body !== null;
+  const contentType = headers.get("content-type") ?? "";
+  const isTextBody = hasRequestBody
+    ? /^(?:text\/|application\/(?:[\w.-]+\+)?(?:json|xml|x-www-form-urlencoded)(?:;|$))/i.test(contentType)
+    : init?.body == null || typeof init.body === "string";
+  const invoke = getTauriInvoke();
+  const Channel = window.__TAURI__?.core?.Channel;
+
+  if (invoke && isTextBody && !isBinaryOrStreamApiPath(path) && (!signal || Channel)) {
+    const body = hasRequestBody
+      ? await withAbort(signal, () => request.clone().text())
+      : init?.body ?? null;
+    const response = await invokeDesktopFetch(invoke, {
+      path, method, headers: Object.fromEntries(headers.entries()), body,
+    }, signal, Channel);
+    if (response && typeof response.status === "number") {
+      const bodyless = method.toUpperCase() === "HEAD" || [204, 205, 304].includes(response.status);
+      return new Response(bodyless ? null : response.body, {
+        status: response.status,
+        headers: response.headers,
+      });
+    }
+  }
+
+  const url = resolveDesktopApiUrl(path);
+  if (!request) return fetch(url, { credentials: "include", ...init });
+  if (url === request.url) return fetch(request);
+
+  const body = hasRequestBody ? await withAbort(signal, () => request.blob()) : undefined;
+  return fetch(url, {
+    method, headers, signal, body,
+    cache: request.cache,
+    credentials: request.credentials,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    mode: request.mode === "same-origin" ? "cors" : request.mode,
+    redirect: request.redirect,
+    referrerPolicy: request.referrerPolicy,
+  });
+}
+
 export function stripDesktopApiOrigin(url) {
   if (typeof url !== "string" || !isDesktopRuntime()) return url;
-  if (activeDesktopProxyUrl && url.startsWith(`${activeDesktopProxyUrl}/api/`)) {
-    return url.slice(activeDesktopProxyUrl.length);
-  }
-  const serverUrl = getDesktopServerUrl();
-  if (serverUrl && url.startsWith(`${serverUrl}/api/`)) {
-    return url.slice(serverUrl.length);
+  for (const base of [activeDesktopProxyUrl, getDesktopServerUrl()]) {
+    if (base && url.startsWith(base) && isApiPath(url.slice(base.length))) {
+      return url.slice(base.length);
+    }
   }
   return url;
 }
@@ -194,22 +304,12 @@ export function resolveDesktopApiUrl(pathOrUrl) {
     return pathOrUrl;
   }
 
-  if (!pathOrUrl.startsWith("/api/") && pathOrUrl !== "/api" && !pathOrUrl.startsWith("/api?")) {
+  if (!isApiPath(pathOrUrl)) {
     return pathOrUrl;
   }
 
   if (activeDesktopProxyUrl) {
     return `${activeDesktopProxyUrl}${pathOrUrl}`;
-  }
-
-  try {
-    const cachedProxy = localStorage.getItem(DESKTOP_PROXY_URL_KEY);
-    if (cachedProxy && cachedProxy.trim()) {
-      activeDesktopProxyUrl = cachedProxy.trim().replace(/\/+$/, "");
-      return `${activeDesktopProxyUrl}${pathOrUrl}`;
-    }
-  } catch {
-    // Ignore storage read errors.
   }
 
   const serverUrl = getDesktopServerUrl();
@@ -238,52 +338,44 @@ export function resolveDesktopApiUrl(pathOrUrl) {
 }
 
 export function resolveRemoteSocketUrl() {
-  const base = isDesktopRuntime() ? remoteProxyUrl : window.location.href;
+  const desktop = isDesktopRuntime();
+  const base = desktop ? remoteProxyUrl : window.location.href;
   if (!base) return null;
-  const url = new URL("/api/v1/remote", base);
+  const url = desktop ? new URL("api/v1/remote", `${base}/`) : new URL("/api/v1/remote", base);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 }
 
 export async function saveDesktopConfig({ serverUrl, closeToTray, autoCheckUpdates } = {}) {
-  const nextServerUrl =
-    serverUrl !== undefined ? normalizeDesktopServerUrl(serverUrl) : getDesktopServerUrl();
-  const nextCloseToTray =
-    typeof closeToTray === "boolean" ? closeToTray : getDesktopCloseToTray();
-  const nextAutoCheckUpdates =
-    typeof autoCheckUpdates === "boolean" ? autoCheckUpdates : getDesktopAutoCheckUpdates();
+  const update = {};
+  if (serverUrl !== undefined) update.serverUrl = normalizeDesktopServerUrl(serverUrl);
+  if (typeof closeToTray === "boolean") update.closeToTray = closeToTray;
+  if (typeof autoCheckUpdates === "boolean") update.autoCheckUpdates = autoCheckUpdates;
 
-  try {
-    localStorage.setItem(DESKTOP_SERVER_URL_KEY, nextServerUrl);
-    localStorage.setItem(DESKTOP_CLOSE_TO_TRAY_KEY, String(nextCloseToTray));
-    localStorage.setItem(DESKTOP_AUTO_UPDATE_KEY, String(nextAutoCheckUpdates));
-  } catch {
-    // Continue even if localStorage is restricted.
-  }
-
-  try {
-    await invokeDesktopCommand("desktop_set_config", {
-      update: {
-        serverUrl: nextServerUrl,
-        closeToTray: nextCloseToTray,
-        autoCheckUpdates: nextAutoCheckUpdates,
-      },
-    });
-  } catch {
-    // Allow frontend config persistence when running in a mocked or preview shell.
-  }
-
-  const detail = {
-    serverUrl: nextServerUrl,
-    closeToTray: nextCloseToTray,
-    autoCheckUpdates: nextAutoCheckUpdates,
-  };
-
-  if (typeof window !== "undefined") {
+  const save = configSaveTail.then(async () => {
+    let saved;
+    try {
+      saved = await invokeDesktopCommand("desktop_set_config", { update });
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    if (typeof saved?.serverUrl !== "string" || typeof saved.closeToTray !== "boolean" ||
+        typeof saved.autoCheckUpdates !== "boolean") {
+      throw new Error("The desktop app could not confirm that server settings were saved.");
+    }
+    const detail = { serverUrl: saved.serverUrl, closeToTray: saved.closeToTray, autoCheckUpdates: saved.autoCheckUpdates };
+    try {
+      localStorage.setItem(DESKTOP_SERVER_URL_KEY, detail.serverUrl);
+      localStorage.setItem(DESKTOP_CLOSE_TO_TRAY_KEY, String(detail.closeToTray));
+      localStorage.setItem(DESKTOP_AUTO_UPDATE_KEY, String(detail.autoCheckUpdates));
+    } catch {
+      // Native settings are already committed.
+    }
     window.dispatchEvent(new CustomEvent(DESKTOP_CONFIG_CHANGED_EVENT, { detail }));
-  }
-
-  return detail;
+    return detail;
+  });
+  configSaveTail = save.catch(() => {});
+  return save;
 }
 
 export async function checkDesktopServerConnection(candidateUrl) {
@@ -341,71 +433,76 @@ export async function checkDesktopServerConnection(candidateUrl) {
   };
 }
 
-export async function checkDesktopUpdates(manifestUrl) {
-  if (!isDesktopRuntime()) {
-    return {
-      updateAvailable: false,
-      currentVersion: "0.1.0",
-      latestVersion: null,
-      installerUrl: null,
-      sha256: null,
-      notes: null,
-      error: null,
-    };
-  }
-
-  try {
-    const nativeResult = await invokeDesktopCommand("desktop_check_for_updates", {
-      manifestUrl: manifestUrl || null,
-    });
-    if (nativeResult && typeof nativeResult === "object" && "updateAvailable" in nativeResult) {
-      return {
-        updateAvailable: Boolean(nativeResult.updateAvailable),
-        currentVersion: nativeResult.currentVersion || "0.1.0",
-        latestVersion: nativeResult.latestVersion || null,
-        buildId: nativeResult.buildId || null,
-        publishedAt: nativeResult.publishedAt || null,
-        notes: nativeResult.notes || null,
-        installerUrl: nativeResult.installerUrl || null,
-        sha256: nativeResult.sha256 || null,
-        error: nativeResult.error || null,
-      };
-    }
-  } catch (err) {
-    return {
-      updateAvailable: false,
-      currentVersion: "0.1.0",
-      latestVersion: null,
-      installerUrl: null,
-      sha256: null,
-      notes: null,
-      error: err?.message || "Failed to check for updates.",
-    };
-  }
-
-  return {
-    updateAvailable: false,
-    currentVersion: "0.1.0",
-    latestVersion: null,
-    installerUrl: null,
-    sha256: null,
-    notes: null,
-    error: null,
-  };
+async function getDesktopUpdateEnvironment() {
+  if (!isDesktopRuntime()) throw new Error("Updates are available in the desktop app.");
+  const environment = await invokeDesktopCommand("desktop_update_environment");
+  if (!environment) throw new Error("The desktop updater is unavailable.");
+  return environment;
 }
 
-export async function installDesktopUpdate({ installerUrl, sha256 }) {
-  if (!isDesktopRuntime()) {
-    throw new Error("Desktop auto-updater is only available in the desktop app.");
+export async function checkDesktopUpdates() {
+  let currentVersion;
+  try {
+    const environment = await getDesktopUpdateEnvironment();
+    currentVersion = environment.currentVersion;
+    if (environment.blockedReason) throw new Error(environment.blockedReason);
+    const update = await check({ timeout: 10_000 });
+    if (!update) return { updateAvailable: false, currentVersion };
+    try {
+      return { updateAvailable: true, currentVersion: update.currentVersion,
+        latestVersion: update.version, notes: update.body };
+    } finally {
+      await update.close();
+    }
+  } catch (error) {
+    return { updateAvailable: false, currentVersion, error: typeof error === "string"
+      ? error : error?.message || "Failed to check for updates." };
   }
-  if (!installerUrl || typeof installerUrl !== "string") {
-    throw new Error("Update installer URL is missing.");
-  }
+}
 
-  return invokeDesktopCommand("desktop_install_update", {
-    installerUrl,
-    sha256: sha256 || null,
-  });
+let pendingDesktopUpdate;
+
+export async function installDesktopUpdate({ onProgress, beforeInstall } = {}) {
+  if (pendingDesktopUpdate) throw new Error("An update is already in progress.");
+  const install = async () => {
+    const environment = await getDesktopUpdateEnvironment();
+    if (environment.blockedReason) throw new Error(environment.blockedReason);
+    const update = await check({ timeout: 10_000 });
+    if (!update) return false;
+
+    let downloadedBytes = 0;
+    let totalBytes;
+    let percentage = -1;
+    try {
+      await update.download(({ event, data }) => {
+        if (event === "Started") {
+          totalBytes = data.contentLength;
+          onProgress?.({ stage: "downloading", downloadedBytes, totalBytes });
+        } else if (event === "Progress" && totalBytes > 0) {
+          downloadedBytes += data.chunkLength;
+          const next = Math.floor(downloadedBytes / totalBytes * 100);
+          if (next !== percentage) {
+            percentage = next;
+            onProgress?.({ stage: "downloading", downloadedBytes, totalBytes });
+          }
+        }
+      }, { timeout: 300_000 });
+      onProgress?.({ stage: "installing" });
+      // The Windows installer can exit the app as soon as install is invoked.
+      await beforeInstall?.();
+      await update.install({ restartAfterInstall: true });
+    } finally {
+      await update.close().catch(() => {});
+    }
+    // On Windows the updater exits the old process and NSIS starts the new one.
+    if (!environment.windows) {
+      await relaunch();
+    }
+    return true;
+  };
+  pendingDesktopUpdate = install();
+  try { return await pendingDesktopUpdate; }
+  finally { pendingDesktopUpdate = undefined; }
 }
 
 export async function syncDesktopPlaybackState({ title, artist, isPlaying }) {
@@ -478,7 +575,6 @@ export function subscribeDesktopRuntimeEvents({
   onMediaControl,
   onOpenServerSettings,
   onCheckForUpdates,
-  onUpdateStatus,
 } = {}) {
   if (!isDesktopRuntime() || typeof window === "undefined") {
     return () => {};
@@ -500,14 +596,9 @@ export function subscribeDesktopRuntimeEvents({
     onCheckForUpdates?.();
   };
 
-  const handleDomUpdateStatus = (event) => {
-    if (event.detail) onUpdateStatus?.(event.detail);
-  };
-
   window.addEventListener(DESKTOP_MEDIA_CONTROL_EVENT, handleDomMediaControl);
   window.addEventListener(DESKTOP_OPEN_SERVER_MODAL_EVENT, handleDomOpenServer);
   window.addEventListener(DESKTOP_CHECK_UPDATES_EVENT, handleDomCheckUpdates);
-  window.addEventListener(DESKTOP_UPDATE_STATUS_EVENT, handleDomUpdateStatus);
 
   const listen = getTauriEventListen();
   if (listen) {
@@ -559,21 +650,6 @@ export function subscribeDesktopRuntimeEvents({
       })
       .catch(() => {});
 
-    Promise.resolve(
-      listen("desktop://update-status", (event) => {
-        if (!disposed && event?.payload) {
-          onUpdateStatus?.(event.payload);
-        }
-      })
-    )
-      .then((unlisten) => {
-        if (disposed && typeof unlisten === "function") {
-          unlisten();
-        } else if (typeof unlisten === "function") {
-          unlisteners.push(unlisten);
-        }
-      })
-      .catch(() => {});
   }
 
   return () => {
@@ -581,7 +657,6 @@ export function subscribeDesktopRuntimeEvents({
     window.removeEventListener(DESKTOP_MEDIA_CONTROL_EVENT, handleDomMediaControl);
     window.removeEventListener(DESKTOP_OPEN_SERVER_MODAL_EVENT, handleDomOpenServer);
     window.removeEventListener(DESKTOP_CHECK_UPDATES_EVENT, handleDomCheckUpdates);
-    window.removeEventListener(DESKTOP_UPDATE_STATUS_EVENT, handleDomUpdateStatus);
     while (unlisteners.length > 0) {
       const fn = unlisteners.pop();
       try {
@@ -630,61 +705,11 @@ export function installDesktopRuntime() {
   }
 
   if (!fetchInterceptorInstalled && typeof window.fetch === "function") {
-    originalFetch = window.fetch.bind(window);
+    const fetch = window.fetch.bind(window);
+    originalFetch = fetch;
     fetchInterceptorInstalled = true;
 
-    window.fetch = async (input, init) => {
-      if (typeof input === "string") {
-        const relativePath = stripDesktopApiOrigin(input);
-        const isApiCall =
-          relativePath.startsWith("/api/") ||
-          relativePath === "/api" ||
-          relativePath.startsWith("/api?");
-
-        if (isApiCall && !isBinaryOrStreamApiPath(relativePath) && getTauriInvoke()) {
-          const headers = {};
-          if (init?.headers) {
-            if (init.headers instanceof Headers) {
-              init.headers.forEach((value, key) => {
-                headers[key] = value;
-              });
-            } else if (Array.isArray(init.headers)) {
-              for (const [key, value] of init.headers) {
-                headers[key] = value;
-              }
-            } else if (typeof init.headers === "object") {
-              Object.assign(headers, init.headers);
-            }
-          }
-
-          const ipcResult = await invokeDesktopCommand("desktop_api_fetch", {
-            request: {
-              path: relativePath,
-              method: init?.method || "GET",
-              headers,
-              body: typeof init?.body === "string" ? init.body : null,
-            },
-          });
-
-          if (ipcResult && typeof ipcResult === "object" && typeof ipcResult.status === "number") {
-            const responseBody = ipcResult.status === 204 ? null : ipcResult.body ?? "";
-            return new Response(responseBody, {
-              status: ipcResult.status,
-              headers: ipcResult.headers || {},
-            });
-          }
-        }
-
-        const resolved = resolveDesktopApiUrl(input);
-        if (resolved !== input) {
-          return originalFetch(resolved, {
-            credentials: "include",
-            ...init,
-          });
-        }
-      }
-      return originalFetch(input, init);
-    };
+    window.fetch = (input, init) => fetchDesktopApi(fetch, input, init);
   }
 
   runtimeSyncPromise = Promise.resolve()
@@ -694,11 +719,6 @@ export function installDesktopRuntime() {
       if (typeof config.proxyUrl === "string" && config.proxyUrl.trim()) {
         activeDesktopProxyUrl = config.proxyUrl.trim().replace(/\/+$/, "");
         remoteProxyUrl = activeDesktopProxyUrl;
-        try {
-          localStorage.setItem(DESKTOP_PROXY_URL_KEY, activeDesktopProxyUrl);
-        } catch {
-          // Ignore storage errors.
-        }
       }
       const hadStoredUrl = hasStoredDesktopServerUrl();
       const storedUrl = hadStoredUrl ? getDesktopServerUrl() : null;

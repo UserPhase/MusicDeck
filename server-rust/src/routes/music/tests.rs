@@ -139,6 +139,18 @@ async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::Join
     tokio::spawn(async move {
         let router = Router::new()
             .route(
+                "/rest/stream.view",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    if params["id"] == "stream-error" {
+                        return Json(json!({"subsonic-response": {"status": "failed", "error": {"code": 70}}})).into_response();
+                    }
+                    (StatusCode::PARTIAL_CONTENT, [
+                        (http::header::CONTENT_TYPE, "audio/flac"),
+                        (http::header::CONTENT_RANGE, "bytes 0-3/8"),
+                    ], "fLaC").into_response()
+                }),
+            )
+            .route(
                 "/rest/getArtist.view",
                 get(|Query(params): Query<HashMap<String, String>>| async move {
                     let id = &params["id"];
@@ -181,6 +193,27 @@ async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::Join
             .await
             .expect("serve fixture library");
     })
+}
+
+#[tokio::test]
+async fn library_stream_skips_a_success_status_with_a_subsonic_error_body() {
+    let (db, state, session) = playback_state(false).await;
+    let provider = add_fixture_library(&db, &state).await;
+    let library = LibraryService::new(db, None);
+    let source = |id: &str| SourceRef {
+        connection_id: "fixture-library".into(),
+        provider_item_id: id.into(),
+    };
+    let id = library.ensure_id(LibraryItemType::Track, &source("stream-error"), None).await.unwrap();
+    let path = format!("/api/tracks/{id}/stream");
+    assert_eq!(request(&state, &session, "GET", &path, None).await.status(), StatusCode::BAD_GATEWAY);
+
+    library.add_source(&id, &source("stream-audio")).await.unwrap();
+    let response = request(&state, &session, "GET", &path, None).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes 0-3/8");
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes().as_ref(), b"fLaC");
+    provider.abort();
 }
 
 #[tokio::test]

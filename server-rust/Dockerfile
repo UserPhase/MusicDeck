@@ -93,7 +93,12 @@ EXPOSE 4534
 VOLUME ["/app/data", "/app/config", "/app/cache"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD gosu musicdeck curl -fsS "http://127.0.0.1:${PORT:-4534}/api/health" > /dev/null || exit 1
+  CMD if [ -n "${MUSICDECK_BIND_ADDR:-}" ]; then bind="${MUSICDECK_BIND_ADDR}"; \
+      else host="${MUSICDECK_HOST:-${HOST:-127.0.0.1}}"; \
+        case "$host" in *:*) host="[$host]";; esac; \
+        bind="$host:${MUSICDECK_PORT:-${PORT:-4534}}"; fi; \
+      case "$bind" in 0.0.0.0:*) bind="127.0.0.1:${bind##*:}";; "[::]:"*) bind="[::1]:${bind##*:}";; esac; \
+      gosu musicdeck curl --noproxy '*' -fsS --max-time 4 "http://$bind/api/health" > /dev/null || exit 1
 
 ENTRYPOINT ["musicdeck-entrypoint"]
 CMD ["musicdeck-server"]

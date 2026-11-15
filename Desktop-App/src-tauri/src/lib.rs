@@ -1,9 +1,9 @@
 pub mod config;
 pub mod proxy;
-pub mod updater;
+mod updater;
 
-use config::{candidate_server_urls, load_config, normalize_server_url, save_config, DesktopConfig};
-use proxy::{apply_response_cookies, start_local_api_proxy};
+use config::{candidate_server_urls, load_config, DesktopConfig, DesktopConnection};
+use proxy::{send_upstream, start_local_api_proxy, upstream_redirect_policy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
@@ -12,21 +12,20 @@ use std::sync::{
 };
 use std::time::Duration;
 use tauri::{
+    ipc::JavaScriptChannelId,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, Webview, WindowEvent,
 };
-use updater::{
-    check_for_updates, download_and_verify_installer, launch_installer, UpdateCheckResponse,
-    UpdateStatus,
-};
+use tokio::sync::oneshot;
 
 pub struct DesktopState {
-    pub config: Arc<Mutex<DesktopConfig>>,
-    pub ephemeral_cookie: Arc<Mutex<Option<String>>>,
+    connection: Arc<Mutex<DesktopConnection>>,
+    config_dir: std::path::PathBuf,
+    http_client: reqwest::Client,
+    pending_requests: Mutex<HashMap<u32, Option<oneshot::Sender<()>>>>,
     pub proxy_url: Option<String>,
     pub quitting: AtomicBool,
-    update_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,14 +64,14 @@ pub struct PlaybackStatusPayload {
     pub is_playing: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopApiRequest {
     pub path: String,
     pub method: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub body: Option<String>,
-    pub server_url: Option<String>,
+    cancel_channel: Option<JavaScriptChannelId>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,15 +100,16 @@ fn show_main_window(app: &AppHandle) {
 #[tauri::command]
 fn desktop_get_config(state: State<'_, DesktopState>) -> Result<DesktopConfigResponse, String> {
     let guard = state
-        .config
+        .connection
         .lock()
         .map_err(|_| "Desktop configuration lock poisoned".to_string())?;
+    let config = &guard.config;
     Ok(DesktopConfigResponse {
-        server_url: guard.server_url.clone(),
+        server_url: config.server_url.clone(),
         proxy_url: state.proxy_url.clone(),
-        close_to_tray: guard.close_to_tray,
-        start_minimized: guard.start_minimized,
-        auto_check_updates: guard.auto_check_updates,
+        close_to_tray: config.close_to_tray,
+        start_minimized: config.start_minimized,
+        auto_check_updates: config.auto_check_updates,
     })
 }
 
@@ -120,46 +120,27 @@ fn desktop_set_config(
     update: DesktopConfigUpdate,
 ) -> Result<DesktopConfigResponse, String> {
     let mut guard = state
-        .config
+        .connection
         .lock()
         .map_err(|_| "Desktop configuration lock poisoned".to_string())?;
 
-    let next_server_url = update
-        .server_url
-        .unwrap_or_else(|| guard.server_url.clone());
-    let prev_normalized = normalize_server_url(&guard.server_url).unwrap_or_else(|_| guard.server_url.clone());
-    let next_normalized = normalize_server_url(&next_server_url).unwrap_or_else(|_| next_server_url.clone());
-    let server_changed = prev_normalized != next_normalized;
-
+    let config = &guard.config;
     let candidate = DesktopConfig {
-        server_url: next_server_url,
-        close_to_tray: update.close_to_tray.unwrap_or(guard.close_to_tray),
-        start_minimized: update.start_minimized.unwrap_or(guard.start_minimized),
+        server_url: update
+            .server_url
+            .unwrap_or_else(|| config.server_url.clone()),
+        close_to_tray: update.close_to_tray.unwrap_or(config.close_to_tray),
+        start_minimized: update.start_minimized.unwrap_or(config.start_minimized),
         auto_check_updates: update
             .auto_check_updates
-            .unwrap_or(guard.auto_check_updates),
-        session_cookie: if server_changed {
-            None
-        } else {
-            guard.session_cookie.clone()
-        },
+            .unwrap_or(config.auto_check_updates),
+        session_cookie: None,
     };
 
-    if server_changed {
-        if let Ok(mut eph) = state.ephemeral_cookie.lock() {
-            *eph = None;
-        }
-    }
-
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|err| format!("Unable to resolve app config directory: {err}"))?;
-    let saved = save_config(&config_dir, &candidate)?;
-    *guard = saved.clone();
-
+    guard.save_settings(&state.config_dir, candidate)?;
+    let saved = &guard.config;
     let response = DesktopConfigResponse {
-        server_url: saved.server_url,
+        server_url: saved.server_url.clone(),
         proxy_url: state.proxy_url.clone(),
         close_to_tray: saved.close_to_tray,
         start_minimized: saved.start_minimized,
@@ -171,34 +152,43 @@ fn desktop_set_config(
 }
 
 #[tauri::command]
-async fn desktop_check_server(server_url: String) -> Result<ServerHealthResponse, String> {
+async fn desktop_check_server(
+    state: State<'_, DesktopState>,
+    server_url: String,
+) -> Result<ServerHealthResponse, String> {
     let candidates = candidate_server_urls(&server_url)?;
     let primary = candidates
         .first()
         .cloned()
         .ok_or_else(|| "Server URL is required".to_string())?;
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(Duration::from_secs(6))
-        .build()
-        .map_err(|err| format!("Failed to initialize HTTP client: {err}"))?;
-
     let mut last_error = String::new();
 
     for candidate in &candidates {
         let endpoint = format!("{candidate}/api/public/config");
-        match client.get(&endpoint).send().await {
+        match state
+            .http_client
+            .get(&endpoint)
+            .timeout(Duration::from_secs(6))
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => {
-                let payload = response.json::<PublicConfigPayload>().await.ok();
-                return Ok(ServerHealthResponse {
-                    reachable: true,
-                    server_url: candidate.clone(),
-                    app_name: payload
-                        .and_then(|p| p.app_name)
-                        .or_else(|| Some("MusicDeck".to_string())),
-                    error: None,
-                });
+                match response.json::<PublicConfigPayload>().await {
+                    Ok(payload) => {
+                        return Ok(ServerHealthResponse {
+                            reachable: true,
+                            server_url: candidate.clone(),
+                            app_name: payload.app_name.or_else(|| Some("MusicDeck".to_string())),
+                            error: None,
+                        })
+                    }
+                    Err(err) => {
+                        last_error = format!(
+                            "{candidate} returned an unreadable MusicDeck configuration: {err}"
+                        )
+                    }
+                }
             }
             Ok(response) => {
                 last_error = format!("{candidate} responded with HTTP {}", response.status());
@@ -220,10 +210,65 @@ async fn desktop_check_server(server_url: String) -> Result<ServerHealthResponse
     })
 }
 
+struct PendingApiRequest<'a> {
+    requests: &'a Mutex<HashMap<u32, Option<oneshot::Sender<()>>>>,
+    id: u32,
+}
+
+impl Drop for PendingApiRequest<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.remove(&self.id);
+        }
+    }
+}
+
+#[tauri::command]
+fn desktop_cancel_api_fetch(state: State<'_, DesktopState>, id: u32) {
+    if let Ok(mut requests) = state.pending_requests.lock() {
+        if let Some(cancel) = requests.get_mut(&id).and_then(Option::take) {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 #[tauri::command]
 async fn desktop_api_fetch(
-    app: AppHandle,
     state: State<'_, DesktopState>,
+    webview: Webview,
+    mut request: DesktopApiRequest,
+) -> Result<DesktopApiResponse, String> {
+    let Some(channel_id) = request.cancel_channel.take() else {
+        return fetch_desktop_api(&state, request).await;
+    };
+    let ready = channel_id.channel_on::<_, bool>(webview);
+    let id = ready.id();
+    let (cancel, cancelled) = oneshot::channel();
+    {
+        let mut requests = state
+            .pending_requests
+            .lock()
+            .map_err(|_| "Could not register the request".to_string())?;
+        let std::collections::hash_map::Entry::Vacant(entry) = requests.entry(id) else {
+            return Err("This desktop request is already registered".into());
+        };
+        entry.insert(Some(cancel));
+    }
+    let _pending = PendingApiRequest {
+        requests: &state.pending_requests,
+        id,
+    };
+    ready.send(true).map_err(|err| err.to_string())?;
+
+    tokio::select! {
+        biased;
+        _ = cancelled => Err("Desktop API request cancelled".into()),
+        response = fetch_desktop_api(&state, request) => response,
+    }
+}
+
+async fn fetch_desktop_api(
+    state: &DesktopState,
     request: DesktopApiRequest,
 ) -> Result<DesktopApiResponse, String> {
     let raw_path = request.path.trim();
@@ -237,59 +282,45 @@ async fn desktop_api_fetch(
         format!("/{raw_path}")
     };
 
-    let (configured_url, cookie_token) = {
-        let cfg = state.config.lock().ok().map(|g| g.clone());
-        let eph = state.ephemeral_cookie.lock().ok().and_then(|g| g.clone());
-        let rust_url = cfg
-            .as_ref()
-            .map(|c| c.server_url.clone())
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        let req_url = request
-            .server_url
-            .as_deref()
-            .and_then(|u| normalize_server_url(u).ok())
-            .filter(|u| !u.is_empty());
-        let server_url = match req_url {
-            Some(ref u) if (rust_url.contains("localhost") || rust_url.contains("127.0.0.1")) && !u.contains("localhost") => {
-                u.clone()
-            }
-            _ => rust_url,
-        };
-        let token = eph.or_else(|| cfg.and_then(|c| c.session_cookie));
-        (server_url, token)
-    };
-
+    let upstream = state
+        .connection
+        .lock()
+        .map_err(|_| "Desktop configuration lock poisoned".to_string())?
+        .begin_request();
     let method_str = request.method.as_deref().unwrap_or("GET").to_uppercase();
     let method = reqwest::Method::from_bytes(method_str.as_bytes())
         .map_err(|err| format!("Invalid HTTP method: {err}"))?;
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(6))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|err| format!("Failed to initialize HTTP client: {err}"))?;
-
-    let candidates =
-        candidate_server_urls(&configured_url).unwrap_or_else(|_| vec![configured_url.clone()]);
+    let candidates = upstream.candidate_urls()?;
 
     let mut upstream_response = None;
-    let mut active_base_url = configured_url.clone();
-    let mut last_error = String::new();
+    let mut active_base_url = upstream.server_url.clone();
+    let mut last_failure = None;
 
     for candidate_base in &candidates {
-        let target_url = format!("{candidate_base}{relative_path}");
-        let mut req_builder = client
-            .request(method.clone(), &target_url)
-            .header("Origin", candidate_base)
+        let target_url = reqwest::Url::parse(&format!("{candidate_base}{relative_path}"))
+            .map_err(|err| format!("Invalid MusicDeck request URL: {err}"))?;
+        let origin = target_url.origin().ascii_serialization();
+        let mut req_builder = state
+            .http_client
+            .request(method.clone(), target_url)
+            .timeout(Duration::from_secs(30))
+            .header("Origin", origin.as_str())
             .header("Referer", format!("{candidate_base}/"));
 
         if let Some(ref headers) = request.headers {
             for (k, v) in headers {
+                if ["cookie", "host", "origin", "referer"]
+                    .iter()
+                    .any(|name| k.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
                 req_builder = req_builder.header(k, v);
             }
         }
 
-        if let Some(ref token) = cookie_token {
+        if let Some(ref token) = upstream.cookie {
             if !token.is_empty() {
                 req_builder = req_builder.header("Cookie", format!("musicdeck_session={token}"));
             }
@@ -299,53 +330,60 @@ async fn desktop_api_fetch(
             req_builder = req_builder.body(body.clone());
         }
 
-        match req_builder.send().await {
+        match send_upstream(req_builder, &method, &origin, Duration::from_secs(30)).await {
             Ok(resp) => {
                 active_base_url = candidate_base.clone();
                 upstream_response = Some(resp);
                 break;
             }
-            Err(err) => {
-                last_error = err.to_string();
+            Err(failure) => {
+                let can_try_alternate = failure.can_try_alternate();
+                last_failure = Some(failure);
+                if !can_try_alternate {
+                    break;
+                }
             }
         }
     }
 
     let Some(resp) = upstream_response else {
-        return Err(format!(
-            "Could not connect to MusicDeck server at {configured_url} ({last_error})"
-        ));
+        let failure = last_failure.ok_or("No MusicDeck server URL was available")?;
+        let (code, message) = failure.details();
+        return Ok(DesktopApiResponse {
+            status: failure.status().as_u16(),
+            ok: false,
+            headers: HashMap::from([("content-type".into(), "application/json".into())]),
+            body: serde_json::json!({ "error": { "code": code, "message": message } }).to_string(),
+        });
     };
-
-    let config_dir = app
-        .path()
-        .app_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("musicdeck-desktop"));
-
-    if let Ok(mut guard) = state.config.lock() {
-        if guard.server_url != active_base_url {
-            guard.server_url = active_base_url;
-            let _ = save_config(&config_dir, &guard);
-        }
-    }
-
-    apply_response_cookies(
-        resp.headers(),
-        &state.config,
-        &state.ephemeral_cookie,
-        &config_dir,
-    );
 
     let status = resp.status().as_u16();
     let ok = resp.status().is_success();
+    let upstream_headers = resp.headers().clone();
     let mut headers = HashMap::new();
-    for (k, v) in resp.headers().iter() {
+    for (k, v) in upstream_headers.iter() {
+        if k == reqwest::header::SET_COOKIE {
+            continue;
+        }
         if let Ok(val_str) = v.to_str() {
             headers.insert(k.as_str().to_string(), val_str.to_string());
         }
     }
 
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| format!("Could not read the MusicDeck response: {err}"))?;
+    state
+        .connection
+        .lock()
+        .map_err(|_| "Desktop configuration lock poisoned".to_string())?
+        .accept_response(
+            &state.config_dir,
+            &upstream,
+            &active_base_url,
+            &upstream_headers,
+        )?;
 
     Ok(DesktopApiResponse {
         status,
@@ -379,7 +417,11 @@ fn desktop_update_playback(app: AppHandle, status: PlaybackStatusPayload) -> Res
     }
 
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let state_label = if status.is_playing { "Playing" } else { "Paused" };
+        let state_label = if status.is_playing {
+            "Playing"
+        } else {
+            "Paused"
+        };
         let tooltip = match (title, artist) {
             (Some(track), Some(artist_name)) => {
                 format!("MusicDeck ({state_label})\n{track} — {artist_name}")
@@ -412,7 +454,7 @@ fn desktop_window_action(app: AppHandle, action: String) -> Result<(), String> {
         "close" => {
             let close_to_tray = app
                 .try_state::<DesktopState>()
-                .and_then(|s| s.config.lock().ok().map(|c| c.close_to_tray))
+                .and_then(|s| s.connection.lock().ok().map(|c| c.config.close_to_tray))
                 .unwrap_or(true);
             if close_to_tray {
                 window.hide().map_err(|e| e.to_string())
@@ -428,49 +470,13 @@ fn desktop_window_action(app: AppHandle, action: String) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-async fn desktop_check_for_updates(
-    manifest_url: Option<String>,
-) -> Result<UpdateCheckResponse, String> {
-    Ok(check_for_updates(manifest_url.as_deref()).await)
-}
-
-#[tauri::command]
-async fn desktop_install_update(
-    app: AppHandle,
-    state: State<'_, DesktopState>,
-    installer_url: String,
-    sha256: Option<String>,
-) -> Result<(), String> {
-    let _update = state
-        .update_lock
-        .try_lock()
-        .map_err(|_| "An update is already in progress")?;
-    if state.quitting.load(Ordering::SeqCst) {
-        return Err("MusicDeck is already closing".to_string());
-    }
-    let report = |status| {
-        let _ = app.emit("desktop://update-status", status);
-    };
-    let installer_path =
-        download_and_verify_installer(&installer_url, sha256.as_deref(), report).await?;
-
-    report(UpdateStatus::Installing);
-    launch_installer(installer_path)?;
-
-    state.quitting.store(true, Ordering::SeqCst);
-    app.exit(0);
-    Ok(())
-}
-
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "Open MusicDeck", true, None::<&str>)?;
     let separator_top = PredefinedMenuItem::separator(app)?;
     let play_pause_item =
         MenuItem::with_id(app, "toggle-play", "Play / Pause", true, None::<&str>)?;
     let next_item = MenuItem::with_id(app, "next", "Next Track", true, None::<&str>)?;
-    let previous_item =
-        MenuItem::with_id(app, "previous", "Previous Track", true, None::<&str>)?;
+    let previous_item = MenuItem::with_id(app, "previous", "Previous Track", true, None::<&str>)?;
     let separator_mid = PredefinedMenuItem::separator(app)?;
     let server_item = MenuItem::with_id(
         app,
@@ -557,6 +563,8 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let config_dir = app
                 .path()
@@ -564,22 +572,24 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir().join("musicdeck-desktop"));
             let initial_config = load_config(&config_dir);
             let start_minimized = initial_config.start_minimized;
-            let initial_cookie = initial_config.session_cookie.clone();
-
-            let shared_config = Arc::new(Mutex::new(initial_config));
-            let shared_cookie = Arc::new(Mutex::new(initial_cookie));
+            let connection = Arc::new(Mutex::new(DesktopConnection::new(initial_config)));
+            let http_client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(6))
+                .redirect(upstream_redirect_policy())
+                .build()?;
             let proxy_url = start_local_api_proxy(
-                Arc::clone(&shared_config),
-                Arc::clone(&shared_cookie),
-                config_dir,
+                Arc::clone(&connection),
+                config_dir.clone(),
+                http_client.clone(),
             );
 
             app.manage(DesktopState {
-                config: shared_config,
-                ephemeral_cookie: shared_cookie,
+                connection,
+                config_dir,
+                http_client,
+                pending_requests: Mutex::new(HashMap::new()),
                 proxy_url,
                 quitting: AtomicBool::new(false),
-                update_lock: tokio::sync::Mutex::new(()),
             });
 
             setup_system_tray(app.handle())?;
@@ -601,9 +611,9 @@ pub fn run() {
                 if let Some(state) = app.try_state::<DesktopState>() {
                     let is_quitting = state.quitting.load(Ordering::SeqCst);
                     let close_to_tray = state
-                        .config
+                        .connection
                         .lock()
-                        .map(|cfg| cfg.close_to_tray)
+                        .map(|connection| connection.config.close_to_tray)
                         .unwrap_or(true);
                     if !is_quitting && close_to_tray {
                         api.prevent_close();
@@ -617,11 +627,66 @@ pub fn run() {
             desktop_set_config,
             desktop_check_server,
             desktop_api_fetch,
+            desktop_cancel_api_fetch,
             desktop_update_playback,
             desktop_window_action,
-            desktop_check_for_updates,
-            desktop_install_update
+            updater::desktop_update_environment
         ])
         .run(tauri::generate_context!())
         .expect("error while running MusicDeck Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn desktop_fetch_rejects_an_incomplete_upstream_body() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = DesktopConfig {
+                server_url: format!("http://{}", listener.local_addr().unwrap()),
+                ..DesktopConfig::default()
+            };
+            let upstream = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\nConnection: close\r\n\r\nshort",
+                    )
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let state = DesktopState {
+                connection: Arc::new(Mutex::new(DesktopConnection::new(config))),
+                config_dir: dir.path().to_owned(),
+                http_client: reqwest::Client::new(),
+                pending_requests: Mutex::default(),
+                proxy_url: None,
+                quitting: AtomicBool::new(false),
+            };
+            let request = DesktopApiRequest {
+                path: "/api/test".into(),
+                method: None,
+                headers: None,
+                body: None,
+                cancel_channel: None,
+            };
+            let error = fetch_desktop_api(&state, request).await.unwrap_err();
+            assert!(error.starts_with("Could not read the MusicDeck response"));
+            upstream.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }

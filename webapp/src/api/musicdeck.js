@@ -21,15 +21,19 @@ export async function request(path, options = {}) {
 
   if (!response.ok) {
     let message = `MusicDeck returned ${response.status}`;
+    let code;
+    let requestId;
 
     try {
       const data = await response.json();
       message = data.error?.message || message;
+      code = data.error?.code;
+      requestId = data.error?.requestId;
     } catch {
       // Keep the status-based message when the body is not JSON.
     }
 
-    throw Object.assign(new Error(message), { status: response.status });
+    throw Object.assign(new Error(message), { status: response.status, code, requestId });
   }
 
   if (response.status === 204) {
@@ -810,8 +814,9 @@ export function getListeningStatistics(period = "30", signal) {
   return request(`/api/listening-activity/statistics?${new URLSearchParams({ period })}`, { signal });
 }
 
-export async function getListeningTrack(trackId) {
-  const data = await request(`/api/tracks/${encodeURIComponent(trackId)}`);
+/** @param {string | number} trackId @param {AbortSignal} [signal] */
+export async function getListeningTrack(trackId, signal = undefined) {
+  const data = await request(`/api/tracks/${encodeURIComponent(trackId)}`, { signal });
   return toSong(data.track);
 }
 

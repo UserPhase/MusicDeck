@@ -87,7 +87,6 @@ function DesktopServerModal({ isOpen, onClose, onSaved }) {
         alignItems: "center",
         justifyContent: "center",
         background: "rgba(0, 0, 0, 0.72)",
-        backdropFilter: "blur(8px)",
         padding: "16px",
       }}
     >

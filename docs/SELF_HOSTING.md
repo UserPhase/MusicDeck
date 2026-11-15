@@ -800,6 +800,77 @@ docker compose logs musicdeck-web
 docker compose logs "$MUSIC_BACKEND"
 ```
 
+### Trace a 502 or 504
+
+1. From the affected device, check the same server URL that MusicDeck uses.
+   Note the UTC time and the failed request's method, path, HTTP status, and
+   JSON error code or request ID in the Network tab. Leave cookies, authorization
+   headers and query strings out of any logs you share.
+
+   ```bash
+   curl -i --connect-timeout 3 --max-time 8 http://your-server:8080/api/health
+   ```
+
+   Substitute your own LAN address or HTTPS URL. If the HTTPS URL fails, run the
+   same check from the host against the published HTTP port. A response from
+   `http://127.0.0.1:8080/api/health` there narrows the issue to the public route,
+   TLS termination, or the network in front of the web container.
+
+2. On the Docker host, compare the web container, its route to Axum, and the
+   Axum listener directly.
+
+   ```bash
+   docker compose ps --all
+   docker compose port musicdeck-web 80
+   docker compose exec -T musicdeck-web wget -T 4 -S -O- http://127.0.0.1/api/health
+   docker compose exec -T musicdeck-web wget -T 4 -S -O- http://musicdeck-server:4534/api/health
+   docker compose exec -T musicdeck-server curl --noproxy '*' -i --max-time 4 http://127.0.0.1:4534/api/health
+   ```
+
+   - If only direct Axum succeeds, confirm the server listens on
+     `0.0.0.0:4534` in the container and both services share a Docker network.
+     An explicit `MUSICDECK_BIND_ADDR` overrides `MUSICDECK_HOST` and
+     `MUSICDECK_PORT`. Validate the running gateway with
+     `docker compose exec -T musicdeck-web nginx -t`.
+   - If the host port is bound to `127.0.0.1`, use the public TLS proxy or
+     configure the documented LAN binding. The backend port `4534` is internal
+     to Compose. Configure Tauri with the same published URL as the browser.
+   - An Axum health response with HTTP 503 indicates an unavailable or busy
+     SQLite pool. HTTP 200 with `setupRequired: true` is normal during setup.
+     If health succeeds while a specific playback path fails, trace that
+     request separately. Streams can depend on Navidrome or Jellyfin.
+
+3. Check the logs around the recorded timestamp and confirm whether the backend
+   restarted, ran out of memory, or was slow to respond.
+
+   ```bash
+   docker compose logs --since 15m --timestamps musicdeck-web musicdeck-server
+   docker inspect --format '{{.State.Status}} started={{.State.StartedAt}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}' musicdeck-server
+   docker events --since 30m --until "$(date -u +%FT%TZ)" --filter container=musicdeck-server
+   docker stats --no-stream musicdeck-web musicdeck-server
+   ```
+
+   - `DESKTOP_UPSTREAM_CONNECT` and `DESKTOP_UPSTREAM_RESPONSE` identify a
+     failure before Tauri received a valid HTTP response. Check the saved URL
+     and scheme, then compare the same URL in the browser. For HTTPS, use
+     `curl -v` to check certificate and hostname validation.
+   - `WEB_UPSTREAM_BAD_GATEWAY` identifies the web container's Nginx boundary.
+     Match the response's `requestId` to the access log. A slow `connect`
+     points to reaching the upstream, while a fast `connect` followed by a
+     slow `header` points to time spent waiting for the upstream application.
+     The Nginx error log distinguishes DNS, refusal, and premature closure.
+   - `DESKTOP_UPSTREAM_TIMEOUT` or `WEB_UPSTREAM_TIMEOUT` identifies the layer
+     that timed out. Compare direct health and route timings during the failure
+     before changing proxy timeouts. A backend response such as `BACKEND_ERROR`
+     keeps its original status and error code through both proxies.
+
+Compose restarts exited containers and gates web startup on backend readiness.
+Docker's unhealthy status stays diagnostic for a running container. A later
+probe succeeds automatically when SQLite can serve requests again, and Nginx
+re-resolves the backend after a container replacement. The desktop bridge
+retries a safe read once on a connection error. Playback checkpoints retain
+their separate bounded retry logic.
+
 Library scans:
 
 Under **Admin → Server → General** you can schedule automatic library scans

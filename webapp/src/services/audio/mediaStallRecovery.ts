@@ -30,7 +30,7 @@ interface RecoveryRun {
 }
 
 const MEDIA_ERR_NETWORK = 2;
-const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
+export const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
 const HAVE_FUTURE_DATA = 3;
 const PROGRESS_EPSILON_SECONDS = 0.25;
 const END_GUARD_SECONDS = 0.25;
@@ -99,18 +99,17 @@ export class MediaStallRecovery {
     if (hasProgressed(this.deck.element, this.watchdogPosition)) this.clearWatchdog();
   }
 
-  /** Returns true when the error is a recoverable network failure. */
-  notifyError(): boolean {
+  /** Browsers may report an HTTP failure as an unsupported source. */
+  notifyError(code: number | undefined, retryAtStart: boolean, startAt?: number): boolean {
     const deck = this.deck;
     if (!deck || !deck.isLoaded()) return false;
     // A failed run stays failed until the user retries; it must not restart on its own.
     if (this.run) return true;
-    const code = deck.element.error?.code;
-    const midStream = deck.position() > 0;
-    if (code !== MEDIA_ERR_NETWORK && !(code === MEDIA_ERR_SRC_NOT_SUPPORTED && midStream)) {
+    if (code !== MEDIA_ERR_NETWORK &&
+      !(code === MEDIA_ERR_SRC_NOT_SUPPORTED && (deck.position() > 0 || retryAtStart))) {
       return false;
     }
-    this.begin();
+    this.begin(startAt);
     return true;
   }
 
@@ -143,13 +142,13 @@ export class MediaStallRecovery {
     this.deck = null;
   }
 
-  private begin(): void {
+  private begin(startAt?: number): void {
     const deck = this.deck;
     if (!deck) return;
     this.clearWatchdog();
     const run: RecoveryRun = {
       key: deck.key,
-      position: deck.position(),
+      position: startAt ?? deck.position(),
       attempt: 0,
       failed: false,
       timer: null,

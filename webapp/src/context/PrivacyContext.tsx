@@ -4,6 +4,7 @@ import { useAuth } from "./AuthContext";
 import { getPrivacySettings, updatePrivacySettings, type PrivacySettings, type PrivacySnapshot } from "../api/privacy";
 import { setBrowserPrivacy } from "../services/privacyPolicy";
 import { sendCachePolicy } from "../services/serviceWorkerRegistration";
+import { startVisualPolling } from "../services/visualActivity";
 
 interface PrivacyContextValue {
   policy: PrivacySnapshot | null;
@@ -53,12 +54,15 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
     setBusy(false);
     if (!userId) return;
     refresh();
-    const interval = window.setInterval(refresh, 5000);
-    window.addEventListener("focus", refresh);
+    // Keep checking policy for external integrations that can still run in the background.
+    const stopPolling = startVisualPolling(refresh, 15_000, {
+      immediate: false, refreshOnWindowFocus: true, backgroundIntervalMs: 60_000,
+    });
+    window.addEventListener("online", refresh);
     return () => {
       controller.current?.abort(); controller.current = null; generation.current += 1;
       saving.current = null;
-      window.clearInterval(interval); window.removeEventListener("focus", refresh); setBrowserPrivacy(null);
+      stopPolling(); window.removeEventListener("online", refresh); setBrowserPrivacy(null);
     };
   }, [refresh, userId]);
   const save = async (settings: PrivacySettings) => {

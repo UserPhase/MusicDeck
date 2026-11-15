@@ -35,15 +35,33 @@ test("holds authenticated children until the initial policy is known", async () 
   expect(screen.getByTestId("permissions")).toHaveTextContent("true/true/true");
 });
 
-test("synchronizes restrictions every five seconds and on window focus", async () => {
+test("synchronizes restrictions every 15 seconds and on window focus", async () => {
   render(<PrivacyProvider><Probe /></PrivacyProvider>);
   await flush();
   getPrivacySettings.mockResolvedValueOnce(denied);
-  await act(async () => { jest.advanceTimersByTime(5000); });
+  await act(async () => { jest.advanceTimersByTime(15_000); });
   expect(screen.getByTestId("permissions")).toHaveTextContent("false/false/false");
   expect(isBrowserIntegrationAllowed("imports")).toBe(false);
   fireEvent(window, new Event("focus"));
   await flush();
+  expect(screen.getByTestId("permissions")).toHaveTextContent("true/true/true");
+});
+
+test("uses a slower policy check while hidden and refreshes immediately on return", async () => {
+  const visibility = jest.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  render(<PrivacyProvider><Probe /></PrivacyProvider>);
+  await flush();
+  visibility.mockReturnValue("hidden");
+  fireEvent(document, new Event("visibilitychange"));
+  getPrivacySettings.mockResolvedValueOnce(denied);
+  await act(async () => { jest.advanceTimersByTime(59_999); });
+  expect(getPrivacySettings).toHaveBeenCalledTimes(1);
+  await act(async () => { jest.advanceTimersByTime(1); });
+  expect(screen.getByTestId("permissions")).toHaveTextContent("false/false/false");
+  visibility.mockReturnValue("visible");
+  fireEvent(document, new Event("visibilitychange"));
+  await flush();
+  expect(getPrivacySettings).toHaveBeenCalledTimes(3);
   expect(screen.getByTestId("permissions")).toHaveTextContent("true/true/true");
 });
 
@@ -54,7 +72,7 @@ test("keeps local playback mounted but fails external access closed during a syn
   const player = screen.getByLabelText("Local player state");
   fireEvent.change(player, { target: { value: "Playing at 2:10" } });
   getPrivacySettings.mockRejectedValueOnce(new Error("Disconnected"));
-  await act(async () => { jest.advanceTimersByTime(5000); });
+  await act(async () => { jest.advanceTimersByTime(15_000); });
   expect(screen.getByLabelText("Local player state")).toBe(player);
   expect(player).toHaveValue("Playing at 2:10");
   expect(screen.getByRole("alert")).toHaveTextContent("Local playback remains available");

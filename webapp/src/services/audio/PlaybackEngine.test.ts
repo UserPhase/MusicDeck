@@ -648,6 +648,21 @@ describe("gapless path", () => {
 });
 
 describe("stall recovery", () => {
+  test("retries a rejected library stream and preserves a cue before metadata arrives", async () => {
+    const { engine, audios, of } = setup();
+    const deck = audios[0];
+    deck.play.mockRejectedValueOnce(new DOMException("Could not load source", "NotSupportedError"));
+    await engine.load({ ...track("a"), offlineTrackId: "one" }, { startAt: 42 });
+    expect(engine.getSnapshot().state).toBe("stalled");
+    expect(of("error")).toEqual([]);
+    deck.loaded(200);
+    await flush();
+    expect(deck.currentTime).toBe(42);
+    expect(engine.isReadyForResume()).toBe(true);
+    expect(engine.getSnapshot().state).toBe("playing");
+    engine.destroy();
+  });
+
   async function playing(options: PlaybackEngineOptions = {}, duration = 200) {
     const harness = setup(options);
     await harness.engine.load(track("a"));

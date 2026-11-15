@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { usePlayer } from "../../context/PlayerContext";
 import {
   checkDesktopUpdates,
   getDesktopAutoCheckUpdates,
@@ -8,12 +9,15 @@ import {
 } from "../../services/desktop/desktopRuntime";
 
 function DesktopUpdateBanner() {
+  const player = usePlayer();
   const [updateInfo, setUpdateInfo] = useState(null);
   const [manualMessage, setManualMessage] = useState("");
   const [installStatus, setInstallStatus] = useState({ stage: "idle" });
   const [installError, setInstallError] = useState("");
   const [dismissed, setDismissed] = useState(false);
   const installing = useRef(false);
+  const flushQueue = useRef(player?.flushQueuePersistence);
+  flushQueue.current = player?.flushQueuePersistence;
 
   const runUpdateCheck = useCallback(async (isManual = false) => {
     if (!isDesktopRuntime() || installing.current) return;
@@ -25,7 +29,7 @@ function DesktopUpdateBanner() {
 
     const result = await checkDesktopUpdates();
     if (installing.current) return;
-    if (result.updateAvailable && result.installerUrl) {
+    if (result.updateAvailable) {
       setUpdateInfo(result);
       setManualMessage("");
       setDismissed(false);
@@ -36,7 +40,7 @@ function DesktopUpdateBanner() {
         setManualMessage("");
       } else {
         setManualMessage(
-          `MusicDeck Desktop is up to date (v${result.currentVersion || "0.1.0"}).`
+          `MusicDeck Desktop is up to date (v${result.currentVersion}).`
         );
       }
     }
@@ -53,27 +57,25 @@ function DesktopUpdateBanner() {
       onCheckForUpdates: () => {
         void runUpdateCheck(true);
       },
-      onUpdateStatus: (payload) => {
-        if (["downloading", "verifying", "installing"].includes(payload?.stage)) {
-          setInstallStatus(payload);
-        } else if (payload?.stage === "error") {
-          setInstallStatus({ stage: "idle" });
-          setInstallError(payload.error || "Update installation failed.");
-        }
-      },
     });
   }, [runUpdateCheck]);
 
   async function handleInstallUpdate() {
-    if (!updateInfo?.installerUrl || installing.current) return;
+    if (!updateInfo || installing.current) return;
     installing.current = true;
     setInstallError("");
     setInstallStatus({ stage: "downloading" });
     try {
-      await installDesktopUpdate({
-        installerUrl: updateInfo.installerUrl,
-        sha256: updateInfo.sha256,
+      const started = await installDesktopUpdate({
+        onProgress: setInstallStatus,
+        beforeInstall: () => flushQueue.current?.(),
       });
+      if (!started) {
+        installing.current = false;
+        setInstallStatus({ stage: "idle" });
+        setUpdateInfo(null);
+        setManualMessage("There is no newer update available.");
+      }
     } catch (err) {
       installing.current = false;
       setInstallStatus({ stage: "idle" });
@@ -139,17 +141,15 @@ function DesktopUpdateBanner() {
           <span style={{ color: "var(--text-secondary, #9ca3af)", fontSize: "0.82rem" }}>
             {installStage === "downloading"
               ? `Downloading update${downloadPercent === undefined ? "..." : ` (${downloadPercent}%)`}`
-              : installStage === "verifying"
-              ? "Verifying the downloaded update..."
               : installStage === "installing"
-              ? "Installing update and restarting MusicDeck..."
+              ? "Verifying the update and preparing to restart MusicDeck..."
               : updateInfo.notes || "A newer version of MusicDeck Desktop is ready to install."}
           </span>
-          {(installStage === "downloading" || installStage === "verifying") && (
+          {isInstalling && (
             <progress
               aria-label="Update download progress"
               max={100}
-              value={installStage === "verifying" ? 100 : downloadPercent}
+              value={installStage === "installing" ? 100 : downloadPercent}
               style={{ width: "100%", accentColor: "var(--accent, #1db954)" }}
             />
           )}
@@ -191,8 +191,6 @@ function DesktopUpdateBanner() {
             >
               {installStage === "downloading"
                 ? "Downloading..."
-                : installStage === "verifying"
-                ? "Verifying..."
                 : installStage === "installing"
                 ? "Restarting..."
                 : "Update & Restart"}

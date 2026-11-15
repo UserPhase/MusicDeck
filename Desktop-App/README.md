@@ -19,7 +19,7 @@ Native desktop shell for **MusicDeck** built with [Tauri v2](https://v2.tauri.ap
 ## Prerequisites
 
 1. **Node.js** (v20+) and **npm**
-2. **Rust toolchain** (`rustup`, `cargo`, `rustc` 1.77.2+)
+2. **Rust toolchain** (current stable via `rustup`)
 3. **Platform WebView runtime**:
    - **Windows**: Microsoft Edge WebView2 (pre-installed on Windows 10/11) and Visual Studio C++ Build Tools
    - **macOS**: Xcode Command Line Tools
@@ -43,23 +43,20 @@ npm run dev
 npm run build
 ```
 
-This runs `npm --prefix ../webapp run build` and packages the native desktop bundle in `src-tauri/target/release/bundle/`:
-- **NSIS Setup `.exe`**: `src-tauri/target/release/bundle/nsis/MusicDeck_0.1.0_x64-setup.exe`
-- **MSI Installer `.msi`**: `src-tauri/target/release/bundle/msi/MusicDeck_0.1.0_x64_en-US.msi`
+This builds the webapp and puts the per-user NSIS setup executable in `src-tauri/target/release/bundle/nsis/`. Local builds use an empty updater public key and can run without signing credentials.
 
 ## Building & Downloading the `.exe` via GitHub (with Auto-Updates)
 
-The repository includes [`.github/workflows/desktop-app.yml`](../.github/workflows/desktop-app.yml), which builds the Windows `.exe` and `.msi` installers automatically on GitHub's `windows-latest` runners (no local Rust or C++ toolchain needed on your PC) and publishes `latest.json` for in-app auto-updates:
+Configure the updater signing key once before running [the desktop release workflow](../.github/workflows/desktop-app.yml). Generate the key pair outside the repository from `Desktop-App/`.
 
-1. Commit and push `Desktop-App`, `webapp`, and `.github/workflows/desktop-app.yml` to `main`.
-2. GitHub Actions runs **Build Desktop App (Windows .exe)** automatically (or you can trigger it manually under **Actions → Build Desktop App (Windows .exe) → Run workflow**).
-3. Once finished, download `MusicDeck_0.1.0_x64-setup.exe` from either:
-   - **GitHub Releases**: under the `desktop-latest` release on your repository's **Releases** page, or
-   - **GitHub Actions**: under the workflow run's **Artifacts** (`MusicDeck-Windows-x64-Installer`).
-4. **Automatic Updates**:
-   - Every build generates a `latest.json` manifest containing the version, commit build ID, download URL, and SHA-256 checksum of the `.exe` installer.
-   - Installed desktop clients automatically check `latest.json` on startup (and via **Check for Updates...** in the system tray or **Desktop Server Connection** dialog).
-   - Clicking **Update & Restart** downloads the new `.exe` over HTTPS from GitHub Releases, verifies its SHA-256 integrity, launches the installer, and upgrades the app in place.
+```powershell
+npx tauri signer generate -w "$env:USERPROFILE\musicdeck-updater.key"
+```
+- In GitHub Actions variables, set `TAURI_UPDATER_PUBLIC_KEY` to the contents of `musicdeck-updater.key.pub`.
+- In GitHub Actions secrets, set `TAURI_SIGNING_PRIVATE_KEY` to the contents of `musicdeck-updater.key` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to its password if one was set. Keep the private key backed up securely. Existing installations continue to trust the public key they shipped with.
+- Increase the version in `Desktop-App/package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` when publishing an update, and regenerate both lockfiles. Tauri offers versions newer than the installed app.
+
+The workflow publishes the signed NSIS setup executable and `latest.json` to GitHub Releases. On Windows, **Update & Restart** displays download progress in MusicDeck, verifies the package signature, and hands off to the silent installer. NSIS reopens MusicDeck after updating the installation in `%LOCALAPPDATA%`. If MusicDeck was installed with the older machine-wide MSI, remove that installation and run the current per-user NSIS setup once.
 
 ## Validation & Tests
 

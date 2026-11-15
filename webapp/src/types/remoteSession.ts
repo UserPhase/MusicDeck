@@ -46,9 +46,10 @@ export interface RemotePlayerAdapter {
   state(): RemotePlayerState;
   queue?(): RemotePlaybackSnapshot["queueState"];
   capture(): RemotePlaybackSnapshot;
-  command(command: RemoteCommand): Promise<void>;
+  command(command: RemoteCommand, signal?: AbortSignal): Promise<void>;
   prepare(snapshot: RemotePlaybackSnapshot, signal: AbortSignal): Promise<void>;
-  start(snapshot: RemotePlaybackSnapshot): Promise<void>;
+  start(snapshot: RemotePlaybackSnapshot, signal?: AbortSignal): Promise<void>;
+  commitTransfer?(signal: AbortSignal): void;
   pause(): void;
   enable(): Promise<void>;
 }

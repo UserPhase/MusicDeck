@@ -140,6 +140,7 @@ export type QueueAction<T extends QueueTrackLike> =
   | { type: "REMOVE_ENTRIES"; ids: readonly string[] }
   | { type: "SET_REPEAT_ONE"; enabled: boolean }
   | { type: "LOAD_CURRENT"; startAt?: number; autoplay?: boolean }
+  | { type: "CANCEL_LOAD"; sequence: number }
   | { type: "STOP" }
   | { type: "ENGINE_STATE"; key: string | null; state: EngineState }
   | { type: "ENGINE_TRACK_END"; key: string }
@@ -500,6 +501,10 @@ export function queueReducer<T extends QueueTrackLike>(
     case "SET_REPEAT_ONE":
       return state.repeatOne === action.enabled ? state : { ...state, repeatOne: action.enabled };
 
+    case "CANCEL_LOAD":
+      return state.loadRequest?.sequence === action.sequence
+        ? { ...withStatus(state, "PAUSE"), loadRequest: null }
+        : state;
     case "LOAD_CURRENT": {
       if (state.currentIndex < 0) return state;
       return loadIndex(
@@ -517,6 +522,7 @@ export function queueReducer<T extends QueueTrackLike>(
     case "ENGINE_STATE": {
       if (!isCurrentKey(state, action.key)) return state;
       const event = ENGINE_STATE_EVENTS[action.state];
+      if (action.state === "playing" && state.lastError) return withStatus({ ...state, lastError: null }, "PLAY");
       return event ? withStatus(state, event) : state;
     }
 
@@ -631,11 +637,20 @@ export interface QueueStore<T extends QueueTrackLike> {
   removeEntries: (ids: readonly string[]) => void;
   setRepeatOne: (enabled: boolean) => void;
   loadCurrent: (options?: { startAt?: number; autoplay?: boolean }) => void;
+  waitForLoad: (sequence: number, signal?: AbortSignal) => Promise<void>;
+  cancelPendingLoad: () => void;
   stop: () => void;
   play: () => void;
   pause: () => void;
   seek: (seconds: number) => void;
 }
+
+type QueueLoad = {
+  sequence: number; entryId: string; autoplay: boolean; loaded: boolean;
+  phase: "LOADING" | "READY" | "PLAYING" | "FAILED";
+  playback?: EngineState;
+  error?: Error;
+};
 
 function playableFor<T extends QueueTrackLike>(
   entry: QueueEntry<T>,
@@ -663,6 +678,49 @@ export function useQueueStore<T extends QueueTrackLike>(
   const thresholdRef = useRef(options.restartThresholdSeconds);
   const unplayableRef = useRef(options.unplayableReason);
   const handledLoadRef = useRef(0);
+  const cancelledLoadRef = useRef(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const load = useRef<QueueLoad | null>(null);
+  const loadListeners = useRef(new Set<() => void>());
+  const notifyLoad = useCallback(() => loadListeners.current.forEach(listener => listener()), []);
+  useEffect(notifyLoad, [state.loadRequest, notifyLoad]);
+
+  const cancelPendingLoad = useCallback(() => {
+    const request = stateRef.current.loadRequest;
+    if (!request || (load.current?.sequence === request.sequence && load.current.phase !== "LOADING")) return;
+    cancelledLoadRef.current = request.sequence;
+    dispatch({ type: "CANCEL_LOAD", sequence: request.sequence });
+  }, []);
+
+  const waitForLoad = useCallback((sequence: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+    const finish = (error?: Error) => {
+      loadListeners.current.delete(check);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error); else resolve();
+    };
+    const check = () => {
+      if (stateRef.current.loadRequest?.sequence !== sequence) {
+        finish(new Error("The selected track changed before it finished loading."));
+        return;
+      }
+      const current = load.current;
+      if (current?.sequence !== sequence) return;
+      if (current.phase === "FAILED") finish(current.error ?? new Error("Could not load the selected track."));
+      else if (current.phase === "READY" || current.phase === "PLAYING") finish();
+    };
+    const abort = () => {
+      finish(new Error("Playback command cancelled."));
+      if (stateRef.current.loadRequest?.sequence === sequence) {
+        engine?.pause();
+        cancelPendingLoad();
+      }
+    };
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener("abort", abort, { once: true });
+    loadListeners.current.add(check);
+    check();
+  }), [engine, cancelPendingLoad]);
 
   useEffect(() => {
     toPlayableRef.current = options.toPlayable;
@@ -675,8 +733,17 @@ export function useQueueStore<T extends QueueTrackLike>(
     // A new engine instance has not loaded anything yet.
     handledLoadRef.current = 0;
     const unsubscribers = [
-      engine.on("stateChange", ({ key, state: engineState }) =>
-        dispatch({ type: "ENGINE_STATE", key, state: engineState })),
+      engine.on("stateChange", ({ key, state: engineState }) => {
+        const current = load.current;
+        if (current?.entryId === key && current.phase === "LOADING") {
+          current.playback = engineState;
+          if (current.loaded && (engineState === "playing" || engineState === "transitioning")) {
+            current.phase = "PLAYING";
+            notifyLoad();
+          }
+        }
+        dispatch({ type: "ENGINE_STATE", key, state: engineState });
+      }),
       engine.on("trackEnd", ({ key }) => dispatch({ type: "ENGINE_TRACK_END", key })),
       engine.on("bufferStall", ({ key }) => dispatch({ type: "ENGINE_BUFFER_STALL", key })),
       engine.on("streamRecovered", ({ key }) => dispatch({ type: "ENGINE_STREAM_RECOVERED", key })),
@@ -687,21 +754,39 @@ export function useQueueStore<T extends QueueTrackLike>(
         dispatch({ type: "ENGINE_TRANSITION_COMMIT", fromKey, toKey })),
       engine.on("transitionCancel", ({ fromKey, toKey }) =>
         dispatch({ type: "ENGINE_TRANSITION_CANCEL", fromKey, toKey })),
-      engine.on("error", ({ key, message }) => dispatch({ type: "ENGINE_ERROR", key, message })),
+      engine.on("error", ({ key, message }) => {
+        const current = load.current;
+        if (current?.entryId === key && current.phase === "LOADING") {
+          current.phase = "FAILED";
+          current.error = new Error(message);
+          notifyLoad();
+        }
+        dispatch({ type: "ENGINE_ERROR", key, message });
+      }),
     ];
     return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
-  }, [engine]);
+  }, [engine, notifyLoad]);
 
   const { loadRequest, entries } = state;
   useEffect(() => {
-    if (!engine || !loadRequest || loadRequest.sequence === handledLoadRef.current) return;
+    if (!engine || !loadRequest || loadRequest.sequence === handledLoadRef.current ||
+        loadRequest.sequence === cancelledLoadRef.current) return;
     const entry = entries.find((candidate) => candidate.entryId === loadRequest.entryId);
     if (!entry) return;
     handledLoadRef.current = loadRequest.sequence;
+    const current: QueueLoad = { ...loadRequest, loaded: false, phase: "LOADING" };
+    load.current = current;
+    const failed = (message: string) => {
+      if (load.current !== current || stateRef.current.loadRequest?.sequence !== current.sequence) return;
+      current.phase = "FAILED";
+      current.error = new Error(message);
+      notifyLoad();
+      dispatch({ type: "ENGINE_ERROR", key: entry.entryId, message });
+    };
     const blocked = unplayableRef.current?.(entry) ?? null;
     if (blocked) {
       engine.pause();
-      dispatch({ type: "ENGINE_ERROR", key: entry.entryId, message: blocked });
+      failed(blocked);
       return;
     }
     engine
@@ -709,14 +794,19 @@ export function useQueueStore<T extends QueueTrackLike>(
         startAt: loadRequest.startAt,
         autoplay: loadRequest.autoplay,
       })
-      .catch((error: unknown) => {
-        dispatch({
-          type: "ENGINE_ERROR",
-          key: entry.entryId,
-          message: error instanceof Error ? error.message : "Could not load this track.",
-        });
-      });
-  }, [engine, loadRequest, entries]);
+      .then(() => {
+        if (load.current !== current || current.phase !== "LOADING") return;
+        current.loaded = true;
+        if (!current.autoplay) current.phase = "READY";
+        else if (current.playback === "playing" || current.playback === "transitioning") current.phase = "PLAYING";
+        else if (current.playback === "paused" || current.playback === "idle" || current.playback === "error") {
+          failed("The selected device could not start playback.");
+          return;
+        }
+        notifyLoad();
+      })
+      .catch((error: unknown) => failed(error instanceof Error ? error.message : "Could not load this track."));
+  }, [engine, loadRequest, entries, notifyLoad]);
 
   const upcomingEntry = upcomingEntryOf(state);
   useEffect(() => {
@@ -763,6 +853,8 @@ export function useQueueStore<T extends QueueTrackLike>(
     state,
     currentEntry: currentEntryOf(state),
     upcomingEntry,
+    waitForLoad,
+    cancelPendingLoad,
     ...actions,
   };
 }
@@ -771,6 +863,7 @@ export function useQueueStore<T extends QueueTrackLike>(
  * entries change; progress writes update a separate small IndexedDB record. */
 export function usePersistentQueue<T extends QueueTrackLike>(store: QueueStore<T>, binding: {
   ownerId: string | null; checkpointKey?: unknown; getCheckpoint(): QueueCheckpoint;
+  canPersist?: () => boolean;
   onRestore(saved: LocalQueue): SetQueueOptions; onReady(owner: string): void; onError(message: string): void;
 }) {
   const [readyOwner, setReadyOwner] = useState<string | null>(null);
@@ -803,7 +896,8 @@ export function usePersistentQueue<T extends QueueTrackLike>(store: QueueStore<T
     const owner = latest.current.binding.ownerId, version = epoch.current;
     if (!owner || readyOwner !== owner) return Promise.resolve(null);
     const task = tail.current.catch(() => null).then(async () => {
-      if (version !== epoch.current || latest.current.binding.ownerId !== owner) return null;
+      if (version !== epoch.current || latest.current.binding.ownerId !== owner ||
+          latest.current.binding.canPersist?.() === false) return null;
       const entries = latest.current.store.state.entries;
       if (!entries.length && !head.current) return null;
       if (savedEntries.current !== entries) {
@@ -811,7 +905,8 @@ export function usePersistentQueue<T extends QueueTrackLike>(store: QueueStore<T
         for (let index = 0; index < entries.length; index++) {
           encoded.push({ entryId: entries[index].entryId, track: sanitizeQueueTrack(entries[index].track) });
           if (index > 0 && index % 500 === 0) await new Promise(resolve => setTimeout(resolve, 0));
-          if (version !== epoch.current || latest.current.store.state.entries !== entries) return null;
+          if (version !== epoch.current || latest.current.store.state.entries !== entries ||
+              latest.current.binding.canPersist?.() === false) return null;
         }
         const next = await writeLocalQueue(owner, { version: 2, entries: encoded }, latest.current.binding.getCheckpoint());
         if (version === epoch.current && latest.current.store.state.entries === entries) { head.current = next; savedEntries.current = entries; }

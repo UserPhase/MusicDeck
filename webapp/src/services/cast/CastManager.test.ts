@@ -3,16 +3,20 @@ import type { CastSdk, CastSession, CastMedia, CastContext, CastApi } from "./Ca
 import type { PlayableTrack } from "../audio/types";
 import type { RemoteAudioSnapshot } from "../audio/remoteOutput";
 import { setBrowserPrivacy } from "../privacyPolicy";
+import { setDesktopForeground } from "../visualActivity";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { PlaybackEngine } from "../audio/PlaybackEngine";
 import { useQueueStore } from "../../hooks/useQueueStore";
 
 const track = (key: string): PlayableTrack & { id: string } => ({ id: key, key, src: "/private-browser-stream", durationHint: 180,
   cast: { trackId: key, title: `Song ${key}`, artist: "Artist", album: "Album" } });
-function setup() {
+function setup({ mediaEvents = true } = {}) {
   let sessionPresent = true;
   const events = new Map<string, () => void>();
   let media: CastMedia | null = null;
+  const mediaUpdates = new Set<(alive: boolean) => void>();
+  const sessionEvents = new Map<string, () => void>();
+  let volume = .5;
   class MediaInfo {
     metadata?: object; streamType?: string; duration?: number;
     constructor(public url: string, public contentType: string) {}
@@ -25,13 +29,21 @@ function setup() {
     if (!(request instanceof LoadRequest)) throw new Error("Invalid load request");
     media = { media: { contentId: request.info.url, duration: request.info.duration }, playerState: request.autoplay ? "PLAYING" : "PAUSED",
       getEstimatedTime: jest.fn(() => request.currentTime),
+      ...(mediaEvents ? {
+        addUpdateListener: (listener: (alive: boolean) => void) => { mediaUpdates.add(listener); },
+        removeUpdateListener: (listener: (alive: boolean) => void) => { mediaUpdates.delete(listener); },
+      } : {}),
       play: (_request, ok) => { if (media) media.playerState = "PLAYING"; ok(); },
       pause: (_request, ok) => { if (media) media.playerState = "PAUSED"; ok(); },
       seek: (seek, ok) => { if (media) media.getEstimatedTime = () => seek.currentTime; ok(); },
     };
   });
   const session: CastSession = { getCastDevice: () => ({ friendlyName: "Living Room" }),
-    getMediaSession: () => media, getVolume: () => .5, loadMedia: load, setVolume: jest.fn(async () => {}) };
+    getMediaSession: () => media, getVolume: () => volume, loadMedia: load,
+    setVolume: jest.fn(async (next) => { volume = next; }),
+    addEventListener: (event, listener) => { sessionEvents.set(event, listener); },
+    removeEventListener: (event) => { sessionEvents.delete(event); },
+  };
   const context: CastContext = { setOptions: jest.fn(), requestSession: jest.fn(async () => {}),
     getCurrentSession: () => sessionPresent ? session : null, getCastState: () => "CONNECTED",
     endCurrentSession: jest.fn(() => { sessionPresent = false; }),
@@ -39,6 +51,7 @@ function setup() {
     removeEventListener: (event) => { events.delete(event); },
   };
   const sdk: CastSdk = { framework: { CastContext: { getInstance: () => context },
+    SessionEventType: { VOLUME_CHANGED: "volume", MEDIA_SESSION: "media" },
     CastContextEventType: { CAST_STATE_CHANGED: "cast", SESSION_STATE_CHANGED: "session" } },
     chrome: { AutoJoinPolicy: { ORIGIN_SCOPED: "origin" }, media: {
       DEFAULT_MEDIA_RECEIVER_APP_ID: "default", StreamType: { BUFFERED: "buffered" },
@@ -50,12 +63,14 @@ function setup() {
     revoke: jest.fn(async () => {}) };
   const loader = jest.fn(async () => sdk);
   const manager = new CastManager(api, loader);
-  return { manager, api, load, session, loader, context, events,
+  return { manager, api, load, session, loader, context, events, mediaUpdates, sessionEvents,
     getMedia: () => { if (!media) throw new Error("Missing media"); return media; },
+    updateMedia: (alive = true) => { for (const listener of [...mediaUpdates]) listener(alive); },
+    changeReceiverVolume: (next: number) => { volume = next; sessionEvents.get("volume")?.(); },
     lose: () => { sessionPresent = false; events.get("session")?.(); } };
 }
 beforeEach(() => { jest.useFakeTimers(); });
-afterEach(() => { jest.useRealTimers(); setBrowserPrivacy(undefined); });
+afterEach(() => { jest.useRealTimers(); setBrowserPrivacy(undefined); setDesktopForeground(null); });
 
 test("SDK stays unloaded until connect, then casts capability URL and music metadata at the exact fractional position", async () => {
   const { manager, loader, load, api, context } = setup();
@@ -73,7 +88,7 @@ test("SDK stays unloaded until connect, then casts capability URL and music meta
 });
 
 test("receiver pause/play/seek/volume stay remote, and finished is emitted exactly once per queue occurrence", async () => {
-  const { manager, session, getMedia } = setup();
+  const { manager, session, getMedia, updateMedia } = setup();
   const events: RemoteAudioSnapshot[] = [];
   manager.subscribe((snapshot) => events.push(snapshot));
   await manager.connect(); await manager.load(track("a"), { autoplay: false });
@@ -82,11 +97,63 @@ test("receiver pause/play/seek/volume stay remote, and finished is emitted exact
   await manager.seek(42.125); expect(manager.getSnapshot().position).toBe(42.125);
   await manager.setVolume(.34); expect(session.setVolume).toHaveBeenCalledWith(.34);
   getMedia().playerState = "IDLE"; getMedia().idleReason = "FINISHED";
+  updateMedia(false);
   jest.advanceTimersByTime(1000);
   expect(events.filter((event) => event.ended)).toHaveLength(1);
   await manager.load(track("b"), { autoplay: true });
   expect(manager.getSnapshot().key).toBe("b");
   await manager.destroy();
+});
+
+test("uses receiver events while paused and samples playing position more slowly in the background", async () => {
+  const { manager, getMedia, updateMedia, changeReceiverVolume, mediaUpdates, sessionEvents } = setup();
+  try {
+    await manager.connect();
+    await manager.load(track("a"), { autoplay: false });
+    const estimate = getMedia().getEstimatedTime as jest.Mock;
+    expect(jest.getTimerCount()).toBe(0);
+    estimate.mockClear();
+    jest.advanceTimersByTime(20_000);
+    expect(estimate).not.toHaveBeenCalled();
+    changeReceiverVolume(.2);
+    expect(manager.getState().volume).toBe(.2);
+
+    setDesktopForeground(false);
+    getMedia().playerState = "PLAYING";
+    updateMedia();
+    expect(manager.getSnapshot().state).toBe("playing");
+    estimate.mockClear();
+    jest.advanceTimersByTime(1999);
+    expect(estimate).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(estimate).toHaveBeenCalledTimes(1);
+
+    getMedia().playerState = "PAUSED";
+    updateMedia();
+    expect(manager.getSnapshot().state).toBe("paused");
+    expect(jest.getTimerCount()).toBe(0);
+  } finally {
+    await manager.destroy();
+  }
+  expect(mediaUpdates.size).toBe(0);
+  expect(sessionEvents.size).toBe(0);
+});
+
+test("keeps a slow paused fallback for receivers without media callbacks", async () => {
+  const { manager, getMedia } = setup({ mediaEvents: false });
+  try {
+    await manager.connect();
+    await manager.load(track("a"), { autoplay: false });
+    const estimate = getMedia().getEstimatedTime as jest.Mock;
+    estimate.mockClear();
+    jest.advanceTimersByTime(2999);
+    expect(estimate).not.toHaveBeenCalled();
+    getMedia().playerState = "PLAYING";
+    jest.advanceTimersByTime(1);
+    expect(manager.getSnapshot().state).toBe("playing");
+  } finally {
+    await manager.destroy();
+  }
 });
 
 test("rapid skips discard stale authorizations and only load the latest queued selection", async () => {
@@ -176,7 +243,7 @@ test("the real CastManager feeds receiver completion into the existing queue sto
   const localPlay = jest.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
   const localPause = jest.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   const localLoad = jest.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
-  const { manager, getMedia } = setup();
+  const { manager, getMedia, updateMedia } = setup();
   const engine = new PlaybackEngine({ audioContext: null, transitionMode: "crossfade" });
   const queue = renderHook(() => useQueueStore<PlayableTrack & { id: string }>(engine, {
     toPlayable: (entry) => ({ ...entry.track, key: entry.entryId }),
@@ -188,7 +255,7 @@ test("the real CastManager feeds receiver completion into the existing queue sto
     await waitFor(() => expect(getMedia().media.contentId).toContain("token=a"));
     const firstOccurrence = queue.result.current.state.entries[0].entryId;
     getMedia().playerState = "IDLE"; getMedia().idleReason = "FINISHED";
-    await act(async () => { jest.advanceTimersByTime(250); });
+    await act(async () => { updateMedia(false); });
     await waitFor(() => expect(getMedia().media.contentId).toContain("token=b"));
     expect(queue.result.current.state.currentIndex).toBe(1);
     expect(engine.getSnapshot().key).not.toBe(firstOccurrence);

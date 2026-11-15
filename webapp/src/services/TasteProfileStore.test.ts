@@ -1,5 +1,6 @@
-import { waitFor } from "@testing-library/react";
+import { act, waitFor } from "@testing-library/react";
 import { tasteProfileStore as store } from "./TasteProfileStore";
+import { setDesktopForeground } from "./visualActivity";
 const state = (extra = {}) => ({ privateListening: false, revision: 0, resetBefore: null, providerHistoryDisabled: false, excludedPlaylistIds: [], excludedTrackIds: [], ...extra });
 const reply = (body: unknown) => Promise.resolve({ ok: true, json: async () => body } as Response);
 beforeEach(() => { store.activate(null); localStorage.clear(); Object.defineProperty(navigator, "onLine", { configurable: true, value: true }); global.fetch = jest.fn(() => reply(state())); });
@@ -26,4 +27,29 @@ test("account changes abort pending writes and never publish another user's pref
   store.activate("bob"); finish(await reply(state({ revision: 8, excludedTrackIds: ["private-song"] })));
   expect(await pending).toBeInstanceOf(Error); await waitFor(() => expect(store.getSnapshot().loaded).toBe(true));
   expect(store.getSnapshot()).toMatchObject({ owner: "bob", excludedTrackIds: [] });
+});
+
+test("backs off when the desktop loses focus and refreshes on focus or a write", async () => {
+  jest.useFakeTimers();
+  try {
+    store.activate("alice");
+    await waitFor(() => expect(store.getSnapshot().loaded).toBe(true));
+    setDesktopForeground(false);
+    jest.advanceTimersByTime(89_999);
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => { jest.advanceTimersByTime(1); });
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    await store.setPrivate(true);
+    expect(fetch).toHaveBeenCalledWith("/api/v1/taste-profile/private", expect.objectContaining({ method: "POST" }));
+
+    (fetch as jest.Mock).mockClear();
+    setDesktopForeground(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    store.activate(null);
+    setDesktopForeground(null);
+    jest.useRealTimers();
+  }
 });

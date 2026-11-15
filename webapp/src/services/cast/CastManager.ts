@@ -1,12 +1,15 @@
 import type { PlayableTrack, LoadOptions, EngineState } from "../audio/types";
 import type { RemoteAudioOutput, RemoteAudioSnapshot } from "../audio/remoteOutput";
 import { assertBrowserIntegrationAllowed } from "../privacyPolicy";
+import { getVisualActivity, subscribeVisualActivity } from "../visualActivity";
 
 export interface CastMedia {
   media: { contentId: string; duration?: number };
   playerState: string;
   idleReason?: string;
   getEstimatedTime(): number;
+  addUpdateListener?(listener: (alive: boolean) => void): void;
+  removeUpdateListener?(listener: (alive: boolean) => void): void;
   play(request: null, success: () => void, failure: (error: unknown) => void): void;
   pause(request: null, success: () => void, failure: (error: unknown) => void): void;
   seek(request: { currentTime: number }, success: () => void, failure: (error: unknown) => void): void;
@@ -17,6 +20,8 @@ export interface CastSession {
   getVolume(): number;
   loadMedia(request: object): Promise<unknown>;
   setVolume(volume: number): Promise<void>;
+  addEventListener?(event: string, listener: () => void): void;
+  removeEventListener?(event: string, listener: () => void): void;
 }
 export interface CastContext {
   setOptions(options: object): void;
@@ -31,6 +36,7 @@ export interface CastSdk {
   framework: {
     CastContext: { getInstance(): CastContext };
     CastContextEventType: { CAST_STATE_CHANGED: string; SESSION_STATE_CHANGED: string };
+    SessionEventType?: { VOLUME_CHANGED: string; MEDIA_SESSION: string };
   };
   chrome: {
     AutoJoinPolicy: { ORIGIN_SCOPED: string };
@@ -126,7 +132,12 @@ export class CastManager implements RemoteAudioOutput {
   private generation = 0;
   private loadedGeneration = -1;
   private serial: Promise<unknown> = Promise.resolve();
-  private timer: ReturnType<typeof setInterval> | null = null;
+  private positionTimer: ReturnType<typeof setTimeout> | undefined;
+  private observedSession: CastSession | null = null;
+  private observedMedia: CastMedia | null = null;
+  private stopSessionEvents: (() => void) | undefined;
+  private stopMediaEvents: (() => void) | undefined;
+  private stopVisibility: (() => void) | undefined;
   private disposed = false;
   private expectedContent = "";
   private endedKey: string | null = null;
@@ -149,19 +160,51 @@ export class CastManager implements RemoteAudioOutput {
     this.snapshot = { ...this.snapshot, ended: false, ...patch };
     this.listeners.forEach((listener) => listener(this.snapshot));
   }
-  private readonly changed = () => {
-    const session = this.context?.getCurrentSession();
-    if (session && this.timer === null) this.timer = setInterval(() => this.poll(), 250);
-    if (!session && this.timer !== null) {
-      clearInterval(this.timer);
-      this.timer = null;
+  private observeSession(session: CastSession | null) {
+    if (this.observedSession === session) return;
+    this.stopSessionEvents?.(); this.stopSessionEvents = undefined;
+    this.stopVisibility?.(); this.stopVisibility = undefined;
+    this.observeMedia(null);
+    this.observedSession = session;
+    if (!session) return;
+
+    this.stopVisibility = subscribeVisualActivity(this.poll);
+    const events = this.sdk?.framework.SessionEventType;
+    if (events && session.addEventListener && session.removeEventListener) {
+      session.addEventListener(events.VOLUME_CHANGED, this.poll);
+      session.addEventListener(events.MEDIA_SESSION, this.poll);
+      this.stopSessionEvents = () => {
+        session.removeEventListener?.(events.VOLUME_CHANGED, this.poll);
+        session.removeEventListener?.(events.MEDIA_SESSION, this.poll);
+      };
     }
+  }
+  private observeMedia(media: CastMedia | null) {
+    if (this.observedMedia === media) return;
+    this.stopMediaEvents?.(); this.stopMediaEvents = undefined;
+    clearTimeout(this.positionTimer); this.positionTimer = undefined;
+    this.observedMedia = media;
+    if (!media?.addUpdateListener || !media.removeUpdateListener) return;
+
+    const updated = (alive: boolean) => {
+      if (this.observedMedia !== media) return;
+      // A completed Media can disappear from getMediaSession before the last update.
+      this.readReceiver(media);
+      if (!alive && this.observedMedia === media) this.observeMedia(null);
+    };
+    this.stopMediaEvents = () => media.removeUpdateListener?.(updated);
+    media.addUpdateListener(updated);
+  }
+  private readonly changed = () => {
+    if (this.disposed) return;
+    const session = this.context?.getCurrentSession() ?? null;
+    this.observeSession(session);
     this.update({ available: this.context?.getCastState() !== "NO_DEVICES_AVAILABLE",
       connected: Boolean(session), device: session?.getCastDevice().friendlyName ?? "" });
     if (!session && this.snapshot.key) {
       this.publish({ state: "paused", disconnected: true });
       void this.releaseTicket().catch((error) => this.report(error));
-    }
+    } else if (session) this.poll();
   };
   async connect(): Promise<void> {
     if (this.disposed) throw new Error("Cast controller is closed");
@@ -191,6 +234,7 @@ export class CastManager implements RemoteAudioOutput {
   }
   async load(track: PlayableTrack, options: LoadOptions): Promise<void> {
     const generation = ++this.generation;
+    this.observeMedia(null);
     this.update({ error: "" });
     this.publish({ key: track.key, state: "loading", position: options.startAt ?? 0,
       duration: track.durationHint ?? 0, disconnected: false });
@@ -259,22 +303,42 @@ export class CastManager implements RemoteAudioOutput {
     request.currentTime = Math.max(0, seconds);
     await this.command(() => this.mediaCommand((media, ok, fail) => media.seek(request, ok, fail)));
   }
-  async setVolume(volume: number): Promise<void> { await this.requireSession().setVolume(Math.max(0, Math.min(1, volume))); }
-  private poll(): void {
+  async setVolume(volume: number): Promise<void> {
+    await this.requireSession().setVolume(Math.max(0, Math.min(1, volume)));
+    this.poll();
+  }
+  private readonly poll = () => this.readReceiver();
+  private readReceiver(observedUpdate?: CastMedia): void {
+    clearTimeout(this.positionTimer); this.positionTimer = undefined;
+    if (this.disposed) return;
     const session = this.context?.getCurrentSession();
     const volume = session?.getVolume();
     if (volume !== undefined && Number.isFinite(volume)) this.update({ volume: Math.max(0, Math.min(1, volume)) });
-    const media = session?.getMediaSession();
-    if (!media || !this.snapshot.key || this.loadedGeneration !== this.generation || media.media.contentId !== this.expectedContent) return;
+    const media = session && (observedUpdate ?? session.getMediaSession());
+    if (!media || !this.snapshot.key || this.loadedGeneration !== this.generation || media.media.contentId !== this.expectedContent) {
+      this.observeMedia(null);
+      return;
+    }
+    this.observeMedia(media);
     const states: Record<string, EngineState> = { PLAYING: "playing", PAUSED: "paused", BUFFERING: "buffering", IDLE: "paused" };
     const finished = media.playerState === "IDLE" && media.idleReason === "FINISHED" && this.endedKey !== this.snapshot.key;
     if (finished) this.endedKey = this.snapshot.key;
     const position = media.getEstimatedTime();
     const duration = media.media.duration;
-    this.publish({ position: Number.isFinite(position) ? Math.max(0, position) : this.snapshot.position,
+    const next = { position: Number.isFinite(position) ? Math.max(0, position) : this.snapshot.position,
       duration: duration !== undefined && Number.isFinite(duration) ? Math.max(0, duration) : this.snapshot.duration,
-      state: media.idleReason === "ERROR" ? "error" : states[media.playerState] ?? "buffering", ended: finished });
+      state: media.idleReason === "ERROR" ? "error" as const : states[media.playerState] ?? "buffering", ended: finished };
+    if (finished || next.position !== this.snapshot.position || next.duration !== this.snapshot.duration || next.state !== this.snapshot.state) {
+      this.publish(next);
+    }
     if (media.idleReason === "ERROR") this.update({ error: "The receiver could not decode or reach this stream. Check receiver network access and stream format." });
+    if (this.observedMedia !== media) return;
+    const playing = next.state === "playing";
+    if (playing || (!this.stopMediaEvents && next.state !== "error" && media.playerState !== "IDLE")) {
+      // Sessions with SDK events retain pause, resume and completion without a paused timer.
+      const delay = getVisualActivity() ? (playing ? 500 : 3000) : (playing ? 2000 : 8000);
+      this.positionTimer = setTimeout(this.poll, delay);
+    }
   }
   private async releaseTicket(): Promise<void> {
     const ticket = this.ticket;
@@ -285,6 +349,7 @@ export class CastManager implements RemoteAudioOutput {
   }
   async disconnect(): Promise<void> {
     ++this.generation;
+    this.observeSession(null);
     await this.serial;
     this.context?.endCurrentSession(true);
     await this.releaseTicket();
@@ -298,7 +363,6 @@ export class CastManager implements RemoteAudioOutput {
   }
   async destroy(): Promise<void> {
     this.disposed = true;
-    if (this.timer) clearInterval(this.timer);
     if (this.context && this.sdk) {
       const events = this.sdk.framework.CastContextEventType;
       this.context.removeEventListener(events.CAST_STATE_CHANGED, this.changed);

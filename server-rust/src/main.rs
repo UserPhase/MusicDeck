@@ -11,7 +11,7 @@
 //! 3. **Application State & Router Assembly**: Constructs the thread-safe
 //!    [`AppState`] and mounts the full [`axum::Router`] middleware hierarchy.
 //! 4. **Asynchronous Socket Binding**: Binds a non-blocking [`tokio::net::TcpListener`]
-//!    to the configured interface address (`0.0.0.0:4533` by default).
+//!    to the configured interface address (`127.0.0.1:4534` by default).
 //! 5. **Graceful Shutdown Orchestration**: Serves incoming HTTP/1.1, HTTP/2, SSE, and
 //!    WebSocket connections until `SIGINT` (`Ctrl+C`) or `SIGTERM` is received,
 //!    draining active in-flight streams cleanly before exiting.

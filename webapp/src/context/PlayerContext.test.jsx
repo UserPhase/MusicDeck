@@ -1054,6 +1054,18 @@ test("ignores a late play rejection from a superseded track request", async () =
   expect(screen.getByTestId("playback-message")).toHaveTextContent("");
 });
 
+test("clears a playback failure when the same library track starts on a manual retry", async () => {
+  const { container } = renderPlayer();
+  HTMLMediaElement.prototype.play.mockRejectedValueOnce(new Error("temporary failure"));
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("unavailable")).toHaveTextContent("true"));
+
+  fireEvent.click(screen.getByText("toggle-play"));
+  fireEvent.playing(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("unavailable")).toHaveTextContent("false"));
+  expect(screen.getByTestId("playback-message")).toBeEmptyDOMElement();
+});
+
 
 test("selected normalized source reaches the stream URL helper", async () => {
   renderPlayer();
@@ -2376,6 +2388,22 @@ test("retries network errors with backoff, then keeps the position for a manual 
   expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
 });
 
+test("retries a failed library stream at 0:00 without marking the track unavailable", async () => {
+  const { container } = await startAlbum();
+  const { audio, loads } = streamingDeck(container, { position: 0, readyState: 0 });
+  Object.defineProperty(audio, "error", { configurable: true, value: { code: 4 } });
+
+  fireEvent.error(audio);
+  expect(loads).toEqual(["/stream/song-1"]);
+  expect(screen.getByTestId("playback-message")).toHaveTextContent("Reconnecting");
+  expect(screen.getByTestId("unavailable")).toHaveTextContent("false");
+
+  fireEvent.loadedMetadata(audio);
+  await waitFor(() => expect(screen.getByTestId("playback-message")).toBeEmptyDOMElement());
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
+});
+
 test("ignores a stalled download while buffered playback keeps advancing", async () => {
   const { container } = await startAlbum();
   const { audio, loads } = streamingDeck(container, { position: 40, readyState: 4 });
@@ -2428,6 +2456,12 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
   const view = renderPlayer();
   try {
     await playerReady();
+    fireEvent.click(screen.getByRole("button", { name: "album-start" }));
+    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1"));
+    await act(async () => { adapter.pause(); });
+    const previousQueue = screen.getByTestId("queue").textContent;
+    const previousVolume = screen.getByTestId("volume").textContent;
+    HTMLMediaElement.prototype.play.mockClear();
     getListeningTrack.mockResolvedValue({ id: "song-1", title: "Live set", duration: 600, source: { kind: "library" } });
     const snapshot = { trackId: "song-1", exactPositionMs: 123456.789, playing: true, volume: .4,
       queueState: { entries: ["first", "repeat", "third"].map((occurrenceId, index) => ({
@@ -2437,8 +2471,9 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
         context: { type: "playlist", id: "mix", name: "Mix", coverArt: null } } };
     let complete = false;
     let preparation;
+    const transfer = new AbortController();
     await act(async () => {
-      preparation = adapter.prepare(snapshot, new AbortController().signal).then(() => { complete = true; });
+      preparation = adapter.prepare(snapshot, transfer.signal).then(() => { complete = true; });
     });
     await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1"));
     const audio = activeAudio(view.container);
@@ -2463,13 +2498,17 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
       Object.defineProperty(this, "paused", { configurable: true, value: false });
       return Promise.resolve();
     });
-    await act(async () => { await adapter.start({ ...snapshot, exactPositionMs: 125789.123 }); });
+    await act(async () => { await adapter.start({ ...snapshot, exactPositionMs: 125789.123 }, transfer.signal); });
     expect(audio.currentTime).toBe(125.789123);
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
     expect(screen.getByTestId("volume")).toHaveTextContent("0.4");
     await act(async () => { await adapter.command({ type: "SEEK", position_ms: 321789.456 }); });
     expect(audio.currentTime).toBe(321789.456 / 1000);
+    await act(async () => { transfer.abort(); });
+    expect(screen.getByTestId("queue")).toHaveTextContent(previousQueue);
+    expect(screen.getByTestId("volume")).toHaveTextContent(previousVolume);
+    expect(screen.getByTestId("is-playing")).toHaveTextContent("false");
   } finally { view.unmount(); hook.mockRestore(); }
 });
 
@@ -2545,13 +2584,23 @@ test("loads a controller's selection on the active player from the requested tra
   const view = renderPlayer();
   try {
     await playerReady();
-    await act(async () => adapter.command({
-      type: "PLAY_SELECTION", tracks: songs, start_index: 1, from_here: true,
-      context: { type: "album", id: "album-1", name: "Album", coverArt: null },
-    }));
+    let playing;
+    let acknowledged = false;
+    await act(async () => {
+      playing = adapter.command({
+        type: "PLAY_SELECTION", tracks: songs, start_index: 1, from_here: true,
+        context: { type: "album", id: "album-1", name: "Album", coverArt: null },
+      }).then(() => { acknowledged = true; });
+    });
     await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
     expect(screen.getByTestId("queue")).toHaveTextContent("song-2,song-3");
     expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-2");
+    expect(acknowledged).toBe(false);
+    const audio = activeAudio(view.container);
+    startDeckPlaying(audio, 200, 0);
+    fireEvent.playing(audio);
+    await act(async () => { await playing; });
+    expect(acknowledged).toBe(true);
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
     expect(command).not.toHaveBeenCalled();
   } finally { view.unmount(); hook.mockRestore(); }
@@ -2574,18 +2623,29 @@ test("the selected desktop sends local pause and skip through the hub before app
     fireEvent.click(screen.getByRole("button", { name: "album-start" }));
     expect(command).toHaveBeenLastCalledWith(expect.objectContaining({ type: "PLAY_SELECTION", start_index: 0 }));
     expect(getStreamUrl).not.toHaveBeenCalled();
-    await act(async () => adapter.command(command.mock.lastCall[0]));
+    let starting;
+    await act(async () => { starting = adapter.command(command.mock.lastCall[0]); });
     await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1"));
     const audio = activeAudio(view.container);
     startDeckPlaying(audio, 200, 10);
     fireEvent.playing(audio);
+    await act(async () => { await starting; });
     await waitFor(() => expect(adapter.state().playing).toBe(true));
 
     fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
     expect(command).toHaveBeenLastCalledWith({ type: "PAUSE" });
     expect(adapter.state().playing).toBe(true);
-    await act(async () => adapter.command({ type: "SKIP", direction: "next" }));
-    await act(async () => adapter.command({ type: "PAUSE" }));
+    let skipping;
+    await act(async () => { skipping = adapter.command({ type: "SKIP", direction: "next" }); });
+    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-2"));
+    let pausing;
+    let paused = false;
+    await act(async () => { pausing = adapter.command({ type: "PAUSE" }).then(() => { paused = true; }); });
+    expect(paused).toBe(false);
+    const next = activeAudio(view.container);
+    startDeckPlaying(next, 200, 0);
+    fireEvent.playing(next);
+    await act(async () => { await Promise.all([skipping, pausing]); });
     expect(adapter.state().current_track.id).toBe("song-2");
     expect(adapter.state().playing).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "next" }));

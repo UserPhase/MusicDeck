@@ -1,8 +1,6 @@
 name: Build Desktop App (Windows .exe)
 
-# Builds the MusicDeck Tauri v2 Windows desktop installer (.exe and .msi),
-# uploads it as a workflow artifact on every build, and attaches it to a
-# GitHub Release so you can download the .exe directly from GitHub.
+# Builds and signs the per-user MusicDeck NSIS installer for unattended updates.
 
 on:
   push:
@@ -14,12 +12,16 @@ on:
       - ".github/workflows/desktop-app.yml"
   workflow_dispatch:
 
+concurrency:
+  group: musicdeck-desktop-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   build-windows:
-    name: Build Windows Installer (.exe & .msi)
+    name: Build Windows NSIS Installer
     runs-on: windows-latest
 
     steps:
@@ -33,6 +35,7 @@ jobs:
           cache: npm
           cache-dependency-path: |
             webapp/package-lock.json
+            Desktop-App/package-lock.json
 
       - name: Set up Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,7 +51,7 @@ jobs:
 
       - name: Install Desktop-App dependencies
         working-directory: Desktop-App
-        run: npm install
+        run: npm ci
 
       - name: Validate Desktop-App configuration
         working-directory: Desktop-App
@@ -56,92 +59,115 @@ jobs:
           npm test
           npm run validate
 
-      - name: Build Tauri Windows installers (.exe & .msi)
+      - name: Test desktop Rust runtime
+        working-directory: Desktop-App/src-tauri
+        run: cargo test --locked --lib
+
+      - name: Build and sign the per-user NSIS installer
         working-directory: Desktop-App
         env:
-          MUSICDECK_BUILD_SHA: ${{ github.sha }}
-        run: npx tauri build
-
-      - name: Generate auto-updater latest.json manifest
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
         run: |
-          $tauriConf = Get-Content "Desktop-App/src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+          if (-not $env:TAURI_UPDATER_PUBLIC_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            throw 'Set the TAURI_UPDATER_PUBLIC_KEY repository variable and the TAURI_SIGNING_PRIVATE_KEY secret before publishing desktop updates.'
+          }
+          $config = Join-Path $env:RUNNER_TEMP 'musicdeck-tauri-signing.json'
+          @{
+            bundle = @{ createUpdaterArtifacts = $true }
+            plugins = @{ updater = @{ pubkey = $env:TAURI_UPDATER_PUBLIC_KEY.Trim() } }
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $config -Encoding utf8NoBOM
+          npx tauri build --config $config --bundles nsis -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare signed release assets and update manifest
+        shell: pwsh
+        run: |
+          $tauriConf = Get-Content 'Desktop-App/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
           $version = $tauriConf.version
-          $exeFile = Get-ChildItem -Path "Desktop-App/src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
-          if (-not $exeFile) {
-            throw "NSIS .exe installer was not found."
-          }
-          $sha256 = (Get-FileHash -Path $exeFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $releaseTag = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF_NAME } else { "desktop-latest" }
-          $encodedName = [uri]::EscapeDataString($exeFile.Name)
-          $installerUrl = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$releaseTag/$encodedName"
+          $bundle = 'Desktop-App/src-tauri/target/release/bundle'
+          $installer = @(Get-ChildItem -Path "$bundle/nsis/*-setup.exe")
+          if ($installer.Count -ne 1) { throw 'Expected one NSIS setup executable.' }
+          $installer = $installer[0]
+          $signature = (Get-Content -LiteralPath "$($installer.FullName).sig" -Raw).Trim()
+          if (-not $signature) { throw 'The NSIS setup executable has no updater signature.' }
 
-          $manifest = [ordered]@{
-            version      = $version
-            buildId      = $env:GITHUB_SHA
-            publishedAt  = (Get-Date).ToUniversalTime().ToString("o")
-            notes        = "MusicDeck Desktop v$version ($($env:GITHUB_SHA.Substring(0, 7)))"
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { 'desktop-latest' }
+          $build = $env:GITHUB_SHA.Substring(0, 12)
+          $name = "MusicDeck_${version}_x64_${build}-setup.exe"
+          $installerUrl = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$([uri]::EscapeDataString($tag))/$name"
+          $publishedAt = [DateTime]::UtcNow.ToString('o')
+          $distribution = New-Item -ItemType Directory -Path "$bundle/distribution" -Force
+          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path $distribution.FullName $name)
+          Copy-Item -LiteralPath "$($installer.FullName).sig" -Destination (Join-Path $distribution.FullName "$name.sig")
+
+          # Preserve the legacy manifest fields so 0.1.x NSIS clients can update to the signed updater.
+          $platform = @{ signature = $signature; url = $installerUrl }
+          [ordered]@{
+            version = $version
+            notes = "MusicDeck Desktop v$version"
+            pub_date = $publishedAt
+            platforms = @{ 'windows-x86_64-nsis' = $platform; 'windows-x86_64' = $platform }
+            buildId = $env:GITHUB_SHA
+            publishedAt = $publishedAt
             installerUrl = $installerUrl
-            sha256       = $sha256
-          }
-          $manifestPath = "Desktop-App/src-tauri/target/release/bundle/latest.json"
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
-          Write-Host "Generated latest.json:"
-          Get-Content $manifestPath
+            sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $distribution.FullName 'latest.json') -Encoding utf8NoBOM
 
-      - name: Upload Windows .exe, .msi, and latest.json artifacts
+      - name: Upload signed Windows installer and update manifest
         uses: actions/upload-artifact@v4
         with:
           name: MusicDeck-Windows-x64-Installer
-          path: |
-            Desktop-App/src-tauri/target/release/bundle/nsis/*.exe
-            Desktop-App/src-tauri/target/release/bundle/msi/*.msi
-            Desktop-App/src-tauri/target/release/bundle/latest.json
-            Desktop-App/src-tauri/target/release/musicdeck-desktop.exe
+          path: Desktop-App/src-tauri/target/release/bundle/distribution/*
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish .exe installer and latest.json to GitHub Releases (latest desktop build)
-        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+      - name: Publish signed installer and then update the feed
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/desktop-v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag = "desktop-latest"
-          $title = "MusicDeck Desktop (Latest Windows Build)"
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { 'desktop-latest' }
+          $title = if ($tag -eq 'desktop-latest') { 'MusicDeck Desktop (Latest Windows Build)' } else { "MusicDeck Desktop $tag" }
           $notes = "Automated Windows desktop build from commit $($env:GITHUB_SHA)."
-          $files = Get-ChildItem -Path "Desktop-App/src-tauri/target/release/bundle/nsis/*.exe", "Desktop-App/src-tauri/target/release/bundle/msi/*.msi", "Desktop-App/src-tauri/target/release/bundle/latest.json"
+          $distribution = 'Desktop-App/src-tauri/target/release/bundle/distribution'
+          $assets = @(Get-ChildItem -Path "$distribution/*-setup.exe", "$distribution/*-setup.exe.sig")
+          $manifest = "$distribution/latest.json"
+          $releases = "repos/$env:GITHUB_REPOSITORY/releases"
+          $releaseId = gh api --paginate "${releases}?per_page=100" --jq '.[] | { tag: .tag_name, id: .id } | @json' |
+            ForEach-Object { ConvertFrom-Json -InputObject $_ } |
+            Where-Object { $_.tag -ceq $tag } |
+            Select-Object -ExpandProperty id
 
-          gh release view $tag >$null 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $files.FullName --clobber
-            gh release edit $tag --title $title --notes $notes
-          } else {
-            gh release create $tag $files.FullName --title $title --notes $notes --prerelease
+          if ($tag -eq 'desktop-latest' -and $releaseId) {
+            $feedAssetId = gh api --paginate "$releases/$releaseId/assets?per_page=100" --jq '.[] | select(.name == "latest.json") | .id'
+            if ($feedAssetId) {
+              $current = gh api "$releases/assets/$feedAssetId" -H 'Accept: application/octet-stream' | ConvertFrom-Json
+              $candidate = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+              if (-not $current.version -or -not $candidate.version) {
+                throw 'Both desktop manifests must contain a version.'
+              }
+              $publishedVersion = [semver]$current.version
+              $candidateVersion = [semver]$candidate.version
+              if ($candidateVersion -lt $publishedVersion) {
+                throw "Desktop feed already serves $publishedVersion. Refusing to publish older version $candidateVersion."
+              }
+              if ($candidateVersion -eq $publishedVersion) {
+                Write-Output "Desktop feed already serves $publishedVersion. Keeping the published installer and manifest."
+                exit 0
+              }
+            }
           }
 
-      - name: Publish .exe installer and latest.json to tagged GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $title = "MusicDeck Desktop $tag"
-          $notes = "MusicDeck Desktop Windows installers for $tag."
-          $files = Get-ChildItem -Path "Desktop-App/src-tauri/target/release/bundle/nsis/*.exe", "Desktop-App/src-tauri/target/release/bundle/msi/*.msi", "Desktop-App/src-tauri/target/release/bundle/latest.json"
-
-          gh release view $tag >$null 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $files.FullName --clobber
-          } else {
-            gh release create $tag $files.FullName --title $title --notes $notes
+          if (-not $releaseId) {
+            $arguments = @('release', 'create', $tag, '--title', $title, '--notes', $notes)
+            if ($tag -eq 'desktop-latest') { $arguments += '--prerelease' }
+            gh @arguments
           }
-
-          # Also update the desktop-latest release manifest so running clients auto-update to this tag
-          gh release view "desktop-latest" >$null 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload "desktop-latest" "Desktop-App/src-tauri/target/release/bundle/latest.json" --clobber
-          } else {
-            gh release create "desktop-latest" "Desktop-App/src-tauri/target/release/bundle/latest.json" --title "MusicDeck Desktop (Latest Windows Build)" --notes $notes --prerelease
-          }
+          gh release upload $tag $assets.FullName --clobber
+          gh release upload $tag $manifest --clobber

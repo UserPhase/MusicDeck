@@ -1,5 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { Request as FetchRequest } from "whatwg-fetch";
 import DesktopServerModal from "../../components/desktop/DesktopServerModal";
 import DesktopUpdateBanner from "../../components/desktop/DesktopUpdateBanner";
 import DesktopWindowControls from "../../components/desktop/DesktopWindowControls";
@@ -10,7 +13,8 @@ import Login, {
 } from "../../pages/Login";
 import {
   checkDesktopServerConnection,
-  DESKTOP_UPDATE_STATUS_EVENT,
+  installDesktopUpdate,
+  DESKTOP_CONFIG_CHANGED_EVENT,
   DEFAULT_DESKTOP_SERVER_URL,
   DESKTOP_SERVER_URL_KEY,
   getDesktopServerUrl,
@@ -19,16 +23,23 @@ import {
   isDesktopRuntime,
   normalizeDesktopServerUrl,
   resolveDesktopApiUrl,
+  resolveRemoteSocketUrl,
   saveDesktopConfig,
   subscribeDesktopRuntimeEvents,
   syncDesktopPlaybackState,
 } from "./desktopRuntime";
 
+jest.mock("@tauri-apps/plugin-updater", () => ({ check: jest.fn() }));
+jest.mock("@tauri-apps/plugin-process", () => ({ relaunch: jest.fn() }));
+
 describe("desktopRuntime", () => {
   const originalFetch = global.fetch;
+  const originalRequest = global.Request;
 
   beforeEach(() => {
     localStorage.clear();
+    check.mockReset();
+    relaunch.mockReset();
     delete window.__TAURI__;
     delete window.__TAURI_INTERNALS__;
     delete window.__MUSICDECK_DESKTOP__;
@@ -41,6 +52,7 @@ describe("desktopRuntime", () => {
     delete window.__TAURI_INTERNALS__;
     delete window.__MUSICDECK_DESKTOP__;
     global.fetch = originalFetch;
+    global.Request = originalRequest;
   });
 
   test("detects browser vs Tauri desktop runtime accurately", () => {
@@ -48,6 +60,52 @@ describe("desktopRuntime", () => {
 
     window.__TAURI_INTERNALS__ = {};
     expect(isDesktopRuntime()).toBe(true);
+  });
+
+  test("keeps the previous settings and surfaces a native save failure", async () => {
+    const originalUrl = "http://existing.example:8080";
+    const rejectedUrl = "http://new.example:8080";
+    localStorage.setItem(DESKTOP_SERVER_URL_KEY, originalUrl);
+    window.__TAURI__ = { core: { invoke: jest.fn().mockRejectedValue("Desktop disk is read-only") } };
+    const changed = jest.fn();
+    window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, changed);
+    try {
+      await expect(saveDesktopConfig({ serverUrl: rejectedUrl })).rejects.toThrow("Desktop disk is read-only");
+      expect(getDesktopServerUrl()).toBe(originalUrl);
+      expect(changed).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, changed);
+    }
+  });
+
+  test("serializes settings saves and publishes the native settings after each commit", async () => {
+    const initial = { serverUrl: "http://music.example:8080", closeToTray: true, autoCheckUpdates: true };
+    let completeFirstSave;
+    const invoke = jest.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { completeFirstSave = resolve; }))
+      .mockResolvedValueOnce({ ...initial, closeToTray: false, autoCheckUpdates: false });
+    window.__TAURI__ = { core: { invoke } };
+    const changes = [];
+    const onChange = (event) => changes.push(event.detail);
+    window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, onChange);
+    try {
+      const first = saveDesktopConfig({ closeToTray: false });
+      const second = saveDesktopConfig({ autoCheckUpdates: false });
+      await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+      expect(changes).toEqual([]);
+      completeFirstSave({ ...initial, closeToTray: false });
+      await Promise.all([first, second]);
+      expect(invoke.mock.calls).toEqual([
+        ["desktop_set_config", { update: { closeToTray: false } }],
+        ["desktop_set_config", { update: { autoCheckUpdates: false } }],
+      ]);
+      expect(changes).toEqual([
+        { ...initial, closeToTray: false },
+        { ...initial, closeToTray: false, autoCheckUpdates: false },
+      ]);
+    } finally {
+      window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, onChange);
+    }
   });
 
   test("tracks native window focus, ignores a stale initial response, and cleans up its listener", async () => {
@@ -218,7 +276,7 @@ describe("desktopRuntime", () => {
       request: {
         path: "/api/auth/login",
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ username: "admin", password: "secret", rememberMe: true }),
       },
     });
@@ -226,12 +284,70 @@ describe("desktopRuntime", () => {
     cleanup();
   });
 
+  test("intercepts a Request with its effective method, headers, body and signal", async () => {
+    global.Request = FetchRequest;
+    const Channel = jest.fn(function (onmessage) { this.onmessage = onmessage; this.id = 47; });
+    const invoke = jest.fn(async (command) => command === "desktop_api_fetch"
+      ? { status: 204, headers: {}, body: "" } : null);
+    window.__TAURI__ = { core: { invoke, Channel } };
+    const cleanup = installDesktopRuntime();
+    try {
+      const controller = new AbortController();
+      const request = new Request(new URL("/api/test", window.location.href), {
+        method: "PATCH", signal: controller.signal, body: '{"value":1}',
+        headers: { "Content-Type": "application/json" },
+      });
+      const response = await window.fetch(request, {
+        headers: { "Content-Type": "application/json", "X-Request-Label": "updated" },
+      });
+      expect(response.status).toBe(204);
+      expect(await response.text()).toBe("");
+      expect(invoke).toHaveBeenCalledWith("desktop_api_fetch", {
+        request: {
+          path: "/api/test", method: "PATCH", body: '{"value":1}',
+          headers: { "content-type": "application/json", "x-request-label": "updated" },
+          cancelChannel: expect.objectContaining({ id: 47 }),
+        },
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rejects pre-aborted fetches and cancels an in-flight IPC request after registration", async () => {
+    let notifyReady;
+    let finishRequest;
+    const Channel = function (onmessage) { notifyReady = onmessage; this.id = 47; };
+    const invoke = jest.fn((command) => command === "desktop_api_fetch"
+      ? new Promise((resolve) => { finishRequest = resolve; })
+      : Promise.resolve());
+    window.__TAURI__ = { core: { invoke, Channel } };
+    const cleanup = installDesktopRuntime();
+    try {
+      const controller = new AbortController();
+      const pending = window.fetch("/api/test", { signal: controller.signal });
+      await waitFor(() => expect(notifyReady).toEqual(expect.any(Function)));
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(invoke).not.toHaveBeenCalledWith("desktop_cancel_api_fetch", expect.anything());
+      notifyReady(true);
+      expect(invoke).toHaveBeenCalledWith("desktop_cancel_api_fetch", { id: 47 });
+      finishRequest({ status: 200, body: "stale" });
+
+      invoke.mockClear();
+      await expect(window.fetch("/api/test", { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+      expect(invoke).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+    }
+  });
+
   test("routes audio stream URLs through the local binary proxy instead of text-only desktop_api_fetch", async () => {
     const invokeMock = jest.fn((cmd) => {
       if (cmd === "desktop_get_config") {
         return Promise.resolve({
           serverUrl: "http://192.168.2.38:8080",
-          proxyUrl: "http://127.0.0.1:4535",
+          proxyUrl: "http://127.0.0.1:4535/proxy-fixture",
           closeToTray: true,
           autoCheckUpdates: true,
         });
@@ -251,13 +367,15 @@ describe("desktopRuntime", () => {
     const cleanup = await initDesktopRuntime();
 
     expect(resolveDesktopApiUrl("/api/tracks/mdtrk_1/stream?inspectionId=abc")).toBe(
-      "http://127.0.0.1:4535/api/tracks/mdtrk_1/stream?inspectionId=abc"
+      "http://127.0.0.1:4535/proxy-fixture/api/tracks/mdtrk_1/stream?inspectionId=abc"
     );
+    expect(resolveRemoteSocketUrl().href).toBe("ws://127.0.0.1:4535/proxy-fixture/api/v1/remote");
+    expect(localStorage.getItem("musicdeck.desktop.proxyUrl")).toBeNull();
 
     await window.fetch("/api/tracks/mdtrk_1/stream?inspectionId=abc");
     expect(invokeMock).not.toHaveBeenCalledWith("desktop_api_fetch", expect.anything());
     expect(rawFetch).toHaveBeenCalledWith(
-      "http://127.0.0.1:4535/api/tracks/mdtrk_1/stream?inspectionId=abc",
+      "http://127.0.0.1:4535/proxy-fixture/api/tracks/mdtrk_1/stream?inspectionId=abc",
       expect.objectContaining({ credentials: "include" })
     );
 
@@ -335,6 +453,9 @@ describe("desktopRuntime", () => {
           error: null,
         });
       }
+      if (cmd === "desktop_set_config") {
+        return Promise.resolve(args.update);
+      }
       return Promise.resolve(null);
     });
     window.__TAURI__ = { core: { invoke: invokeMock } };
@@ -368,65 +489,87 @@ describe("desktopRuntime", () => {
   });
 
   test("starts a one-click update, reports download progress and allows retry on failure", async () => {
-    let rejectInstall;
-    const invokeMock = jest.fn((cmd) => {
-      if (cmd === "desktop_check_for_updates") {
-        return Promise.resolve({
-          updateAvailable: true,
-          currentVersion: "0.1.0",
-          latestVersion: "0.2.0",
-          notes: "MusicDeck Desktop v0.2.0",
-          installerUrl:
-            "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/MusicDeck_0.2.0_x64-setup.exe",
-          sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          error: null,
-        });
-      }
-      if (cmd === "desktop_install_update") {
-        return new Promise((resolve, reject) => { rejectInstall = reject; });
-      }
-      return Promise.resolve(null);
-    });
-
-    window.__TAURI__ = {
-      core: { invoke: invokeMock },
+    let finishDownload;
+    let progressHandler;
+    const update = {
+      currentVersion: "0.2.0", version: "0.3.0", body: "MusicDeck Desktop v0.3.0",
+      close: jest.fn().mockResolvedValue(undefined),
+      download: jest.fn((handler) => new Promise((resolve) => {
+        progressHandler = handler;
+        finishDownload = resolve;
+      })),
+      install: jest.fn().mockRejectedValue("Failed to launch update installer"),
     };
-
+    check.mockResolvedValue(update);
+    window.__TAURI__ = { core: { invoke: jest.fn().mockResolvedValue({ windows: true, currentVersion: "0.2.0" }) } };
     render(<DesktopUpdateBanner />);
 
-    expect(
-      await screen.findByText(/Update Available \(v0\.2\.0\)/i)
-    ).toBeInTheDocument();
-
+    expect(await screen.findByText(/Update Available \(v0\.3\.0\)/i)).toBeInTheDocument();
+    expect(update.close).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: /Update & Restart/i }));
-
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("desktop_install_update", {
-        installerUrl:
-          "https://github.com/UserPhase/MusicDeck/releases/download/desktop-latest/MusicDeck_0.2.0_x64-setup.exe",
-        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      });
-    });
+    await waitFor(() => expect(update.download).toHaveBeenCalledWith(expect.any(Function), {
+      timeout: 300_000,
+    }));
     const progress = screen.getByRole("progressbar", { name: "Update download progress" });
     expect(progress).not.toHaveAttribute("value");
-    expect(screen.getByRole("button", { name: "Downloading..." })).toBeDisabled();
 
-    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, {
-      detail: { stage: "downloading", downloadedBytes: 512, totalBytes: 1024 },
-    }));
+    act(() => {
+      progressHandler({ event: "Started", data: { contentLength: 1024 } });
+      progressHandler({ event: "Progress", data: { chunkLength: 512 } });
+    });
     expect(progress).toHaveAttribute("value", "50");
-    expect(screen.getByText("Downloading update (50%)")).toBeInTheDocument();
-
-    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, { detail: { stage: "verifying" } }));
+    act(() => {
+      progressHandler({ event: "Progress", data: { chunkLength: 512 } });
+      progressHandler({ event: "Finished" });
+    });
     expect(progress).toHaveAttribute("value", "100");
-    expect(screen.getByRole("button", { name: "Verifying..." })).toBeDisabled();
-
-    fireEvent(window, new CustomEvent(DESKTOP_UPDATE_STATUS_EVENT, { detail: { stage: "installing" } }));
-    expect(screen.getByRole("button", { name: "Restarting..." })).toBeDisabled();
-
-    rejectInstall("Failed to launch update installer");
+    expect(update.install).not.toHaveBeenCalled();
+    finishDownload();
     expect(await screen.findByRole("alert")).toHaveTextContent("Failed to launch update installer");
     expect(screen.getByRole("button", { name: /Update & Restart/i })).toBeEnabled();
+    expect(relaunch).not.toHaveBeenCalled();
+  });
+
+  test("uses the installer to relaunch on Windows and the process plugin after installation elsewhere", async () => {
+    const command = jest.fn();
+    window.__TAURI__ = { core: { invoke: command } };
+    const update = {
+      close: jest.fn().mockResolvedValue(undefined),
+      download: jest.fn().mockResolvedValue(undefined),
+      install: jest.fn().mockResolvedValue(undefined),
+    };
+    check.mockResolvedValue(update);
+    const saveQueue = jest.fn().mockResolvedValue(undefined);
+    command.mockResolvedValue({ windows: true });
+    await expect(installDesktopUpdate({ beforeInstall: saveQueue })).resolves.toBe(true);
+    expect(update.download.mock.invocationCallOrder[0]).toBeLessThan(saveQueue.mock.invocationCallOrder[0]);
+    expect(saveQueue.mock.invocationCallOrder[0]).toBeLessThan(update.install.mock.invocationCallOrder[0]);
+    expect(update.install).toHaveBeenCalledWith({ restartAfterInstall: true });
+    expect(relaunch).not.toHaveBeenCalled();
+
+    command.mockResolvedValue({ windows: false });
+    await expect(installDesktopUpdate()).resolves.toBe(true);
+    expect(relaunch).toHaveBeenCalledTimes(1);
+
+    command.mockResolvedValue({ windows: true, blockedReason: "Reinstall with NSIS" });
+    await expect(installDesktopUpdate()).rejects.toThrow("Reinstall with NSIS");
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  test("waits for the final checkpoint and keeps the app open if it fails", async () => {
+    const update = { close: jest.fn().mockResolvedValue(), download: jest.fn().mockResolvedValue(), install: jest.fn() };
+    check.mockResolvedValue(update);
+    window.__TAURI__ = { core: { invoke: jest.fn().mockResolvedValue({ windows: true }) } };
+    let failCheckpoint;
+    const saveQueue = jest.fn(() => new Promise((_, reject) => { failCheckpoint = reject; }));
+    const pending = installDesktopUpdate({ beforeInstall: saveQueue });
+    await waitFor(() => expect(saveQueue).toHaveBeenCalledTimes(1));
+    expect(update.install).not.toHaveBeenCalled();
+    failCheckpoint(new Error("Could not save queue"));
+    await expect(pending).rejects.toThrow("Could not save queue");
+    expect(update.install).not.toHaveBeenCalled();
+    expect(update.close).toHaveBeenCalledTimes(1);
+    expect(relaunch).not.toHaveBeenCalled();
   });
 
   test("shows Server Connection controls on Login only when running in desktop mode", async () => {

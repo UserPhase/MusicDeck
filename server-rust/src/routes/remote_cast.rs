@@ -25,7 +25,9 @@ use crate::auth::{AuthenticatedUser, extract_session_cookie};
 use crate::cast::{CastError, CastTicketRequest};
 use crate::catalog::{LibraryItemType, LibraryService, SourceResolver};
 use crate::error::{ApiErrorBody, ApiErrorEnvelope, ServerError};
-use crate::remote::{REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage, RemoteControlHub};
+use crate::remote::{
+    REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage, RemoteControlHub,
+};
 use crate::services::privacy::{PrivacyCategory, PrivacyError};
 use crate::state::AppState;
 use crate::streaming::{proxy_upstream_stream, send_error_response};
@@ -101,8 +103,13 @@ async fn remote_ws_or_426_handler(
     let Some(store) = state.session_store().cloned() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let Ok(Some(user)) = store.get_session_user_by_id(&session_id).await else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let user = match store.get_session_user_by_id(&session_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "Remote session lookup failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
 
     let now_ms = current_epoch_ms();
@@ -200,6 +207,9 @@ async fn drive_remote_websocket(
     let Some(mut disconnected) = hub.disconnect_signal(conn_id) else {
         return;
     };
+    let Some(deadline_changed) = hub.deadline_signal(conn_id) else {
+        return;
+    };
     let reg_deadline = tokio::time::sleep(Duration::from_millis(REGISTRATION_TIMEOUT_MS));
     tokio::pin!(reg_deadline);
     let mut reg_checked = false;
@@ -210,21 +220,28 @@ async fn drive_remote_websocket(
 
     loop {
         let pong_deadline = heartbeat.deadline;
-        if *disconnected.borrow()
-            || pong_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
+        if *disconnected.borrow() || pong_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            send_remote_frame(
+                &mut socket,
+                WsMessage::Close(Some(CloseFrame {
+                    code: 4002,
+                    reason: "Device playback control revoked".into(),
+                })),
+            )
+            .await;
             break;
         }
         let operation_deadline = hub.operation_deadline(conn_id);
         tokio::select! {
-            _ = disconnected.changed() => break,
+            _ = disconnected.changed() => continue,
+            () = deadline_changed.notified() => continue,
             () = async {
                 if let Some(deadline) = pong_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => break,
+            } => continue,
             () = async {
                 if let Some(deadline) = operation_deadline {
                     tokio::time::sleep_until(deadline).await;
@@ -244,23 +261,29 @@ async fn drive_remote_websocket(
             }
             _ = ping_ticker.tick() => {
                 // Do not let a stalled session lookup keep an unreachable device online.
-                let Ok(session) = tokio::time::timeout(
+                let session = tokio::time::timeout(
                     REMOTE_PONG_TIMEOUT, store.get_session_user_by_id(&session_id)
-                ).await else { break };
-                let valid = session
-                    .ok()
-                    .flatten()
-                    .is_some_and(|u| u.id == user_id);
-                if !valid {
+                ).await;
+                let close = match session {
+                    Ok(Ok(Some(user))) if user.id == user_id => None,
+                    Ok(Ok(_)) => Some((4001, "Session expired")),
+                    _ => Some((1011, "Session storage temporarily unavailable")),
+                };
+                if let Some((code, reason)) = close {
                     send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
-                        code: 4001,
-                        reason: "Session expired".into(),
+                        code,
+                        reason: reason.into(),
                     }))).await;
                     break;
                 }
                 if heartbeat.deadline.is_some() { break; }
                 heartbeat.sent_ping(tokio::time::Instant::now());
                 if !send_remote_frame(&mut socket, WsMessage::Ping(heartbeat.ping_id.to_be_bytes().to_vec())).await {
+                    break;
+                }
+                if hub.supports_control_watchdog(conn_id) && !send_remote_frame(&mut socket, WsMessage::Text(
+                    serde_json::json!({ "type": "REMOTE_HEARTBEAT", "server_time": current_epoch_ms() }).to_string().into()
+                )).await {
                     break;
                 }
             }

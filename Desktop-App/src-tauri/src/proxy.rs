@@ -1,65 +1,124 @@
-use crate::config::{candidate_server_urls, save_config, DesktopConfig};
+use crate::config::DesktopConnection;
 use futures_util::StreamExt;
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-pub struct ProxySharedState {
-    pub config: Arc<Mutex<DesktopConfig>>,
-    pub ephemeral_cookie: Arc<Mutex<Option<String>>>,
-    pub config_dir: PathBuf,
-    pub client: reqwest::Client,
+struct ProxySharedState {
+    connection: Arc<Mutex<DesktopConnection>>,
+    config_dir: PathBuf,
+    path_prefix: String,
+    client: reqwest::Client,
 }
 
-fn extract_session_cookie_from_set_cookie(header_val: &str) -> Option<(String, bool)> {
-    let mut parts = header_val.split(';');
-    let first = parts.next()?.trim();
-    let value = first.strip_prefix("musicdeck_session=")?;
-    let lower = header_val.to_ascii_lowercase();
-    let is_persistent = lower.contains("expires=") || lower.contains("max-age=");
-    Some((value.to_string(), is_persistent))
+pub(crate) enum UpstreamFailure {
+    Request(reqwest::Error),
+    HeaderTimeout,
 }
 
-pub fn apply_response_cookies(
-    headers: &reqwest::header::HeaderMap,
-    config: &Arc<Mutex<DesktopConfig>>,
-    ephemeral_cookie: &Arc<Mutex<Option<String>>>,
-    config_dir: & std::path::Path,
-) {
-    for val in headers.get_all(reqwest::header::SET_COOKIE).iter() {
-        if let Ok(raw_cookie) = val.to_str() {
-            if let Some((token, is_persistent)) = extract_session_cookie_from_set_cookie(raw_cookie)
-            {
-                if token.is_empty() {
-                    if let Ok(mut eph) = ephemeral_cookie.lock() {
-                        *eph = None;
-                    }
-                    if let Ok(mut guard) = config.lock() {
-                        guard.session_cookie = None;
-                        let _ = save_config(config_dir, &guard);
-                    }
-                } else if is_persistent {
-                    if let Ok(mut eph) = ephemeral_cookie.lock() {
-                        *eph = Some(token.clone());
-                    }
-                    if let Ok(mut guard) = config.lock() {
-                        guard.session_cookie = Some(token);
-                        let _ = save_config(config_dir, &guard);
-                    }
-                } else {
-                    if let Ok(mut eph) = ephemeral_cookie.lock() {
-                        *eph = Some(token);
-                    }
-                    if let Ok(mut guard) = config.lock() {
-                        guard.session_cookie = None;
-                        let _ = save_config(config_dir, &guard);
-                    }
-                }
-            }
+impl UpstreamFailure {
+    pub(crate) fn can_try_alternate(&self) -> bool {
+        matches!(self, Self::Request(error) if error.is_connect())
+    }
+
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        match self {
+            Self::HeaderTimeout => reqwest::StatusCode::GATEWAY_TIMEOUT,
+            Self::Request(error) if error.is_timeout() => reqwest::StatusCode::GATEWAY_TIMEOUT,
+            Self::Request(_) => reqwest::StatusCode::BAD_GATEWAY,
         }
     }
+
+    pub(crate) fn details(&self) -> (&'static str, &'static str) {
+        if self.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
+            ("DESKTOP_UPSTREAM_TIMEOUT", "The desktop proxy timed out waiting for the MusicDeck server.")
+        } else if self.can_try_alternate() {
+            ("DESKTOP_UPSTREAM_CONNECT", "The desktop proxy could not connect to the MusicDeck server. Check Server Connection settings.")
+        } else {
+            ("DESKTOP_UPSTREAM_RESPONSE", "The desktop proxy lost the connection or received an invalid response from the MusicDeck server.")
+        }
+    }
+}
+
+pub(crate) async fn send_upstream(
+    request: reqwest::RequestBuilder,
+    method: &reqwest::Method,
+    origin: &str,
+    header_timeout: Duration,
+) -> Result<reqwest::Response, UpstreamFailure> {
+    let retry = matches!(*method, reqwest::Method::GET | reqwest::Method::HEAD)
+        .then(|| request.try_clone())
+        .flatten();
+    let started = std::time::Instant::now();
+    // Apply one deadline across both attempts, independently of streaming the body.
+    let result = tokio::time::timeout(header_timeout, async {
+        match request.send().await {
+            Err(error) if error.is_connect() && !error.is_timeout() => {
+                if let Some(retry) = retry {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    retry.send().await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    })
+    .await
+    .map_err(|_| UpstreamFailure::HeaderTimeout)
+    .and_then(|result| result.map_err(UpstreamFailure::Request));
+    if let Err(failure) = &result {
+        // Only log the origin and the OS error kind. Request paths, query strings
+        // and underlying errors can contain session or media capability tokens.
+        let io_kind = match failure {
+            UpstreamFailure::Request(error) => {
+                std::iter::successors(error.source(), |source| (*source).source()).find_map(
+                    |source| source.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                )
+            }
+            UpstreamFailure::HeaderTimeout => None,
+        };
+        eprintln!(
+            "MusicDeck desktop upstream: method={method} origin={origin} code={} io={io_kind:?} elapsed_ms={}",
+            failure.details().0,
+            started.elapsed().as_millis()
+        );
+    }
+    result
+}
+
+pub(crate) fn upstream_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("Too many redirects")
+        } else if attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin())
+        {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+async fn write_proxy_error(
+    stream: &mut TcpStream,
+    status: &str,
+    cors: &str,
+    code: &str,
+    message: String,
+) {
+    let body = serde_json::json!({ "error": { "code": code, "message": message } }).to_string();
+    let reply = format!(
+        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(reply.as_bytes()).await;
 }
 
 async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedState>) {
@@ -98,7 +157,9 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     };
 
     let mut content_length: usize = 0;
-    let mut request_origin: Option<String> = None;
+    let mut request_origin = None;
+    let mut request_host = None;
+    let mut duplicate_authority_header = false;
     let mut websocket_upgrade = false;
     let mut websocket_headers = Vec::new();
     let mut forwarded_headers: Vec<(String, String)> = Vec::new();
@@ -113,8 +174,10 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             let lower = key.to_ascii_lowercase();
             if lower == "content-length" {
                 content_length = value.parse::<usize>().unwrap_or(0);
-            } else if lower == "origin" && !value.is_empty() && value != "null" {
-                request_origin = Some(value.to_string());
+            } else if lower == "origin" {
+                duplicate_authority_header |= request_origin.replace(value).is_some();
+            } else if lower == "host" {
+                duplicate_authority_header |= request_host.replace(value).is_some();
             } else if lower == "upgrade" {
                 websocket_upgrade = value.eq_ignore_ascii_case("websocket");
             } else if matches!(
@@ -131,35 +194,53 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
                     | "if-none-match"
                     | "if-modified-since"
                     | "cache-control"
+                    | "x-musicdeck-confirm-restore"
             ) {
                 forwarded_headers.push((key.to_string(), value.to_string()));
             }
         }
     }
 
-    let cors_origin = request_origin.as_deref().unwrap_or("*");
-
-    if websocket_upgrade
-        && (!method_str.eq_ignore_ascii_case("GET")
-            || path_and_query != "/api/v1/remote"
-            || !is_desktop_websocket_origin(request_origin.as_deref())
-            || content_length != 0
-            || buf.len() != header_end)
+    let method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
+        Ok(method) => method,
+        Err(_) => return,
+    };
+    let authorized_origin = request_origin.filter(|origin| is_desktop_origin(origin));
+    let expected_host = stream.local_addr().ok().map(|address| address.to_string());
+    let api_path = path_and_query
+        .strip_prefix(&shared.path_prefix)
+        .filter(|path| *path == "/api" || path.starts_with("/api/") || path.starts_with("/api?"));
+    let origin_required =
+        websocket_upgrade || !matches!(method, reqwest::Method::GET | reqwest::Method::HEAD);
+    if duplicate_authority_header
+        || expected_host.is_none()
+        || request_host != expected_host.as_deref()
+        || (authorized_origin.is_none() && (origin_required || request_origin.is_some()))
+        || api_path.is_none()
+        || (websocket_upgrade
+            && (method != reqwest::Method::GET
+                || api_path != Some("/api/v1/remote")
+                || content_length != 0
+                || buf.len() != header_end))
     {
         let _ = stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     }
+    let path_and_query = api_path.expect("authorized API path");
+    let mut cors = String::from("Vary: Origin\r\n");
+    if let Some(origin) = authorized_origin {
+        cors.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Private-Network: true\r\n"
+        ));
+    }
 
-    if method_str.eq_ignore_ascii_case("OPTIONS") {
+    if method == reqwest::Method::OPTIONS {
         let preflight = format!(
             "HTTP/1.1 204 No Content\r\n\
-             Access-Control-Allow-Origin: {cors_origin}\r\n\
-             Access-Control-Allow-Credentials: true\r\n\
-             Access-Control-Allow-Private-Network: true\r\n\
-             Access-Control-Allow-Methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type, Authorization, Range, If-Range, Accept, Cache-Control\r\n\
+             {cors}Access-Control-Allow-Methods: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
+             Access-Control-Allow-Headers: Content-Type, Authorization, Range, If-Range, Accept, Cache-Control, If-None-Match, If-Modified-Since, X-MusicDeck-Confirm-Restore\r\n\
              Access-Control-Max-Age: 86400\r\n\
              Content-Length: 0\r\n\
              Connection: close\r\n\r\n"
@@ -172,40 +253,48 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     let mut body = buf[header_end..].to_vec();
     while body.len() < content_length {
         match stream.read(&mut temp).await {
-            Ok(0) => break,
+            Ok(0) => return,
             Ok(n) => body.extend_from_slice(&temp[..n]),
             Err(_) => return,
         }
     }
     body.truncate(content_length);
 
-    let (configured_url, cookie_token) = {
-        let cfg = shared.config.lock().ok().map(|g| g.clone());
-        let eph = shared.ephemeral_cookie.lock().ok().and_then(|g| g.clone());
-        let server_url = cfg
-            .as_ref()
-            .map(|c| c.server_url.clone())
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        let token = eph.or_else(|| cfg.and_then(|c| c.session_cookie));
-        (server_url, token)
+    let upstream = shared
+        .connection
+        .lock()
+        .ok()
+        .map(|mut guard| guard.begin_request());
+    let Some(upstream) = upstream else {
+        return;
     };
-
-    let Ok(method) = reqwest::Method::from_bytes(method_str.as_bytes()) else {
+    let Ok(candidates) = upstream.candidate_urls() else {
+        write_proxy_error(
+            &mut stream,
+            "500 Internal Server Error",
+            &cors,
+            "DESKTOP_INVALID_SERVER_CONFIG",
+            "Check the MusicDeck server URL in Server Connection settings.".into(),
+        )
+        .await;
         return;
     };
 
-    let candidates =
-        candidate_server_urls(&configured_url).unwrap_or_else(|_| vec![configured_url.clone()]);
-
     let mut upstream_response = None;
-    let mut active_base_url = configured_url.clone();
+    let mut active_base_url = upstream.server_url.clone();
+    let mut last_failure = None;
 
     for candidate_base in &candidates {
-        let target_url = format!("{candidate_base}{path_and_query}");
+        let Ok(target_url) = reqwest::Url::parse(&format!("{candidate_base}{path_and_query}"))
+        else {
+            break;
+        };
+        let origin = target_url.origin().ascii_serialization();
         let mut req_builder = shared
             .client
-            .request(method.clone(), &target_url)
-            .header("Origin", candidate_base)
+            .request(method.clone(), target_url)
+            .timeout(Duration::from_secs(3600))
+            .header("Origin", origin.as_str())
             .header("Referer", format!("{candidate_base}/"));
 
         for (k, v) in &forwarded_headers {
@@ -221,7 +310,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             }
         }
 
-        if let Some(ref token) = cookie_token {
+        if let Some(ref token) = upstream.cookie {
             if !token.is_empty() {
                 req_builder = req_builder.header("Cookie", format!("musicdeck_session={token}"));
             }
@@ -231,38 +320,80 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             req_builder = req_builder.body(body.clone());
         }
 
-        match req_builder.send().await {
+        // Keep the upload budget for large archive imports that use this proxy.
+        let header_timeout = if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(3600)
+        };
+        let send = send_upstream(req_builder, &method, &origin, header_timeout);
+        let result = if websocket_upgrade {
+            send.await
+        } else {
+            tokio::select! {
+                biased;
+                _ = stream.read(&mut temp[..1]) => return,
+                result = send => result,
+            }
+        };
+        match result {
             Ok(resp) => {
                 active_base_url = candidate_base.clone();
                 upstream_response = Some(resp);
                 break;
             }
-            Err(_) => continue,
+            Err(failure) => {
+                let can_try_alternate = failure.can_try_alternate();
+                last_failure = Some(failure);
+                if !can_try_alternate {
+                    break;
+                }
+            }
         }
     }
 
     let Some(resp) = upstream_response else {
-        let err_json = serde_json::json!({
-            "error": {
-                "code": "DESKTOP_SERVER_UNREACHABLE",
-                "message": format!("Could not reach MusicDeck server at {configured_url}. Check Server Connection settings.")
-            }
-        })
-        .to_string();
-        let reply = format!(
-            "HTTP/1.1 502 Bad Gateway\r\n\
-             Content-Type: application/json\r\n\
-             Access-Control-Allow-Origin: {cors_origin}\r\n\
-             Access-Control-Allow-Credentials: true\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{}",
-            err_json.len(),
-            err_json
-        );
-        let _ = stream.write_all(reply.as_bytes()).await;
-        let _ = stream.flush().await;
+        if let Some(failure) = last_failure {
+            let status = failure.status();
+            let status = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+            let (code, message) = failure.details();
+            write_proxy_error(&mut stream, &status, &cors, code, message.into()).await;
+        } else {
+            write_proxy_error(
+                &mut stream,
+                "500 Internal Server Error",
+                &cors,
+                "DESKTOP_INVALID_SERVER_CONFIG",
+                "Could not construct the MusicDeck server request.".into(),
+            )
+            .await;
+        }
         return;
     };
+
+    let accepted = shared
+        .connection
+        .lock()
+        .map_err(|_| "Desktop configuration lock poisoned".to_string())
+        .and_then(|mut guard| {
+            guard.accept_response(
+                &shared.config_dir,
+                &upstream,
+                &active_base_url,
+                resp.headers(),
+            )
+        });
+    if let Err(error) = accepted {
+        write_proxy_error(
+            &mut stream,
+            "409 Conflict",
+            &cors,
+            "DESKTOP_CONNECTION_CHANGED",
+            error,
+        )
+        .await;
+        return;
+    }
 
     if websocket_upgrade && resp.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS {
         let Some(accept) = resp
@@ -281,34 +412,21 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         return;
     }
 
-    // If an alternate port (e.g. :8080 instead of :4534) succeeded, persist it automatically.
-    if active_base_url != configured_url {
-        if let Ok(mut guard) = shared.config.lock() {
-            guard.server_url = active_base_url;
-            let _ = save_config(&shared.config_dir, &guard);
-        }
-    }
-
-    // Capture Set-Cookie headers from login / session renewal / logout.
-    apply_response_cookies(
-        resp.headers(),
-        &shared.config,
-        &shared.ephemeral_cookie,
-        &shared.config_dir,
-    );
-
     let status = resp.status();
     let status_code = status.as_u16();
     let reason = status.canonical_reason().unwrap_or("OK");
+    let chunked = method != reqwest::Method::HEAD
+        && !matches!(status_code, 204 | 205 | 304)
+        && !resp.headers().contains_key(reqwest::header::CONTENT_LENGTH);
 
     let mut response_head = format!(
         "HTTP/1.1 {status_code} {reason}\r\n\
-         Access-Control-Allow-Origin: {cors_origin}\r\n\
-         Access-Control-Allow-Credentials: true\r\n\
-         Access-Control-Allow-Private-Network: true\r\n\
-         Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition\r\n\
+         {cors}Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, Retry-After\r\n\
          Connection: close\r\n"
     );
+    if chunked {
+        response_head.push_str("Transfer-Encoding: chunked\r\n");
+    }
 
     for (name, value) in resp.headers().iter() {
         let key_lower = name.as_str().to_ascii_lowercase();
@@ -336,30 +454,75 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
 
     let mut body_stream = resp.bytes_stream();
-    while let Some(chunk_res) = body_stream.next().await {
+    while let Some(chunk_res) = tokio::select! {
+        biased;
+        _ = stream.read(&mut temp[..1]) => return,
+        chunk = body_stream.next() => chunk,
+    } {
         match chunk_res {
             Ok(chunk) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if chunked
+                    && stream
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
                 if stream.write_all(&chunk).await.is_err() {
-                    break;
+                    return;
+                }
+                if chunked && stream.write_all(b"\r\n").await.is_err() {
+                    return;
                 }
             }
-            Err(_) => break,
+            Err(_) => return,
         }
+    }
+    if chunked {
+        let _ = stream.write_all(b"0\r\n\r\n").await;
     }
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 }
 
-fn is_desktop_websocket_origin(origin: Option<&str>) -> bool {
+fn is_desktop_origin(origin: &str) -> bool {
     matches!(
         origin,
-        Some("http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost")
-    ) || (cfg!(debug_assertions) && origin == Some("http://localhost:3000"))
+        "http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost"
+    ) || (cfg!(debug_assertions) && origin == "http://localhost:3000")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DesktopConfig;
+
+    #[test]
+    fn only_exact_desktop_origins_are_allowed() {
+        for origin in [
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "tauri://localhost",
+        ] {
+            assert!(is_desktop_origin(origin));
+        }
+        for origin in [
+            "null",
+            "",
+            "https://example.invalid",
+            "http://tauri.localhost:8080",
+        ] {
+            assert!(!is_desktop_origin(origin));
+        }
+        assert_eq!(
+            is_desktop_origin("http://localhost:3000"),
+            cfg!(debug_assertions)
+        );
+    }
 
     async fn read_head(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
@@ -370,6 +533,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_request_has_a_deadline_for_response_headers() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", upstream.local_addr().unwrap());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // Keep the listener alive without serving a response.
+        let result = send_upstream(
+            client.get(format!("{origin}/api/health")),
+            &reqwest::Method::GET,
+            &origin,
+            Duration::from_millis(100),
+        )
+        .await;
+        let Err(failure) = result else { panic!("expected the request to time out") };
+        assert!(matches!(failure, UpstreamFailure::HeaderTimeout));
+        assert_eq!(failure.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(failure.details().0, "DESKTOP_UPSTREAM_TIMEOUT");
+        drop(upstream);
+    }
+
+    #[tokio::test]
     async fn remote_socket_tunnels_the_session_only_for_the_desktop_origin() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -377,9 +560,13 @@ mod tests {
             let proxy_addr = proxy.local_addr().unwrap();
             let server_url = format!("http://{}", upstream.local_addr().unwrap());
             let shared = Arc::new(ProxySharedState {
-                config: Arc::new(Mutex::new(DesktopConfig { server_url: server_url.clone(), ..Default::default() })),
-                ephemeral_cookie: Arc::new(Mutex::new(Some("fixture-session".into()))),
+                connection: Arc::new(Mutex::new(DesktopConnection::new(DesktopConfig {
+                    server_url: server_url.clone(),
+                    session_cookie: Some("fixture-session".into()),
+                    ..Default::default()
+                }))),
                 config_dir: std::env::temp_dir(),
+                path_prefix: "/fixture".into(),
                 client: reqwest::Client::new(),
             });
             let proxy_task = tokio::spawn(async move {
@@ -388,7 +575,7 @@ mod tests {
                     handle_proxy_connection(stream, shared.clone()).await;
                 }
             });
-            let request = |origin: &str| format!("GET /api/v1/remote HTTP/1.1\r\nHost: {proxy_addr}\r\nOrigin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+            let request = |origin: &str| format!("GET /fixture/api/v1/remote HTTP/1.1\r\nHost: {proxy_addr}\r\nOrigin: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
             let mut rejected = TcpStream::connect(proxy_addr).await.unwrap();
             rejected.write_all(request("https://outside.example").as_bytes()).await.unwrap();
             assert!(read_head(&mut rejected).await.starts_with("HTTP/1.1 403"));
@@ -414,6 +601,107 @@ mod tests {
             proxy_task.await.unwrap();
         }).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn serves_trusted_http_requests_and_originless_media_on_the_private_path() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy.local_addr().unwrap();
+            let config = DesktopConfig {
+                server_url: format!("http://{}", upstream.local_addr().unwrap()),
+                session_cookie: Some("fixture-session".into()),
+                ..DesktopConfig::default()
+            };
+            let shared = Arc::new(ProxySharedState {
+                connection: Arc::new(Mutex::new(DesktopConnection::new(config))),
+                config_dir: std::env::temp_dir(),
+                path_prefix: "/fixture".into(),
+                client: reqwest::Client::new(),
+            });
+            let proxy_task = tokio::spawn(async move {
+                for _ in 0..9 {
+                    let (stream, _) = proxy.accept().await.unwrap();
+                    handle_proxy_connection(stream, shared.clone()).await;
+                }
+            });
+            for (path, origin) in [
+                ("/fixture/api/artwork/cover", "Origin: https://example.invalid\r\n"),
+                ("/fixture/api/artwork/cover", "Origin: null\r\n"),
+                ("/api/artwork/cover", ""),
+            ] {
+                let mut rejected = TcpStream::connect(proxy_addr).await.unwrap();
+                rejected.write_all(format!(
+                    "GET {path} HTTP/1.1\r\nHost: {proxy_addr}\r\n{origin}\r\n"
+                ).as_bytes()).await.unwrap();
+                let response = read_head(&mut rejected).await;
+                assert!(response.starts_with("HTTP/1.1 403"));
+                assert!(!response.contains("Access-Control-Allow-Origin:"));
+            }
+            let mut preflight = TcpStream::connect(proxy_addr).await.unwrap();
+            preflight.write_all(format!(
+                "OPTIONS /fixture/api/auth/session HTTP/1.1\r\nHost: {proxy_addr}\r\nOrigin: http://tauri.localhost\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            let response = read_head(&mut preflight).await;
+            assert!(response.starts_with("HTTP/1.1 204"));
+            assert!(response.contains("Access-Control-Allow-Origin: http://tauri.localhost\r\n"));
+
+            for origin in ["Origin: http://tauri.localhost\r\n", ""] {
+                let mut desktop = TcpStream::connect(proxy_addr).await.unwrap();
+                desktop.write_all(format!(
+                    "GET /fixture/api/artwork/cover HTTP/1.1\r\nHost: {proxy_addr}\r\n{origin}\r\n"
+                ).as_bytes()).await.unwrap();
+                let (mut server, _) = upstream.accept().await.unwrap();
+                let request = read_head(&mut server).await.to_ascii_lowercase();
+                assert!(request.starts_with("get /api/artwork/cover http/1.1\r\n"));
+                assert!(request.contains("cookie: musicdeck_session=fixture-session\r\n"));
+                server.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nart").await.unwrap();
+                let response = read_head(&mut desktop).await;
+                assert!(response.starts_with("HTTP/1.1 200"));
+                assert_eq!(response.contains("Access-Control-Allow-Origin: http://tauri.localhost\r\n"), !origin.is_empty());
+                let mut body = [0; 3];
+                desktop.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"art");
+            }
+            let truncated = tokio::spawn(async move {
+                let response = reqwest::get(format!("http://{proxy_addr}/fixture/api/artwork/cover"))
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+                assert!(response.bytes().await.is_err());
+            });
+            let (mut server, _) = upstream.accept().await.unwrap();
+            read_head(&mut server).await;
+            server.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nart\r\n")
+                .await.unwrap();
+            server.shutdown().await.unwrap();
+            truncated.await.unwrap();
+
+            let mut cancelled = TcpStream::connect(proxy_addr).await.unwrap();
+            cancelled.write_all(format!(
+                "GET /fixture/api/artwork/cover HTTP/1.1\r\nHost: {proxy_addr}\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            let (mut server, _) = upstream.accept().await.unwrap();
+            read_head(&mut server).await;
+            drop(cancelled);
+            assert!(server.read_u8().await.is_err());
+
+            // A 502 from the backend must retain its body and must not be
+            // handled as a local connect error or retried.
+            let forwarded = tokio::spawn(async move {
+                let response = reqwest::get(format!("http://{proxy_addr}/fixture/api/artwork/cover"))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+                assert_eq!(response.text().await.unwrap(), "backend error");
+            });
+            let (mut server, _) = upstream.accept().await.unwrap();
+            read_head(&mut server).await;
+            server.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\nConnection: close\r\n\r\nbackend error").await.unwrap();
+            forwarded.await.unwrap();
+            proxy_task.await.unwrap();
+        }).await.unwrap();
+    }
 }
 
 fn bind_proxy_listener() -> Option<std::net::TcpListener> {
@@ -425,51 +713,36 @@ fn bind_proxy_listener() -> Option<std::net::TcpListener> {
     std::net::TcpListener::bind("127.0.0.1:0").ok()
 }
 
-pub fn start_local_api_proxy(
-    config: Arc<Mutex<DesktopConfig>>,
-    ephemeral_cookie: Arc<Mutex<Option<String>>>,
+pub(crate) fn start_local_api_proxy(
+    connection: Arc<Mutex<DesktopConnection>>,
     config_dir: PathBuf,
+    client: reqwest::Client,
 ) -> Option<String> {
     let std_listener = bind_proxy_listener()?;
     std_listener.set_nonblocking(true).ok()?;
     let local_addr = std_listener.local_addr().ok()?;
-    let proxy_url = format!("http://127.0.0.1:{}", local_addr.port());
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(6))
-        .timeout(Duration::from_secs(3600))
-        .build()
-        .ok()?;
+    // Media elements may omit Origin. A fresh, unguessable path authenticates
+    // requests from the desktop webview without exposing the upstream cookie.
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).ok()?;
+    let path_prefix = format!("/{}", secret.map(|byte| format!("{byte:02x}")).concat());
+    let proxy_url = format!("http://{local_addr}{path_prefix}");
 
     let shared = Arc::new(ProxySharedState {
-        config,
-        ephemeral_cookie,
+        connection,
         config_dir,
+        path_prefix,
         client,
     });
 
-    std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        else {
+    tauri::async_runtime::spawn(async move {
+        let Ok(listener) = TcpListener::from_std(std_listener) else {
             return;
         };
-
-        rt.block_on(async move {
-            let Ok(listener) = TcpListener::from_std(std_listener) else {
-                return;
-            };
-            loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    let state_clone = Arc::clone(&shared);
-                    tokio::spawn(async move {
-                        handle_proxy_connection(stream, state_clone).await;
-                    });
-                }
-            }
-        });
+        while let Ok((stream, _)) = listener.accept().await {
+            let state_clone = Arc::clone(&shared);
+            tokio::spawn(handle_proxy_connection(stream, state_clone));
+        }
     });
 
     Some(proxy_url)

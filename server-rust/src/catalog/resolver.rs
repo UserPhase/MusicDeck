@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use http::StatusCode;
+use http::{StatusCode, header::CONTENT_TYPE};
 use thiserror::Error;
 
 use crate::catalog::library::{LibraryService, SourceRef};
@@ -158,6 +158,18 @@ impl SourceResolver {
                 .await
                 && matches!(result.status, StatusCode::OK | StatusCode::PARTIAL_CONTENT)
             {
+                // Subsonic can return an error document with HTTP 200. A reverse
+                // proxy can do the same with a login page. Keep looking for audio.
+                let content_type = result.headers.get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .unwrap_or_default().trim().to_ascii_lowercase();
+                if content_type.starts_with("text/") || matches!(content_type.as_str(), "application/json" | "application/xml")
+                    || content_type.ends_with("+json") || content_type.ends_with("+xml")
+                {
+                    tracing::debug!(connection_id = %source.connection_id, %content_type, "Provider returned a document instead of an audio stream");
+                    continue;
+                }
                 let mut stream_info = result.audio_stream.unwrap_or(AudioStreamInfo {
                     direct: max_bit_rate.is_none(),
                     requested_bitrate_kbps: max_bit_rate,

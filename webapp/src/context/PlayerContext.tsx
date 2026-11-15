@@ -1145,8 +1145,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     setPlaybackUnavailable(false);
   }, [cancelRestoreResume]);
 
-  const continueAfterQueueEnd = useCallback(async () => {
-    if (queueEndPendingRef.current) return;
+  const continueAfterQueueEnd = useCallback(async (signal?: AbortSignal) => {
+    if (queueEndPendingRef.current || signal?.aborted) return;
     const context = playbackContextRef.current;
     const playlistId = context?.type === "playlist" ? String(context.id) : context?.playlistLoopId;
     if (playlistId && loopPlaylistRef.current === playlistId) {
@@ -1168,7 +1168,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const seed = currentEntryOf(state)?.track ?? state.entries[state.entries.length - 1]?.track;
       if (!seed) { stopAtQueueEnd(); return; }
       const nextSongs = await autoplayTracksFor(seed, QUEUE_END_AUTOPLAY_COUNT, state.entries.map((entry) => entry.track.id));
-      if (!mountedRef.current || stateRef.current.generation !== queueGeneration) return;
+      if (signal?.aborted || !mountedRef.current || stateRef.current.generation !== queueGeneration) return;
       if (!autoplayRef.current || feedbackVersionRef.current !== feedbackVersion || tasteProfileStore.excludes(seed) || tasteProfileStore.getSnapshot().privateListening) { stopAtQueueEnd(); return; }
       if (!Array.isArray(nextSongs) || nextSongs.length === 0) {
         stopAtQueueEnd();
@@ -1181,10 +1181,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         stopAtQueueEnd();
         return;
       }
-      storeRef.current.setQueue(generated, 0);
+      if (signal) flushSync(() => storeRef.current.setQueue(generated, 0));
+      else storeRef.current.setQueue(generated, 0);
     } catch (error) {
       console.error("Could not generate local autoplay:", error);
-      if (mountedRef.current && stateRef.current.generation === queueGeneration) {
+      if (!signal?.aborted && mountedRef.current && stateRef.current.generation === queueGeneration) {
         setPlaybackMessage("Autoplay is unavailable. Please try again.");
         stopAtQueueEnd();
       }
@@ -1212,6 +1213,10 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         const type = STATE_CLOCK_EVENTS[state];
         const clock = key ? clocksRef.current.get(key) : undefined;
         if (type && clock) clock.emit(type);
+        if (state === "playing" && key === currentKey() && stateRef.current.lastError) {
+          setPlaybackUnavailable(false);
+          setPlaybackMessage("");
+        }
         const entry = state === "playing" ? stateRef.current.entries.find((candidate) => candidate.entryId === key) : null;
         if (entry) recordShufflePlay(entry);
       }),
@@ -1230,6 +1235,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       engine.on("sleepStop", () => listeningSessionRef.current?.finish()),
       engine.on("bufferStall", ({ key }) => {
         if (key !== currentKey()) return;
+        setPlaybackUnavailable(false);
         setPlaybackMessage(RECONNECTING_MESSAGE);
       }),
       engine.on("streamRecovered", ({ key, restartedFromBeginning }) => {
@@ -1261,7 +1267,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     // A blocked restore waits silently for the next click or key press.
     if (restoreRef.current && lastError === PLAYBACK_BLOCKED_MESSAGE) return;
     setPlaybackMessage(lastError);
-    setPlaybackUnavailable(true);
+    setPlaybackUnavailable(lastError !== PLAYBACK_BLOCKED_MESSAGE);
   }, [loadSequence, lastError]);
 
   useEffect(() => {
@@ -1702,7 +1708,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     changeAlbumAware(checkpoint.albumAware); storeRef.current.setRepeatOne(checkpoint.repeatOne);
     changeVolume(checkpoint.volume); setPlaybackContext(checkpoint.context);
   };
+  const transferTransaction = useRef<{ signal: AbortSignal; rollback: () => void } | null>(null);
   const persistedQueue = usePersistentQueue(store, { ownerId: localQueueOwner,
+    canPersist: () => !transferTransaction.current,
     checkpointKey: `${Math.floor(currentTime)}:${volume}:${isShuffleEnabled}:${isAlbumAware}:${shuffleMode}:${restorePending}`,
     getCheckpoint: () => queueCheckpointRef.current(), onError: setQueuePersistenceError, onReady: setHydratedQueueUserId,
     onRestore: saved => {
@@ -1734,7 +1742,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   useEffect(() => {
     const owner = isAuthenticated ? sessionId : null;
     queueSyncClient.activate(owner);
-    queueSyncClient.bind(() => queuePersistenceRef.current.flush(), () => !followingAccountQueue.current);
+    queueSyncClient.bind(() => queuePersistenceRef.current.flush(), () => !followingAccountQueue.current && !transferTransaction.current);
     return () => { queueSyncClient.bind(null); queueSyncClient.activate(null); };
   }, [isAuthenticated, sessionId]);
   useEffect(() => {
@@ -1795,12 +1803,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     writeStored("playerShuffleMode", mode, "shuffle mode");
   }, []);
 
-  const changeAlbumAware = useCallback((enabled: boolean) => {
+  const changeAlbumAware = useCallback((enabled: boolean, persist = true) => {
     albumAwareRef.current = Boolean(enabled);
     albumPreferenceVersionRef.current++;
     setIsAlbumAware(Boolean(enabled));
     engineRef.current?.setAlbumAware(Boolean(enabled));
-    writeStored("playerAlbumAware", String(Boolean(enabled)), "album-aware mode");
+    if (persist) writeStored("playerAlbumAware", String(Boolean(enabled)), "album-aware mode");
   }, []);
 
   const changeShuffleMode = useCallback((mode: ShuffleMode) => {
@@ -1880,12 +1888,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     writeStored("playerNormalizationEnabled", String(next), "ReplayGain preference");
   }, []);
 
-  function changeVolume(value: number) {
+  function changeVolume(value: number, persist = true) {
     if (!Number.isFinite(Number(value))) return;
     const next = Math.max(0, Math.min(1, Number(value)));
     setVolume(next);
     engineRef.current?.setVolume(perceptualVolumeToGain(next));
-    writeStored("playerVolume", String(next), "volume");
+    if (persist) writeStored("playerVolume", String(next), "volume");
   }
 
   function changeLayoutDensity(value: string) {
@@ -2283,7 +2291,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     storeRef.current.move(from, to);
   }
 
-  async function nextSong() {
+  async function nextSong(signal?: AbortSignal) {
+    if (signal?.aborted) throw new Error("Playback command cancelled.");
     const state = stateRef.current;
     if (state.currentIndex < 0) return;
     cancelRestoreResume();
@@ -2291,8 +2300,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       storeRef.current.playNext();
       return;
     }
+    if (signal && queueEndPendingRef.current) throw new Error("The player is already finding the next track.");
     listeningSessionRef.current?.finish();
-    await continueAfterQueueEnd();
+    await continueAfterQueueEnd(signal);
   }
 
   /** Restarts the current entry; a restart is a new listening session. */
@@ -2442,13 +2452,31 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     queue: liveQueue,
     pause: () => {
       cancelRestoreResume();
+      storeRef.current.cancelPendingLoad();
       engineRef.current?.pause();
     },
-    command: async (command) => {
+    command: async (command, signal) => {
       const activeEngine = engineRef.current;
       if (!activeEngine) throw new Error("The playback engine is not ready");
       if (activeEngine.isRemoteOutput) throw new Error("Control this receiver from its Google Cast sender, or stop Cast before using device control.");
+      const checkCancellation = () => {
+        if (signal?.aborted) throw new Error("Playback command cancelled.");
+      };
+      checkCancellation();
       if (command.type === "SET_VOLUME") { flushSync(() => changeVolume(command.volume)); return; }
+      const load = stateRef.current.loadRequest;
+      if (load) await storeRef.current.waitForLoad(load.sequence, signal).catch(() => {});
+      checkCancellation();
+      const applyAndWait = async (apply: () => void | Promise<void>) => {
+        const previousSequence = stateRef.current.loadSequence;
+        const result = flushSync(apply);
+        if (result) {
+          await result;
+        }
+        checkCancellation();
+        const next = stateRef.current.loadRequest;
+        if (next && next.sequence > previousSequence) await storeRef.current.waitForLoad(next.sequence, signal);
+      };
       if (command.type === "PLAY_SELECTION") {
         if (remote.isRemote) throw new Error("The active player changed. Try playing the selection again.");
         const tracks = command.tracks.map(sanitizeQueueTrack);
@@ -2456,7 +2484,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         if (!selected) throw new Error("The selected track is missing from the queue.");
         const reason = unplayableReasonFor(selected);
         if (reason) throw new Error(reason);
-        flushSync(() => startSelection(tracks, command.start_index, command.context, command.from_here));
+        await applyAndWait(() => startSelection(tracks, command.start_index, command.context, command.from_here));
         return;
       }
       if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
@@ -2474,7 +2502,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         const state = stateRef.current;
         const index = state.entries.findIndex(entry => entry.entryId === command.entry_id);
         if (index < 0) throw new Error("The active queue changed. Try again after it syncs.");
-        if (command.type === "PLAY_QUEUE_ENTRY") { await flushSync(() => playQueueSong(index)); return; }
+        if (command.type === "PLAY_QUEUE_ENTRY") { await applyAndWait(() => playQueueSong(index)); return; }
         const target = state.entries.findIndex(entry => entry.entryId === command.target_id);
         if (index <= state.currentIndex || target <= state.currentIndex) throw new Error("Only upcoming tracks can be moved.");
         flushSync(() => moveQueueItem(index, target));
@@ -2482,11 +2510,14 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       }
       if (command.type === "PAUSE") flushSync(() => activeEngine.pause());
       else if (command.type === "PLAY") {
-        if (!engineHasLoaded(currentEntryId)) { flushSync(togglePlay); return; }
+        const key = currentEntryOf(stateRef.current)?.entryId ?? null;
+        if (!engineHasLoaded(key)) { await applyAndWait(togglePlay); return; }
         await activeEngine.play();
-        if (activeEngine.getSnapshot().state !== "playing") throw new Error(PLAYBACK_BLOCKED_MESSAGE);
+        checkCancellation();
+        const state = activeEngine.getSnapshot().state;
+        if (state !== "playing" && state !== "transitioning") throw new Error("The selected device could not start playback.");
       } else if (command.type === "SKIP") {
-        await flushSync(command.direction === "next" ? nextSong : previousSong);
+        await applyAndWait(command.direction === "next" ? () => nextSong(signal) : previousSong);
       } else if (command.type === "SEEK") {
         const total = activeEngine.getSnapshot().duration;
         if (total <= 0) throw new Error("The active stream is not seekable yet");
@@ -2506,13 +2537,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const activeEngine = engineRef.current;
       if (!activeEngine) throw new Error("The playback engine is not ready");
       if (activeEngine.isRemoteOutput) throw new Error("Stop Google Cast on the target before transferring playback.");
-      const selected = await getListeningTrack(snapshot.trackId);
+      const selected = await getListeningTrack(snapshot.trackId, signal);
       if (signal.aborted) throw new Error("Transfer cancelled");
       if (!selected?.id || String(selected.id) !== snapshot.trackId || !isLibraryPlayable({ ...selected, id: selected.id })) {
         throw new Error("The target cannot access this library track");
       }
-      activeEngine.pause();
-      cancelRestoreResume();
       const queue = snapshot.queueState;
       const tracks = queue.entries.map((item, index): Song => ({
         ...(index === queue.index ? selected : { id: item.trackId, title: item.title, artist: item.artist, album: item.album,
@@ -2523,40 +2552,87 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           occurrenceId: null,
         } : undefined),
       }));
-      shuffleEnabledRef.current = queue.shuffle; setIsShuffleEnabled(queue.shuffle);
-      shuffleModeRef.current = queue.shuffleMode; setShuffleMode(queue.shuffleMode);
-      changeAlbumAware(queue.albumAware);
-      setPlaybackContext(queue.context);
-      const previousGeneration = stateRef.current.generation;
-      storeRef.current.setQueue(tracks, queue.index, { autoplay: false, startAt: snapshot.exactPositionMs / 1000, shuffleSeed: queue.shuffleSeed });
-      storeRef.current.setRepeatOne(queue.repeatOne);
+      const previous = stateRef.current;
+      const previousCheckpoint = queueCheckpointRef.current();
+      const previousContext = playbackContextRef.current;
+      const previousLoop = loopPlaylistRef.current;
+      const owner = trackingUserRef.current;
+      let staged: QueueState<Song> | undefined;
+      const rollback = () => {
+        if (transferTransaction.current?.signal !== signal) return;
+        transferTransaction.current = null;
+        const current = stateRef.current;
+        if (!mountedRef.current || !staged || trackingUserRef.current !== owner || current.generation !== staged.generation ||
+            current.entries !== staged.entries || current.currentIndex !== staged.currentIndex) return;
+        activeEngine.pause();
+        flushSync(() => {
+          storeRef.current.hydrate(previous.entries, previous.currentIndex, {
+            autoplay: false, startAt: previousCheckpoint.position, shuffleSeed: previous.shuffleSeed,
+            deferLoad: !previous.loadRequest,
+          });
+          applyQueuePreferences(previousCheckpoint);
+          loopPlaylistRef.current = previousLoop; setLoopPlaylistId(previousLoop);
+          setPlaybackContext(previousContext);
+          const entry = previous.entries[previous.currentIndex];
+          cuedPositionRef.current = entry ? { trackId: String(entry.track.id), seconds: previousCheckpoint.position } : null;
+          setCurrentTime(previousCheckpoint.position);
+        });
+      };
+      transferTransaction.current = { signal, rollback };
+      signal.addEventListener("abort", rollback, { once: true });
+      activeEngine.pause();
+      cancelRestoreResume();
+      flushSync(() => {
+        shuffleEnabledRef.current = queue.shuffle; setIsShuffleEnabled(queue.shuffle);
+        shuffleModeRef.current = queue.shuffleMode; setShuffleMode(queue.shuffleMode);
+        changeAlbumAware(queue.albumAware, false);
+        setPlaybackContext(queue.context);
+        storeRef.current.setQueue(tracks, queue.index, { autoplay: false, startAt: snapshot.exactPositionMs / 1000, shuffleSeed: queue.shuffleSeed });
+        storeRef.current.setRepeatOne(queue.repeatOne);
+      });
+      staged = stateRef.current;
       await new Promise<void>((resolve, reject) => {
-        const started = Date.now();
+        const started = performance.now();
+        const finish = (error?: Error) => {
+          window.clearInterval(timer);
+          signal.removeEventListener("abort", abort);
+          if (error) reject(error); else resolve();
+        };
+        const abort = () => finish(new Error("Transfer cancelled"));
         const timer = window.setInterval(() => {
           const entry = currentEntryOf(stateRef.current);
           const actual = activeEngine.getSnapshot();
-          if (signal.aborted || Date.now() - started > 12000) {
-            window.clearInterval(timer); reject(new Error(signal.aborted ? "Transfer cancelled" : "The target could not buffer this track in time")); return;
-          }
-          if (stateRef.current.generation <= previousGeneration) return;
+          if (performance.now() - started > 12000) { finish(new Error("The target could not buffer this track in time")); return; }
           if (entry?.track.remoteOccurrenceId !== queue.entries[queue.index].occurrenceId ||
               stateRef.current.entries.length !== queue.entries.length ||
               stateRef.current.entries.some((item, index) => item.track.remoteOccurrenceId !== queue.entries[index].occurrenceId)) {
-            window.clearInterval(timer); reject(new Error("The target queue changed during preparation")); return;
+            finish(new Error("The target queue changed during preparation")); return;
           }
           if (actual.key !== entry.entryId) return;
           if (actual.state === "error" || stateRef.current.lastError) {
-            window.clearInterval(timer); reject(new Error(stateRef.current.lastError || "The target could not load this stream")); return;
+            finish(new Error(stateRef.current.lastError || "The target could not load this stream")); return;
           }
           if (activeEngine.isReadyForResume() && actual.duration > 0 && Math.abs(actual.position - snapshot.exactPositionMs / 1000) < .25) {
-            window.clearInterval(timer); resolve();
+            finish();
           }
         }, 40);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
       });
     },
-    start: async (snapshot) => {
+    commitTransfer: (signal) => {
+      const transaction = transferTransaction.current;
+      if (transaction?.signal !== signal) return;
+      signal.removeEventListener("abort", transaction.rollback);
+      transferTransaction.current = null;
+      writeStored("playerAlbumAware", String(albumAwareRef.current), "album-aware mode");
+      writeStored("playerVolume", String(volume), "volume");
+      void persistedQueue.flush().catch(() => {});
+    },
+    start: async (snapshot, signal) => {
       const activeEngine = engineRef.current;
       if (!activeEngine) throw new Error("The playback engine is not ready");
+      if (signal?.aborted) throw new Error("Transfer cancelled");
       const entry = currentEntryOf(stateRef.current);
       if (entry?.track.remoteOccurrenceId !== snapshot.queueState.entries[snapshot.queueState.index].occurrenceId ||
           stateRef.current.entries.length !== snapshot.queueState.entries.length ||
@@ -2564,10 +2640,13 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           stateRef.current.currentIndex !== snapshot.queueState.index ||
           stateRef.current.repeatOne !== snapshot.queueState.repeatOne) throw new Error("The target queue changed during handoff");
       activeEngine.seek(snapshot.exactPositionMs / 1000);
-      changeVolume(snapshot.volume);
-      setCurrentTime(snapshot.exactPositionMs / 1000);
+      flushSync(() => {
+        changeVolume(snapshot.volume, false);
+        setCurrentTime(snapshot.exactPositionMs / 1000);
+      });
       if (snapshot.playing) {
         await activeEngine.play();
+        if (signal?.aborted) throw new Error("Transfer cancelled");
         if (activeEngine.getSnapshot().state !== "playing") { activeEngine.pause(); throw new Error(PLAYBACK_BLOCKED_MESSAGE); }
       }
     },
@@ -2755,7 +2834,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const entry_id = queueOccurrenceAt(from), target_id = queueOccurrenceAt(to);
       if (entry_id && target_id) void controlRemote({ type: "MOVE_QUEUE_ENTRY", entry_id, target_id });
     } : pausedAccountQueue ? (from, to) => { takeAccountQueue(); moveQueueItem(from, to); } : moveQueueItem,
-    nextSong: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "SKIP", direction: "next" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex + 1) : nextSong,
+    nextSong: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "SKIP", direction: "next" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex + 1) : () => nextSong(),
     previousSong: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "SKIP", direction: "previous" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex - 1) : previousSong,
     toggleShuffle: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "TOGGLE_SHUFFLE" }) : pausedAccountQueue ? () => {
       takeAccountQueue();

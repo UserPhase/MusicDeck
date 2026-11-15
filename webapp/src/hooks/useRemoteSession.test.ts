@@ -39,14 +39,14 @@ afterEach(() => {
 async function receive(ws: FakeSocket, message: object) { await act(async () => { ws.message(message); }); }
 test("registers same-origin cookies-only control, publishes explicit playback claims and reconnects cleanly", async () => {
   const player = adapter();
-  const { result, unmount } = renderHook(() => useRemoteSession("user", player));
+  const { result, rerender, unmount } = renderHook(() => useRemoteSession("user", player));
   const ws = FakeSocket.instances[0];
   act(() => ws.open());
   expect(ws.url.pathname).toBe("/api/v1/remote");
   expect(ws.url.search).toBe("");
   expect(ws.sent[0]).toMatchObject({ type: "REGISTER", can_receive: false, state: initial });
   player.state.mockReturnValue({ ...initial, playing: true });
-  act(() => jest.advanceTimersByTime(500));
+  rerender();
   expect(ws.sent).toContainEqual({ type: "STATE", state: { ...initial, playing: true }, claim: true });
   act(() => ws.close(1006));
   expect(result.current.status).toBe("reconnecting");
@@ -66,21 +66,40 @@ test("registers same-origin cookies-only control, publishes explicit playback cl
   unmount(); expect(next.readyState).toBe(3);
 });
 
-test("reduces background state traffic while keeping the same remote socket open", () => {
+test("samples only the playing device and backs off in the background without closing its socket", async () => {
   const player = adapter();
-  const { unmount } = renderHook(() => useRemoteSession("user", player));
+  const { result, rerender, unmount } = renderHook(() => useRemoteSession("user", player));
   const ws = FakeSocket.instances[0];
   try {
     act(() => ws.open());
+    await receive(ws, { type: "DEVICES", devices: [] });
+    const listenersBefore = player.state.mock.calls.length;
+    act(() => jest.advanceTimersByTime(30_000));
+    expect(player.state).toHaveBeenCalledTimes(listenersBefore);
+
     act(() => setDesktopForeground(false));
     player.state.mockReturnValue({ ...initial, playing: true });
-    act(() => jest.advanceTimersByTime(1999));
-    expect(ws.sent).toHaveLength(1);
-    act(() => jest.advanceTimersByTime(1));
+    rerender();
     expect(ws.sent[1]).toMatchObject({ type: "STATE", claim: true });
+    const now = Date.now();
+    const state = { device_id: result.current.deviceId, track: initial.current_track, position_ms: initial.position_ms,
+      duration_ms: initial.duration_ms, volume: initial.volume, updated_at: now, is_playing: true, revision: 1 };
+    await receive(ws, { type: "INITIAL_STATE", state, server_time: now });
     player.state.mockReturnValue({ ...initial, playing: true, position_ms: 140000 });
-    act(() => setDesktopForeground(true));
+    act(() => jest.advanceTimersByTime(19_999));
+    expect(ws.sent).toHaveLength(2);
+    act(() => jest.advanceTimersByTime(1));
     expect(ws.sent[2]).toMatchObject({ type: "STATE", state: { position_ms: 140000 } });
+
+    player.state.mockReturnValue({ ...initial, playing: true, position_ms: 142000 });
+    act(() => setDesktopForeground(true));
+    expect(ws.sent[3]).toMatchObject({ type: "STATE", state: { position_ms: 142000 } });
+
+    player.state.mockReturnValue({ ...initial, playing: false });
+    rerender();
+    const listenersAfterPause = player.state.mock.calls.length;
+    act(() => jest.advanceTimersByTime(30_000));
+    expect(player.state).toHaveBeenCalledTimes(listenersAfterPause);
     expect(ws.readyState).toBe(FakeSocket.OPEN);
     expect(FakeSocket.instances).toHaveLength(1);
   } finally {
@@ -150,7 +169,7 @@ test("requires an explicit target gesture and preserves exact preparation/start 
   expect(player.start).not.toHaveBeenCalled();
   const fresh = { ...snapshot, exactPositionMs: 125789.123 };
   await receive(ws, { type: "START_TRANSFER", transferId: "transfer", snapshot: fresh });
-  expect(player.start).toHaveBeenCalledWith(fresh);
+  expect(player.start).toHaveBeenCalledWith(fresh, expect.any(AbortSignal));
   expect(ws.sent).toContainEqual({ type: "STARTED", transferId: "transfer" });
   await receive(ws, { type: "TRANSFER_COMPLETE", transferId: "transfer" });
 });
@@ -166,7 +185,116 @@ test("source keeps playing until PAUSE_FOR_TRANSFER and captures before pausing"
   expect(player.pause).toHaveBeenCalledTimes(1);
   expect(ws.sent).toContainEqual({ type: "SOURCE_PAUSED", transferId: "transfer", snapshot });
   await receive(ws, { type: "ABORT_TRANSFER", transferId: "transfer", resume: true });
-  expect(player.command).toHaveBeenCalledWith({ type: "PLAY" });
+  expect(player.command).toHaveBeenCalledWith({ type: "PLAY" }, expect.any(AbortSignal));
+});
+
+test("expires queued executions and pauses the output when its socket closes", async () => {
+  const player = adapter();
+  let complete!: () => void;
+  player.command.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const now = Date.now();
+  await receive(ws, { type: "INITIAL_STATE", server_time: now, state: {
+    device_id: result.current.deviceId, track: initial.current_track, position_ms: 1000,
+    duration_ms: 30000, is_playing: true, volume: 1, updated_at: now, revision: 1,
+  } });
+  await receive(ws, { type: "EXECUTE", requestId: "first", command: { type: "PLAY" },
+    expiresAt: now + 8000, deadlineAt: now + 8000, timeoutMs: 8000 });
+  await receive(ws, { type: "EXECUTE", requestId: "queued", command: { type: "SKIP", direction: "next" },
+    expiresAt: now + 100, deadlineAt: now + 100, timeoutMs: 100 });
+  act(() => jest.advanceTimersByTime(101));
+  await act(async () => { complete(); });
+  expect(player.command).toHaveBeenCalledTimes(1);
+  expect(ws.sent).toContainEqual({
+    type: "COMMAND_RESULT", requestId: "queued", expiresAt: now + 100, ok: false,
+    message: "Playback command expired before execution",
+  });
+  act(() => ws.close(1006));
+  expect(player.pause).toHaveBeenCalledTimes(1);
+});
+
+test("only resets reconnect backoff after the application handshake", async () => {
+  jest.spyOn(Math, "random").mockReturnValue(0);
+  const { result } = renderHook(() => useRemoteSession("user", adapter()));
+  try {
+    const first = FakeSocket.instances[0];
+    act(() => first.open());
+    await receive(first, { type: "DEVICES", live_state_protocol: true, devices: [] });
+    act(() => jest.advanceTimersByTime(12_500));
+    const second = FakeSocket.instances[1];
+    act(() => second.open());
+    act(() => jest.advanceTimersByTime(12_999));
+    expect(FakeSocket.instances).toHaveLength(2);
+    act(() => jest.advanceTimersByTime(1));
+    const third = FakeSocket.instances[2];
+    act(() => third.open());
+    const now = Date.now();
+    await receive(third, { type: "INITIAL_STATE", server_time: now, state: {
+      device_id: null, track: null, position_ms: 0, duration_ms: 0, is_playing: false,
+      volume: 1, updated_at: now, revision: 1,
+    }});
+    expect(result.current.status).toBe("connected");
+    act(() => third.close(1011));
+    act(() => jest.advanceTimersByTime(500));
+    expect(FakeSocket.instances).toHaveLength(4);
+  } finally {
+    jest.restoreAllMocks();
+  }
+});
+
+test("a wall clock jump does not move the remote playhead", async () => {
+  const { result } = renderHook(() => useRemoteSession("user", adapter()));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const now = Date.now();
+  const state = { device_id: "desk", track: initial.current_track, position_ms: 1000,
+    duration_ms: 60000, is_playing: true, volume: 1, updated_at: now, revision: 1 };
+  await receive(ws, { type: "INITIAL_STATE", state, server_time: now });
+  act(() => { jest.setSystemTime(now + 3600_000); jest.advanceTimersByTime(100); });
+  await receive(ws, { type: "STATE_SYNC", state: { ...state, revision: 2, position_ms: 1100, updated_at: now + 100 },
+    server_time: now + 100 });
+  expect(result.current.readPosition?.()).toBeCloseTo(1.1);
+});
+
+test("stops an active output that no longer receives control heartbeats", async () => {
+  const player = adapter();
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const now = Date.now();
+  await receive(ws, { type: "INITIAL_STATE", server_time: now, controlTimeoutMs: 25_000, state: {
+    device_id: result.current.deviceId, track: initial.current_track, position_ms: 1000,
+    duration_ms: 60000, is_playing: true, volume: 1, updated_at: now, revision: 1,
+  }});
+  act(() => jest.advanceTimersByTime(15_000));
+  await receive(ws, { type: "REMOTE_HEARTBEAT", server_time: now + 15_000 });
+  act(() => jest.advanceTimersByTime(24_999));
+  expect(player.pause).not.toHaveBeenCalled();
+  act(() => jest.advanceTimersByTime(1));
+  expect(player.pause).toHaveBeenCalledTimes(1);
+  expect(ws.readyState).toBe(3);
+  expect(result.current.status).toBe("reconnecting");
+});
+
+test("aborts a target start before confirming rollback and suppresses its late success", async () => {
+  const player = adapter();
+  let finish!: () => void;
+  player.start.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  await act(async () => { await result.current.enable(); });
+  await receive(ws, { type: "INITIALIZE_PLAYER", transferId: "handoff", snapshot });
+  await receive(ws, { type: "START_TRANSFER", transferId: "handoff", snapshot });
+  await receive(ws, { type: "ABORT_TRANSFER", transferId: "handoff" });
+  const signal = player.prepare.mock.calls[0][1];
+  expect(signal.aborted).toBe(true);
+  expect(player.pause).toHaveBeenCalledTimes(1);
+  expect(ws.sent).toContainEqual({ type: "TRANSFER_ROLLED_BACK", transferId: "handoff" });
+  await act(async () => { finish(); });
+  expect(ws.sent.some(frame => frame.type === "STARTED")).toBe(false);
 });
 test("account changes abort pending preparation and prevent a late READY or old commands", async () => {
   const player = adapter();

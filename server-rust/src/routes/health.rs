@@ -10,6 +10,8 @@
 //! telemetry (`HealthStatus`). If a registered subsystem probe (such as SQLite) reports
 //! an unhealthy state, the handler returns `HTTP 503 Service Unavailable` with `ok: false`.
 
+use std::time::Duration;
+
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -20,6 +22,8 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
+
+const DATABASE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Canonical service identifier returned by `GET /api/health`.
 pub const SERVICE_NAME: &str = "musicdeck-server";
@@ -98,50 +102,61 @@ pub fn health_routes() -> Router<AppState> {
 /// `GET /api/health` handler returning `200 OK` when healthy or `503 Service Unavailable`
 /// if the database health check fails.
 pub async fn health_check(State(state): State<AppState>) -> Response {
-    let db_healthy = state.is_database_healthy();
-    let db_mode = if state.config().database.is_persistent() {
+    let config = state.config();
+    let db_probe = match state.db() {
+        Some(db) => match tokio::time::timeout(DATABASE_PROBE_TIMEOUT, db.ping()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some("Database connectivity check failed"),
+            Err(_) => Some("Database connectivity check timed out"),
+        },
+        None => None, // The standalone router used in tests has no pool.
+    };
+    let db_message = db_probe.or_else(|| {
+        (!state.is_database_healthy()).then_some("Database connectivity check failed")
+    });
+    let db_healthy = db_message.is_none();
+    let db_mode = if config.database.is_persistent() {
         String::from("wal")
     } else {
         String::from("memory")
     };
 
-    let (http_status, status, db_message) = if !db_healthy {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ServiceHealthState::Unhealthy,
-            Some(String::from("Database connectivity check failed")),
-        )
-    } else if state.config().setup_required {
-        (
-            StatusCode::OK,
-            ServiceHealthState::Degraded,
-            None,
-        )
+    let (http_status, status) = if !db_healthy {
+        (StatusCode::SERVICE_UNAVAILABLE, ServiceHealthState::Unhealthy)
+    } else if config.setup_required {
+        (StatusCode::OK, ServiceHealthState::Degraded)
     } else {
-        (StatusCode::OK, ServiceHealthState::Healthy, None)
+        (StatusCode::OK, ServiceHealthState::Healthy)
     };
 
-    let log_stats = state.logs().stats_async().await;
+    let log_stats = tokio::time::timeout(Duration::from_millis(100), state.logs().stats_async())
+        .await
+        .ok();
     let payload = HealthStatus {
         ok: db_healthy,
         service: String::from(SERVICE_NAME),
         status,
         uptime_seconds: state.uptime_seconds(),
-        setup_required: state.config().setup_required,
+        setup_required: config.setup_required,
         timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         database: DatabaseHealth {
             connected: db_healthy,
             mode: db_mode,
-            message: db_message,
+            message: db_message.map(str::to_owned),
         },
         memory: MemoryMetrics {
             resident_set_bytes: sample_process_rss_bytes(),
-            log_buffer_bytes: log_stats.bytes,
-            log_buffer_entries: log_stats.size,
+            log_buffer_bytes: log_stats.map_or(0, |stats| stats.bytes),
+            log_buffer_entries: log_stats.map_or(0, |stats| stats.size),
         },
     };
 
-    (http_status, Json(payload)).into_response()
+    (
+        http_status,
+        [(http::header::CACHE_CONTROL, "no-store")],
+        Json(payload),
+    )
+        .into_response()
 }
 
 /// Reads the current process RSS from `/proc/self/statm` on Linux containers,
@@ -161,5 +176,42 @@ pub fn sample_process_rss_bytes() -> u64 {
     #[cfg(not(target_os = "linux"))]
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppConfig, create_router, db};
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn readiness_recovers_when_the_sqlite_pool_has_capacity_again() {
+        let db = db::DbPool::connect_memory().await.unwrap();
+        db::run_migrations(&db, None).await.unwrap();
+        let state = AppState::with_database(AppConfig::default(), db.clone())
+            .await
+            .unwrap();
+        let router = create_router(state);
+        let request = || Request::get("/api/health").body(axum::body::Body::empty()).unwrap();
+
+        let connection = db.inner().acquire().await.unwrap();
+        let response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::CACHE_CONTROL], "no-store");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: HealthStatus = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.status, ServiceHealthState::Unhealthy);
+        assert!(!health.database.connected);
+        assert_eq!(health.database.message.as_deref(), Some("Database connectivity check timed out"));
+
+        drop(connection);
+        let response = router.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: HealthStatus = serde_json::from_slice(&body).unwrap();
+        assert!(health.database.connected);
     }
 }

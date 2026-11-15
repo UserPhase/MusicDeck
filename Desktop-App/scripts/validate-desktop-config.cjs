@@ -22,6 +22,12 @@ function validateDesktopProject() {
   assert.equal(tauriConf.build.frontendDist, "../../webapp/build");
   assert.equal(tauriConf.app.withGlobalTauri, true);
   assert.equal(tauriConf.app.windows[0].decorations, false, "Main window must use decorations: false for seamless titlebar");
+  assert.deepEqual(tauriConf.bundle.targets, ["nsis"]);
+  assert.equal(tauriConf.bundle.windows.nsis.installMode, "currentUser");
+  assert.equal(tauriConf.plugins.updater.windows.installMode, "quiet");
+  assert.equal(tauriConf.plugins.updater.requireSignedVersion, true);
+  assert.equal(new URL(tauriConf.plugins.updater.endpoints[0]).protocol, "https:");
+  assert.equal(tauriConf.version, pkg.version);
 
   const resolvedWebappDir = path.resolve(tauriRoot, tauriConf.build.frontendDist, "..");
   assert.equal(
@@ -37,6 +43,8 @@ function validateDesktopProject() {
   assert.ok(Array.isArray(capability.permissions) && capability.permissions.includes("core:default"));
   assert.ok(capability.permissions.includes("core:tray:default"));
   assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
+  assert.ok(capability.permissions.includes("updater:default"));
+  assert.ok(capability.permissions.includes("process:allow-restart"));
 
   for (const iconRel of tauriConf.bundle.icon) {
     const iconPath = path.join(tauriRoot, iconRel);
@@ -54,7 +62,9 @@ function validateDesktopProject() {
   const cargoToml = fs.readFileSync(cargoTomlPath, "utf8");
   assert.match(cargoToml, /name\s*=\s*"musicdeck-desktop"/);
   assert.match(cargoToml, /name\s*=\s*"musicdeck_desktop_lib"/);
-  assert.match(cargoToml, /sha2\s*=/);
+  assert.equal(cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1], tauriConf.version);
+  assert.match(cargoToml, /tauri-plugin-updater\s*=/);
+  assert.match(cargoToml, /tauri-plugin-process\s*=/);
 
   const updaterRsPath = path.join(tauriRoot, "src", "updater.rs");
   assert.ok(fs.existsSync(updaterRsPath), "src-tauri/src/updater.rs must exist");
@@ -70,8 +80,7 @@ function validateDesktopProject() {
     "desktop_api_fetch",
     "desktop_update_playback",
     "desktop_window_action",
-    "desktop_check_for_updates",
-    "desktop_install_update",
+    "desktop_update_environment",
   ]) {
     assert.ok(libRs.includes(cmd), `src/lib.rs must register command ${cmd}`);
   }
@@ -82,6 +91,7 @@ function validateDesktopProject() {
   assert.match(workflowContent, /runs-on:\s*windows-latest/);
   assert.match(workflowContent, /npx tauri build/);
   assert.match(workflowContent, /latest\.json/);
+  assert.match(workflowContent, /createUpdaterArtifacts\s*=\s*\$true/);
 
   return {
     productName: tauriConf.productName,

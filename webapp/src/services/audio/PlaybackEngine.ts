@@ -11,7 +11,7 @@ import {
 } from "./crossfadeTransition";
 import { GaplessTransition } from "./gaplessTransition";
 import { offlineDownloadEngine } from "../storage/OfflineDownloadEngine";
-import { MediaStallRecovery } from "./mediaStallRecovery";
+import { MEDIA_ERR_SRC_NOT_SUPPORTED, MediaStallRecovery } from "./mediaStallRecovery";
 import {
   AudioGraph,
   BufferVoice,
@@ -851,14 +851,18 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   }
 
   private async startOutput(output: PlaybackOutput): Promise<void> {
+    const key = output.key;
     this.graph?.resume();
     try {
       await output.play();
-      if (this.sleepStoppedKey === output.key && !this.wantsPlayback) output.pause();
+      if (output === this.active && output.key === key && !this.wantsPlayback) output.pause();
     } catch (error) {
-      if (output !== this.active || this.destroyed) return;
+      if (output !== this.active || output.key !== key || this.destroyed ||
+        !this.wantsPlayback || this.recovery.isRecovering() || this.recovery.hasFailed()) return;
       const name = errorName(error);
       if (name === "AbortError") return;
+      if (output instanceof MediaDeck && name !== "NotAllowedError" && this.recoverMediaError(output,
+        output.element.error?.code ?? (name === "NotSupportedError" ? MEDIA_ERR_SRC_NOT_SUPPORTED : undefined))) return;
       this.wantsPlayback = false;
       this.setState("paused");
       this.emit("error", {
@@ -869,9 +873,19 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       });
       return;
     }
-    if (output !== this.active || !this.wantsPlayback || this.recovery.isRecovering()) return;
+    if (output !== this.active || output.key !== key || !this.wantsPlayback || this.recovery.isRecovering()) return;
     if (output instanceof BufferVoice) this.startTicker();
     if (output.isPlaying()) this.setState(this.transition ? "transitioning" : "playing");
+  }
+
+  private recoverMediaError(deck: MediaDeck, code: number | undefined): boolean {
+    const track = this.activeSourceTrack;
+    const retryAtStart = Boolean(track?.key === deck.key && track.offlineTrackId && !track.offlineOnly &&
+      deck.src && !/^(blob:|data:|asset:|file:)/i.test(deck.src));
+    const pending = this.pendingStartAt?.deck === deck ? this.pendingStartAt : null;
+    if (!this.wantsPlayback || !this.recovery.notifyError(code, retryAtStart, pending?.seconds)) return false;
+    if (pending) this.pendingStartAt = null;
+    return true;
   }
 
   private handleProgress(output: PlaybackOutput): void {
@@ -1061,8 +1075,8 @@ export class PlaybackEngine implements QueuePlaybackEngine {
         this.crossfade.onDeckError(deck);
         return;
       }
-      if (!deck.isLoaded() || this.recovery.isRecovering()) return;
-      if (this.recovery.notifyError()) return;
+      if (!deck.isLoaded() || this.recovery.isRecovering() || this.recovery.hasFailed()) return;
+      if (this.recoverMediaError(deck, element.error?.code)) return;
       this.cancelTransition("error");
       this.wantsPlayback = false;
       this.setState("error");
