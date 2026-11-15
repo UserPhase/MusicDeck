@@ -47,13 +47,21 @@ This builds the webapp and puts the per-user NSIS setup executable in `src-tauri
 
 ## Building & Downloading the `.exe` via GitHub (with Auto-Updates)
 
-Configure the updater signing key once before running [the desktop release workflow](../.github/workflows/desktop-app.yml). Generate the key pair outside the repository from `Desktop-App/`.
+[The desktop workflow](../.github/workflows/desktop-app.yml) provides a
+`MusicDeck-Windows-x64-Manual-Installer` artifact on the Actions run when
+updater signing credentials are missing. That installer supports manual
+installation and has automatic updates disabled. GitHub Releases and the update
+feed require both signing credentials.
+
+To enable automatic updates, reuse the existing updater key pair if you
+already have one. For a first signed release, generate a key pair outside the
+repository from `Desktop-App/`.
 
 ```powershell
 npx tauri signer generate -w "$env:USERPROFILE\musicdeck-updater.key"
 ```
-- In GitHub Actions variables, set `TAURI_UPDATER_PUBLIC_KEY` to the contents of `musicdeck-updater.key.pub`.
-- In GitHub Actions secrets, set `TAURI_SIGNING_PRIVATE_KEY` to the contents of `musicdeck-updater.key` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to its password if one was set. Keep the private key backed up securely. Existing installations continue to trust the public key they shipped with.
+- Under **Settings → Secrets and variables → Actions → Variables**, set the repository variable `TAURI_UPDATER_PUBLIC_KEY` to the contents of `musicdeck-updater.key.pub`.
+- Under **Settings → Secrets and variables → Actions → Secrets**, set the repository secret `TAURI_SIGNING_PRIVATE_KEY` to the contents of `musicdeck-updater.key` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to its password if one was set. Keep the private key backed up securely. Existing installations continue to trust the public key they shipped with.
 - Increase the version in `Desktop-App/package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` when publishing an update, and regenerate both lockfiles. Tauri offers versions newer than the installed app.
 
 The workflow publishes the signed NSIS setup executable and `latest.json` to GitHub Releases. On Windows, **Update & Restart** displays download progress in MusicDeck, verifies the package signature, and hands off to the silent installer. NSIS reopens MusicDeck after updating the installation in `%LOCALAPPDATA%`. If MusicDeck was installed with the older machine-wide MSI, remove that installation and run the current per-user NSIS setup once.

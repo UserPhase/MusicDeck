@@ -1,6 +1,6 @@
 name: Build Desktop App (Windows .exe)
 
-# Builds and signs the per-user MusicDeck NSIS installer for unattended updates.
+# Builds the per-user MusicDeck NSIS installer and publishes signed updates when configured.
 
 on:
   push:
@@ -63,7 +63,25 @@ jobs:
         working-directory: Desktop-App/src-tauri
         run: cargo test --locked --lib
 
+      - name: Check updater signing configuration
+        id: updater-signing
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          $missing = @(
+            if ([string]::IsNullOrWhiteSpace($env:TAURI_UPDATER_PUBLIC_KEY)) { 'TAURI_UPDATER_PUBLIC_KEY repository variable' }
+            if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { 'TAURI_SIGNING_PRIVATE_KEY repository secret' }
+          )
+          $enabled = $missing.Count -eq 0
+          "enabled=$($enabled.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if (-not $enabled) {
+            Write-Output "::warning::Missing $($missing -join ' and '). This run will upload an installer for manual installation and skip GitHub Releases."
+          }
+
       - name: Build and sign the per-user NSIS installer
+        if: steps.updater-signing.outputs.enabled == 'true'
         working-directory: Desktop-App
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
@@ -71,9 +89,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: pwsh
         run: |
-          if (-not $env:TAURI_UPDATER_PUBLIC_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY) {
-            throw 'Set the TAURI_UPDATER_PUBLIC_KEY repository variable and the TAURI_SIGNING_PRIVATE_KEY secret before publishing desktop updates.'
-          }
           $config = Join-Path $env:RUNNER_TEMP 'musicdeck-tauri-signing.json'
           @{
             bundle = @{ createUpdaterArtifacts = $true }
@@ -82,7 +97,22 @@ jobs:
           npx tauri build --config $config --bundles nsis -- --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Build the NSIS installer for manual installation
+        if: steps.updater-signing.outputs.enabled == 'false'
+        working-directory: Desktop-App
+        run: npx tauri build --bundles nsis -- --locked
+
+      - name: Upload the Windows installer for manual installation
+        if: steps.updater-signing.outputs.enabled == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicDeck-Windows-x64-Manual-Installer
+          path: Desktop-App/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Prepare signed release assets and update manifest
+        if: steps.updater-signing.outputs.enabled == 'true'
         shell: pwsh
         run: |
           $tauriConf = Get-Content 'Desktop-App/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
@@ -117,6 +147,7 @@ jobs:
           } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $distribution.FullName 'latest.json') -Encoding utf8NoBOM
 
       - name: Upload signed Windows installer and update manifest
+        if: steps.updater-signing.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: MusicDeck-Windows-x64-Installer
@@ -125,7 +156,9 @@ jobs:
           retention-days: 30
 
       - name: Publish signed installer and then update the feed
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/desktop-v')
+        if: >-
+          steps.updater-signing.outputs.enabled == 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/desktop-v'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
