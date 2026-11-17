@@ -41,6 +41,22 @@ impl UpstreamFailure {
             ("DESKTOP_UPSTREAM_RESPONSE", "The desktop proxy lost the connection or received an invalid response from the MusicDeck server.")
         }
     }
+
+    fn log_transport(&self, method: &reqwest::Method, origin: &str, elapsed: Duration, retrying: bool) {
+        // Lower-level error strings can contain URLs with capability tokens.
+        let io_error = match self {
+            Self::Request(error) => std::iter::successors(error.source(), |source| (*source).source())
+                .find_map(|source| source.downcast_ref::<std::io::Error>()),
+            Self::HeaderTimeout => None,
+        };
+        let io_kind = io_error.map(std::io::Error::kind);
+        let os_error = io_error.and_then(std::io::Error::raw_os_error);
+        eprintln!(
+            "MusicDeck desktop upstream: method={method} origin={origin} code={} io={io_kind:?} os_error={os_error:?} retrying={retrying} elapsed_ms={}",
+            self.details().0,
+            elapsed.as_millis()
+        );
+    }
 }
 
 pub(crate) async fn send_upstream(
@@ -56,8 +72,11 @@ pub(crate) async fn send_upstream(
     // Apply one deadline across both attempts, independently of streaming the body.
     let result = tokio::time::timeout(header_timeout, async {
         match request.send().await {
-            Err(error) if error.is_connect() && !error.is_timeout() => {
+            // send() has not returned response headers. A truncated body or a
+            // valid HTTP error response never enters this retry branch.
+            Err(error) if error.is_request() && !error.is_timeout() => {
                 if let Some(retry) = retry {
+                    UpstreamFailure::Request(error).log_transport(method, origin, started.elapsed(), true);
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     retry.send().await
                 } else {
@@ -71,21 +90,7 @@ pub(crate) async fn send_upstream(
     .map_err(|_| UpstreamFailure::HeaderTimeout)
     .and_then(|result| result.map_err(UpstreamFailure::Request));
     if let Err(failure) = &result {
-        // Only log the origin and the OS error kind. Request paths, query strings
-        // and underlying errors can contain session or media capability tokens.
-        let io_kind = match failure {
-            UpstreamFailure::Request(error) => {
-                std::iter::successors(error.source(), |source| (*source).source()).find_map(
-                    |source| source.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
-                )
-            }
-            UpstreamFailure::HeaderTimeout => None,
-        };
-        eprintln!(
-            "MusicDeck desktop upstream: method={method} origin={origin} code={} io={io_kind:?} elapsed_ms={}",
-            failure.details().0,
-            started.elapsed().as_millis()
-        );
+        failure.log_transport(method, origin, started.elapsed(), false);
     }
     result
 }
@@ -530,6 +535,56 @@ mod tests {
             bytes.push(stream.read_u8().await.unwrap());
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retries_a_read_after_early_upstream_eof_but_preserves_single_attempt_for_writes() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", upstream.local_addr().unwrap());
+            let endpoint = format!("{origin}/api/checkpoint");
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap();
+            let backend = tokio::spawn(async move {
+                for (expected, respond) in [("GET ", false), ("GET ", true), ("POST ", false)] {
+                    let (mut stream, _) = upstream.accept().await.unwrap();
+                    assert!(read_head(&mut stream).await.starts_with(expected));
+                    if respond {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                            .await
+                            .unwrap();
+                    }
+                    stream.shutdown().await.unwrap();
+                }
+                assert!(tokio::time::timeout(Duration::from_millis(400), upstream.accept()).await.is_err());
+            });
+            let response = send_upstream(
+                client.get(&endpoint),
+                &reqwest::Method::GET,
+                &origin,
+                Duration::from_secs(2),
+            )
+            .await
+            .ok()
+            .expect("GET recovers on a fresh connection");
+            assert_eq!(response.text().await.unwrap(), "ok");
+
+            let result = send_upstream(
+                client.post(&endpoint),
+                &reqwest::Method::POST,
+                &origin,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(result, Err(UpstreamFailure::Request(error)) if !error.is_timeout()));
+            backend.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

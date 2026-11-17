@@ -21,7 +21,8 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite-journal
-/music/
+/music/*
+!/music/.gitkeep
 /server/music/
 /server-rust/music/
 /extensions/

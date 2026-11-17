@@ -4,7 +4,7 @@
 //! - `traits`: Polymorphic [`MusicBackend`] trait and [`ProviderError`] taxonomy.
 //! - `models`: [`Track`], [`Album`], [`Artist`], [`Playlist`], [`SearchResult`], and [`StreamResult`].
 //! - `navidrome`: [`NavidromeClient`] implementing Subsonic REST API + MD5/salt auth + `UserDataSync`.
-//! - `jellyfin`: [`JellyfinClient`] implementing Jellyfin REST API (`X-Emby-Token`) + tick conversion.
+//! - `jellyfin`: [`JellyfinClient`] implementing Jellyfin REST API and tick conversion.
 //! - `local_sync`: [`LocalUserDataSyncAdapter`] and [`with_local_user_data_sync`].
 //! - `registry`: Thread-safe [`BackendRegistry`] (`ProviderRegistry`) and [`create_provider_registry`].
 
@@ -16,7 +16,7 @@ pub mod registry;
 pub mod traits;
 
 pub use jellyfin::{
-    HEADER_X_EMBY_TOKEN, JELLYFIN_REQUEST_TIMEOUT_MS, JellyfinBackend, JellyfinClient,
+    JELLYFIN_REQUEST_TIMEOUT_MS, JellyfinBackend, JellyfinClient,
     map_jellyfin_album, map_jellyfin_artist, map_jellyfin_track,
 };
 pub use local_sync::{LocalUserDataSyncAdapter, has_user_data_sync, with_local_user_data_sync};

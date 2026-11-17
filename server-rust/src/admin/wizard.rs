@@ -6,7 +6,7 @@
 //! - [`DiagnosticCheck`] and [`DiagnosticReport`]
 //! - [`SystemHealthWizard`]:
 //!   1. `backend-connection`: Verifies Navidrome Subsonic `rest/ping.view` (MD5 + salt) or
-//!      Jellyfin `System/Info` (`X-Emby-Token`) with an 8-second timeout and `1 MiB` response ceiling
+//!      authenticated Jellyfin `System/Info` with an 8-second timeout and `1 MiB` response ceiling
 //!   2. `database-directory`, `music-directory`, `download-directory`, `artwork-directory`,
 //!      `backup-directory`: Performs an atomic write-sync-unlink probe
 //!   3. `spotdl` & `ffmpeg`: Verifies executable availability via [`ProcessRunner`]
@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, BackendType};
 use crate::db::DbPool;
+use crate::providers::jellyfin::jellyfin_authorization;
 use crate::tasks::{DefaultProcessRunner, ProcessOptions, ProcessRunner};
 
 /// Diagnostic check outcome status (`pass | warning | fail`).
@@ -316,7 +317,10 @@ impl SystemHealthWizard {
             .get(endpoint.as_str())
             .header("accept", "application/json");
         if is_jellyfin {
-            req = req.header("X-Emby-Token", &self.config.jellyfin.api_key);
+            req = req.header(
+                reqwest::header::AUTHORIZATION,
+                jellyfin_authorization(&self.config.jellyfin.api_key),
+            );
         }
 
         let Ok(resp) = req.send().await else {

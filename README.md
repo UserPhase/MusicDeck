@@ -12,7 +12,7 @@ your library from multiple backends.
 ```text
 Browser
   -> MusicDeck Web (React, nginx in production)
-  -> MusicDeck API (Fastify + SQLite)
+  -> MusicDeck API (Rust/Axum + SQLite)
   -> Provider layer
      ├── Navidrome
      └── Jellyfin
@@ -25,15 +25,16 @@ and resolves playback to an available provider source automatically.
 ## Repository structure
 
 - `webapp/` — React web client
-- `server/` — MusicDeck API server (Fastify, TypeScript, SQLite)
+- `server-rust/` — MusicDeck API server (Rust, Axum, SQLite)
 - `docker-compose.yml` — self-hosted production stack
 - `.env.example` — environment template for the Docker stack
-- `server/.env.example` — environment template for local server development
 - `docs/` — architecture, product, and self-hosting documentation
 
 ## Quick start (Docker Compose)
 
-Follow these steps to deploy MusicDeck using Docker Compose.
+Install Docker Engine with the Compose plugin on the server first. If your
+Docker setup needs administrator privileges, prefix the `docker` commands with
+`sudo`. [Install Docker Engine on Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
 
 ### Step 1: Create Project Directory
 
@@ -46,8 +47,9 @@ mkdir musicdeck && cd musicdeck
 Fetch the pre-configured docker-compose.yml and .env template:
 
 ```bash
-curl -O https://raw.githubusercontent.com/UserPhase/MusicDeck/main/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/UserPhase/MusicDeck/main/.env.example
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/UserPhase/MusicDeck/main/docker-compose.yml
+curl -fsSL -o .env https://raw.githubusercontent.com/UserPhase/MusicDeck/main/.env.example
+mkdir -p ./music
 ```
 
 ### Step 3: Configure Base Environment
@@ -58,20 +60,25 @@ Open .env to configure your initial deployment:
 nano .env
 ```
 
-Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin. 
+Set `MUSIC_BACKEND` to `navidrome` or `jellyfin` and leave the template's
+`COMPOSE_PROFILES` setting in place so Compose starts the selected backend.
 
 - Set host path & IP:
 
-  - MUSIC_ROOT: Absolute path to your music folder (e.g., /media/music).
+  - `MUSIC_ROOT` defaults to `./music` beside `docker-compose.yml`. Add your
+    music files there or set an absolute path for an existing library.
+    Set `PUID` and `PGID` to the UID and GID of the account that owns the
+    music folder. For the default folder created in step 2, use `id -u`
+    and `id -g`.
 
     - MUSICDECK_PUBLIC_URL: Your server's LAN IP (e.g., http://192.168.1.50:8080).
       - Tip (Find your Server IP): Run  `ip -4  addr` in your server terminal. Look for your primary network interface (e.g., enp3s0 or eth0) and use the IP address listed after inet.
 
-  - For restricted LAN access, set `MUSICDECK_WEB_BIND`, `NAVIDROME_BIND`, and
-    `JELLYFIN_BIND` to that host LAN IP. `127.0.0.1` permits host-local access
-    only; `0.0.0.0` (the onboarding template) binds all IPv4 interfaces, not just
-    your LAN. Firewall published ports to trusted networks and never
-    port-forward these setup/admin interfaces to the internet. See
+  - Set `MUSICDECK_WEB_BIND` to the host's LAN IP to bind the MusicDeck web
+    port to that interface. The onboarding template uses `0.0.0.0`, which
+    listens on all IPv4 interfaces. Restrict access to your trusted network.
+    Navidrome and Jellyfin administration ports bind to `127.0.0.1` in
+    production Compose. See
     [network restrictions](./docs/SELF_HOSTING.md#backend-bindings-and-network-restrictions).
 
   - The template enables HTTP on a trusted LAN with
@@ -86,88 +93,56 @@ Select your backend: Set MUSIC_BACKEND=navidrome OR MUSIC_BACKEND=jellyfin.
 
   - MUSICDECK_ADMIN_PASSWORD: Set your MusicDeck admin password.
 
-### Step 4: First-Run Setup (Choose Your Backend)
-Option A: Navidrome Setup
+### Step 4: Set Up Your Music Backend
 
-- Set NAVIDROME_PASSWORD in .env.
+#### Option A: Navidrome
 
-  - Start the stack:
-
-```bash
-    docker compose pull && docker compose up -d
-```
-
-  - From another device on your LAN, open http://[YOUR_SERVER_IP]:4533 and create the account matching NAVIDROME_USERNAME and NAVIDROME_PASSWORD. No SSH or Compose edits are required; the host binding and port can be configured in `.env`.
-
-Option B: Jellyfin Setup
-
-  - Start Jellyfin first so you can configure it:
+Set `NAVIDROME_USERNAME` and `NAVIDROME_PASSWORD` in `.env`, then start the
+Navidrome container.
 
 ```bash
-    docker compose pull && docker compose up -d jellyfin
+docker compose up -d navidrome
 ```
-    
-  - From another device on your LAN, open http://[YOUR_SERVER_IP]:8096, complete the setup wizard, and log in. Keep the binding reachable by that LAN device until the API key is created; ongoing direct access remains available.
 
-  - Go to Dashboard -> API Keys, create a new API key (e.g., named "MusicDeck"), and copy the key string.
-
-  - Open .env and set JELLYFIN_API_KEY=[YOUR_COPIED_API_KEY]:
+On your PC, open an SSH tunnel using your server login. Leave it running while
+you open `http://127.0.0.1:4533` on the PC and create the Navidrome account
+matching the credentials in `.env`.
 
 ```bash
-    nano .env
+ssh -N -L 127.0.0.1:4533:127.0.0.1:4533 user@SERVER_IP
 ```
 
-  - Start the full MusicDeck stack:
+#### Option B: Jellyfin
 
 ```bash
-    docker compose up -d
+docker compose up -d jellyfin
 ```
 
-Step 5: Access MusicDeck
+On your PC, open an SSH tunnel and visit `http://127.0.0.1:8096` in your
+browser. Complete the setup wizard and add a Music library using `/music`.
+In **Dashboard → API Keys**, create a key and set `JELLYFIN_API_KEY` in `.env`.
 
-Open http://[YOUR_SERVER_IP]:8080 in your browser and log in using your MUSICDECK_ADMIN_USERNAME and MUSICDECK_ADMIN_PASSWORD.
+```bash
+ssh -N -L 127.0.0.1:8096:127.0.0.1:8096 user@SERVER_IP
+```
 
+### Step 5: Start MusicDeck
 
+```bash
+docker compose pull
+docker compose up -d --wait
+```
+
+Open `MUSICDECK_PUBLIC_URL` in your browser and sign in with
+`MUSICDECK_ADMIN_USERNAME` and `MUSICDECK_ADMIN_PASSWORD`. To verify the
+provider connection, open **Library** and play a track from the folder you
+mounted at `/music`.
 
 ## Local development (for tweaking it yourself)
 
-Run the server and the web client separately. The React dev server proxies
-`/api/*` to the server on `http://localhost:4534` (see `webapp/package.json`).
-
-### 1. Configure and start the server
-
-From the workspace root:
-
-```powershell
-cd server
-Copy-Item .env.example .env
-notepad .env
-```
-
-Set at least:
-
-```text
-MUSICDECK_SESSION_SECRET=replace-with-a-local-random-string
-MUSICDECK_DB_PATH=./data/musicdeck.sqlite
-MUSICDECK_ADMIN_USERNAME=admin
-MUSICDECK_ADMIN_PASSWORD=choose-a-development-password
-NAVIDROME_URL=http://your-navidrome-host:4533
-NAVIDROME_USERNAME=your-navidrome-service-user
-NAVIDROME_PASSWORD=your-navidrome-service-password
-```
-
-Install dependencies and start the dev server (this also initializes the
-SQLite database and applies migrations on startup):
-
-```powershell
-npm install
-npm start
-```
-
-The server listens on `http://localhost:4534`.
-
-The client opens on `http://localhost:3000` and proxies API calls to the
-server.
+Build the Rust server and React client from a source checkout. The React dev
+server listens on `http://localhost:3000` and forwards API requests to the
+Rust server on port 4534. [Development setup](./docs/SELF_HOSTING.md#development-workflow)
 
 ## First admin setup
 
@@ -195,8 +170,8 @@ NAVIDROME_PASSWORD=service-password
 
 ### Jellyfin
 
-Configured with a URL and an API key (sent via the `X-Emby-Token` header, never
-in URLs):
+Configured with a URL and an API key. MusicDeck sends the key in its
+authorization header.
 
 ```text
 JELLYFIN_URL=http://your-jellyfin-host:8096

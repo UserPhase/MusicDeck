@@ -96,7 +96,7 @@ services:
       - musicdeck-cache:/app/cache
       # Read-write: downloaded tracks land exactly where Navidrome/Jellyfin
       # scan from.
-      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music
+      - ${MUSIC_ROOT:-./music}:/music
     # No depends_on for the backends: only the backend selected by
     # MUSIC_BACKEND is started (via Compose profiles), and depending on a
     # non-activated profile service would drag the unused backend back in.
@@ -125,7 +125,7 @@ services:
       ND_SESSIONTIMEOUT: 24h
     volumes:
       - ${NAVIDROME_DATA:-./navidrome-data}:/data
-      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
+      - ${MUSIC_ROOT:-./music}:/music:ro
     # Preserve direct setup/admin access; prefer a host LAN IP or loopback.
     # 0.0.0.0 is not LAN-only: firewall access to trusted networks.
     ports:
@@ -145,7 +145,7 @@ services:
     volumes:
       - ${JELLYFIN_CONFIG:-./jellyfin-config}:/config
       - ${JELLYFIN_CACHE:-./jellyfin-cache}:/cache
-      - ${MUSIC_ROOT:?Set MUSIC_ROOT in .env to your music library folder}:/music:ro
+      - ${MUSIC_ROOT:-./music}:/music:ro
     # Direct setup/admin access remains configurable after setup.
     # Restrict any non-loopback binding with a Docker-aware firewall.
     ports:

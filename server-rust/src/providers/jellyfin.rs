@@ -4,9 +4,8 @@
 //! and `server/src/backends/jellyfin/jellyfin-mapper.ts`.
 //!
 //! ## Authentication & Protocol Invariants
-//! - **Header-Only API Key (`X-Emby-Token`)**: Jellyfin authentication is transmitted
-//!   exclusively via the `X-Emby-Token` HTTP request header. The API key is never
-//!   placed in query parameters, URLs, or error messages.
+//! - **Header-Only API Key**: Jellyfin requests use the `MediaBrowser` authorization
+//!   scheme. The API key stays out of URLs and error messages.
 //! - **Tick Conversion**: Jellyfin `RunTimeTicks` ($100\text{ ns}$ units) are converted
 //!   to seconds via `(ticks as f64 / 10_000_000.0).round() as u32`.
 //! - **Catalog + Stream Only**: Jellyfin implements catalog browsing and direct/transcoded
@@ -17,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use http::header::RANGE;
+use http::header::{AUTHORIZATION, RANGE};
 use serde_json::Value;
 use url::Url;
 
@@ -32,8 +31,14 @@ use crate::providers::traits::{MusicBackend, ProviderError};
 /// Control-plane HTTP timeout (`15,000` ms) matching `JELLYFIN_REQUEST_TIMEOUT_MS`.
 pub const JELLYFIN_REQUEST_TIMEOUT_MS: u64 = 15_000;
 
-/// Canonical Jellyfin token header name.
-pub const HEADER_X_EMBY_TOKEN: &str = "X-Emby-Token";
+/// Builds the authorization value accepted by Jellyfin 12 and earlier versions.
+pub(crate) fn jellyfin_authorization(api_key: &str) -> String {
+    let token = urlencoding::encode(api_key.trim());
+    let version = urlencoding::encode(env!("CARGO_PKG_VERSION"));
+    format!(
+        "MediaBrowser Client=\"MusicDeck\", Device=\"MusicDeck%20Server\", DeviceId=\"musicdeck-server\", Version=\"{version}\", Token=\"{token}\""
+    )
+}
 
 /// Asynchronous Jellyfin media backend client backed by a pooled `reqwest::Client`.
 #[derive(Debug, Clone)]
@@ -99,7 +104,7 @@ impl JellyfinClient {
         let response = self
             .http
             .get(url)
-            .header(HEADER_X_EMBY_TOKEN, &self.api_key)
+            .header(AUTHORIZATION, jellyfin_authorization(&self.api_key))
             .timeout(Duration::from_millis(JELLYFIN_REQUEST_TIMEOUT_MS))
             .send()
             .await
@@ -619,7 +624,7 @@ impl MusicBackend for JellyfinClient {
         let response = self
             .http
             .post(url)
-            .header(HEADER_X_EMBY_TOKEN, &self.api_key)
+            .header(AUTHORIZATION, jellyfin_authorization(&self.api_key))
             .timeout(Duration::from_millis(JELLYFIN_REQUEST_TIMEOUT_MS))
             .send()
             .await
@@ -665,7 +670,10 @@ impl MusicBackend for JellyfinClient {
         }
 
         let url = self.build_url(&path, &params)?;
-        let mut req = self.http.get(url).header(HEADER_X_EMBY_TOKEN, &self.api_key);
+        let mut req = self
+            .http
+            .get(url)
+            .header(AUTHORIZATION, jellyfin_authorization(&self.api_key));
         if let Some(range_val) = range {
             req = req.header(RANGE, range_val);
         }
@@ -703,7 +711,7 @@ impl MusicBackend for JellyfinClient {
         let response = self
             .http
             .get(url)
-            .header(HEADER_X_EMBY_TOKEN, &self.api_key)
+            .header(AUTHORIZATION, jellyfin_authorization(&self.api_key))
             .send()
             .await
             .map_err(|err| ProviderError::Upstream {

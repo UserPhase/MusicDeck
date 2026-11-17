@@ -575,6 +575,8 @@ pub fn run() {
             let connection = Arc::new(Mutex::new(DesktopConnection::new(initial_config)));
             let http_client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(6))
+                // Expire idle connections before the bundled web gateway's 60s limit.
+                .pool_idle_timeout(Duration::from_secs(20))
                 .redirect(upstream_redirect_policy())
                 .build()?;
             let proxy_url = start_local_api_proxy(

@@ -206,6 +206,7 @@ Create the install folder and fetch the two files:
 mkdir -p /opt/musicdeck && cd /opt/musicdeck
 curl -O https://raw.githubusercontent.com/UserPhase/MusicDeck/main/docker-compose.yml
 curl -o .env https://raw.githubusercontent.com/UserPhase/MusicDeck/main/.env.example
+mkdir -p ./music
 ```
 
 Set these values before starting (see `.env.example` for the full list and
@@ -219,7 +220,6 @@ MUSICDECK_ADMIN_USERNAME=admin
 MUSICDECK_ADMIN_PASSWORD=change-this-admin-password
 PUID=1000
 PGID=1000
-MUSIC_ROOT=/media/music
 
 # Required only when MUSIC_BACKEND=navidrome
 NAVIDROME_USERNAME=admin
@@ -238,7 +238,7 @@ For HTTPS through a same-host TLS proxy, use an HTTPS public URL,
 `MUSICDECK_WEB_BIND=127.0.0.1`, and `MUSICDECK_SECURE_COOKIES=true`.
 `docker compose up` intentionally
 fails fast with a clear error if `MUSICDECK_PUBLIC_URL`,
-`MUSICDECK_SESSION_SECRET`, `MUSICDECK_ADMIN_PASSWORD`, or `MUSIC_ROOT` are
+`MUSICDECK_SESSION_SECRET`, or `MUSICDECK_ADMIN_PASSWORD` are
 missing — there is no silent `localhost` fallback in production.
 `MUSICDECK_CORS_ORIGIN` defaults to `MUSICDECK_PUBLIC_URL` if not set
 separately. The server additionally validates, at startup, that the selected
@@ -247,17 +247,15 @@ backend's own credentials are present.
 Leave `COMPOSE_PROFILES=${MUSIC_BACKEND}` in `.env` exactly as shipped — it is
 what makes Compose start only the backend you selected.
 
-`MUSIC_ROOT` must be an absolute path that already exists on the Docker host
-and is writable by `PUID:PGID`. On most Linux hosts, set these to the account
-that owns the library (`id -u` and `id -g`). If needed, fix an existing
-library's ownership before startup:
-
-```bash
-sudo chown -R "$(id -u):$(id -g)" /media/music
-```
+`MUSIC_ROOT` defaults to `./music`, the folder beside `docker-compose.yml`.
+The setup command above creates it under your account before Docker mounts
+it as `/music` in the containers. Drop audio files into that folder, or set
+`MUSIC_ROOT` to an absolute path on the Docker host for an existing library.
+The folder must be writable by the MusicDeck Server identity. On most Linux
+hosts, set `PUID` and `PGID` to the library owner's IDs (`id -u` and `id -g`).
 
 MusicDeck uses root only for container initialization, then immediately drops
-to `PUID:PGID` before starting Node. It never runs the application or
+to `PUID:PGID` before starting the server. It never runs the application or
 downloader as root. Startup fails with an ownership/mode diagnostic when the
 configured identity cannot write to the music root, rather than allowing a
 later download to fail with `EACCES`.
@@ -276,43 +274,37 @@ absolute host paths.
 `MUSICDECK_ADMIN_PASSWORD` is used only when the MusicDeck database has no
 users. It is not used to reset an existing admin account.
 
-Start the stack:
+If you selected Navidrome in `.env`, start its container.
+
+```bash
+docker compose up -d navidrome
+```
+
+Open [Navidrome setup](http://127.0.0.1:4533) on the Docker host and create a
+user matching `NAVIDROME_USERNAME` and `NAVIDROME_PASSWORD`.
+
+If you selected Jellyfin in `.env`, start its container.
+
+```bash
+docker compose up -d jellyfin
+```
+
+Open [Jellyfin setup](http://127.0.0.1:8096) on the Docker host. Complete the
+wizard, add a Music library from `/music`, and create an API key under
+**Dashboard → API Keys**. Set `JELLYFIN_API_KEY` in `.env`.
+
+If you use a different computer for setup, open the relevant SSH tunnel
+described in [Backend bindings and network restrictions](#backend-bindings-and-network-restrictions).
+
+Once the selected backend is configured, start MusicDeck.
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --wait
 ```
 
-Open MusicDeck from your other LAN device using `MUSICDECK_PUBLIC_URL`:
-
-```text
-http://SERVER_IP:8080
-```
-
-If you selected `MUSIC_BACKEND=navidrome`, open Navidrome on the Docker host
-for initial setup and service-account creation:
-
-```text
-http://127.0.0.1:4533
-```
-
-After Navidrome has a user matching `NAVIDROME_USERNAME` and
-`NAVIDROME_PASSWORD`, MusicDeck Server can use it as the backend service
-account.
-
-If you selected `MUSIC_BACKEND=jellyfin`, open Jellyfin on the Docker host
-to complete its first-run wizard:
-
-```text
-http://127.0.0.1:8096
-```
-
-Create an API key under **Dashboard → API Keys**, set `JELLYFIN_API_KEY` in
-`.env`, then `docker compose up -d` again.
-
-For Jellyfin, start just that backend first with
-`docker compose up -d jellyfin`, complete the wizard, then set the API key
-before starting the full stack.
+Open `MUSICDECK_PUBLIC_URL` in your browser and sign in with the MusicDeck
+admin account.
 
 ## Backend bindings and network restrictions
 
@@ -460,7 +452,7 @@ Docker named volumes:
 
 Docker host bind mounts (all configurable via `.env`):
 
-- `MUSIC_ROOT`: your music library folder (required)
+- `MUSIC_ROOT`: your music library folder (defaults to `./music`)
 - `NAVIDROME_DATA`: Navidrome database/config/cache (optional, defaults to
   `./navidrome-data`)
 - `JELLYFIN_CONFIG`: Jellyfin configuration (optional, defaults to
@@ -527,7 +519,7 @@ MusicDeck:
 Image selection:
 
 - `MUSICDECK_VERSION` — image tag to run; defaults to the published commit tag
-  `sha-752688b` in the provided compose file. Use a tag published for both the web
+  `sha-bdfdbc6` in the provided compose file. Use a tag published for both the web
   and server images; the package version does not imply a published image release.
   Keep this pinned to an explicit release or commit tag for controlled rollback.
 - `MUSICDECK_IMAGE_SERVER`, `MUSICDECK_IMAGE_WEB` — override only if you
@@ -562,7 +554,7 @@ Jellyfin backend connection (required when `MUSIC_BACKEND=jellyfin`):
 
 Music library:
 
-- `MUSIC_ROOT` — required host path, mounted read-write into MusicDeck
+- `MUSIC_ROOT` — host path (defaults to `./music`), mounted read-write into MusicDeck
   Server and read-only into Navidrome/Jellyfin
 
 Secret file support exists for:
@@ -855,21 +847,34 @@ docker compose logs "$MUSIC_BACKEND"
      and scheme, then compare the same URL in the browser. For HTTPS, use
      `curl -v` to check certificate and hostname validation.
    - `WEB_UPSTREAM_BAD_GATEWAY` identifies the web container's Nginx boundary.
-     Match the response's `requestId` to the access log. A slow `connect`
-     points to reaching the upstream, while a fast `connect` followed by a
-     slow `header` points to time spent waiting for the upstream application.
-     The Nginx error log distinguishes DNS, refusal, and premature closure.
+     Match the response's `requestId` to the access log. Use that line's
+     `conn` value and timestamp to find the corresponding `*<connection>`
+     line in the Nginx error log. It distinguishes DNS errors, connection
+     refusals, resets, and premature closure. Comma-separated upstream status
+     and timing fields show each attempt. A slow `connect` points to reaching
+     the upstream, while a fast `connect` followed by a slow `header` points
+     to time spent waiting for the upstream application.
    - `DESKTOP_UPSTREAM_TIMEOUT` or `WEB_UPSTREAM_TIMEOUT` identifies the layer
      that timed out. Compare direct health and route timings during the failure
      before changing proxy timeouts. A backend response such as `BACKEND_ERROR`
      keeps its original status and error code through both proxies.
 
+4. If backend uptime resets repeatedly, compare Docker exit and restart events
+   with the host's storage and filesystem logs. On a Linux host with systemd,
+   run `journalctl -k --since '30 minutes ago'` and look for I/O errors,
+   filesystem remounts, and disk or controller resets at the same time. Check
+   the device health for the volumes that hold Docker and MusicDeck's SQLite
+   data. A successful later health probe only shows that SQLite answered at
+   that moment.
+
 Compose restarts exited containers and gates web startup on backend readiness.
-Docker's unhealthy status stays diagnostic for a running container. A later
-probe succeeds automatically when SQLite can serve requests again, and Nginx
-re-resolves the backend after a container replacement. The desktop bridge
-retries a safe read once on a connection error. Playback checkpoints retain
-their separate bounded retry logic.
+Nginx keeps the Docker service address refreshed and opens a fresh connection
+for each attempt to Axum. It allows one extra attempt for upstream transport
+and response-header failures. Nginx treats POST and PATCH as non-idempotent
+and stops retrying them once sent. The desktop HTTP client expires idle
+connections after 20 seconds, ahead of the web gateway's 60-second limit,
+and retries GET and HEAD once on an early transport error. Playback
+checkpoints retain their separate bounded retry logic.
 
 Library scans:
 
@@ -895,7 +900,7 @@ Common startup issues:
   backend service credentials (only needed when `MUSIC_BACKEND=navidrome`).
 - `JELLYFIN_API_KEY is required when MUSIC_BACKEND=jellyfin`: create an API key
   in Jellyfin's dashboard and set it in `.env`.
-- `Set MUSIC_ROOT in .env` (Compose variable error): `MUSIC_ROOT` has no default and must point at a real, existing absolute folder. `NAVIDROME_DATA`/`JELLYFIN_CONFIG`/`JELLYFIN_CACHE` are optional and default to folders created next to `docker-compose.yml` if omitted.
+- `MusicDeck cannot write to /music`: Create the default folder with `mkdir -p ./music` as your normal user before starting Compose. If it already exists, check its ownership or the permissions of your custom `MUSIC_ROOT` against `PUID` and `PGID`.
 - Cannot find music: check the `MUSIC_ROOT` host path in `.env` and host file/folder permissions.
 - Downloads via On-Demand Library/spotDL complete successfully but tracks never appear in the library or play: MusicDeck Server and the backend are not sharing the same music folder. In Docker Compose both containers already mount `$MUSIC_ROOT`; for local/manual development, set `MUSICDECK_MUSIC_ROOT` to a path the backend's music folder also resolves to.
 - `spotdl: not found`, missing Deno, or FFmpeg errors during acquisition:

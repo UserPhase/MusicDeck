@@ -456,6 +456,17 @@ impl CatalogService {
         types: &[&str],
         pagination: Option<SearchPagination>,
     ) -> Result<CatalogSearchResult, ProviderError> {
+        // Catalog callers also use the singular API result kinds.
+        let provider_types: Vec<_> = types
+            .iter()
+            .copied()
+            .map(|kind| match kind {
+                "artist" => "artists",
+                "album" => "albums",
+                "track" | "song" => "tracks",
+                other => other,
+            })
+            .collect();
         let providers = self.registry.list();
         let mut artists = Vec::new();
         let mut albums = Vec::new();
@@ -467,7 +478,11 @@ impl CatalogService {
             if !entry.enabled {
                 continue;
             }
-            match entry.provider.search(query, types, pagination).await {
+            match entry
+                .provider
+                .search(query, &provider_types, pagination)
+                .await
+            {
                 Ok(res) => {
                     successes += 1;
                     for artist in res.artists {

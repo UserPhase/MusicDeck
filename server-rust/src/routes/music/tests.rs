@@ -1,9 +1,9 @@
 use super::*;
 use crate::auth::SESSION_COOKIE;
 use crate::catalog::{LibraryItemType, SourceRef};
-use crate::config::{AppConfig, NavidromeConfig};
+use crate::config::{AppConfig, JellyfinConfig, NavidromeConfig};
 use crate::db::run_migrations;
-use crate::providers::{NavidromeClient, RegisteredProvider};
+use crate::providers::{JellyfinClient, MusicBackend, NavidromeClient, RegisteredProvider};
 use crate::routes::playlists::playlist_routes;
 use axum::body::Body;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -99,6 +99,78 @@ async fn json_response(response: Response) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).expect("JSON response"),
     )
+}
+
+#[tokio::test]
+async fn library_search_returns_tracks_from_navidrome_and_jellyfin() {
+    let (db, state, session) = playback_state(true).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route(
+            "/rest/search3.view",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                assert_eq!(params["query"], "Fixture Track");
+                assert_eq!(params["artistCount"], "20");
+                assert_eq!(params["albumCount"], "20");
+                assert_ne!(params["songCount"], "0");
+                Json(json!({
+                    "subsonic-response": { "status": "ok", "searchResult3": {
+                        "song": [{ "id": "navidrome-track", "title": "Fixture Track" }]
+                    }}
+                }))
+            }),
+        )
+        .route(
+            "/Items",
+            get(|headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
+                let authorization = headers[http::header::AUTHORIZATION].to_str().unwrap();
+                assert!(authorization.starts_with("MediaBrowser Client=\"MusicDeck\""));
+                assert!(authorization.ends_with("Token=\"fixture\""));
+                assert_eq!(params["searchTerm"], "Fixture Track");
+                assert_eq!(params["IncludeItemTypes"], "MusicArtist,MusicAlbum,Audio");
+                Json(json!({ "Items": [{
+                    "Id": "jellyfin-track", "Name": "Fixture Track", "Type": "Audio"
+                }] }))
+            }),
+        );
+    let upstream = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let providers: [(&str, Arc<dyn MusicBackend>); 2] = [
+        ("navidrome", Arc::new(NavidromeClient::new(NavidromeConfig {
+            url: url.clone(),
+            username: "fixture".into(),
+            password: "fixture".into(),
+        }).unwrap())),
+        ("jellyfin", Arc::new(JellyfinClient::new(JellyfinConfig {
+            url,
+            api_key: "fixture".into(),
+        }).unwrap())),
+    ];
+    for (kind, provider) in providers {
+        sqlx::query(
+            "INSERT INTO backend_connections (id, type, name, config_json, enabled, created_at, updated_at)
+             VALUES (?, ?, 'Fixture', '{}', 1, '2026-01-01', '2026-01-01')",
+        )
+        .bind(kind)
+        .bind(kind)
+        .execute(db.inner())
+        .await
+        .unwrap();
+        state.providers().replace_all(vec![RegisteredProvider {
+            connection_id: kind.into(),
+            provider_type: kind.into(),
+            name: "Fixture".into(),
+            enabled: true,
+            provider,
+        }]);
+
+        let path = "/api/search?q=Fixture%20Track&types=track&mode=library&phase=local";
+        let (status, body) = json_response(request(&state, &session, "GET", path, None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["degraded"], false, "{kind}: {body}");
+        assert_eq!(body["tracks"][0]["title"], "Fixture Track", "{kind}: {body}");
+    }
+    upstream.abort();
 }
 
 fn fixture_cover(color: u8) -> Vec<u8> {
