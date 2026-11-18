@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
-import { discoveryInput, useSavedDiscoveries } from "../hooks/useSavedDiscoveries";
-import type { ExternalItemKind, ExternalMetadataItem } from "../services/externalActions";
+import { discoveryInput, useSavedDiscoveries, type SavedDiscoveryKind } from "../hooks/useSavedDiscoveries";
+import type { ExternalMetadataItem } from "../services/externalActions";
 
 export default function SaveDiscoveryButton({ kind, item, compact = false }: {
-  kind: ExternalItemKind; item: ExternalMetadataItem; compact?: boolean;
+  kind: SavedDiscoveryKind; item: ExternalMetadataItem; compact?: boolean;
 }) {
   const saved = useSavedDiscoveries();
   const [busy, setBusy] = useState(false);

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { getSavedDiscoveries, removeSavedDiscovery, saveDiscovery } from "../api/musicdeck";
 import { useAuth } from "../context/AuthContext";
-import type { ExternalItemKind, ExternalMetadataItem } from "../services/externalActions";
+import type { ExternalMetadataItem } from "../services/externalActions";
+
+export type SavedDiscoveryKind = "track" | "album";
 
 export interface SavedDiscovery {
   id: string;
   provider: "deezer" | "itunes";
   external_id: string;
-  type: ExternalItemKind;
+  type: SavedDiscoveryKind;
   title: string;
   artist: string;
   cover_url: string | null;
@@ -27,7 +29,7 @@ type Dependencies = {
 };
 
 /** Provider IDs are normalized once for bookmark identity and reconstructed for imports. */
-export function discoveryInput(kind: ExternalItemKind, item: ExternalMetadataItem): SaveInput | null {
+export function discoveryInput(kind: SavedDiscoveryKind, item: ExternalMetadataItem): SaveInput | null {
   const prefixed = /^external_(deezer|itunes)_(track|album)_(.+)$/.exec(item.id);
   const provider = prefixed?.[1] || item.provider;
   if (provider !== "deezer" && provider !== "itunes") return null;
