@@ -31,12 +31,12 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
   const controller = useRef<AbortController | null>(null);
   const generation = useRef(0);
   const saving = useRef<symbol | null>(null);
-  const refresh = useCallback(() => {
+  const refreshPolicy = useCallback((retryUnavailable: boolean) => {
     if (!userId || controller.current || saving.current) return;
     const active = new AbortController();
     const version = generation.current;
     controller.current = active;
-    void getPrivacySettings(active.signal).then((policy) => {
+    void getPrivacySettings(active.signal, retryUnavailable).then((policy) => {
       if (active.signal.aborted || owner.current !== userId || version !== generation.current) return;
       setBrowserPrivacy(policy);
       setState((old) => JSON.stringify(old.policy) === JSON.stringify(policy) && !old.error && old.owner === userId
@@ -49,11 +49,12 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
         error: failure instanceof Error ? failure.message : "Could not synchronize privacy policy." }));
     }).finally(() => { if (controller.current === active) controller.current = null; });
   }, [userId]);
+  const refresh = useCallback(() => refreshPolicy(false), [refreshPolicy]);
   useEffect(() => {
     setBrowserPrivacy(null);
     setBusy(false);
     if (!userId) return;
-    refresh();
+    refreshPolicy(true);
     // Keep checking policy for external integrations that can still run in the background.
     const stopPolling = startVisualPolling(refresh, 15_000, {
       immediate: false, refreshOnWindowFocus: true, backgroundIntervalMs: 60_000,
@@ -64,7 +65,7 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
       saving.current = null;
       stopPolling(); window.removeEventListener("online", refresh); setBrowserPrivacy(null);
     };
-  }, [refresh, userId]);
+  }, [refresh, refreshPolicy, userId]);
   const save = async (settings: PrivacySettings) => {
     if (saving.current || !userId) throw new Error("Privacy settings are busy or authentication is unavailable");
     const operation = Symbol("privacy-save");
@@ -110,9 +111,10 @@ export function PrivacyProvider({ children }: { children: ReactNode }) {
   }, [cacheOwner, cacheArtwork, cacheMetadata]);
   return <PrivacyContext.Provider value={value}>
     {userId && !policy ? <div className="page-state" role={value.error ? "alert" : "status"}>
-      {value.error ? <>Privacy policy unavailable. External features remain blocked. <button type="button" onClick={refresh}>Retry</button></> : "Loading server privacy policy..."}
+      {value.error ? <>Privacy policy unavailable. External features remain blocked. {value.error} <button type="button" onClick={refresh}>Retry</button></> : "Loading server privacy policy..."}
     </div> : <>{userId && value.error && <div className="privacy-sync-warning" role="alert">
       Privacy policy synchronization failed. Local playback remains available; external features are blocked until synchronization succeeds.
+      {" "}{value.error}
       <button type="button" onClick={refresh}>Retry privacy sync</button>
     </div>}{children}</>}
   </PrivacyContext.Provider>;

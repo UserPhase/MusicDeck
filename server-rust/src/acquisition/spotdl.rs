@@ -500,6 +500,10 @@ impl SpotDLDownloaderAdapter {
         s
     }
 
+    pub(super) fn tagger(&self) -> crate::audio::AudioTaggerService {
+        crate::audio::AudioTaggerService::with_runner(Arc::clone(&self.runner))
+    }
+
     /// Overrides the executable; otherwise `SPOTDL_PATH` or `spotdl` on PATH is used.
     #[must_use]
     pub fn with_spotdl_path(mut self, path: impl Into<String>) -> Self {

@@ -1179,12 +1179,17 @@ async fn stream_track_handler(
         .get(RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let if_range = headers.get(axum::http::header::IF_RANGE).and_then(|value| value.to_str().ok());
 
-    if let Some(playable_source) = params
+    let playable_source = params
         .get("playableSource")
         .map(String::as_str)
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+    // Older web and desktop clients send a selected connection as playableSource.
+    let library_connection = playable_source.filter(|id| {
+        state.providers().get_by_connection_id(id).is_some_and(|provider| provider.enabled)
+    });
+    if let Some(playable_source) = playable_source.filter(|_| library_connection.is_none()) {
         if state
             .source_providers()
             .is_external_source(&track_id, playable_source)
@@ -1205,6 +1210,7 @@ async fn stream_track_handler(
             &track_id,
             playable_source,
             range_header.as_deref(),
+            if_range,
         );
         let fetched = if external {
             match state
@@ -1219,7 +1225,10 @@ async fn stream_track_handler(
             fetch.await
         };
         return match fetched {
-            Ok(stream_result) => {
+            Ok(crate::registry::source_providers::ResolvedPlayableStream::Library(stream)) => {
+                proxy_upstream_stream(stream, None)
+            }
+            Ok(crate::registry::source_providers::ResolvedPlayableStream::External(stream_result)) => {
                 let status = StatusCode::from_u16(stream_result.status).unwrap_or(StatusCode::OK);
                 let mut resp_headers = HeaderMap::new();
                 for (k, v) in stream_result.headers {
@@ -1252,7 +1261,8 @@ async fn stream_track_handler(
     let preferred_source = params
         .get("source")
         .map(String::as_str)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .or(library_connection);
     let max_bit_rate = params
         .get("maxBitRate")
         .and_then(|s| s.parse::<u32>().ok())
@@ -1279,6 +1289,7 @@ async fn stream_track_handler(
         .fetch_stream(
             &track_id,
             range_header.as_deref(),
+            if_range,
             preferred_source,
             max_bit_rate,
         )

@@ -209,17 +209,41 @@ async fn add_fixture_library(db: &DbPool, state: &AppState) -> tokio::task::Join
     }]);
 
     tokio::spawn(async move {
+        let stream_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let router = Router::new()
             .route(
                 "/rest/stream.view",
-                get(|Query(params): Query<HashMap<String, String>>| async move {
+                get(move |Query(params): Query<HashMap<String, String>>, headers: HeaderMap| {
+                    let stream_attempts = stream_attempts.clone();
+                    async move {
                     if params["id"] == "stream-error" {
                         return Json(json!({"subsonic-response": {"status": "failed", "error": {"code": 70}}})).into_response();
+                    }
+                    if params["id"] == "stream-retry" {
+                        if headers[RANGE] == "bytes=12-" {
+                            return (StatusCode::RANGE_NOT_SATISFIABLE, [(http::header::CONTENT_RANGE, "bytes */12")]).into_response();
+                        }
+                        assert_eq!(headers[RANGE], "bytes=4-11");
+                        assert_eq!(headers[http::header::IF_RANGE], "\"fixture\"");
+                        assert_eq!(headers[http::header::ACCEPT_ENCODING], "identity");
+                        if stream_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        let chunks = tokio_stream::StreamExt::chain(
+                            tokio_stream::once(Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"fLaC"))),
+                            tokio_stream::pending(),
+                        );
+                        return (StatusCode::PARTIAL_CONTENT, [
+                            (http::header::CONTENT_TYPE, "audio/flac"),
+                            (http::header::CONTENT_RANGE, "bytes 4-11/12"),
+                            (http::header::CONTENT_LENGTH, "8"),
+                        ], Body::from_stream(chunks)).into_response();
                     }
                     (StatusCode::PARTIAL_CONTENT, [
                         (http::header::CONTENT_TYPE, "audio/flac"),
                         (http::header::CONTENT_RANGE, "bytes 0-3/8"),
                     ], "fLaC").into_response()
+                    }
                 }),
             )
             .route(
@@ -285,6 +309,62 @@ async fn library_stream_skips_a_success_status_with_a_subsonic_error_body() {
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes 0-3/8");
     assert_eq!(response.into_body().collect().await.unwrap().to_bytes().as_ref(), b"fLaC");
+    provider.abort();
+}
+
+#[tokio::test]
+async fn selected_library_source_retries_gateway_failure_and_streams_a_validated_range() {
+    let (db, state, session) = playback_state(false).await;
+    let provider = add_fixture_library(&db, &state).await;
+    let library = LibraryService::new(db, None);
+    let id = library.ensure_id(LibraryItemType::Track, &SourceRef {
+        connection_id: "fixture-library".into(),
+        provider_item_id: "stream-retry".into(),
+    }, None).await.unwrap();
+    // Legacy clients send selected connection IDs in playableSource.
+    let uri = format!("/api/tracks/{id}/stream?playableSource=fixture-library");
+    let router = music_routes().with_state(state);
+    let send_range = |range| router.clone().oneshot(Request::builder()
+        .uri(&uri)
+        .header(http::header::COOKIE, format!("{SESSION_COOKIE}={session}"))
+        .header(RANGE, range)
+        .header(http::header::IF_RANGE, "\"fixture\"")
+        .body(Body::empty()).unwrap());
+
+    let response = tokio::time::timeout(Timeout::from_secs(3), send_range("bytes=4-11"))
+        .await.expect("stream header arrived while the body was still pending").unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes 4-11/12");
+    assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "8");
+    let first = tokio::time::timeout(Timeout::from_secs(3), response.into_body().frame())
+        .await.unwrap().unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first.as_ref(), b"fLaC");
+
+    let response = send_range("bytes=12-").await.unwrap();
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers()[http::header::CONTENT_RANGE], "bytes */12");
+    provider.abort();
+}
+
+#[tokio::test]
+async fn background_normalization_returns_unavailable_when_no_measurement_or_job_exists() {
+    let (db, state, session) = playback_state(false).await;
+    let provider = add_fixture_library(&db, &state).await;
+    let id = LibraryService::new(db, None).ensure_id(LibraryItemType::Track, &SourceRef {
+        connection_id: "fixture-library".into(),
+        provider_item_id: "stream-audio".into(),
+    }, None).await.unwrap();
+    let response = crate::routes::audio_playback::audio_playback_routes()
+        .with_state(state)
+        .oneshot(Request::builder().method("POST").uri("/api/playback/normalize")
+            .header(http::header::COOKIE, format!("{SESSION_COOKIE}={session}"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"trackId": id, "background": true, "targetLufs": -16}).to_string()))
+            .unwrap())
+        .await.unwrap();
+    let (status, body) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "unavailable");
     provider.abort();
 }
 

@@ -496,7 +496,7 @@ pub struct AppConfig {
     pub extensions_dir: String,
     /// Root folder where music files are stored and scanned (`MUSICDECK_MUSIC_ROOT`).
     pub music_root: String,
-    /// Subdirectory under `music_root` for Spotify imports (`MUSICDECK_SPOTIFY_IMPORT_SUBDIR`).
+    /// Subdirectory under `music_root` used to recognize legacy Spotify imports (`MUSICDECK_SPOTIFY_IMPORT_SUBDIR`).
     pub spotify_import_subdir: String,
     /// Temporary download staging directory (`MUSICDECK_ACQUISITION_TMP_DIR`).
     pub acquisition_tmp_dir: String,

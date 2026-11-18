@@ -47,8 +47,6 @@ struct NormalizePlaybackRequestBody {
     #[serde(default)]
     pub bit_rate: Option<u32>,
     #[serde(default)]
-    pub background: Option<bool>,
-    #[serde(default)]
     pub target_lufs: Option<i32>,
 }
 
@@ -310,29 +308,6 @@ async fn post_playback_normalize_handler(
     }
 
     let target_lufs = f64::from(body.target_lufs.unwrap_or(LOUDNESS_TARGET as i32));
-    if body.source.is_none() && body.playable_source.is_none() && body.preview_url.is_none() {
-        let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
-        if let Some(track) = catalog.get_track(&body.track_id).await {
-            if let Some(loudness) = track.item.loudness {
-                let gain_db = measured_playback_gain(
-                    loudness.integrated_lufs,
-                    loudness.true_peak_db,
-                    target_lufs,
-                );
-                return Ok((
-                    StatusCode::OK,
-                    Json(json!({
-                        "status": "measured",
-                        "integratedLufs": loudness.integrated_lufs,
-                        "truePeakDb": loudness.true_peak_db,
-                        "gainDb": gain_db,
-                    })),
-                )
-                    .into_response());
-            }
-        }
-    }
-
     let loudness_service = LoudnessService::new(Some(pool.clone()));
     let ident = playback_identity(
         &body.track_id,
@@ -365,12 +340,27 @@ async fn post_playback_normalize_handler(
             .into_response());
     }
 
-    let fallback_status = if body.background == Some(true) {
-        "processing"
-    } else {
-        "unavailable"
-    };
-    Ok((StatusCode::OK, Json(json!({ "status": fallback_status }))).into_response())
+    if body.source.is_none() && body.playable_source.is_none() && body.preview_url.is_none() {
+        let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+        if let Ok(Some(track)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            catalog.get_track(&body.track_id),
+        ).await
+            && let Some(loudness) = track.item.loudness
+        {
+            let gain_db = measured_playback_gain(loudness.integrated_lufs, loudness.true_peak_db, target_lufs);
+            return Ok(Json(json!({
+                "status": "measured",
+                "integratedLufs": loudness.integrated_lufs,
+                "truePeakDb": loudness.true_peak_db,
+                "gainDb": gain_db,
+            })).into_response());
+        }
+    }
+
+    // This endpoint reads measurements. Explicit library scans schedule analysis.
+    // Reporting processing without a job sends clients into a needless poll loop.
+    Ok(Json(json!({ "status": "unavailable" })).into_response())
 }
 
 async fn get_silence_scan_handler(

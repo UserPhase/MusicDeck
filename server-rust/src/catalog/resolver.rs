@@ -141,6 +141,7 @@ impl SourceResolver {
         &self,
         library_item_id: &str,
         range: Option<&str>,
+        if_range: Option<&str>,
         preferred_connection_id: Option<&str>,
         max_bit_rate: Option<u32>,
     ) -> Result<StreamResult, SourceUnavailableError> {
@@ -151,13 +152,20 @@ impl SourceResolver {
             return Err(SourceUnavailableError::default());
         }
 
+        let mut unsatisfied_range = None;
         for CandidateSource { source, provider } in candidates {
-            if let Ok(mut result) = provider
+            let mut result = match provider
                 .provider
-                .fetch_stream(&source.provider_item_id, range, max_bit_rate)
+                .fetch_stream(&source.provider_item_id, range, if_range, max_bit_rate)
                 .await
-                && matches!(result.status, StatusCode::OK | StatusCode::PARTIAL_CONTENT)
             {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(connection_id = %source.connection_id, range_requested = range.is_some(), %error, "Could not open library audio stream");
+                    continue;
+                }
+            };
+            if matches!(result.status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) {
                 // Subsonic can return an error document with HTTP 200. A reverse
                 // proxy can do the same with a login page. Keep looking for audio.
                 let content_type = result.headers.get(CONTENT_TYPE)
@@ -179,9 +187,14 @@ impl SourceResolver {
                 result.audio_stream = Some(stream_info);
                 return Ok(result);
             }
+            if range.is_some() && result.status == StatusCode::RANGE_NOT_SATISFIABLE {
+                unsatisfied_range.get_or_insert(result);
+                continue;
+            }
+            tracing::warn!(connection_id = %source.connection_id, status = %result.status, "Library audio provider rejected the stream request");
         }
 
-        Err(SourceUnavailableError::default())
+        unsatisfied_range.ok_or_else(SourceUnavailableError::default)
     }
 
     /// Fetches cover artwork for `library_item_id` with source fallback.

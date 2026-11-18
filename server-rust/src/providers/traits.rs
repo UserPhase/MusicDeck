@@ -158,6 +158,7 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
     /// Finds a newly indexed track by its actual path relative to the shared music root.
     async fn find_imported_track(
         &self,
+        _music_root: &std::path::Path,
         _relative_path: &str,
         _title: &str,
     ) -> Result<Option<Track>, ProviderError> {
@@ -192,12 +193,12 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
         format_artwork_url(Some(artwork_id))
     }
 
-    /// Opens an upstream audio stream for `track_id`, forwarding an optional HTTP `Range`
-    /// header and optional `max_bit_rate` (kbps) transcoding hint.
+    /// Opens an upstream stream, forwarding range headers and the optional transcoding hint.
     async fn fetch_stream(
         &self,
         track_id: &str,
         range: Option<&str>,
+        if_range: Option<&str>,
         max_bit_rate: Option<u32>,
     ) -> Result<StreamResult, ProviderError>;
 

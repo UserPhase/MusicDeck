@@ -631,7 +631,11 @@ async fn cast_stream_handler(
     let range_hdr = headers.get(RANGE).and_then(|v| v.to_str().ok());
 
     match resolver
-        .fetch_stream(&lease.track_id, range_hdr, None, lease.max_bit_rate)
+        .fetch_stream(
+            &lease.track_id, range_hdr,
+            headers.get(axum::http::header::IF_RANGE).and_then(|value| value.to_str().ok()),
+            None, lease.max_bit_rate,
+        )
         .await
     {
         Ok(stream_result) => {

@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::catalog::{LibraryService, SourceResolver, normalize_music_text};
 use crate::db::DbPool;
-use crate::providers::{BackendRegistry, UpstreamStreamResponse};
+use crate::providers::{BackendRegistry, StreamResult, UpstreamStreamResponse};
 use crate::registry::playable_sources::{
     PlayableSource, PlayableSourceAvailability, PlayableSourceQuality, PlayableSourceType,
     SourcePreference, SourceProvider, SourceProviderCapabilities, SourceProviderTestResult,
@@ -36,6 +36,11 @@ use crate::search::{SearchResultType, UnifiedSearchResult};
 pub const PLAYABLE_SOURCE_TOKEN_TTL_MS: u64 = 5 * 60 * 1_000;
 /// Per-provider timeout during [`SourceProviderRegistry::resolve`] (`10,000 ms`).
 pub const SOURCE_PROVIDER_RESOLVE_TIMEOUT_MS: u64 = 10_000;
+
+pub enum ResolvedPlayableStream {
+    Library(StreamResult),
+    External(UpstreamStreamResponse),
+}
 
 /// Built-in [`SourceProvider`] backed by [`LibraryService`] and [`BackendRegistry`].
 pub struct LibrarySourceProvider {
@@ -98,7 +103,6 @@ impl SourceProvider for LibrarySourceProvider {
                 continue;
             }
             sources.push(PlayableSource {
-                // Replaced with an opaque `playable_<nanoid>` token by `SourceProviderRegistry`.
                 id: source_ref.connection_id,
                 provider: String::from("library"),
                 source_type: PlayableSourceType::Library,
@@ -874,6 +878,12 @@ impl SourceProviderRegistry {
             {
                 Ok(Ok(provider_sources)) => {
                     for mut src in provider_sources {
+                        if provider.id() == "library" && src.source_type == PlayableSourceType::Library {
+                            // Library requests already require authentication and a DB source
+                            // mapping. Seeks must work after any external token would expire.
+                            sources.push(src);
+                            continue;
+                        }
                         let token_id = format!("playable_{}", nanoid!(16));
                         let raw_source_id = std::mem::replace(&mut src.id, token_id.clone());
                         src.expires_at = Some(expires_str.clone());
@@ -1000,7 +1010,8 @@ impl SourceProviderRegistry {
         result_id: &str,
         source_id: &str,
         range: Option<&str>,
-    ) -> Result<UpstreamStreamResponse, String> {
+        if_range: Option<&str>,
+    ) -> Result<ResolvedPlayableStream, String> {
         let stored = {
             let mut guard = self
                 .source_cache
@@ -1022,31 +1033,17 @@ impl SourceProviderRegistry {
             };
             let lib = LibraryService::new(pool.clone(), None);
             let resolver = SourceResolver::new(self.backends.clone(), lib);
-            let stream_res = resolver
+            return resolver
                 .fetch_stream(
                     result_id,
                     range,
+                    if_range,
                     Some(&stored.provider_source_id),
                     None,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
-            let status = stream_res.status.as_u16();
-            let headers = stream_res
-                .headers
-                .iter()
-                .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-                .collect();
-            let bytes = stream_res
-                .response
-                .bytes()
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(UpstreamStreamResponse {
-                status,
-                headers,
-                bytes,
-            });
+                .map(ResolvedPlayableStream::Library)
+                .map_err(|e| e.to_string());
         }
 
         let provider = self
@@ -1058,6 +1055,6 @@ impl SourceProviderRegistry {
 
         let mut internal_source = stored.source;
         internal_source.id = stored.provider_source_id;
-        provider.fetch_stream(&internal_source, range).await
+        provider.fetch_stream(&internal_source, range).await.map(ResolvedPlayableStream::External)
     }
 }

@@ -657,6 +657,7 @@ impl MusicBackend for JellyfinClient {
         &self,
         track_id: &str,
         range: Option<&str>,
+        if_range: Option<&str>,
         max_bit_rate: Option<u32>,
     ) -> Result<StreamResult, ProviderError> {
         let path = format!("Audio/{}/stream", urlencoding::encode(track_id));
@@ -673,9 +674,13 @@ impl MusicBackend for JellyfinClient {
         let mut req = self
             .http
             .get(url)
+            .header(http::header::ACCEPT_ENCODING, "identity")
             .header(AUTHORIZATION, jellyfin_authorization(&self.api_key));
         if let Some(range_val) = range {
             req = req.header(RANGE, range_val);
+            if let Some(validator) = if_range {
+                req = req.header(http::header::IF_RANGE, validator);
+            }
         }
 
         let response = req.send().await.map_err(|err| ProviderError::Upstream {

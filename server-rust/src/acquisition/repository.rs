@@ -747,7 +747,7 @@ impl SpotifyPlaylistImportService {
                         "Could not open the shared music directory: {err}"
                     ))
                 })?;
-                Ok((backend, root, PathBuf::from(&cfg.spotify_import_subdir)))
+                Ok((backend, root))
             });
         let library = match library {
             Some(load) => Some(load.await?),
@@ -796,7 +796,7 @@ impl SpotifyPlaylistImportService {
                 &spotify_id[..spotify_id.len().min(8)]
             )
         });
-        let (backend, music_root, import_subdir) = library.ok_or_else(|| {
+        let (backend, music_root) = library.ok_or_else(|| {
             TaskError::ExecutionFailed(
                 "Shared Navidrome library is not configured for playlist imports".into(),
             )
@@ -819,8 +819,8 @@ impl SpotifyPlaylistImportService {
                 .count(),
         );
 
-        let collection = import_subdir.join(&job.id);
-        let mut published = HashSet::new();
+        let mut published: HashMap<PathBuf, String> = HashMap::new();
+        let tagger = downloader.tagger();
         for entry in &mut entries {
             if let Err(err) = context.checkpoint().await {
                 job.manifest = Some(entries);
@@ -834,22 +834,19 @@ impl SpotifyPlaylistImportService {
                 let staged = staged
                     .as_deref()
                     .ok_or("Downloaded file is missing".to_owned())?;
-                let relative = if published.contains(staged) {
-                    collection.join(
-                        staged
-                            .strip_prefix(&stage)
-                            .map_err(|_| "Downloaded file is outside staging".to_owned())?,
-                    )
-                } else {
-                    let relative = publish_staged_track(&music_root, &collection, &stage, staged)
+                if let Some(path) = published.get(staged) {
+                    return Ok::<String, String>(path.clone());
+                }
+                let publication =
+                    publish_staged_track(&music_root, &stage, staged, &entry.source, &tagger)
                         .await
                         .map_err(|err| {
                             format!("Could not save audio to the shared music directory: {err}")
                         })?;
-                    published.insert(staged.to_path_buf());
-                    relative
-                };
-                navidrome_path(&relative).ok_or("Invalid library import path".to_owned())
+                let path = navidrome_path(&publication.path)
+                    .ok_or("Invalid library import path".to_owned())?;
+                published.insert(staged.to_path_buf(), path.clone());
+                Ok(path)
             }
             .await;
             match transfer {
@@ -907,7 +904,7 @@ impl SpotifyPlaylistImportService {
                 let title = &entry.source.title;
                 let lookup = tokio::select! {
                     () = cancellation.cancelled() => return Err(TaskError::Cancelled),
-                    result = provider.find_imported_track(path, title) => result,
+                    result = provider.find_imported_track(&music_root, path, title) => result,
                 };
                 let track = match lookup {
                     Ok(Some(track)) => track,
@@ -1017,7 +1014,7 @@ impl SpotifyPlaylistImportService {
         if failed == 0
             && scan_downloaded_audio_files(&stage)
                 .await
-                .is_ok_and(|files| files.iter().all(|file| published.contains(file)))
+                .is_ok_and(|files| files.iter().all(|file| published.contains_key(file)))
         {
             cleanup_staging(staging_dir).await;
         }
@@ -1037,9 +1034,15 @@ impl SpotifyPlaylistImportService {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct SpotdlPlaylistTrack {
-    name: String,
-    artist: String,
-    url: String,
+    name: Option<String>,
+    artist: Option<String>,
+    artists: Option<Vec<String>>,
+    url: Option<String>,
+    song_id: Option<String>,
+    album_name: Option<String>,
+    album_artist: Option<String>,
+    duration: Option<f64>,
+    isrc: Option<String>,
     list_name: Option<String>,
     list_length: Option<usize>,
 }
@@ -1133,6 +1136,10 @@ pub(super) async fn download_manifest(
         .map(str::trim)
         .find(|name| !name.is_empty())
         .map(|name| name.chars().take(200).collect());
+    let metadata_by_id: HashMap<_, _> = metadata
+        .iter()
+        .filter_map(|track| Some((track.song_id.as_deref()?, track)))
+        .collect();
     let mut entries = Vec::new();
     for (position, line) in manifest
         .trim_start_matches('\u{feff}')
@@ -1142,26 +1149,32 @@ pub(super) async fn download_manifest(
         .enumerate()
     {
         context.checkpoint().await?;
-        let source = metadata.get(position);
+        let stem = Path::new(line).file_stem().and_then(|stem| stem.to_str());
+        let staged_id = stem
+            .and_then(|stem| stem.rsplit_once(" ["))
+            .and_then(|(_, id)| id.strip_suffix(']'))
+            .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        let source = staged_id
+            .and_then(|id| metadata_by_id.get(id).copied())
+            .or_else(|| {
+                metadata.get(position).filter(|track| {
+                    staged_id
+                        .zip(track.song_id.as_deref())
+                        .is_none_or(|(file_id, manifest_id)| file_id == manifest_id)
+                })
+            });
         let title = source
-            .map(|track| track.name.as_str())
+            .and_then(|track| track.name.as_deref())
             .filter(|name| !name.trim().is_empty())
             .or_else(|| {
-                Path::new(line)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| {
-                        let title = stem.split_once(" - ").map_or(stem, |(_, title)| title);
-                        title
-                            .rsplit_once(" [")
-                            .filter(|(_, id)| {
-                                id.strip_suffix(']').is_some_and(|value| {
-                                    !value.is_empty()
-                                        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
-                                })
-                            })
-                            .map_or(title, |(title, _)| title)
-                    })
+                stem.map(|stem| {
+                    let name = if staged_id.is_some() {
+                        stem.rsplit_once(" [").map_or(stem, |(name, _)| name)
+                    } else {
+                        stem
+                    };
+                    name.split_once(" - ").map_or(name, |(_, title)| title)
+                })
             })
             .unwrap_or_default();
         let path = staged_playlist_path(&stage, line)
@@ -1171,16 +1184,22 @@ pub(super) async fn download_manifest(
             position: position + 1,
             source: SpotifyImportTrackMetadata {
                 position: position + 1,
-                url: source.map_or_else(String::new, |track| track.url.clone()),
+                url: source
+                    .and_then(|track| track.url.clone())
+                    .unwrap_or_default(),
                 title: title.to_owned(),
-                artist: source.map_or_else(String::new, |track| track.artist.clone()),
-                artists: Vec::new(),
-                duration: 0.0,
-                album: None,
-                album_artist: None,
+                artist: source
+                    .and_then(|track| track.artist.clone())
+                    .unwrap_or_default(),
+                artists: source
+                    .and_then(|track| track.artists.clone())
+                    .unwrap_or_default(),
+                duration: source.and_then(|track| track.duration).unwrap_or_default(),
+                album: source.and_then(|track| track.album_name.clone()),
+                album_artist: source.and_then(|track| track.album_artist.clone()),
                 year: None,
                 artwork_url: None,
-                isrc: None,
+                isrc: source.and_then(|track| track.isrc.clone()),
             },
             status: ImportEntryStatus::Downloaded,
             error: None,

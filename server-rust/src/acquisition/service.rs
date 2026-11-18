@@ -192,6 +192,9 @@ pub struct AcquiredFileRecord {
     pub provider_track_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_id: Option<String>,
+    /// True when the job linked to an existing library file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
     pub status: String,
 }
 
@@ -825,21 +828,23 @@ impl AcquisitionService {
         let music_root = tokio::fs::canonicalize(&config.music_root)
             .await
             .map_err(task_db_error)?;
-        let collection = Path::new(&config.spotify_import_subdir).join(job_id);
         let expected = batch
             .expected_count
             .max(target.expected_count.unwrap_or(0))
             .max(batch.entries.len());
         let mut published = Vec::new();
         let mut failure = None;
+        let tagger = downloader.tagger();
         for entry in batch.entries {
             context.checkpoint().await?;
             let Some(source) = entry.file_path.as_deref().map(std::path::PathBuf::from) else {
                 failure = failure.or(entry.error);
                 continue;
             };
-            match publish_staged_track(&music_root, &collection, &stage_root, &source).await {
-                Ok(relative) => published.push((source, relative, entry.source)),
+            match publish_staged_track(&music_root, &stage_root, &source, &entry.source, &tagger)
+                .await
+            {
+                Ok(publication) => published.push((source, publication, entry.source)),
                 Err(err) => {
                     tracing::warn!(job_id, error = %err, "Could not publish downloaded audio");
                     failure.get_or_insert_with(|| {
@@ -877,9 +882,9 @@ impl AcquisitionService {
         };
         let mut indexed = std::collections::HashSet::new();
         let mut files = Vec::new();
-        for (staged, relative, source) in published {
+        for (staged, publication, source) in published {
             context.checkpoint().await?;
-            let Some(path) = navidrome_path(&relative) else {
+            let Some(path) = navidrome_path(&publication.path) else {
                 failure.get_or_insert_with(|| {
                     "An imported path could not be read by Navidrome".into()
                 });
@@ -887,11 +892,11 @@ impl AcquisitionService {
             };
             let lookup = tokio::select! {
                 () = cancel.cancelled() => return Err(TaskError::Cancelled),
-                result = backend.provider.find_imported_track(&path, &source.title) => result,
+                result = backend.provider.find_imported_track(&music_root, &path, &source.title) => result,
             };
             match lookup {
                 Ok(Some(track)) => {
-                    let destination = music_root.join(&relative);
+                    let destination = music_root.join(&publication.path);
                     let size = tokio::fs::metadata(&destination)
                         .await
                         .map_err(task_db_error)?
@@ -909,6 +914,7 @@ impl AcquisitionService {
                         size: Some(size),
                         provider_track_id: Some(track.provider_id),
                         connection_id: Some(backend.connection_id.clone()),
+                        reused: publication.reused,
                         status: "imported".into(),
                     });
                 }

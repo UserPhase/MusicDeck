@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use http::header::RANGE;
+use http::header::{ACCEPT_ENCODING, IF_RANGE, RANGE};
 use md5::{Digest, Md5};
 use serde_json::Value;
 use url::Url;
@@ -49,6 +49,7 @@ pub struct NavidromeClient {
     username: String,
     password: String,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
     scan_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -60,11 +61,23 @@ impl NavidromeClient {
     pub fn new(config: NavidromeConfig) -> Result<Self, ProviderError> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(5_000))
+            .pool_idle_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(16)
             .build()
-            .map_err(|err| ProviderError::Configuration(format!("HTTP client init failed: {err}")))?;
+            .map_err(|err| {
+                ProviderError::Configuration(format!("HTTP client init failed: {err}"))
+            })?;
 
-        Ok(Self::with_client(config, http))
+        let stream_http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(45))
+            // Range requests use a fresh HTTP/1 connection. Navidrome or an
+            // intervening proxy may close idle sockets on its own schedule.
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|err| ProviderError::Configuration(format!("HTTP stream client init failed: {err}")))?;
+        Ok(Self { stream_http, ..Self::with_client(config, http) })
     }
 
     /// Constructs a [`NavidromeClient`] using an existing pooled [`reqwest::Client`].
@@ -74,6 +87,7 @@ impl NavidromeClient {
             base_url: config.url.trim_end_matches('/').to_owned(),
             username: config.username,
             password: config.password,
+            stream_http: http.clone(),
             http,
             scan_lock: Default::default(),
         }
@@ -391,9 +405,14 @@ impl MusicBackend for NavidromeClient {
             artist.image_url = raw_artist.get("artistImageUrl").and_then(artist_image_url);
         }
         let artwork_is_album_cover = artist.artwork_id.as_ref().is_some_and(|artwork_id| {
-            raw_artist.get("album").and_then(Value::as_array).is_some_and(|albums| {
-                albums.iter().any(|album| album.get("coverArt").and_then(value_to_string).as_ref() == Some(artwork_id))
-            })
+            raw_artist
+                .get("album")
+                .and_then(Value::as_array)
+                .is_some_and(|albums| {
+                    albums.iter().any(|album| {
+                        album.get("coverArt").and_then(value_to_string).as_ref() == Some(artwork_id)
+                    })
+                })
         });
         if include_artist_info && artist.image_url.is_none()
             && (artist.artwork_id.is_none() || artwork_is_album_cover)
@@ -828,10 +847,22 @@ impl MusicBackend for NavidromeClient {
 
     async fn find_imported_track(
         &self,
+        music_root: &std::path::Path,
         relative_path: &str,
         title: &str,
     ) -> Result<Option<Track>, ProviderError> {
         let suffix = format!("/{relative_path}");
+        let root = music_root.to_string_lossy().replace('\\', "/");
+        let root = root
+            .strip_prefix("//?/")
+            .unwrap_or(&root)
+            .trim_end_matches('/');
+        let exact_path = format!("{root}{suffix}");
+        // The Compose stack mounts the same library at /music in Navidrome.
+        let compose_path = format!("/music{suffix}");
+        let root_prefix = format!("{root}/");
+        let mut alternate: Option<Track> = None;
+        let mut ambiguous = false;
         for offset in (0..500).step_by(100) {
             let result = self
                 .request_json(
@@ -849,20 +880,38 @@ impl MusicBackend for NavidromeClient {
             let Some(songs) = result["searchResult3"]["song"].as_array() else {
                 break;
             };
-            if let Some(song) = songs.iter().find(|song| {
-                song["id"].as_str().is_some_and(|id| !id.is_empty())
-                    && song["path"].as_str().is_some_and(|path| {
-                        let path = path.replace('\\', "/");
-                        path == relative_path || path.ends_with(&suffix)
-                    })
-            }) {
-                return Ok(Some(map_subsonic_track(song)));
+            for song in songs {
+                let (Some(id), Some(path)) = (song["id"].as_str(), song["path"].as_str()) else {
+                    continue;
+                };
+                if id.is_empty() {
+                    continue;
+                }
+                let path = path.replace('\\', "/");
+                let path = path.strip_prefix("//?/").unwrap_or(&path);
+                if path == relative_path || path == exact_path || path == compose_path {
+                    return Ok(Some(map_subsonic_track(song)));
+                }
+                // Some deployments use different absolute mount paths on the two servers.
+                // A suffix under a known root is a different track. An unknown mount
+                // can only be used when the suffix identifies a unique result.
+                if !path.starts_with(&root_prefix)
+                    && !path.starts_with("/music/")
+                    && path.ends_with(&suffix)
+                    && (path.starts_with('/') || path.as_bytes().get(1) == Some(&b':'))
+                {
+                    if let Some(track) = &alternate {
+                        ambiguous |= track.provider_id != id;
+                    } else {
+                        alternate = Some(map_subsonic_track(song));
+                    }
+                }
             }
             if songs.len() < 100 {
                 break;
             }
         }
-        Ok(None)
+        Ok(if ambiguous { None } else { alternate })
     }
 
     async fn create_imported_playlist(
@@ -926,6 +975,7 @@ impl MusicBackend for NavidromeClient {
         &self,
         track_id: &str,
         range: Option<&str>,
+        if_range: Option<&str>,
         max_bit_rate: Option<u32>,
     ) -> Result<StreamResult, ProviderError> {
         let mut params = vec![("id", track_id.to_owned())];
@@ -937,14 +987,40 @@ impl MusicBackend for NavidromeClient {
         }
 
         let url = self.build_url("stream", &params)?;
-        let mut req = self.http.get(url);
-        if let Some(range_val) = range {
-            req = req.header(RANGE, range_val);
-        }
-
-        let response = req.send().await.map_err(|err| ProviderError::Upstream {
+        let request = || {
+            let mut req = self.stream_http.get(url.clone()).header(ACCEPT_ENCODING, "identity");
+            if let Some(value) = range {
+                req = req.header(RANGE, value);
+                if let Some(validator) = if_range {
+                    req = req.header(IF_RANGE, validator);
+                }
+            }
+            req
+        };
+        let response = tokio::time::timeout(Duration::from_secs(12), async {
+            let first = request().send().await;
+            let retry = match &first {
+                Ok(response) => matches!(response.status().as_u16(), 502..=504),
+                Err(error) => error.is_request() && !error.is_timeout(),
+            };
+            if !retry {
+                return first;
+            }
+            tracing::debug!(
+                range_requested = range.is_some(),
+                status = first.as_ref().ok().map(|response| response.status().as_u16()),
+                transport = ?first.as_ref().err().and_then(|error| std::error::Error::source(error)),
+                "Retrying Navidrome media request before forwarding headers"
+            );
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            request().send().await
+        })
+        .await
+        .map_err(|_| ProviderError::Timeout { provider: "Navidrome stream headers" })?
+        .map_err(|err| ProviderError::Upstream {
             provider: "Navidrome",
-            message: err.to_string(),
+            message: format!("{:?}", err.without_url()),
         })?;
 
         Ok(StreamResult {
@@ -1049,7 +1125,11 @@ impl MusicBackend for NavidromeClient {
             .get("playlists")
             .and_then(|p| p.get("playlist"))
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().map(|pl| map_subsonic_playlist(pl, false)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .map(|pl| map_subsonic_playlist(pl, false))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 

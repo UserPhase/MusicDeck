@@ -87,7 +87,7 @@ pub struct PlayableSourceQuality {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayableSource {
-    /// Opaque, short-lived MusicDeck source token (`playable_<nanoid>`).
+    /// Library connection ID or a short-lived external source token.
     pub id: String,
     /// `"library" | "external" | "plugin"`.
     pub provider: String,

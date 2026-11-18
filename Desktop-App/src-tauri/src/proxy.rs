@@ -234,6 +234,11 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         return;
     }
     let path_and_query = api_path.expect("authorized API path");
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let audio_stream = path.starts_with("/api/stream/")
+        || (path.starts_with("/api/tracks/") && path.ends_with("/stream"))
+        || path.starts_with("/api/playback/normalized/")
+        || path == "/api/v1/cast/stream";
     let mut cors = String::from("Vary: Origin\r\n");
     if let Some(origin) = authorized_origin {
         cors.push_str(&format!(
@@ -298,9 +303,11 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         let mut req_builder = shared
             .client
             .request(method.clone(), target_url)
-            .timeout(Duration::from_secs(3600))
             .header("Origin", origin.as_str())
             .header("Referer", format!("{candidate_base}/"));
+        if !audio_stream {
+            req_builder = req_builder.timeout(Duration::from_secs(3600));
+        }
 
         for (k, v) in &forwarded_headers {
             req_builder = req_builder.header(k, v);
@@ -438,6 +445,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         if matches!(
             key_lower.as_str(),
             "content-type"
+                | "content-encoding"
                 | "content-length"
                 | "content-range"
                 | "accept-ranges"
@@ -459,11 +467,28 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
 
     let mut body_stream = resp.bytes_stream();
-    while let Some(chunk_res) = tokio::select! {
-        biased;
-        _ = stream.read(&mut temp[..1]) => return,
-        chunk = body_stream.next() => chunk,
-    } {
+    let mut delivered_bytes = 0_u64;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = stream.read(&mut temp[..1]) => return,
+            chunk = async {
+                if audio_stream {
+                    tokio::time::timeout(Duration::from_secs(45), body_stream.next()).await
+                } else {
+                    Ok(body_stream.next().await)
+                }
+            } => chunk,
+        };
+        let chunk_res = match next {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!("MusicDeck desktop media read timed out after headers: status={status_code} delivered_bytes={delivered_bytes}");
+                // Leave the response incomplete so the media element can recover.
+                return;
+            }
+        };
         match chunk_res {
             Ok(chunk) => {
                 if chunk.is_empty() {
@@ -480,11 +505,15 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
                 if stream.write_all(&chunk).await.is_err() {
                     return;
                 }
+                delivered_bytes += chunk.len() as u64;
                 if chunked && stream.write_all(b"\r\n").await.is_err() {
                     return;
                 }
             }
-            Err(_) => return,
+            Err(error) => {
+                eprintln!("MusicDeck desktop upstream body failed: status={status_code} delivered_bytes={delivered_bytes} error={:?}", error.without_url());
+                return;
+            }
         }
     }
     if chunked {

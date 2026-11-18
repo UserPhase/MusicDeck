@@ -1669,6 +1669,19 @@ test("polls processing jobs and applies measurements while audio continues playi
   } finally { jest.useRealTimers(); }
 });
 
+test("a gateway error from optional loudness normalization leaves audio playing", async () => {
+  const { container } = renderPlayer({ normalize: true });
+  let fail;
+  prepareNormalizedPlayback.mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+  await act(async () => fireEvent.click(screen.getByText("direct")));
+  const audio = activeAudio(container);
+  audio.currentTime = 25;
+  await act(async () => fail(Object.assign(new Error("Gateway error"), { status: 502 })));
+  expect(audio).toHaveAttribute("src", "/stream/song-1");
+  expect(audio.currentTime).toBe(25);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
+});
+
 test("uses Web Audio for smooth boosts while keeping the volume slider and source intact", async () => {
   const gain = { value: 1, cancelScheduledValues: jest.fn(), cancelAndHoldAtTime: jest.fn(), setValueAtTime: jest.fn(), setValueCurveAtTime: jest.fn() };
   const node = { gain, connect: jest.fn(), disconnect: jest.fn() };
@@ -2333,7 +2346,10 @@ test("reconnects a stalled stream at the saved position without changing the que
     expect(loads).toHaveLength(2);
     setSeekable(audio, false);
     audio.currentTime = 0;
-    await act(async () => fireEvent.loadedMetadata(audio));
+    await act(async () => {
+      fireEvent.loadedMetadata(audio);
+      fireEvent.canPlay(audio);
+    });
     expect(audio.currentTime).toBe(0);
     act(() => fireEvent.playing(audio));
     expect(screen.getByTestId("playback-message")).toHaveTextContent("restarted");
@@ -2398,6 +2414,7 @@ test("retries a failed library stream at 0:00 without marking the track unavaila
   expect(screen.getByTestId("playback-message")).toHaveTextContent("Reconnecting");
   expect(screen.getByTestId("unavailable")).toHaveTextContent("false");
 
+  Object.defineProperty(audio, "readyState", { configurable: true, value: 1 });
   fireEvent.loadedMetadata(audio);
   await waitFor(() => expect(screen.getByTestId("playback-message")).toBeEmptyDOMElement());
   expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");

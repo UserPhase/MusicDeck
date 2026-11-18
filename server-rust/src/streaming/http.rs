@@ -22,7 +22,7 @@ use std::path::Path;
 use axum::Json;
 use axum::body::Body;
 use axum::http::header::{
-    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
     HeaderValue, LAST_MODIFIED,
 };
 use axum::http::StatusCode;
@@ -40,8 +40,9 @@ pub const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Allowed upstream headers forwarded by [`proxy_upstream_stream`], matching
 /// `sendProxyResponse` in `server/src/routes/music-routes.ts`.
-pub const ALLOWED_PROXY_HEADERS: [HeaderName; 7] = [
+pub const ALLOWED_PROXY_HEADERS: [HeaderName; 8] = [
     CONTENT_TYPE,
+    CONTENT_ENCODING,
     CONTENT_LENGTH,
     CONTENT_RANGE,
     ACCEPT_RANGES,
@@ -285,7 +286,21 @@ pub fn proxy_upstream_stream(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let byte_stream = upstream.response.bytes_stream();
+    let connection_id = upstream.audio_stream.as_ref().and_then(|info| info.source_connection_id.clone());
+    let mut delivered_bytes = 0_u64;
+    let byte_stream = upstream.response.bytes_stream().map(move |result| {
+        match result {
+            Ok(bytes) => {
+                delivered_bytes += bytes.len() as u64;
+                Ok(bytes)
+            }
+            Err(error) => {
+                let error = error.without_url();
+                tracing::warn!(?connection_id, %status, delivered_bytes, error = ?error, "Upstream media response failed after headers");
+                Err(error)
+            }
+        }
+    });
 
     let body = if let Some((inspector, user_id, track_id, inspection_id, range_hdr)) = inspection {
         inspector.begin_observation(

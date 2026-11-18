@@ -1035,7 +1035,11 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       this.handleProgress(deck);
       this.endAtTrim(deck);
     });
-    listen("seeking", () => { if (deck === this.active) this.sleepTimer.resetBoundaryFade(); });
+    listen("seeking", () => {
+      if (deck !== this.active) return;
+      this.recovery.notifyProgress();
+      this.sleepTimer.resetBoundaryFade();
+    });
     listen("seeked", () => { if (deck === this.active) this.updateSleepBoundary(); });
     listen("loadedmetadata", () => {
       const pending = this.pendingStartAt;
@@ -1063,7 +1067,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     listen("pause", () => {
       // External pauses (OS media keys, headphones unplugged) keep engine intent in sync.
       if (deck !== this.active || this.recovery.isRecovering() || this.recovery.hasFailed()) return;
-      if (!this.wantsPlayback || element.ended || !deck.isLoaded()) return;
+      if (!this.wantsPlayback || element.ended || element.error || !deck.isLoaded()) return;
       this.wantsPlayback = false;
       this.cancelTransition("paused");
       this.setState("paused");

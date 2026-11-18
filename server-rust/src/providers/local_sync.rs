@@ -161,9 +161,10 @@ impl MusicBackend for LocalUserDataSyncAdapter {
         &self,
         track_id: &str,
         range: Option<&str>,
+        if_range: Option<&str>,
         max_bit_rate: Option<u32>,
     ) -> Result<StreamResult, ProviderError> {
-        self.inner.fetch_stream(track_id, range, max_bit_rate).await
+        self.inner.fetch_stream(track_id, range, if_range, max_bit_rate).await
     }
 
     async fn fetch_artwork(

@@ -110,6 +110,17 @@ pub struct AudioTagMetadata {
     pub artwork_hashes: Option<Vec<String>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordingTags {
+    #[serde(flatten)]
+    pub metadata: AudioTagMetadata,
+    pub source_url: Option<String>,
+    pub duration: Option<f64>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+}
+
 fn tag_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
     let Some(exp) = clean_str(expected) else {
         return true;
@@ -122,10 +133,7 @@ fn tag_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
 
 /// Determines whether `tags` requires repair to match `expected` (`server/src/services/media/audioTaggerService.ts`).
 #[must_use]
-pub fn needs_metadata_repair(
-    tags: &AudioTagMetadata,
-    expected: &CanonicalAudioMetadata,
-) -> bool {
+pub fn needs_metadata_repair(tags: &AudioTagMetadata, expected: &CanonicalAudioMetadata) -> bool {
     let expected_artists: Vec<String> = expected
         .artists
         .iter()
@@ -183,12 +191,17 @@ def value(*keys):
         try: item = tags.get(key)
         except (KeyError, ValueError): continue
         if item is None: continue
-        item = getattr(item, 'text', item)
+        item = getattr(item, 'url', getattr(item, 'text', item))
         if not isinstance(item, (list, tuple)): item = [item]
         values = [v.decode('utf-8', 'replace') if isinstance(v, bytes) else str(v) for v in item]
         result = '; '.join(v.strip() for v in values if v.strip())
         if result: return result
     return None
+def number(mp4_key, *keys):
+    item = tags.get(mp4_key)
+    if item and isinstance(item[0], tuple): return item[0][0]
+    result = (value(*keys) or '').split('/', 1)[0].strip()
+    return int(result) if result.isascii() and result.isdecimal() else None
 if isinstance(tags, ID3):
     image_data = [frame.data for frame in tags.getall('APIC')]
 elif getattr(audio, 'pictures', None):
@@ -210,6 +223,10 @@ print(json.dumps({
     'album': value('TALB', '\xa9alb', 'album'),
     'year': value('TDRC', 'TYER', '\xa9day', 'date', 'year'),
     'isrc': value('TSRC', '----:com.apple.iTunes:ISRC', '----:spotdl:ISRC', 'isrc'),
+    'sourceUrl': value('WOAS', '----:spotdl:WOAS', 'woas'),
+    'duration': getattr(audio.info, 'length', None),
+    'trackNumber': number('trkn', 'TRCK', 'tracknumber'),
+    'discNumber': number('disk', 'TPOS', 'discnumber'),
     'hasArtwork': bool(artwork),
     'artworkHashes': artwork
 }))
@@ -364,6 +381,14 @@ impl AudioTaggerService {
     }
 
     async fn inspect_native(&self, file_path: &Path) -> Result<AudioTagMetadata, String> {
+        Ok(self.inspect_recording(file_path).await?.metadata)
+    }
+
+    /// Reads recording identifiers, duration, and album track position from embedded tags.
+    pub(crate) async fn inspect_recording(
+        &self,
+        file_path: &Path,
+    ) -> Result<RecordingTags, String> {
         let args = vec![
             String::from("-c"),
             String::from(NATIVE_TAG_INSPECT),
@@ -380,7 +405,12 @@ impl AudioTaggerService {
                 },
             )
             .await
-            .map_err(|e| format!("Audio metadata inspection could not start {}: {e}", self.python_bin))?;
+            .map_err(|e| {
+                format!(
+                    "Audio metadata inspection could not start {}: {e}",
+                    self.python_bin
+                )
+            })?;
 
         if res.exit_code != Some(0) {
             return Err(format!(
@@ -390,9 +420,8 @@ impl AudioTaggerService {
             ));
         }
 
-        let meta: AudioTagMetadata = serde_json::from_str(&res.stdout)
-            .map_err(|_| String::from("Native audio metadata inspector returned invalid data"))?;
-        Ok(meta)
+        serde_json::from_str(&res.stdout)
+            .map_err(|_| String::from("Native audio metadata inspector returned invalid data"))
     }
 
     /// Verifies `file_path`'s tags against `expected` and atomically rewrites the file via FFmpeg `-c copy`

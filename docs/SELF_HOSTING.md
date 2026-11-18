@@ -194,6 +194,11 @@ Images are published to GHCR by the repository's
 - `ghcr.io/userphase/musicdeck-server`
 - `ghcr.io/userphase/musicdeck-web`
 
+If you publish your own GHCR images for public use, open **Package settings →
+Danger Zone → Change visibility → Public** once for each package after its first
+successful publish. Public GHCR packages can be pulled without signing in.
+[GitHub package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-your-personal-account)
+
 Developers who want to build from source instead use `docker-compose.dev.yml`
 (see "Local development" below), which needs `server-rust/Dockerfile`,
 `webapp/Dockerfile`, and `webapp/nginx.conf` from a source checkout.
@@ -856,6 +861,12 @@ docker compose logs "$MUSIC_BACKEND"
      and timing fields show each attempt. A slow `connect` points to reaching
      the upstream, while a fast `connect` followed by a slow `header` points
      to time spent waiting for the upstream application.
+     Check the request path if the error appeared during playback. A
+     `POST /api/playback/normalize` failure is a background loudness lookup.
+     For a failed `GET /api/tracks/.../stream` or `GET /api/stream/...`, compare
+     `range`, `upstream_range`, and `body_sent`. If a connection drops after
+     audio headers have arrived, the access log still shows the original
+     `200` or `206` status.
    - `DESKTOP_UPSTREAM_TIMEOUT` or `WEB_UPSTREAM_TIMEOUT` identifies the layer
      that timed out. Compare direct health and route timings during the failure
      before changing proxy timeouts. A backend response such as `BACKEND_ERROR`

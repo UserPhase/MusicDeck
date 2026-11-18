@@ -538,6 +538,7 @@ test("library match requests are bounded and preserve all batch responses", asyn
 test("stream and artwork URLs never include backend credentials", () => {
   expect(getStreamUrl("track-1")).toBe("/api/tracks/track-1/stream");
   expect(getStreamUrl("track-1", { id: "playable_1" })).toBe("/api/tracks/track-1/stream?playableSource=playable_1");
+  expect(getStreamUrl("track-1", { id: "connection", type: "library" }, "320")).toBe("/api/tracks/track-1/stream?source=connection&maxBitRate=320");
   expect(getStreamUrl("track-1", null, "128")).toBe("/api/tracks/track-1/stream?maxBitRate=128");
   expect(getStreamUrl("track-1", { id: "playable_1" }, "320")).toBe("/api/tracks/track-1/stream?playableSource=playable_1&maxBitRate=320");
   expect(getStreamUrl("track-1", null, "256")).toBe("/api/tracks/track-1/stream?maxBitRate=256");

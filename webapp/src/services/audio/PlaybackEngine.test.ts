@@ -739,6 +739,47 @@ describe("stall recovery", () => {
     engine.destroy();
   });
 
+  test("restores the last position when a media error resets time and seekable ranges arrive late", async () => {
+    const { engine, deck, of } = await playing();
+    deck.currentTime = 0;
+    deck.error = { code: 3 };
+    deck.fire("pause");
+    deck.fire("error");
+    expect(of("bufferStall")[0]).toEqual(expect.objectContaining({ position: 42 }));
+    deck.loaded(200, false);
+    expect(of("streamRecovered")).toEqual([]);
+    expect(deck.currentTime).toBe(0);
+    deck.seekableEnd = 200;
+    deck.fire("progress");
+    await flush();
+    expect(deck.currentTime).toBe(42);
+    expect(of("streamRecovered")).toEqual([
+      { key: "a", position: 42, attempts: 1, restartedFromBeginning: false },
+    ]);
+    engine.destroy();
+  });
+
+  test("retries a failed seek before a pending media play settles", async () => {
+    const { engine, deck, of } = await playing();
+    let finishStalePlay!: () => void;
+    deck.play.mockReturnValueOnce(new Promise<void>(resolve => { finishStalePlay = resolve; }));
+    deck.error = { code: 2 };
+    deck.fire("error");
+    deck.loaded(200);
+    deck.error = { code: 2 };
+    deck.fire("error");
+    finishStalePlay();
+    await flush();
+    expect(of("streamRecovered")).toEqual([]);
+    jest.advanceTimersByTime(1000);
+    deck.loaded(200);
+    await flush();
+    expect(of("streamRecovered")).toEqual([
+      { key: "a", position: 42, attempts: 2, restartedFromBeginning: false },
+    ]);
+    engine.destroy();
+  });
+
   test("unseekable live transcodes restart from the beginning", async () => {
     const { engine, deck, of } = await playing({}, Number.POSITIVE_INFINITY);
     deck.fire("waiting");

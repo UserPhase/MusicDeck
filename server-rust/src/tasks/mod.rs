@@ -268,7 +268,13 @@ mod tests {
         let files = completed_acq.files.unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].provider_track_id.as_deref(), Some("nav-First"));
-        assert_eq!(std::fs::read(&files[0].path).unwrap().len(), 364);
+        let first_path = music_root.path().join(spotdl::fixture_path("First"));
+        assert_eq!(
+            std::fs::canonicalize(&files[0].path).unwrap(),
+            std::fs::canonicalize(&first_path).unwrap()
+        );
+        let first_file = std::fs::read(&first_path).unwrap();
+        assert_eq!(first_file.len(), 364);
         assert!(std::fs::read_dir(staging.path()).unwrap().next().is_none());
 
         // 2. Valid playlist import job executes payload and updates SQLite to completed
@@ -345,8 +351,72 @@ mod tests {
                 entry.status,
                 crate::acquisition::ImportEntryStatus::Completed
             );
-            assert!(music_root.path().join(entry.file_path.unwrap()).is_file());
+            let path = entry.file_path.unwrap();
+            assert_eq!(path, spotdl::fixture_path(&entry.source.title));
+            assert!(music_root.path().join(path).is_file());
         }
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_file);
+        assert_eq!(
+            std::fs::read_dir(first_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+        assert!(!music_root.path().join("Spotify Imports").exists());
+
+        let alternate = acquisitions
+            .create_job(
+                AcquisitionCreateOptions {
+                    user_id: "alice".into(),
+                    track_id: Some(format!(
+                        "https://open.spotify.com/track/{}",
+                        spotdl::ALTERNATE_RECORDING
+                    )),
+                    ..AcquisitionCreateOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("create acquisition for a different recording with the same title");
+        let alternate_task = manager
+            .enqueue(
+                TaskType::SpotdlDownload,
+                json!({ "kind": "acquisition", "jobId": alternate.id }),
+                "alice",
+                None,
+            )
+            .await
+            .unwrap();
+        let settled = manager
+            .wait_for_settlement(&alternate_task.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(settled.state, TaskStatus::Finished, "{:?}", settled.error);
+        let alternate = acquisitions
+            .get_job(&alternate.id, "alice", false)
+            .await
+            .unwrap();
+        assert_eq!(alternate.status, AcquisitionJobStatus::Completed);
+        let alternate_files = alternate.files.unwrap();
+        let alternate_path = music_root
+            .path()
+            .join(spotdl::fixture_path("First [Differen]"));
+        assert_eq!(
+            std::fs::canonicalize(&alternate_files[0].path).unwrap(),
+            std::fs::canonicalize(&alternate_path).unwrap()
+        );
+        assert_eq!(
+            alternate_files[0].provider_track_id.as_deref(),
+            Some("nav-First [Differen]")
+        );
+        assert_eq!(std::fs::read(alternate_path).unwrap()[44], 3);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_file);
+        assert_eq!(
+            std::fs::read_dir(first_path.parent().unwrap())
+                .unwrap()
+                .count(),
+            3
+        );
         navidrome.abort();
 
         // 3. Non-existent job IDs fail with TaskError::NotFound instead of marking success
@@ -411,7 +481,9 @@ mod tests {
             .create_job(
                 AcquisitionCreateOptions {
                     user_id: String::from("alice"),
-                    track_id: Some(String::from("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT")),
+                    track_id: Some(String::from(
+                        "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+                    )),
                     ..AcquisitionCreateOptions::default()
                 },
                 None,

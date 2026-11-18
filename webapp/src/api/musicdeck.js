@@ -510,13 +510,22 @@ export function getCoverUrl(coverArt, size) {
   return resolveDesktopApiUrl(size ? `${url}?size=${encodeURIComponent(size)}` : url);
 }
 
+function playbackSourceParams(source) {
+  if (source && typeof source === "object" && source.id) {
+    return source.type === "library" && !source.expiresAt
+      ? { source: source.id }
+      : { playableSource: source.id };
+  }
+  return source ? { source } : {};
+}
+
 export async function prepareNormalizedPlayback(songId, source, previewUrl, signal, streamQuality = "original", targetLufs = -16) {
   return request("/api/playback/normalize", {
     method: "POST",
     signal,
     body: JSON.stringify({
       trackId: String(songId),
-      ...(source && typeof source === "object" && source.id ? { playableSource: source.id } : source ? { source } : {}),
+      ...playbackSourceParams(source),
       ...(previewUrl ? { previewUrl } : {}),
       ...(["128", "192", "256", "320"].includes(streamQuality) ? { bitRate: Number(streamQuality) } : {}),
       background: true,
@@ -547,13 +556,7 @@ export function getStreamUrl(songId, source, streamQuality = "original") {
   }
 
   const base = `/api/tracks/${encodeURIComponent(songId)}/stream`;
-  const params = new URLSearchParams();
-
-  if (source && typeof source === "object" && source.id) {
-    params.set("playableSource", source.id);
-  } else if (source) {
-    params.set("source", source);
-  }
+  const params = new URLSearchParams(playbackSourceParams(source));
 
   if (["128", "192", "256", "320"].includes(streamQuality)) {
     params.set("maxBitRate", streamQuality);

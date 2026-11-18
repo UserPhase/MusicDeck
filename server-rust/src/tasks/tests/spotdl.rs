@@ -16,6 +16,8 @@ use std::sync::{
 
 const FIXTURE_ALBUM: &str = "Fixture Artist/Fixture Album";
 const FIXTURE_NAME: &str = "Imported Fixture Playlist";
+const FIRST_RECORDING: &str = "4cOdK2wGLETKBW3PvgPWqT";
+pub(super) const ALTERNATE_RECORDING: &str = "DifferentRecording";
 
 /// Explicit success fixture, injected only by tests; production always spawns spotDL.
 pub(super) struct SuccessfulProcessRunner;
@@ -28,6 +30,25 @@ impl ProcessRunner for SuccessfulProcessRunner {
         args: &[String],
         options: ProcessOptions,
     ) -> Result<ProcessExecutionResult, ProcessError> {
+        if args.first().is_some_and(|arg| arg == "-c") {
+            let file = tokio::fs::read(args.last().expect("tag inspection filename"))
+                .await
+                .unwrap();
+            let id = match file[44] {
+                1 | 2 => FIRST_RECORDING,
+                3 => ALTERNATE_RECORDING,
+                _ => "SecondRecording",
+            };
+            return Ok(ProcessExecutionResult {
+                exit_code: Some(0),
+                stdout: json!({
+                    "hasArtwork": false, "sourceUrl": format!("https://open.spotify.com/track/{id}")
+                })
+                .to_string(),
+                stderr: String::new(),
+                signal: None,
+            });
+        }
         let directory = options.cwd.expect("download output directory");
         // A small valid mono PCM WAV file for the output discovery step.
         let mut wav = Vec::new();
@@ -49,27 +70,41 @@ impl ProcessRunner for SuccessfulProcessRunner {
                 .await
                 .unwrap();
             let single = args.last().is_some_and(|target| target.contains("/track/"));
+            let alternate = args
+                .last()
+                .is_some_and(|target| target.ends_with(ALTERNATE_RECORDING));
             let titles: &[&str] = if single {
                 &["First"]
             } else {
                 &["Second", "First", "Second"]
             };
             for title in titles {
-                tokio::fs::write(directory.join(fixture_path(title)), &wav)
+                // The playlist encoding differs from the single download even for the same recording.
+                let (id, marker) = match (*title, single, alternate) {
+                    ("First", _, true) => (ALTERNATE_RECORDING, 3),
+                    ("First", true, false) => (FIRST_RECORDING, 1),
+                    ("First", false, false) => (FIRST_RECORDING, 2),
+                    _ => ("SecondRecording", 4),
+                };
+                wav[44] = marker;
+                tokio::fs::write(directory.join(staged_fixture_path(title, id)), &wav)
                     .await
                     .unwrap();
             }
             // Alphabetical order differs from playlist order and a repeated song stays repeated.
             let manifest = titles
                 .iter()
-                .map(|title| fixture_path(title))
+                .map(|title| staged_fixture_path(title, fixture_recording(title, alternate)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let metadata = titles
                 .iter()
                 .map(|title| {
+                    let id = fixture_recording(title, alternate);
                     json!({
-                        "name": title, "list_name": FIXTURE_NAME, "list_length": titles.len()
+                        "name": title, "artist": "Fixture Artist", "album_name": "Fixture Album",
+                        "song_id": id, "url": format!("https://open.spotify.com/track/{id}"),
+                        "list_name": FIXTURE_NAME, "list_length": titles.len()
                     })
                 })
                 .collect::<Vec<_>>();
@@ -96,8 +131,20 @@ impl ProcessRunner for SuccessfulProcessRunner {
     }
 }
 
-fn fixture_path(title: &str) -> String {
-    format!("{FIXTURE_ALBUM}/Fixture Artist - {title}.wav")
+fn fixture_recording(title: &str, alternate: bool) -> &str {
+    match (title, alternate) {
+        ("First", true) => ALTERNATE_RECORDING,
+        ("First", false) => FIRST_RECORDING,
+        _ => "SecondRecording",
+    }
+}
+
+fn staged_fixture_path(title: &str, recording: &str) -> String {
+    format!("{FIXTURE_ALBUM}/Fixture Artist - {title} [{recording}].wav")
+}
+
+pub(super) fn fixture_path(title: &str) -> String {
+    format!("{FIXTURE_ALBUM}/{title}.wav")
 }
 
 #[derive(Clone, Copy)]
@@ -120,16 +167,9 @@ async fn navidrome_request(
     method: axum::http::Method,
     body: Bytes,
 ) -> Json<Value> {
-    let imports = mock.music_root.join("Spotify Imports");
-    let job_path = std::fs::read_dir(&imports)
-        .unwrap()
-        .filter_map(Result::ok)
-        .max_by_key(|entry| entry.file_name().to_string_lossy().starts_with("spimp"))
-        .unwrap()
-        .path();
-    assert!(job_path.join(fixture_path("First")).is_file());
+    assert!(mock.music_root.join(fixture_path("First")).is_file());
     for title in ["First", "Second"] {
-        let path = job_path.join(fixture_path(title));
+        let path = mock.music_root.join(fixture_path(title));
         if !path.exists() {
             continue;
         }
@@ -153,13 +193,19 @@ async fn navidrome_request(
         "search3.view" => {
             assert!(mock.scans.load(Ordering::SeqCst) >= 2);
             let title = &query["query"];
-            let job_id = job_path.file_name().unwrap().to_str().unwrap();
             let mut songs = vec![
                 json!({"id":"wrong-path", "title":title, "path":format!("/music/Existing/{}", fixture_path(title))}),
             ];
             if !(matches!(mock.result, NavidromeResult::MissingTrack) && title == "First") {
-                songs.push(json!({"id":format!("nav-{title}"), "title":title,
-                    "path":format!("/music/Spotify Imports/{job_id}/{}", fixture_path(title))}));
+                for file in std::fs::read_dir(mock.music_root.join(FIXTURE_ALBUM)).unwrap() {
+                    let file = file.unwrap();
+                    let path = file.path();
+                    let stem = path.file_stem().unwrap().to_str().unwrap();
+                    if stem == title || stem.starts_with(&format!("{title} [")) {
+                        songs.push(json!({"id":format!("nav-{stem}"), "title":title,
+                            "path":format!("/music/{FIXTURE_ALBUM}/{}", file.file_name().to_string_lossy())}));
+                    }
+                }
             }
             json!({"status":"ok", "searchResult3":{"song":songs}})
         }
@@ -313,13 +359,7 @@ async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_ev
             .await
             .unwrap();
         assert_eq!(playlists, i64::from(imported > 0));
-        assert!(
-            music
-                .path()
-                .join("Spotify Imports/spimp_fixture")
-                .join(fixture_path("First"))
-                .is_file()
-        );
+        assert!(music.path().join(fixture_path("First")).is_file());
         assert!(stage.path().join("spimp_fixture").exists());
         mock.abort();
     }
@@ -438,7 +478,7 @@ async fn album_acquisition_reports_partial_and_preserves_unindexed_staging() {
         stage
             .path()
             .join(format!("{}-{task_id}", job.id))
-            .join(fixture_path("First"))
+            .join(staged_fixture_path("First", FIRST_RECORDING))
             .is_file()
     );
     mock.abort();

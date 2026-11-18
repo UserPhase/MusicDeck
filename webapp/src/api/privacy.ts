@@ -1,3 +1,5 @@
+import { request } from "./musicdeck";
+
 export interface PrivacySettings {
   localOnly: boolean;
   allowMetadata: boolean;
@@ -8,18 +10,46 @@ export interface PrivacySnapshot extends PrivacySettings {
   enforcedByEnvironment: boolean;
   effective: { metadata: boolean; imports: boolean; artwork: boolean; external: boolean };
 }
-async function request(method: "GET" | "PATCH", signal?: AbortSignal, settings?: PrivacySettings): Promise<PrivacySnapshot> {
-  const response = await fetch("/api/v1/privacy", {
-    method, credentials: "include", cache: "no-store", signal,
-    ...(settings ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) } : {}),
+async function requestPolicy(method: "GET" | "PATCH", signal?: AbortSignal, settings?: PrivacySettings): Promise<PrivacySnapshot> {
+  const payload = await request("/api/v1/privacy", {
+    method, cache: "no-store", signal,
+    ...(settings ? { body: JSON.stringify(settings) } : {}),
+  }).catch((error: unknown) => {
+    if (error instanceof SyntaxError) throw new Error("Invalid privacy settings response");
+    throw error;
   });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload?.error?.message || `Privacy settings request failed (${response.status})`);
   if (!payload || ["localOnly", "allowMetadata", "allowImports", "allowArtwork", "enforcedByEnvironment"].some((key) => typeof payload[key] !== "boolean") ||
       !payload.effective || ["metadata", "imports", "artwork", "external"].some((key) => typeof payload.effective[key] !== "boolean")) {
     throw new Error("Invalid privacy settings response");
   }
   return payload;
 }
-export const getPrivacySettings = (signal?: AbortSignal) => request("GET", signal);
-export const updatePrivacySettings = (settings: PrivacySettings, signal?: AbortSignal) => request("PATCH", signal, settings);
+
+function isTemporarilyUnavailable(error: unknown) {
+  return error instanceof TypeError || (
+    error instanceof Error && "status" in error &&
+    (error.status === 502 || error.status === 503 || error.status === 504)
+  );
+}
+
+export async function getPrivacySettings(signal?: AbortSignal, retryUnavailable = false) {
+  try {
+    return await requestPolicy("GET", signal);
+  } catch (error) {
+    if (!retryUnavailable || signal?.aborted || !isTemporarilyUnavailable(error)) throw error;
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        window.clearTimeout(timer);
+        reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+      };
+      const timer = window.setTimeout(() => {
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      }, 1500);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+    return requestPolicy("GET", signal);
+  }
+}
+
+export const updatePrivacySettings = (settings: PrivacySettings, signal?: AbortSignal) => requestPolicy("PATCH", signal, settings);

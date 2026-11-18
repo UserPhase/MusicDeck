@@ -92,6 +92,7 @@ test("an initial failure stays closed and exposes retry", async () => {
   await flush();
   expect(screen.queryByLabelText("Local player state")).not.toBeInTheDocument();
   expect(screen.getByRole("alert")).toHaveTextContent("Privacy policy unavailable");
+  expect(screen.getByRole("alert")).toHaveTextContent("Offline");
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await flush();
   expect(screen.getByLabelText("Local player state")).toBeInTheDocument();

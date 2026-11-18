@@ -196,6 +196,9 @@ async fn recorded_spotdl_paths(db: Option<&DbPool>, root: &Path) -> HashSet<Stri
             continue;
         };
         for item in items {
+            if item.get("reused").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             let status = item.get("status").and_then(Value::as_str);
             let rel_path = item.get("path").and_then(Value::as_str);
             let (Some("imported"), Some(rel_path)) = (status, rel_path) else {

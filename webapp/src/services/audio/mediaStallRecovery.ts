@@ -30,6 +30,7 @@ interface RecoveryRun {
 }
 
 const MEDIA_ERR_NETWORK = 2;
+const MEDIA_ERR_DECODE = 3;
 export const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
 const HAVE_FUTURE_DATA = 3;
 const PROGRESS_EPSILON_SECONDS = 0.25;
@@ -53,6 +54,7 @@ export class MediaStallRecovery {
   private deck: MediaDeck | null = null;
   private watchdog: ReturnType<typeof setTimeout> | null = null;
   private watchdogPosition = 0;
+  private lastPosition = 0;
   private run: RecoveryRun | null = null;
 
   constructor(
@@ -95,7 +97,9 @@ export class MediaStallRecovery {
 
   /** `timeupdate`: a recovered stream disarms the watchdog. */
   notifyProgress(): void {
-    if (this.watchdog === null || !this.deck) return;
+    if (!this.deck || this.run) return;
+    this.lastPosition = this.deck.position();
+    if (this.watchdog === null) return;
     if (hasProgressed(this.deck.element, this.watchdogPosition)) this.clearWatchdog();
   }
 
@@ -105,8 +109,9 @@ export class MediaStallRecovery {
     if (!deck || !deck.isLoaded()) return false;
     // A failed run stays failed until the user retries; it must not restart on its own.
     if (this.run) return true;
-    if (code !== MEDIA_ERR_NETWORK &&
-      !(code === MEDIA_ERR_SRC_NOT_SUPPORTED && (deck.position() > 0 || retryAtStart))) {
+    const interruptedDecode = code === MEDIA_ERR_DECODE && this.lastPosition > 0;
+    if (code !== MEDIA_ERR_NETWORK && !interruptedDecode &&
+      !(code === MEDIA_ERR_SRC_NOT_SUPPORTED && (deck.position() > 0 || this.lastPosition > 0 || retryAtStart))) {
       return false;
     }
     this.begin(startAt);
@@ -130,6 +135,7 @@ export class MediaStallRecovery {
 
   cancel(): void {
     this.clearWatchdog();
+    this.lastPosition = 0;
     const run = this.run;
     this.run = null;
     if (!run) return;
@@ -148,7 +154,7 @@ export class MediaStallRecovery {
     this.clearWatchdog();
     const run: RecoveryRun = {
       key: deck.key,
-      position: startAt ?? deck.position(),
+      position: startAt ?? (deck.position() || this.lastPosition),
       attempt: 0,
       failed: false,
       timer: null,
@@ -203,42 +209,52 @@ export class MediaStallRecovery {
     const deck = this.deck;
     if (this.run !== run || !deck || deck.key !== run.key) return;
     const element = deck.element;
+    let restoring = false;
 
     const detach = () => {
-      element.removeEventListener("loadedmetadata", onMetadata);
+      element.removeEventListener("loadedmetadata", onReady);
+      element.removeEventListener("progress", onReady);
+      element.removeEventListener("canplay", onReady);
       element.removeEventListener("error", onError);
       if (run.timer !== null) clearTimeout(run.timer);
       run.timer = null;
       run.detach = null;
     };
-    const onError = () => {
-      detach();
-      this.scheduleAttempt(run);
-    };
-    const onMetadata = () => {
-      detach();
-      if (this.run !== run) return;
+    const onError = () => this.scheduleAttempt(run);
+    const onReady = (event: Event) => {
+      if (restoring || run.detach !== detach || element.readyState < 1) return;
       const seekable = deck.isSeekable();
       const duration = deck.duration();
+      // A finite stream can expose metadata before its first seekable range.
+      if (run.position > 0 && !seekable && Number.isFinite(element.duration) && event.type !== "canplay") return;
+      restoring = true;
       const target = seekable && Number.isFinite(duration)
         ? Math.min(run.position, Math.max(0, duration - END_GUARD_SECONDS))
         : 0;
       if (target > 0) deck.seek(target);
       const restarted = !seekable && run.position > 0;
-      if (!this.host.wantsPlayback()) {
+      const finish = () => {
+        if (run.detach !== detach) return;
+        detach();
         this.succeed(run, restarted, target);
+      };
+      if (!this.host.wantsPlayback()) {
+        finish();
         return;
       }
       deck.play().then(
-        () => this.succeed(run, restarted, target),
+        finish,
         () => {
-          if (!this.host.wantsPlayback()) this.succeed(run, restarted, target);
+          if (run.detach !== detach) return;
+          if (!this.host.wantsPlayback()) finish();
           else this.scheduleAttempt(run);
         }
       );
     };
 
-    element.addEventListener("loadedmetadata", onMetadata);
+    element.addEventListener("loadedmetadata", onReady);
+    element.addEventListener("progress", onReady);
+    element.addEventListener("canplay", onReady);
     element.addEventListener("error", onError);
     run.detach = detach;
     run.timer = setTimeout(() => {
@@ -251,6 +267,7 @@ export class MediaStallRecovery {
   private succeed(run: RecoveryRun, restartedFromBeginning: boolean, position: number): void {
     if (this.run !== run) return;
     this.run = null;
+    this.lastPosition = position;
     this.host.onRecovered({
       key: run.key,
       position,
