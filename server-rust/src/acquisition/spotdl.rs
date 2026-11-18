@@ -19,10 +19,15 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use super::input::{Operand, supports_direct_manual};
+use crate::db::DbPool;
+use crate::services::privacy::{PrivacyCategory, PrivacyManager};
 use crate::tasks::{DefaultProcessRunner, ProcessError, ProcessOptions, ProcessRunner};
+use tokio_util::sync::CancellationToken;
 
 /// Shared on-disk relative path template for spotDL downloads and playlist imports.
-pub const SPOTDL_LIBRARY_TEMPLATE: &str = "{artists}/{album}/{artists} - {title}.{output-ext}";
+pub const SPOTDL_LIBRARY_TEMPLATE: &str =
+    "{artists}/{album}/{artists} - {title} [{track-id}].{output-ext}";
 
 /// Supported spotDL output container formats (`SpotDLOutputFormat`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -126,10 +131,11 @@ pub fn canonical_spotify_url(raw: &str) -> Result<String, AcquisitionValidationE
     if url.host_str() != Some("open.spotify.com") {
         return Err(AcquisitionValidationError);
     }
-    let re = Regex::new(r"^/(track|album|playlist)/([a-zA-Z0-9]{1,64})/?$").expect("valid regex");
-    let caps = re
-        .captures(url.path())
-        .ok_or(AcquisitionValidationError)?;
+    let re = Regex::new(
+        r"^/(?:intl-[a-zA-Z0-9-]+/)?(track|album|playlist|artist)/([a-zA-Z0-9]{1,64})/?$",
+    )
+    .expect("valid regex");
+    let caps = re.captures(url.path()).ok_or(AcquisitionValidationError)?;
     let kind = caps.get(1).unwrap().as_str();
     let id = caps.get(2).unwrap().as_str();
     Ok(format!("https://open.spotify.com/{kind}/{id}"))
@@ -165,7 +171,12 @@ pub fn canonical_manual_acquisition_url(raw: &str) -> Result<String, Acquisition
         };
 
         if let Some(vid) = video_id.filter(|v| id_re.is_match(v)) {
-            return Ok(format!("https://www.youtube.com/watch?v={vid}"));
+            let host = if host == "music.youtube.com" {
+                "music.youtube.com"
+            } else {
+                "www.youtube.com"
+            };
+            return Ok(format!("https://{host}/watch?v={vid}"));
         }
 
         if is_yt && url.path() == "/playlist" {
@@ -187,10 +198,8 @@ pub fn canonical_manual_acquisition_url(raw: &str) -> Result<String, Acquisition
         Regex::new(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.bandcamp\.com$").expect("valid regex");
     let is_bandcamp = bandcamp_re.is_match(&host);
 
-    let sc_path_re =
-        Regex::new(r"^/[a-zA-Z0-9_-]+/[a-zA-Z0-9_/-]+/?$").expect("valid regex");
-    let bc_path_re =
-        Regex::new(r"^/(track|album)/[a-zA-Z0-9_-]+/?$").expect("valid regex");
+    let sc_path_re = Regex::new(r"^/[a-zA-Z0-9_-]+/[a-zA-Z0-9_/-]+/?$").expect("valid regex");
+    let bc_path_re = Regex::new(r"^/(track|album)/[a-zA-Z0-9_-]+/?$").expect("valid regex");
 
     if (is_soundcloud && sc_path_re.is_match(url.path()))
         || (is_bandcamp && bc_path_re.is_match(url.path()))
@@ -214,6 +223,8 @@ pub struct TrackImportRequest {
     pub playlist_m3u_name: Option<String>,
     pub broaden_audio_search: bool,
     pub timeout_ms: Option<u64>,
+    #[serde(skip)]
+    pub(crate) operands: Vec<Operand>,
 }
 
 /// Validates a [`TrackImportRequest`] against the acquisition URL & query security policy.
@@ -237,14 +248,30 @@ pub fn validate_spotdl_request(
         if q.starts_with("https://open.spotify.com/") {
             canonical_spotify_url(q)?;
         } else {
-            let forbidden_scheme = Regex::new(
-                r"(?i)^[-/\\.]|[|\x00-\x1f\x7f]|[a-z][a-z0-9+.-]*://|(?:https?|file|ftp|sftp|data|gopher|spotify):",
-            )
-            .expect("valid regex");
-            if q.is_empty() || q.len() > 2000 || forbidden_scheme.is_match(q) {
-                return Err(AcquisitionValidationError);
-            }
+            validate_search_query(q)?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_search_query(q: &str) -> Result<(), AcquisitionValidationError> {
+    let forbidden = Regex::new(r"(?i)^[-/\\.]|[|\x00-\x1f\x7f]|[a-z][a-z0-9+.-]*://|(?:https?|file|ftp|sftp|data|gopher|spotify|album|artist|playlist):")
+        .expect("valid regex");
+    let lower = q.to_ascii_lowercase();
+    if q.is_empty()
+        || q.len() > 2000
+        || forbidden.is_match(q)
+        || lower.ends_with(".spotdl")
+        || matches!(
+            lower.as_str(),
+            "saved"
+                | "all-user-playlists"
+                | "all-saved-playlists"
+                | "all-user-followed-artists"
+                | "all-user-saved-albums"
+        )
+    {
+        return Err(AcquisitionValidationError);
     }
     Ok(())
 }
@@ -330,8 +357,7 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
         }
     }
 
-    let speed_re =
-        Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)/s").expect("valid regex");
+    let speed_re = Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)/s").expect("valid regex");
     if let Some(caps) = speed_re.captures(trimmed) {
         if let Some(bps) = parse_byte_size_with_unit(&caps[1], &caps[2]) {
             progress.speed_bytes_per_second = Some(bps);
@@ -339,10 +365,9 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
         }
     }
 
-    let bytes_re = Regex::new(
-        r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)\s*/\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b)",
-    )
-    .expect("valid regex");
+    let bytes_re =
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)\s*/\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b)")
+            .expect("valid regex");
     if let Some(caps) = bytes_re.captures(trimmed) {
         progress.bytes_downloaded = parse_byte_size_with_unit(&caps[1], &caps[2]);
         progress.total_bytes = parse_byte_size_with_unit(&caps[3], &caps[4]);
@@ -374,13 +399,15 @@ pub fn classify_spotdl_error(output: &str) -> &'static str {
     {
         "rate-limited"
     } else if lower.contains("sign in to confirm")
-        || lower.contains("cookies")
+        || lower.contains("cookies are required")
+        || lower.contains("use --cookies")
+        || lower.contains("cookie file is invalid")
         || lower.contains("login required")
         || lower.contains("age-restricted")
     {
         "auth-required"
     } else if lower.contains("no results found")
-        || lower.contains("audioProviderError")
+        || lower.contains("audioprovidererror")
         || lower.contains("could not match")
     {
         "no-match"
@@ -425,6 +452,9 @@ pub struct SpotDLDownloaderAdapter {
     client_id: Option<String>,
     client_secret: Option<String>,
     cookie_file: Option<String>,
+    cookie_temp: Option<Arc<tempfile::TempPath>>,
+    privacy: Option<PrivacyManager>,
+    startup_error: Option<String>,
 }
 
 impl std::fmt::Debug for SpotDLDownloaderAdapter {
@@ -456,6 +486,9 @@ impl SpotDLDownloaderAdapter {
             client_id: None,
             client_secret: None,
             cookie_file: None,
+            cookie_temp: None,
+            privacy: None,
+            startup_error: None,
         }
     }
 
@@ -472,6 +505,75 @@ impl SpotDLDownloaderAdapter {
     pub fn with_spotdl_path(mut self, path: impl Into<String>) -> Self {
         self.spotdl_path = path.into();
         self
+    }
+
+    pub(crate) async fn with_saved_settings(mut self, db: Option<&DbPool>) -> Self {
+        if let Err(err) = self.load_settings(db).await {
+            self.startup_error = Some(err);
+        }
+        self
+    }
+
+    async fn load_settings(&mut self, db: Option<&DbPool>) -> Result<(), String> {
+        let Some(db) = db else {
+            return Ok(());
+        };
+        let row: Option<(bool, String)> = sqlx::query_as(
+            "SELECT enabled, config_json FROM plugin_configs WHERE plugin_id = 'spotdl-downloader'",
+        )
+        .fetch_optional(db.inner())
+        .await
+        .map_err(|_| "Could not load spotDL plugin settings")?;
+        let Some((enabled, raw)) = row else {
+            return Ok(());
+        };
+        if !enabled {
+            return Err("The spotDL Downloader plugin is disabled".into());
+        }
+        let config: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|_| "Invalid saved spotDL plugin settings")?;
+        let setting = |key: &str| {
+            config[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        if let Some(path) = setting("spotdlPath") {
+            self.spotdl_path = executable_path(path)?;
+        }
+        if let Some(path) = setting("ffmpegPath") {
+            self.ffmpeg_path = executable_path(path)?;
+        }
+        self.output_format = SpotDLOutputFormat::parse(setting("outputFormat"))?;
+        self.client_id = setting("clientId").map(str::to_owned);
+        self.client_secret = setting("clientSecret").map(str::to_owned);
+        if self.client_id.is_some() != self.client_secret.is_some() {
+            return Err("Configure both Spotify client ID and client secret".into());
+        }
+        if let Some(cookies) = setting("youtubeCookies") {
+            use std::io::Write as _;
+            let mut file = tempfile::Builder::new()
+                .prefix("musicdeck-cookies-")
+                .tempfile()
+                .map_err(|_| "Could not create a private spotDL cookie file")?;
+            writeln!(file, "{cookies}").map_err(|_| "Could not write spotDL cookie file")?;
+            let path = file.into_temp_path();
+            self.cookie_file = Some(path.to_string_lossy().into_owned());
+            self.cookie_temp = Some(Arc::new(path));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_privacy(mut self, privacy: Option<PrivacyManager>) -> Self {
+        self.privacy = privacy;
+        self
+    }
+
+    pub(crate) fn tool_paths(&self) -> Result<(&str, &str), &str> {
+        if let Some(error) = self.startup_error.as_deref() {
+            return Err(error);
+        }
+        Ok((&self.spotdl_path, &self.ffmpeg_path))
     }
 
     /// Configures Spotify API credentials and output format.
@@ -509,7 +611,9 @@ impl SpotDLDownloaderAdapter {
         let target = match (manual_url, spotify_url) {
             (Some(m), Some(s)) => format!("{m}|{s}"),
             (None, Some(s)) => s,
-            (Some(m), None) => m,
+            (Some(m), None) if supports_direct_manual(&m) => m,
+            (Some(_), None) => return Err(AcquisitionValidationError),
+            (None, None) if !request.operands.is_empty() => String::new(),
             (None, None) => {
                 let q = request
                     .query
@@ -578,13 +682,15 @@ impl SpotDLDownloaderAdapter {
                 String::from("--m3u"),
                 m3u.clone(),
                 String::from("--add-unavailable"),
-                String::from("--save-file"),
-                String::from("musicdeck-source.spotdl"),
-                String::from("--save-errors"),
-                String::from("musicdeck-errors.txt"),
             ]);
         }
 
+        args.extend([
+            "--save-file".into(),
+            "musicdeck-source.spotdl".into(),
+            "--save-errors".into(),
+            "musicdeck-errors.txt".into(),
+        ]);
         if self.ffmpeg_path != "ffmpeg" {
             args.extend([String::from("--ffmpeg"), self.ffmpeg_path.clone()]);
         }
@@ -600,7 +706,18 @@ impl SpotDLDownloaderAdapter {
             args.extend([String::from("--cookie-file"), cookie.clone()]);
         }
 
-        args.extend([String::from("download"), target]);
+        args.push("download".into());
+        if request.operands.is_empty() {
+            args.push(target);
+        } else {
+            for operand in &request.operands {
+                args.push(
+                    operand
+                        .cli_value()
+                        .map_err(|_| AcquisitionValidationError)?,
+                );
+            }
+        }
         Ok(args)
     }
 
@@ -679,6 +796,23 @@ impl SpotDLDownloaderAdapter {
     where
         F: Fn(AcquisitionProgress) + Send + Sync + 'static,
     {
+        self.download_with_cancel(request, CancellationToken::new(), on_progress)
+            .await
+            .map(|output| output.files)
+    }
+
+    pub(super) async fn download_with_cancel<F>(
+        &self,
+        request: &TrackImportRequest,
+        cancel: CancellationToken,
+        on_progress: F,
+    ) -> Result<DownloadOutput, SpotDLDownloadError>
+    where
+        F: Fn(AcquisitionProgress) + Send + Sync + 'static,
+    {
+        if let Some(error) = &self.startup_error {
+            return Err(SpotDLDownloadError::Download(error.clone()));
+        }
         let args = self
             .build_cli_args(request)
             .map_err(|e| SpotDLDownloadError::Download(e.to_string()))?;
@@ -694,68 +828,166 @@ impl SpotDLDownloaderAdapter {
         env.insert(String::from("COLUMNS"), String::from("240"));
         env.insert(String::from("NO_COLOR"), String::from("1"));
 
-        let res = self
-            .runner
-            .run(
-                &self.spotdl_path,
-                &args,
-                ProcessOptions {
-                    cwd: Some(request.output_directory.clone()),
-                    env,
-                    timeout_ms: Some(request.timeout_ms.unwrap_or(self.timeout_ms)),
-                    on_stdout_line: Some(Arc::new(move |line| {
-                        if let Some(p) = parse_spotdl_progress(line) {
-                            cb_out(p);
-                        }
-                    })),
-                    on_stderr_line: Some(Arc::new(move |line| {
-                        if let Some(p) = parse_spotdl_progress(line) {
-                            cb_err(p);
-                        }
-                    })),
-                    ..ProcessOptions::default()
-                },
-            )
-            .await?;
-
+        let work = self.runner.run(
+            &self.spotdl_path,
+            &args,
+            ProcessOptions {
+                cwd: Some(request.output_directory.clone()),
+                cancel_token: Some(cancel),
+                env,
+                timeout_ms: Some(request.timeout_ms.unwrap_or(self.timeout_ms)),
+                on_stdout_line: Some(Arc::new(move |line| {
+                    if let Some(p) = parse_spotdl_progress(line) {
+                        cb_out(p);
+                    }
+                })),
+                on_stderr_line: Some(Arc::new(move |line| {
+                    if let Some(p) = parse_spotdl_progress(line) {
+                        cb_err(p);
+                    }
+                })),
+                ..ProcessOptions::default()
+            },
+        );
+        let res = if let Some(privacy) = &self.privacy {
+            privacy
+                .run_external(PrivacyCategory::Imports, work)
+                .await
+                .map_err(|err| SpotDLDownloadError::Download(err.to_string()))??
+        } else {
+            work.await?
+        };
+        let saved_errors = super::playlist_files::read_playlist_artifact(
+            &request.output_directory.join("musicdeck-errors.txt"),
+        )
+        .await
+        .unwrap_or_default();
+        let combined = format!("{}\n{}\n{}", res.stdout, res.stderr, saved_errors);
+        let code = classify_spotdl_error(&combined);
         if res.exit_code != Some(0) {
-            let combined = format!("{}\n{}", res.stdout, res.stderr);
-            let code = classify_spotdl_error(&combined);
             return Err(SpotDLDownloadError::Download(format!(
                 "spotDL failed ({code}): exit {:?}",
                 res.exit_code
             )));
         }
 
-        let files = scan_downloaded_audio_files(&request.output_directory).await;
+        let files = scan_downloaded_audio_files(&request.output_directory)
+            .await
+            .map_err(|err| {
+                SpotDLDownloadError::Download(format!("Could not read spotDL output: {err}"))
+            })?;
         if files.is_empty() {
-            return Err(SpotDLDownloadError::Download(String::from(
-                "spotDL exited successfully but produced no audio files",
-            )));
+            let message = if code == "general" {
+                "spotDL exited successfully but produced no audio files".into()
+            } else {
+                format!("spotDL produced no usable audio ({code})")
+            };
+            return Err(SpotDLDownloadError::Download(message));
         }
-        Ok(files)
+        Ok(DownloadOutput {
+            files,
+            warning: (code != "general").then_some(code),
+        })
     }
 }
 
-async fn scan_downloaded_audio_files(dir: &Path) -> Vec<PathBuf> {
+pub(super) struct DownloadOutput {
+    pub files: Vec<PathBuf>,
+    pub warning: Option<&'static str>,
+}
+
+fn executable_path(raw: &str) -> Result<String, String> {
+    let path = Path::new(raw);
+    if path.is_absolute() || !raw.contains(['/', '\\']) {
+        return Ok(raw.to_owned());
+    }
+    std::path::absolute(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| "Could not resolve configured tool path".into())
+}
+
+pub(super) async fn scan_downloaded_audio_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(curr) = stack.pop() {
-        let Ok(mut rd) = tokio::fs::read_dir(&curr).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
+        let mut rd = tokio::fs::read_dir(&curr).await?;
+        while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
-            let Ok(ft) = entry.file_type().await else {
-                continue;
-            };
+            let ft = entry.file_type().await?;
             if ft.is_dir() {
                 stack.push(path);
-            } else if ft.is_file() && crate::audio::is_supported_audio_file(&path) {
+            } else if ft.is_file()
+                && crate::audio::is_supported_audio_file(&path)
+                && entry.metadata().await?.len() > 0
+            {
                 found.push(path);
             }
         }
     }
     found.sort();
-    found
+    Ok(found)
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saved_plugin_configuration_supplies_downloader_arguments() {
+        let db = DbPool::connect_memory().await.unwrap();
+        crate::db::run_migrations(&db, None).await.unwrap();
+        let settings = serde_json::json!({
+            "spotdlPath": "fixture-downloader",
+            "ffmpegPath": "fixture-ffmpeg",
+            "outputFormat": "mp3",
+            "clientId": "fixture-client",
+            "clientSecret": "fixture-secret",
+            "youtubeCookies": "# Netscape HTTP Cookie File"
+        });
+        sqlx::query(
+            "INSERT INTO plugin_configs(plugin_id,enabled,config_json,permissions_json,updated_at)
+            VALUES ('spotdl-downloader',1,?,'[]',CURRENT_TIMESTAMP)",
+        )
+        .bind(settings.to_string())
+        .execute(db.inner())
+        .await
+        .unwrap();
+        let adapter = SpotDLDownloaderAdapter::new()
+            .with_saved_settings(Some(&db))
+            .await;
+        assert_eq!(
+            adapter.tool_paths(),
+            Ok(("fixture-downloader", "fixture-ffmpeg"))
+        );
+        let args = adapter
+            .build_cli_args(&TrackImportRequest {
+                spotify_track_url: Some("https://open.spotify.com/track/FixtureTrack".into()),
+                output_directory: PathBuf::from("fixture"),
+                ..Default::default()
+            })
+            .unwrap();
+        let option = |name: &str| {
+            args.windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1].as_str())
+        };
+        for (name, value) in [
+            ("--format", "mp3"),
+            ("--bitrate", "320k"),
+            ("--ffmpeg", "fixture-ffmpeg"),
+            ("--client-id", "fixture-client"),
+            ("--client-secret", "fixture-secret"),
+            ("--save-file", "musicdeck-source.spotdl"),
+            ("--save-errors", "musicdeck-errors.txt"),
+        ] {
+            assert_eq!(option(name), Some(value));
+        }
+        let cookie = PathBuf::from(option("--cookie-file").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&cookie).unwrap().trim(),
+            "# Netscape HTTP Cookie File"
+        );
+        drop(adapter);
+        assert!(!cookie.exists());
+    }
 }

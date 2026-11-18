@@ -13,6 +13,7 @@ import {
 
 
 jest.mock("./musicdeck", () => ({
+  request: jest.requireActual("./musicdeck").request,
   getPlaylists: jest.fn(),
   getPlaylist: jest.fn(),
   createPlaylist: jest.fn(),
@@ -151,5 +152,5 @@ test("starts and polls a Spotify playlist import with session credentials", asyn
     method: "POST", credentials: "include", body: JSON.stringify({ playlistUrl: "https://open.spotify.com/playlist/abc123" }),
   }));
   await expect(getSpotifyPlaylistImport("job-1")).resolves.toMatchObject({ playlistId: "mdpl_1" });
-  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1", { credentials: "include" });
+  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1", expect.objectContaining({ credentials: "include" }));
 });

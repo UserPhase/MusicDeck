@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { createAcquisition, getAcquisition } from "../api/musicdeck";
+import { createAcquisition, getAcquisition, retryAcquisition } from "../api/musicdeck";
+import { acquisitionPayload } from "../services/externalActions";
 import { usePrivacy } from "../context/PrivacyContext";
 import { startVisualPolling } from "../services/visualActivity";
 
@@ -33,6 +34,7 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
   const [progress, setProgress] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const stopPollingRef = useRef(null);
+  const jobRef = useRef(null);
   const isMountedRef = useRef(true);
 
   useEffect(() => {
@@ -42,6 +44,14 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
       stopPollingRef.current?.();
     };
   }, []);
+
+  useEffect(() => {
+    jobRef.current = null;
+    stopPollingRef.current?.();
+    setStatus("idle");
+    setProgress(null);
+    setErrorMessage(null);
+  }, [song?.id]);
 
   if (!song) {
     return null;
@@ -87,31 +97,13 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
       setErrorMessage(null);
       setProgress(null);
 
-      const title = song.title || "";
-      const artist = song.artist || (typeof song.artistName === "string" ? song.artistName : "");
-      const album = song.album || (typeof song.albumName === "string" ? song.albumName : "");
-
-      const payload = {
-        result: {
-          id: song.id,
-          type: "track",
-          title,
-          artist,
-          album,
-          provider: song.provider || (song.source?.kind === "external" ? "external" : "library"),
-          source: song.source || { kind: song.source?.kind || "library", count: 1 },
-          metadata: {
-            ...(song.metadata || {}),
-            spotifyTrackUrl: song.metadata?.spotifyTrackUrl || song.spotifyUrl,
-            spotifyTrackId: song.metadata?.spotifyTrackId,
-          },
-        },
-        trackId: song.id,
-        sourceProvider: "spotdl",
-      };
-
-      const res = await createAcquisition(payload);
-
+      const res = status === "failed" && jobRef.current
+        ? await retryAcquisition(jobRef.current)
+        : await createAcquisition(acquisitionPayload("track", {
+          ...song,
+          artist: song.artist || song.artistName,
+          album: song.album || song.albumName,
+        }));
       if (!isMountedRef.current) return;
 
       if (res.status === "completed") {
@@ -123,6 +115,7 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
 
       const jobId = res.jobId || res.job?.id;
       if (!jobId) return;
+      jobRef.current = jobId;
 
       stopPollingRef.current?.();
       let inFlight = false;
@@ -142,6 +135,9 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
             if (job.status === "completed") {
               stopPolling();
               setStatus("completed");
+            } else if (job.status === "partial") {
+              stopPolling();
+              setErrorMessage(job.errorMessage || "Part of the download was imported");
             } else if (job.status === "failed") {
               stopPolling();
               setStatus("failed");
@@ -180,6 +176,9 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
   } else if (status === "completed") {
     label = `${titleText} downloaded to library`;
     titleAttr = "Downloaded to library";
+  } else if (status === "partial") {
+    label = `Partially imported ${titleText}`;
+    titleAttr = errorMessage || "Partially imported";
   } else if (status === "failed") {
     label = `Download failed for ${titleText}. Click to retry.`;
     titleAttr = errorMessage || "Download failed (click to retry)";
@@ -206,7 +205,7 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
         className={`track-download-btn ${status !== "idle" ? status : ""} ${isWorking ? "active" : ""}`.trim()}
         aria-label={label}
         title={titleAttr}
-        disabled={isWorking}
+        disabled={isWorking || status === "partial" || status === "completed"}
         onClick={handleDownload}
       >
         {isWorking ? (

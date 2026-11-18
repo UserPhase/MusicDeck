@@ -36,7 +36,8 @@ function SavedCard({ item, selected, onSelect, onRemove, onStatusChange, selecti
   useEffect(() => {
     if (snapshot.state !== "IDLE") void onStatusChange();
   }, [snapshot.state, onStatusChange]);
-  const state = item.inLibrary || snapshot.state === "IN_LIBRARY" ? "IN_LIBRARY"
+  const state = snapshot.state === "PARTIAL" ? "PARTIAL"
+    : item.inLibrary || snapshot.state === "IN_LIBRARY" ? "IN_LIBRARY"
     : snapshot.state !== "IDLE" ? snapshot.state : item.status || "IDLE";
   const importing = state === "QUEUED" || state === "IMPORTING";
   const inLibrary = state === "IN_LIBRARY";
@@ -108,7 +109,7 @@ function SavedCard({ item, selected, onSelect, onRemove, onStatusChange, selecti
     <div className="saved-discovery-actions">
       {canImport && <button type="button" className="saved-discovery-import" disabled={importing || inLibrary || selectionLocked}
         onClick={() => { void start(); }}>
-        {inLibrary ? "In Library" : state === "QUEUED" ? "Queued" : importing ? "Importing…" : state === "FAILED" ? "Retry import" : "Import to Library"}
+        {inLibrary ? "In Library" : state === "PARTIAL" ? "Partially Imported" : state === "QUEUED" ? "Queued" : importing ? "Importing…" : state === "FAILED" ? "Retry import" : "Import to Library"}
       </button>}
       <button type="button" className="saved-discovery-remove" disabled={removing || selectionLocked}
         aria-label={`Remove from Saved: ${item.title}`} title="Remove from Saved Discoveries"

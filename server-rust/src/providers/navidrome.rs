@@ -49,6 +49,7 @@ pub struct NavidromeClient {
     username: String,
     password: String,
     http: reqwest::Client,
+    scan_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Alias matching the legacy TypeScript class name `NavidromeBackend`.
@@ -74,6 +75,7 @@ impl NavidromeClient {
             username: config.username,
             password: config.password,
             http,
+            scan_lock: Default::default(),
         }
     }
 
@@ -130,9 +132,15 @@ impl NavidromeClient {
         timeout_ms: u64,
     ) -> Result<Value, ProviderError> {
         let url = self.build_url(endpoint, params)?;
-        let response = self
-            .http
-            .get(url)
+        self.send_json(self.http.get(url), timeout_ms).await
+    }
+
+    async fn send_json(
+        &self,
+        request: reqwest::RequestBuilder,
+        timeout_ms: u64,
+    ) -> Result<Value, ProviderError> {
+        let response = request
             .timeout(Duration::from_millis(timeout_ms))
             .send()
             .await
@@ -144,7 +152,7 @@ impl NavidromeClient {
                 } else {
                     ProviderError::Upstream {
                         provider: "Navidrome",
-                        message: err.to_string(),
+                        message: err.without_url().to_string(),
                     }
                 }
             })?;
@@ -767,42 +775,151 @@ impl MusicBackend for NavidromeClient {
     }
 
     async fn scan_library(&self) -> Result<LibraryScanResult, ProviderError> {
-        self.request_library_rescan().await?;
+        let _scan = self.scan_lock.lock().await;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            self.request_library_rescan().await?;
+            let mut delay = Duration::from_millis(250);
+            let mut failures = 0;
+            loop {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(3));
+                match self
+                    .request_json("getScanStatus", &[], NAVIDROME_REQUEST_TIMEOUT_MS)
+                    .await
+                {
+                    Ok(res) => {
+                        let status = &res["scanStatus"];
+                        match status["scanning"].as_bool() {
+                            Some(false) => {
+                                if let Some(error) = status["error"].as_str().filter(|err| !err.is_empty()) {
+                                    return Err(ProviderError::Upstream {
+                                        provider: "Navidrome",
+                                        message: format!("Navidrome scanner failed: {error}"),
+                                    });
+                                }
+                                return Ok(LibraryScanResult {
+                                    scanning: false,
+                                    count: status["count"].as_u64(),
+                                });
+                            }
+                            Some(true) => failures = 0,
+                            None => {
+                                return Err(ProviderError::Upstream {
+                                    provider: "Navidrome",
+                                    message: "Missing scan status in Navidrome response".into(),
+                                });
+                            }
+                        }
+                    }
+                    Err(ProviderError::Timeout { .. } | ProviderError::Upstream { .. })
+                        if failures < 2 =>
+                    {
+                        failures += 1;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        })
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            provider: "Navidrome scan",
+        })?
+    }
 
-        let mut last_count = None;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let Ok(res) = self
-                .request_json("getScanStatus", &[], NAVIDROME_REQUEST_TIMEOUT_MS)
-                .await
-            else {
+    async fn find_imported_track(
+        &self,
+        relative_path: &str,
+        title: &str,
+    ) -> Result<Option<Track>, ProviderError> {
+        let suffix = format!("/{relative_path}");
+        for offset in (0..500).step_by(100) {
+            let result = self
+                .request_json(
+                    "search3",
+                    &[
+                        ("query", title.to_owned()),
+                        ("artistCount", "0".into()),
+                        ("albumCount", "0".into()),
+                        ("songCount", "100".into()),
+                        ("songOffset", offset.to_string()),
+                    ],
+                    NAVIDROME_REQUEST_TIMEOUT_MS,
+                )
+                .await?;
+            let Some(songs) = result["searchResult3"]["song"].as_array() else {
                 break;
             };
-
-            let status_obj = res.get("scanStatus");
-            if let Some(count) = status_obj
-                .and_then(|s| s.get("count"))
-                .and_then(Value::as_u64)
-            {
-                last_count = Some(count);
+            if let Some(song) = songs.iter().find(|song| {
+                song["id"].as_str().is_some_and(|id| !id.is_empty())
+                    && song["path"].as_str().is_some_and(|path| {
+                        let path = path.replace('\\', "/");
+                        path == relative_path || path.ends_with(&suffix)
+                    })
+            }) {
+                return Ok(Some(map_subsonic_track(song)));
             }
-
-            let scanning = status_obj
-                .and_then(|s| s.get("scanning"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if !scanning {
-                return Ok(LibraryScanResult {
-                    scanning: false,
-                    count: last_count,
-                });
+            if songs.len() < 100 {
+                break;
             }
         }
+        Ok(None)
+    }
 
-        Ok(LibraryScanResult {
-            scanning: false,
-            count: last_count,
-        })
+    async fn create_imported_playlist(
+        &self,
+        name: &str,
+        description: &str,
+        track_ids: &[String],
+    ) -> Result<String, ProviderError> {
+        let mut form = vec![("name", name)];
+        form.extend(track_ids.iter().map(|id| ("songId", id.as_str())));
+        let url = self.build_url("createPlaylist", &[])?;
+        let result = self
+            .send_json(
+                self.http.post(url).form(&form),
+                NAVIDROME_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+        let playlist = &result["playlist"];
+        let id = playlist["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ProviderError::Upstream {
+                provider: "Navidrome",
+                message: "Navidrome did not return the created playlist ID".into(),
+            })?;
+        let verify_and_update = async {
+            if !playlist["entry"].as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["id"].as_str())
+                    .eq(track_ids.iter().map(|id| Some(id.as_str())))
+            }) {
+                return Err(ProviderError::Upstream {
+                    provider: "Navidrome",
+                    message: "Navidrome did not attach all requested tracks in order".into(),
+                });
+            }
+            self.request_json(
+                "updatePlaylist",
+                &[
+                    ("playlistId", id.to_owned()),
+                    ("comment", description.to_owned()),
+                    ("public", "false".into()),
+                ],
+                NAVIDROME_REQUEST_TIMEOUT_MS,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = verify_and_update {
+            if let Err(cleanup) = self.delete_playlist(id).await {
+                tracing::warn!(playlist_id = id, error = %cleanup, "Could not remove incomplete Navidrome import playlist");
+            }
+            return Err(err);
+        }
+        Ok(id.to_owned())
     }
 
     async fn fetch_stream(

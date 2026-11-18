@@ -313,20 +313,22 @@ Docker Engine releases older than 28.0.0 can allow hosts on the same network
 segment to reach loopback-published ports. See the [Docker port publishing
 documentation](https://docs.docker.com/engine/network/port-publishing/).
 
-For remote setup, forward the selected backend port through SSH, then open
-the corresponding `127.0.0.1` URL above in your local browser. Replace
+For remote setup, forward the selected backend port through SSH. Open
+`http://127.0.0.1:14533` on your PC for Navidrome or `http://127.0.0.1:8096`
+for Jellyfin. Replace
 `user@SERVER_IP` with your SSH login and run the command for your backend.
 
 ```bash
 # Navidrome
-ssh -N -L 127.0.0.1:4533:127.0.0.1:4533 user@SERVER_IP
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:14533:127.0.0.1:4533 user@SERVER_IP
 # Jellyfin
 ssh -N -L 127.0.0.1:8096:127.0.0.1:8096 user@SERVER_IP
 ```
 
-Existing `NAVIDROME_PORT` and `JELLYFIN_PORT` remain numeric host-port
-overrides. Use the configured host port in the browser and SSH command if
-you change it. Recreate the selected backend after changes with
+The first port in the forwarding rule is on your PC. If it cannot be opened,
+choose another local port and use that port in your browser. The last port
+must match the Docker host's published port (`NAVIDROME_PORT` or
+`JELLYFIN_PORT`). Recreate the selected backend after changing its published port with
 `docker compose up -d navidrome` or `docker compose up -d jellyfin`.
 
 Internal Docker URLs/ports are unchanged; MusicDeck does not use published

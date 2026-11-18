@@ -62,8 +62,8 @@ function ReleaseCard({ release }: { release: NewRelease }) {
             catch (reason) { if (alive.current) setError(message(reason)); }
             finally { savingRef.current = false; if (alive.current) setSaving(false); }
           }}>{saving ? "Saving…" : existing ? "In wishlist" : "Save to wishlist"}</button>
-        <button type="button" disabled={!canImport || busy || snapshot.state === "IN_LIBRARY"} onClick={() => void start()}>
-          {snapshot.state === "IN_LIBRARY" ? "In library" : busy ? snapshot.state === "QUEUED" ? "Import queued" : "Importing…" : snapshot.state === "FAILED" ? "Retry import" : "Import via spotDL"}</button>
+        <button type="button" disabled={!canImport || busy || snapshot.state === "IN_LIBRARY" || snapshot.state === "PARTIAL"} onClick={() => void start()}>
+          {snapshot.state === "IN_LIBRARY" ? "In library" : snapshot.state === "PARTIAL" ? "Partially imported" : busy ? snapshot.state === "QUEUED" ? "Import queued" : "Importing…" : snapshot.state === "FAILED" ? "Retry import" : "Import via spotDL"}</button>
       </div>
       {snapshot.message && <p role={snapshot.state === "FAILED" ? "alert" : "status"} className="release-status">{snapshot.message}</p>}
       {error && <p role="alert" className="release-error">{error}</p>}

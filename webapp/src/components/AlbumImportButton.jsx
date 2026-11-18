@@ -1,7 +1,7 @@
 import { useExternalAction } from "../services/externalActions";
 import { usePrivacy } from "../context/PrivacyContext";
 
-const labels = { IDLE: "Add to Library", QUEUED: "Queued…", IMPORTING: "Importing…", IN_LIBRARY: "In Library", FAILED: "Retry Import" };
+const labels = { IDLE: "Add to Library", QUEUED: "Queued…", IMPORTING: "Importing…", IN_LIBRARY: "In Library", PARTIAL: "Partially Imported", FAILED: "Retry Import" };
 
 export default function AlbumImportButton({ album, actions }) {
   const { canImport } = usePrivacy();
@@ -10,7 +10,7 @@ export default function AlbumImportButton({ album, actions }) {
   const busy = snapshot.state === "QUEUED" || snapshot.state === "IMPORTING";
   return <>
     <button type="button" className="detail-secondary-action album-import-action"
-      disabled={busy || snapshot.state === "IN_LIBRARY"} aria-busy={busy || undefined}
+      disabled={busy || snapshot.state === "IN_LIBRARY" || snapshot.state === "PARTIAL"} aria-busy={busy || undefined}
       onClick={() => { void start(); }}>
       <span aria-hidden="true">☁</span> {snapshot.state === "IMPORTING" && snapshot.progress != null ? `Importing ${snapshot.progress}%` : labels[snapshot.state]}
     </button>

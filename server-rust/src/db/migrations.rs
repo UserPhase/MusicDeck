@@ -3,14 +3,14 @@
 //! Complete Rust port of `server/src/db/migrations.ts`.
 //!
 //! ## Key Capabilities
-//! 1. **50-Step Sequential Migration Engine ([`run_migrations`])**:
+//! 1. **Sequential Migration Engine ([`run_migrations`])**:
 //!    - Maintains the `schema_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`
 //!      ledger table.
 //!    - Supports full initialization (`up_to = None`) and targeted version roll-forward
 //!      (`up_to = Some(target_version)`) for testing legacy database upgrade paths.
 //!    - Wraps every individual migration step in an atomic SQLite transaction (`BEGIN` /
 //!      `COMMIT` / `ROLLBACK`), re-checking `schema_migrations` inside the write lock.
-//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=50) and
+//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=51) and
 //!      procedural data-transforming migrations (migration 39: `upgrade-legacy-smart-playlist-projection`).
 //! 2. **Transactional Initial Seeding ([`seed_initial_data`])**:
 //!    - Seeds `roles` (`admin`, `user`) and the primary `backend_connections` row matching
@@ -38,7 +38,7 @@ use crate::db::migrations_sql::{RAW_MIGRATIONS, SMART_PLAYLIST_ACTIVITY_SCHEMA_B
 use crate::db::{DbError, DbPool, protect_database_files};
 
 /// Total number of sequential migrations defined in the MusicDeck schema registry.
-pub const LATEST_SCHEMA_VERSION: u32 = 50;
+pub const LATEST_SCHEMA_VERSION: u32 = 51;
 
 /// Bcrypt work factor (`12`) matching `PASSWORD_COST` in `server/src/auth/passwords.ts`.
 pub const BCRYPT_PASSWORD_COST: u32 = 12;
@@ -62,7 +62,7 @@ pub enum MigrationKind {
 /// Metadata and execution hook for a single schema migration step.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    /// Monotonically increasing migration version identifier (`1..=50`).
+    /// Monotonically increasing migration version identifier (`1..=51`).
     pub id: u32,
     /// Descriptive kebab-case migration slug stored in `schema_migrations.name`.
     pub name: &'static str,
@@ -124,7 +124,7 @@ pub struct BackfillReport {
     pub playlist_items_backfilled: u64,
 }
 
-/// Returns the ordered registry of all 50 MusicDeck schema migrations.
+/// Returns the ordered registry of all MusicDeck schema migrations.
 #[must_use]
 pub fn migrations_registry() -> Vec<Migration> {
     RAW_MIGRATIONS
@@ -170,7 +170,7 @@ pub async fn list_applied_migrations(pool: &DbPool) -> Result<Vec<AppliedMigrati
     Ok(applied)
 }
 
-/// Executes all unapplied migrations up to `up_to` (or all 50 migrations when `up_to` is `None`),
+/// Executes all unapplied migrations up to `up_to` (or all migrations when `up_to` is `None`),
 /// wrapping each individual migration in an atomic SQLite transaction.
 pub async fn run_migrations(
     pool: &DbPool,
@@ -811,7 +811,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn applies_partial_and_full_50_migrations_and_backfills_identities() {
+    async fn applies_partial_and_full_migrations_and_backfills_identities() {
         let pool = DbPool::connect_memory().await.expect("open memory pool");
 
         // 1. Roll forward to migration 3 (connection-scoped user data)
@@ -848,11 +848,11 @@ mod tests {
             .expect("backfill scope at v3");
         assert_eq!(scope_report.connection_scope_rows_updated, 1);
 
-        // 3. Roll forward through all 50 migrations
+        // 3. Roll forward through all migrations
         let full = run_migrations(&pool, None)
             .await
-            .expect("migrate up to v50");
-        assert_eq!(full.total_applied, 50);
+            .expect("migrate to latest");
+        assert_eq!(full.total_applied, LATEST_SCHEMA_VERSION as usize);
 
         // 4. Run library identity backfill and verify 'nav-track-1' is mapped to 'md_...'
         let id_report = backfill_library_identities(&pool)

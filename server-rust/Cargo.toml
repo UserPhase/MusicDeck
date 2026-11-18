@@ -114,6 +114,7 @@ unicode-normalization = "=0.1.24"
 tokio-stream = { version = "=0.1.17", features = ["sync"] }
 tokio-util = { version = "=0.7.13", features = ["io"] }
 nanoid = "=0.4.0"
+tempfile = "=3.17.1"
 
 # Safe binary image decoding/resizing (JPEG, PNG, WebP), base64, gzip, tar, and URL encoding.
 image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -151,7 +152,6 @@ thiserror = "=2.0.11"
 # Enables `ServiceExt::oneshot` for driving `axum::Router` in unit tests without TCP.
 tower = { version = "=0.5.2", features = ["util"] }
 http-body-util = "=0.1.2"
-tempfile = "=3.17.1"
 pretty_assertions = "=1.4.1"
 approx = "=0.5.1"
 

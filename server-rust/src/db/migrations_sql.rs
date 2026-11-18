@@ -56,4 +56,11 @@ pub const RAW_MIGRATIONS: &[(u32, &str, Option<&str>)] = &[
     (48, "playlist-scoped-audio-scans", Some("\n  ALTER TABLE loudness_scan_jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'library' CHECK(scope IN ('library','playlists'));\n  ALTER TABLE silence_scan_jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'library' CHECK(scope IN ('library','playlists'));\n")),
     (49, "playlist-pin-order", Some("\n  ALTER TABLE playlist_placements ADD COLUMN pin_position INTEGER;\n")),
     (50, "catalog-and-playlist-query-indexes", Some("\n  CREATE INDEX playlists_owner_deleted_idx ON playlists(owner_user_id, deleted_at);\n  CREATE INDEX smart_tracks_artist ON smart_playlist_tracks(artist COLLATE NOCASE, title COLLATE NOCASE, id);\n  CREATE INDEX smart_tracks_album ON smart_playlist_tracks(album COLLATE NOCASE, title COLLATE NOCASE, id);\n")),
+    (51, "acquisition-execution-checkpoints", Some("
+        ALTER TABLE acquisition_jobs ADD COLUMN active_task_id TEXT;
+        ALTER TABLE acquisition_jobs ADD COLUMN requested_title TEXT;
+        ALTER TABLE acquisition_jobs ADD COLUMN requested_artist TEXT;
+        ALTER TABLE acquisition_jobs ADD COLUMN expected_count INTEGER;
+        ALTER TABLE acquisition_jobs ADD COLUMN imported_count INTEGER;
+    ")),
 ];

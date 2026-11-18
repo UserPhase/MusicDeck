@@ -155,6 +155,29 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
     /// Triggers a library scan and (when supported by the provider) polls until completion.
     async fn scan_library(&self) -> Result<LibraryScanResult, ProviderError>;
 
+    /// Finds a newly indexed track by its actual path relative to the shared music root.
+    async fn find_imported_track(
+        &self,
+        _relative_path: &str,
+        _title: &str,
+    ) -> Result<Option<Track>, ProviderError> {
+        Err(ProviderError::Configuration(
+            "Indexed import lookup requires Navidrome".into(),
+        ))
+    }
+
+    /// Creates an upstream playlist containing the given provider-native IDs in order.
+    async fn create_imported_playlist(
+        &self,
+        _name: &str,
+        _description: &str,
+        _track_ids: &[String],
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError::Configuration(
+            "Upstream playlist import requires Navidrome".into(),
+        ))
+    }
+
     // ------------------------------------------------------------------------
     // Stream & Artwork Capabilities (`StreamProvider`)
     // ------------------------------------------------------------------------

@@ -105,11 +105,11 @@ docker compose up -d navidrome
 ```
 
 On your PC, open an SSH tunnel using your server login. Leave it running while
-you open `http://127.0.0.1:4533` on the PC and create the Navidrome account
+you open `http://127.0.0.1:14533` on the PC and create the Navidrome account
 matching the credentials in `.env`.
 
 ```bash
-ssh -N -L 127.0.0.1:4533:127.0.0.1:4533 user@SERVER_IP
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:14533:127.0.0.1:4533 user@SERVER_IP
 ```
 
 #### Option B: Jellyfin

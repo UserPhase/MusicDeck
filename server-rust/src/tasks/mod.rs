@@ -200,8 +200,14 @@ mod tests {
         run_migrations(&pool, None).await.expect("run migrations");
         seed_test_user(&pool).await;
 
-        let acquisitions = AcquisitionService::new(Some(pool.clone()));
-        let spotify_imports = SpotifyPlaylistImportService::new(Some(pool.clone()));
+        let music_root = tempfile::tempdir().expect("shared music root");
+        let staging = tempfile::tempdir().expect("SpotDL staging root");
+        let (spotify_imports, acquisitions, navidrome) = spotdl::import_fixture(
+            pool.clone(),
+            music_root.path(),
+            spotdl::NavidromeResult::Success,
+        )
+        .await;
         let manager = TaskManager::new(Some(pool.clone()));
         manager.initialize_tables().await;
 
@@ -215,7 +221,8 @@ mod tests {
                 crate::acquisition::SpotDLDownloaderAdapter::with_runner(Arc::new(
                     spotdl::SuccessfulProcessRunner,
                 )),
-            )),
+            ))
+            .with_output_dir(staging.path()),
         );
         manager.register(TaskType::SpotdlDownload, Arc::clone(&runner));
         manager.register(TaskType::SpotdlImport, Arc::clone(&runner));
@@ -258,7 +265,11 @@ mod tests {
             .await
             .expect("load completed acquisition job");
         assert_eq!(completed_acq.status, AcquisitionJobStatus::Completed);
-        assert!(completed_acq.files.as_ref().is_some_and(|f| !f.is_empty()));
+        let files = completed_acq.files.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].provider_track_id.as_deref(), Some("nav-First"));
+        assert_eq!(std::fs::read(&files[0].path).unwrap().len(), 364);
+        assert!(std::fs::read_dir(staging.path()).unwrap().next().is_none());
 
         // 2. Valid playlist import job executes payload and updates SQLite to completed
         let user_rec = UserRecord {
@@ -301,7 +312,7 @@ mod tests {
             .wait_for_settlement(&imp_task.id, Duration::from_secs(3))
             .await
             .expect("settle spotdl import");
-        assert_eq!(settled_imp.state, TaskStatus::Finished);
+        assert_eq!(settled_imp.state, TaskStatus::Finished, "{:?}", settled_imp.error);
 
         let completed_imp = spotify_imports
             .get(&import_job.id, "alice")
@@ -309,6 +320,34 @@ mod tests {
             .expect("load completed playlist import");
         assert_eq!(completed_imp.status, "completed");
         assert_eq!(completed_imp.stage, "completed");
+        assert_eq!(completed_imp.imported_count, Some(3));
+        assert_eq!(completed_imp.failed_count, Some(0));
+        assert!(!staging.path().join(&import_job.id).exists());
+        let local_playlist_id = completed_imp.playlist_id.expect("MusicDeck playlist ID");
+        let playlist: (String, String) =
+            sqlx::query_as("SELECT owner_user_id, source_playlist_id FROM playlists WHERE id = ?")
+                .bind(&local_playlist_id)
+                .fetch_one(pool.inner())
+                .await
+                .unwrap();
+        assert_eq!(playlist, ("alice".into(), "nav-playlist".into()));
+        let track_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT provider_track_id FROM playlist_items
+             WHERE playlist_id = ? AND library_track_id IS NOT NULL ORDER BY position",
+        )
+        .bind(&local_playlist_id)
+        .fetch_all(pool.inner())
+        .await
+        .unwrap();
+        assert_eq!(track_ids, ["nav-Second", "nav-First", "nav-Second"]);
+        for entry in completed_imp.manifest.unwrap() {
+            assert_eq!(
+                entry.status,
+                crate::acquisition::ImportEntryStatus::Completed
+            );
+            assert!(music_root.path().join(entry.file_path.unwrap()).is_file());
+        }
+        navidrome.abort();
 
         // 3. Non-existent job IDs fail with TaskError::NotFound instead of marking success
         let missing_acq_task = manager

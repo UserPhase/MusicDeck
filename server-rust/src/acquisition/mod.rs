@@ -5,9 +5,12 @@
 //! [`canonical_manual_acquisition_url`], [`SqliteImportJobRepository`], [`ImportJob`],
 //! [`SpotifyPlaylistImportService`], and [`AcquisitionService`].
 
+mod input;
+mod playlist_files;
 pub mod repository;
 pub mod service;
 pub mod spotdl;
+pub use input::{AcquisitionKind, AcquisitionResult};
 
 pub use repository::{
     ImportEntry, ImportEntryStatus, ImportJob, PlaylistImportForbiddenError,
@@ -112,7 +115,7 @@ mod tests {
             .create_job(
                 AcquisitionCreateOptions {
                     user_id: String::from("alice"),
-                    track_id: Some(String::from("external_deezer_track_123")),
+                    query: Some("Fixture Artist - Fixture Track".into()),
                     ..AcquisitionCreateOptions::default()
                 },
                 None,
@@ -121,12 +124,29 @@ mod tests {
             .expect("create acquisition job");
         assert_eq!(job.status, AcquisitionJobStatus::Queued);
 
-        assert!(acq.cancel_job(&job.id, "alice", false).await);
-        let retried = acq
-            .retry_job(&job.id, "alice", false)
-            .await
-            .expect("retry cancelled job");
-        assert_eq!(retried.status, AcquisitionJobStatus::Queued);
+        let tasks = crate::tasks::TaskManager::new_with_dispatch(Some(pool.clone()), false);
+        tasks.initialize_tables().await;
+        tasks.register(
+            crate::tasks::TaskType::SpotdlDownload,
+            std::sync::Arc::new(crate::tasks::SpotdlRunner::with_db(Some(pool.clone()))),
+        );
+        assert!(
+            acq.cancel_job(&job.id, "alice", false, &tasks)
+                .await
+                .unwrap()
+        );
+        let (first, second) = tokio::join!(
+            acq.retry_job(&job.id, "alice", false, &tasks),
+            acq.retry_job(&job.id, "alice", false, &tasks),
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(
+            first.or(second).unwrap().status,
+            AcquisitionJobStatus::Queued
+        );
+        let queued = tasks.list(None, false).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].payload["jobId"], job.id);
 
         pool.close().await;
     }

@@ -15,6 +15,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -27,11 +28,11 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
 use crate::acquisition::{
-    AcquisitionCreateOptions, AcquisitionJobError, AcquisitionJobStatus,
-    parse_spotify_playlist_url,
+    AcquisitionCreateOptions, AcquisitionJobError, AcquisitionJobStatus, parse_spotify_playlist_url,
 };
 use crate::auth::AuthenticatedUser;
 use crate::error::ServerError;
+use crate::streaming::http::send_error_response;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,7 +73,7 @@ pub fn acquisition_routes() -> Router<AppState> {
 async fn create_acquisition_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(mut body): Json<AcquisitionCreateOptions>,
+    payload: Result<Json<AcquisitionCreateOptions>, JsonRejection>,
 ) -> Result<Response, ServerError> {
     if !auth.user.is_admin() && !auth.user.external_playback_enabled {
         return Err(ServerError::Forbidden(String::from(
@@ -80,6 +81,16 @@ async fn create_acquisition_handler(
         )));
     }
 
+    let Json(mut body) = match payload {
+        Ok(body) => body,
+        Err(err) => {
+            return Ok(send_error_response(
+                err.status(),
+                "Invalid download request. Check the track or album details and try again.",
+                "INVALID_ACQUISITION_REQUEST",
+            ));
+        }
+    };
     body.user_id = auth.user.id.clone();
     match state
         .acquisitions()
@@ -123,6 +134,7 @@ async fn create_acquisition_handler(
             )
                 .into_response())
         }
+        Err(err) if err.starts_with("STORAGE:") => Err(ServerError::Internal(err)),
         Err(err) => Err(ServerError::BadRequest(err)),
     }
 }
@@ -171,8 +183,8 @@ async fn cancel_acquisition_handler(
 ) -> Result<Response, ServerError> {
     if !state
         .acquisitions()
-        .cancel_job(&id, &auth.user.id, auth.user.is_admin())
-        .await
+        .cancel_job(&id, &auth.user.id, auth.user.is_admin(), state.tasks())
+        .await.map_err(|err| ServerError::Internal(err.to_string()))?
     {
         return Err(ServerError::BadRequest(String::from(
             "Could not cancel acquisition job",
@@ -190,9 +202,12 @@ async fn retry_acquisition_handler(
     auth: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> Result<Response, ServerError> {
+    if !auth.user.is_admin() && !auth.user.external_playback_enabled {
+        return Err(ServerError::Forbidden("On-demand acquisitions are not enabled for this user".into()));
+    }
     match state
         .acquisitions()
-        .retry_job(&id, &auth.user.id, auth.user.is_admin())
+        .retry_job(&id, &auth.user.id, auth.user.is_admin(), state.tasks())
         .await
     {
         Ok(job) => Ok((StatusCode::OK, Json(json!({ "ok": true, "job": job }))).into_response()),
@@ -200,8 +215,9 @@ async fn retry_acquisition_handler(
             Err(ServerError::NotFound(String::from("Job not found")))
         }
         Err(AcquisitionJobError::NotRetryable) => Err(ServerError::Conflict(String::from(
-            "Only settled failed or cancelled jobs can be retried",
+            "Only failed or cancelled jobs with a saved download target can be retried",
         ))),
+        Err(AcquisitionJobError::Storage(err)) => Err(ServerError::Internal(err)),
     }
 }
 
@@ -239,8 +255,12 @@ async fn stream_acquisition_events_handler(
 async fn start_spotify_playlist_import_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<StartSpotifyImportBody>,
+    payload: Result<Json<StartSpotifyImportBody>, JsonRejection>,
 ) -> Result<Response, ServerError> {
+    let Json(body) = match payload {
+        Ok(body) => body,
+        Err(err) => return Ok(send_error_response(err.status(), "Provide a valid Spotify playlist URL.", "INVALID_PLAYLIST_IMPORT")),
+    };
     if !auth.user.is_admin() && !auth.user.external_playback_enabled {
         return Err(ServerError::Forbidden(String::from(
             "Downloads are not enabled for this user",
@@ -270,4 +290,103 @@ async fn get_spotify_playlist_import_handler(
         return Err(ServerError::NotFound(String::from("Import job not found")));
     };
     Ok((StatusCode::OK, Json(json!({ "job": job }))).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use crate::auth::SESSION_COOKIE;
+    use crate::config::AppConfig;
+    use crate::db::{DbPool, run_migrations};
+    use crate::tasks::{TaskDefinition, TaskError, TaskRunContext, TaskType};
+
+    struct FakeDownloader;
+
+    #[async_trait::async_trait]
+    impl TaskDefinition for FakeDownloader {
+        fn validate(&self, payload: &Value) -> bool {
+            payload["kind"] == "acquisition" && payload["jobId"].is_string()
+        }
+
+        async fn run(&self, _: Value, _: TaskRunContext) -> Result<(), TaskError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn track_download_uses_the_signed_in_account() {
+        let pool = DbPool::connect_memory().await.unwrap();
+        run_migrations(&pool, None).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT OR IGNORE INTO roles VALUES ('admin', 'Admin');
+             INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+             VALUES ('alice', 'alice', 'hash', 'Alice', 'admin', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);",
+        )
+        .execute(pool.inner())
+        .await
+        .unwrap();
+        let config = AppConfig::load_from_iter(std::iter::empty::<(String, String)>()).unwrap();
+        let state = AppState::with_database(config, pool).await.unwrap();
+        state.tasks().initialize_tables().await;
+        state
+            .tasks()
+            .register(TaskType::SpotdlDownload, Arc::new(FakeDownloader));
+        let session = state
+            .session_store()
+            .unwrap()
+            .create_session("alice", false)
+            .await
+            .unwrap();
+        let cookie = format!("{SESSION_COOKIE}={}", session.id);
+        let router = acquisition_routes().with_state(state);
+
+        let download = json!({
+            "trackId": "external_deezer_track_123",
+            "sourceProvider": "spotdl",
+            "result": {
+                "id": "external_deezer_track_123",
+                "type": "track",
+                "title": "Fixture Track",
+                "artist": "Fixture Artist",
+                "provider": "external",
+                "source": { "kind": "external", "count": 0 }
+            }
+        });
+        let mut download_with_user = download.clone();
+        download_with_user["userId"] = json!("other-user");
+        for (body, status) in [
+            (download, StatusCode::ACCEPTED),
+            (download_with_user, StatusCode::ACCEPTED),
+            (json!({ "trackId": 123 }), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/acquisitions")
+                        .header(header::COOKIE, &cookie)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let actual_status = response.status();
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(actual_status, status, "{}", String::from_utf8_lossy(&bytes));
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if status == StatusCode::ACCEPTED {
+                assert_eq!(body["job"]["userId"], "alice");
+                assert_eq!(body["job"]["requestedTrackId"], "external_deezer_track_123");
+            } else {
+                assert_eq!(body["error"]["code"], "INVALID_ACQUISITION_REQUEST");
+            }
+        }
+    }
 }

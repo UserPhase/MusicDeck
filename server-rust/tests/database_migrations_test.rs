@@ -79,7 +79,7 @@ async fn fresh_in_memory_database_applies_all_50_migrations_and_uses_catalog_ind
         .await
         .expect("idempotent second migration run");
     assert!(second_run.newly_applied.is_empty());
-    assert_eq!(second_run.total_applied, 50);
+    assert_eq!(second_run.total_applied, LATEST_SCHEMA_VERSION as usize);
 
     // Verify core and late-stage domain tables exist in sqlite_master.
     let table_rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table';")
@@ -350,8 +350,8 @@ async fn upgrades_v38_through_v43_procedural_smart_playlists_scrobble_and_taste_
 
     // Finish migrating 44..=50
     let final_report = run_migrations(&pool, None).await.expect("migrate 44..=50");
-    assert_eq!(final_report.newly_applied, vec![44, 45, 46, 47, 48, 49, 50]);
-    assert_eq!(final_report.total_applied, 50);
+    assert_eq!(final_report.newly_applied, (44..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>());
+    assert_eq!(final_report.total_applied, LATEST_SCHEMA_VERSION as usize);
 
     pool.close().await;
 }

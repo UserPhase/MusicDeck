@@ -24,15 +24,20 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
-use crate::acquisition::spotdl::{
-    AcquisitionProgress, AcquisitionValidationError, SpotDLDownloaderAdapter, TrackImportRequest,
-    canonical_manual_acquisition_url, canonical_spotify_url,
+use super::input::{AcquisitionKind, AcquisitionResult, ValidatedTarget};
+use super::playlist_files::{
+    AcquisitionLibrary, cleanup_staging, navidrome_path, publish_staged_track, staging_path,
 };
+use super::repository::download_manifest;
+use crate::acquisition::spotdl::{
+    AcquisitionProgress, SpotDLDownloaderAdapter, TrackImportRequest, scan_downloaded_audio_files,
+};
+use crate::config::AppConfig;
 use crate::db::DbPool;
+use crate::providers::BackendRegistry;
 use crate::registry::SourceCandidate;
-use crate::search::UnifiedSearchResult;
 use crate::tasks::{TaskError, TaskManager, TaskProgressPatch, TaskRunContext, TaskType};
 
 /// Capacity and rate-limiting thresholds for the acquisition subsystem (`DEFAULT_ACQUISITION_LIMITS`).
@@ -92,6 +97,8 @@ pub enum AcquisitionJobError {
     NotFound,
     #[error("Only settled failed or cancelled jobs can be retried")]
     NotRetryable,
+    #[error("Could not queue acquisition: {0}")]
+    Storage(String),
 }
 
 impl AcquisitionJobError {
@@ -101,6 +108,7 @@ impl AcquisitionJobError {
         match self {
             Self::NotFound => "ACQUISITION_NOT_FOUND",
             Self::NotRetryable => "ACQUISITION_NOT_RETRYABLE",
+            Self::Storage(_) => "ACQUISITION_STORAGE_ERROR",
         }
     }
 }
@@ -115,6 +123,7 @@ pub enum AcquisitionJobStatus {
     Processing,
     Importing,
     Completed,
+    Partial,
     Failed,
     Cancelled,
 }
@@ -130,6 +139,7 @@ impl AcquisitionJobStatus {
             Self::Processing => "processing",
             Self::Importing => "importing",
             Self::Completed => "completed",
+            Self::Partial => "partial",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
@@ -145,6 +155,7 @@ impl AcquisitionJobStatus {
             "processing" => Self::Processing,
             "importing" => Self::Importing,
             "completed" => Self::Completed,
+            "partial" => Self::Partial,
             "cancelled" => Self::Cancelled,
             _ => Self::Failed,
         }
@@ -177,6 +188,10 @@ pub struct AcquiredFileRecord {
     pub album: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_track_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
     pub status: String,
 }
 
@@ -210,6 +225,10 @@ pub struct AcquisitionJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<AcquisitionProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<AcquiredFileRecord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -225,13 +244,19 @@ pub struct AcquisitionJob {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionCreateOptions {
+    // The HTTP handler supplies the owner from the authenticated session.
+    #[serde(skip_deserializing)]
     pub user_id: String,
     #[serde(default)]
     pub candidate: Option<SourceCandidate>,
     #[serde(default)]
     pub candidate_id: Option<String>,
     #[serde(default)]
-    pub result: Option<UnifiedSearchResult>,
+    pub result: Option<AcquisitionResult>,
+    #[serde(default)]
+    pub albums: Vec<AcquisitionResult>,
+    pub query: Option<String>,
+    pub source_url: Option<String>,
     #[serde(default)]
     pub source_provider: Option<String>,
     #[serde(default)]
@@ -281,6 +306,7 @@ pub struct AcquisitionService {
     limits: AcquisitionLimits,
     rate_window: Arc<Mutex<SubmissionRateWindow>>,
     events_tx: broadcast::Sender<AcquisitionEvent>,
+    library: Option<AcquisitionLibrary>,
 }
 
 impl std::fmt::Debug for AcquisitionService {
@@ -301,7 +327,17 @@ impl AcquisitionService {
             limits: AcquisitionLimits::default(),
             rate_window: Arc::new(Mutex::new(SubmissionRateWindow::default())),
             events_tx,
+            library: None,
         }
+    }
+
+    pub(crate) fn with_library(
+        mut self,
+        config: Arc<std::sync::RwLock<Arc<AppConfig>>>,
+        providers: BackendRegistry,
+    ) -> Self {
+        self.library = Some(AcquisitionLibrary { config, providers });
+        self
     }
 
     /// Subscribes to live [`AcquisitionEvent`] broadcasts.
@@ -311,52 +347,49 @@ impl AcquisitionService {
     }
 
     /// Recovers interrupted acquisition jobs on startup by marking in-flight jobs `failed` (`SERVER_RESTARTED`).
-    pub async fn recover_interrupted_jobs(&self) {
+    pub async fn recover_interrupted_jobs(&self) -> Result<(), sqlx::Error> {
         let Some(pool) = &self.db else {
-            return;
+            return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        let _ = sqlx::query(
+        sqlx::query(
             r"
             UPDATE acquisition_jobs
             SET status = 'failed',
+                stage = 'failed',
                 error_code = 'SERVER_RESTARTED',
                 error_message = 'Acquisition was interrupted by server restart',
                 updated_at = ?,
                 completed_at = ?
             WHERE status IN ('discovering', 'downloading', 'processing', 'importing')
+               OR (status='queued' AND NOT EXISTS (SELECT 1 FROM background_tasks WHERE id=acquisition_jobs.active_task_id AND state='QUEUED'))
             ",
         )
         .bind(&now)
         .bind(&now)
         .execute(pool.inner())
-        .await;
+        .await?;
+        Ok(())
     }
 
     fn map_row(row: &sqlx::sqlite::SqliteRow) -> Option<AcquisitionJob> {
+        let optional_text = |name| row.try_get::<Option<String>, _>(name).ok().flatten();
+        let optional_integer = |name| row.try_get::<Option<i64>, _>(name).ok().flatten();
         let status_str: String = row.try_get("status").ok()?;
         let status = AcquisitionJobStatus::parse(&status_str);
-        let files_str: Option<String> = row.try_get("files_json").ok();
+        let files_str = optional_text("files_json");
 
         let bytes_downloaded = row
             .try_get::<i64, _>("bytes_downloaded")
             .ok()
             .map(|n| n.max(0) as u64)
             .unwrap_or(0);
-        let total_bytes = row
-            .try_get::<i64, _>("total_bytes")
-            .ok()
-            .map(|n| n.max(0) as u64);
-        let percent = row.try_get::<f64, _>("percent").ok();
-        let stage = row.try_get::<String, _>("stage").ok();
-        let speed_bytes_per_second = row
-            .try_get::<i64, _>("speed_bytes_per_second")
-            .ok()
-            .map(|n| n.max(0) as u64);
-        let auto_play = row
-            .try_get::<i64, _>("auto_play")
-            .ok()
-            .map(|n| n != 0);
+        let total_bytes = optional_integer("total_bytes").map(|n| n.max(0) as u64);
+        let percent = row.try_get::<Option<f64>, _>("percent").ok().flatten();
+        let stage = optional_text("stage");
+        let speed_bytes_per_second =
+            optional_integer("speed_bytes_per_second").map(|n| n.max(0) as u64);
+        let auto_play = optional_integer("auto_play").map(|n| n != 0);
 
         let progress = Some(AcquisitionProgress {
             bytes_downloaded: Some(bytes_downloaded),
@@ -370,11 +403,8 @@ impl AcquisitionService {
             .filter(|s| !s.is_empty())
             .and_then(|s| serde_json::from_str::<Vec<AcquiredFileRecord>>(&s).ok());
 
-        let error_code: Option<String> = row.try_get("error_code").ok();
-        let db_error_message: Option<String> = row
-            .try_get::<String, _>("error_message")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let error_code = optional_text("error_code");
+        let db_error_message = optional_text("error_message").filter(|s| !s.is_empty());
         let error_message = if status == AcquisitionJobStatus::Failed {
             Some(
                 db_error_message
@@ -388,13 +418,23 @@ impl AcquisitionService {
             id: row.try_get("id").ok()?,
             user_id: row.try_get("user_id").ok()?,
             status,
-            source_provider: row.try_get("source_provider").ok(),
-            source_candidate_id: row.try_get("source_candidate_id").ok(),
-            requested_track_id: row.try_get("requested_track_id").ok(),
-            requested_album_id: row.try_get("requested_album_id").ok(),
-            requested_title: row.try_get("requested_title").ok(),
-            requested_artist: row.try_get("requested_artist").ok(),
-            container_id: row.try_get("container_id").ok(),
+            source_provider: optional_text("source_provider"),
+            source_candidate_id: optional_text("source_candidate_id"),
+            requested_track_id: optional_text("requested_track_id"),
+            requested_album_id: optional_text("requested_album_id"),
+            expected_count: row
+                .try_get::<Option<i64>, _>("expected_count")
+                .ok()
+                .flatten()
+                .and_then(|n| usize::try_from(n).ok()),
+            imported_count: row
+                .try_get::<Option<i64>, _>("imported_count")
+                .ok()
+                .flatten()
+                .and_then(|n| usize::try_from(n).ok()),
+            requested_title: optional_text("requested_title"),
+            requested_artist: optional_text("requested_artist"),
+            container_id: optional_text("container_id"),
             auto_play,
             stage,
             speed_bytes_per_second,
@@ -404,7 +444,7 @@ impl AcquisitionService {
             error_message,
             created_at: row.try_get("created_at").unwrap_or_default(),
             updated_at: row.try_get("updated_at").unwrap_or_default(),
-            completed_at: row.try_get("completed_at").ok(),
+            completed_at: optional_text("completed_at"),
         })
     }
 
@@ -479,107 +519,90 @@ impl AcquisitionService {
         options: AcquisitionCreateOptions,
         tasks: Option<&TaskManager>,
     ) -> Result<AcquisitionJob, String> {
-        let has_target = options.candidate.is_some()
-            || options.candidate_id.is_some()
-            || options.result.is_some()
-            || options.track_id.is_some()
-            || options.album_id.is_some();
-        if !has_target {
-            return Err(AcquisitionValidationError.to_string());
-        }
-
-        if let Some(ref sp_url) = options.spotify_track_url {
-            canonical_spotify_url(sp_url).map_err(|e| e.to_string())?;
-        }
-        if let Some(ref sp_url) = options.spotify_url {
-            canonical_spotify_url(sp_url).map_err(|e| e.to_string())?;
-        }
-
+        let target = ValidatedTarget::resolve(&options)?;
+        let input = serde_json::to_string(&target).map_err(|e| e.to_string())?;
         self.check_capacity_and_rate_limits(&options.user_id)
             .await
             .map_err(|e| format!("CAPACITY:{}", e.retry_after))?;
-
-        let pool = self
-            .db
-            .as_ref()
-            .ok_or_else(|| String::from("Database is unavailable"))?;
-
+        let pool = self.db.as_ref().ok_or("Database is unavailable")?;
         let id = format!("acq_{}", nanoid!(16));
         let now = Utc::now().to_rfc3339();
-        let source_provider = options
-            .source_provider
-            .or(options.provider_id)
-            .or_else(|| options.candidate.as_ref().map(|c| c.provider.clone()))
-            .or_else(|| Some(String::from("spotdl")));
-        let source_candidate_id = options
+        let result = options.result.as_ref();
+        let candidate = options.candidate.as_ref();
+        let catalog_id = result.and_then(|item| item.id.as_deref());
+        let track_id = (target.kind == AcquisitionKind::Track)
+            .then(|| options.track_id.as_deref().or(catalog_id))
+            .flatten();
+        let album_id = if target.kind == AcquisitionKind::Album || options.album_id.is_some() {
+            options.album_id.as_deref().or(catalog_id)
+        } else {
+            None
+        };
+        let title = result
+            .and_then(|item| item.title.as_deref())
+            .or_else(|| candidate.and_then(|item| item.title.as_deref()));
+        let artist = result
+            .and_then(|item| item.artist.as_deref())
+            .or_else(|| candidate.and_then(|item| item.artist.as_deref()));
+        let candidate_id = options
             .candidate_id
-            .or_else(|| options.candidate.as_ref().map(|c| c.id.clone()));
-        let requested_track_id = options
-            .track_id
-            .or_else(|| options.result.as_ref().map(|r| r.id.clone()));
-        let requested_album_id = options.album_id;
-        let requested_title = options
-            .result
-            .as_ref()
-            .map(|r| r.title.clone())
-            .or_else(|| options.candidate.as_ref().and_then(|c| c.title.clone()));
-        let requested_artist = options
-            .result
-            .as_ref()
-            .and_then(|r| r.artist.clone())
-            .or_else(|| options.candidate.as_ref().and_then(|c| c.artist.clone()));
-        let auto_play_flag = i64::from(options.auto_play.unwrap_or(false));
+            .as_deref()
+            .or_else(|| candidate.map(|item| item.id.as_str()));
 
-        sqlx::query(
-            r"
-            INSERT INTO acquisition_jobs (
-                id, user_id, status, source_provider, source_candidate_id,
-                requested_track_id, requested_album_id, container_id,
-                bytes_downloaded, total_bytes, percent, stage,
-                speed_bytes_per_second, auto_play, files_json,
-                created_at, updated_at
-            )
-            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, NULL, 0, 'queued', NULL, ?, '[]', ?, ?)
-            ",
-        )
-        .bind(&id)
-        .bind(&options.user_id)
-        .bind(&source_provider)
-        .bind(&source_candidate_id)
-        .bind(&requested_track_id)
-        .bind(&requested_album_id)
-        .bind(&options.container_id)
-        .bind(auto_play_flag)
-        .bind(&now)
-        .bind(&now)
-        .execute(pool.inner())
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let mut job = self
-            .get_job(&id, &options.user_id, true)
+        let mut tx = pool
+            .inner()
+            .begin()
             .await
-            .ok_or_else(|| String::from("Failed to load created acquisition job"))?;
-        job.requested_title = requested_title;
-        job.requested_artist = requested_artist;
-        job.auto_play = options.auto_play;
-
-        let _ = self.events_tx.send(AcquisitionEvent {
-            event: String::from("job.created"),
-            job: job.clone(),
-        });
-
-        if let Some(tm) = tasks {
-            let _ = tm
-                .enqueue(
+            .map_err(|e| format!("STORAGE:{e}"))?;
+        sqlx::query(
+            "INSERT INTO acquisition_jobs (
+                id, user_id, status, source_provider, source_candidate_id, requested_track_id, requested_album_id,
+                requested_title, requested_artist, container_id, auto_play, stage, created_at, updated_at
+            ) VALUES (?, ?, 'queued', 'spotdl', ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+        ).bind(&id).bind(&options.user_id).bind(candidate_id).bind(track_id).bind(album_id)
+            .bind(title).bind(artist).bind(&options.container_id).bind(options.auto_play.unwrap_or(false))
+            .bind(&now).bind(&now).execute(&mut *tx).await.map_err(|e| format!("STORAGE:{e}"))?;
+        sqlx::query("INSERT INTO acquisition_job_inputs (job_id, input_json) VALUES (?, ?)")
+            .bind(&id)
+            .bind(input)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("STORAGE:{e}"))?;
+        let task = if let Some(manager) = tasks {
+            let task = manager
+                .enqueue_on(
+                    &mut tx,
                     TaskType::SpotdlDownload,
                     json!({ "kind": "acquisition", "jobId": id }),
                     &options.user_id,
                     None,
                 )
-                .await;
+                .await
+                .map_err(|e| format!("STORAGE:{e}"))?;
+            sqlx::query("UPDATE acquisition_jobs SET active_task_id = ? WHERE id = ?")
+                .bind(&task.id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("STORAGE:{e}"))?;
+            Some(task)
+        } else {
+            None
+        };
+        let row = sqlx::query("SELECT * FROM acquisition_jobs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| format!("STORAGE:{e}"))?;
+        let job = Self::map_row(&row).ok_or("STORAGE:Could not read created acquisition")?;
+        tx.commit().await.map_err(|e| format!("STORAGE:{e}"))?;
+        let _ = self.events_tx.send(AcquisitionEvent {
+            event: "job.created".into(),
+            job: job.clone(),
+        });
+        if let (Some(manager), Some(task)) = (tasks, task) {
+            manager.notify_committed(&task);
         }
-
         Ok(job)
     }
 
@@ -610,12 +633,7 @@ impl AcquisitionService {
     }
 
     /// Retrieves a single acquisition job by ID if visible to `user_id` (`is_admin`).
-    pub async fn get_job(
-        &self,
-        id: &str,
-        user_id: &str,
-        is_admin: bool,
-    ) -> Option<AcquisitionJob> {
+    pub async fn get_job(&self, id: &str, user_id: &str, is_admin: bool) -> Option<AcquisitionJob> {
         let pool = self.db.as_ref()?;
         let row = if is_admin {
             sqlx::query("SELECT * FROM acquisition_jobs WHERE id = ?")
@@ -659,330 +677,322 @@ impl AcquisitionService {
         downloader: &SpotDLDownloaderAdapter,
         output_dir: Option<&Path>,
     ) -> Result<AcquisitionJob, TaskError> {
-        context.checkpoint().await?;
-
         let pool = self
             .db
             .as_ref()
             .or_else(|| context.db())
-            .ok_or(TaskError::NotFound)?
-            .clone();
-
-        let row = sqlx::query("SELECT * FROM acquisition_jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool.inner())
-            .await
-            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?
             .ok_or(TaskError::NotFound)?;
-
-        let job = Self::map_row(&row).ok_or(TaskError::NotFound)?;
-
-        if job.status == AcquisitionJobStatus::Cancelled {
-            return Err(TaskError::Cancelled);
+        let job = self
+            .get_job_from_pool(pool, id)
+            .await
+            .ok_or(TaskError::NotFound)?;
+        match job.status {
+            AcquisitionJobStatus::Cancelled => return Err(TaskError::Cancelled),
+            AcquisitionJobStatus::Completed | AcquisitionJobStatus::Partial => return Ok(job),
+            AcquisitionJobStatus::Failed => {
+                return Err(TaskError::ExecutionFailed(
+                    job.error_message
+                        .unwrap_or_else(|| "Acquisition failed".into()),
+                ));
+            }
+            _ => {}
         }
-        if job.status == AcquisitionJobStatus::Failed {
-            let msg = job
-                .error_message
-                .unwrap_or_else(|| String::from("Acquisition job failed"));
-            return Err(TaskError::ExecutionFailed(msg));
+        let row = sqlx::query("UPDATE acquisition_jobs SET status='downloading', stage='downloading', active_task_id=?,
+            updated_at=? WHERE id=? AND status='queued' AND (active_task_id IS NULL OR active_task_id=?)")
+            .bind(context.task_id()).bind(Utc::now().to_rfc3339()).bind(id).bind(context.task_id())
+            .execute(pool.inner()).await.map_err(task_db_error)?;
+        if row.rows_affected() != 1 {
+            return Err(TaskError::Conflict(
+                "Acquisition is no longer queued for this task".into(),
+            ));
         }
-        if job.status == AcquisitionJobStatus::Completed {
-            context
-                .report(TaskProgressPatch {
-                    percent: Some(100.0),
-                    items_processed: Some(1),
-                    total_items: Some(Some(1)),
-                    message: Some(Some(String::from("Import completed"))),
-                    ..TaskProgressPatch::default()
-                })
-                .await;
-            return Ok(job);
-        }
-
-        let staging_dir = output_dir
-            .map(|p| p.join(id))
-            .unwrap_or_else(|| std::env::temp_dir().join("musicdeck-acquisitions").join(id));
-
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'discovering',
-                stage = 'discovering',
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&now)
-        .bind(id)
-        .execute(pool.inner())
-        .await
-        .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
-
-        let raw_target = job
-            .source_candidate_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                job.requested_track_id
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .or_else(|| {
-                job.requested_album_id
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-            });
-
-        let Some(target) = raw_target else {
-            let err_msg = "No candidates found for requested recording";
-            self.fail_job_in_db(&pool, id, "NO_CANDIDATES", err_msg).await;
-            return Err(TaskError::ExecutionFailed(err_msg.to_owned()));
-        };
-
-        let mut request = TrackImportRequest {
-            output_directory: staging_dir.clone(),
-            ..TrackImportRequest::default()
-        };
-
-        if let Ok(sp_url) = canonical_spotify_url(target) {
-            request.spotify_track_url = Some(sp_url);
-        } else if let Ok(manual_url) = canonical_manual_acquisition_url(target) {
-            request.source_url = Some(manual_url);
-        } else if target.contains("://")
-            || target.starts_with("http:")
-            || target.starts_with("https:")
-            || target.starts_with("ftp:")
-            || target.starts_with("file:")
-            || target.starts_with("data:")
-            || target.starts_with("spotify:")
-        {
-            request.source_url = Some(target.to_owned());
-        } else {
-            let sanitized_query: String = target
-                .trim_start_matches(['-', '/', '\\', '.'])
-                .replace(['|', ':'], " ")
-                .trim()
-                .to_owned();
-            request.query = Some(sanitized_query);
-        }
-
-        context.checkpoint().await?;
-
-        let dl_now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'downloading',
-                stage = 'downloading',
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&dl_now)
-        .bind(id)
-        .execute(pool.inner())
-        .await
-        .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
-
-        if let Some(updated) = self.get_job_from_pool(&pool, id).await {
-            let _ = self.events_tx.send(AcquisitionEvent {
-                event: String::from("job.updated"),
-                job: updated,
-            });
-        }
-
-        let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<AcquisitionProgress>();
-        let prog_pool = pool.clone();
-        let prog_ctx = context.clone();
-        let prog_job_id = id.to_owned();
-        let prog_events = self.events_tx.clone();
-
-        let progress_worker = tokio::spawn(async move {
-            while let Some(p) = prog_rx.recv().await {
-                let ts = Utc::now().to_rfc3339();
-                let bytes_dl = p.bytes_downloaded.unwrap_or(0) as i64;
-                let total_b = p.total_bytes.map(|n| n as i64);
-                let pct = p.percent.unwrap_or(0.0);
-                let stage = p.stage.clone().unwrap_or_else(|| String::from("downloading"));
-                let speed = p.speed_bytes_per_second.map(|n| n as i64);
-
-                let _ = sqlx::query(
-                    r"
-                    UPDATE acquisition_jobs
-                    SET bytes_downloaded = ?,
-                        total_bytes = COALESCE(?, total_bytes),
-                        percent = ?,
-                        stage = ?,
-                        speed_bytes_per_second = COALESCE(?, speed_bytes_per_second),
-                        updated_at = ?
-                    WHERE id = ?
-                    ",
-                )
-                .bind(bytes_dl)
-                .bind(total_b)
-                .bind(pct)
-                .bind(&stage)
-                .bind(speed)
-                .bind(&ts)
-                .bind(&prog_job_id)
-                .execute(prog_pool.inner())
-                .await;
-
-                prog_ctx
-                    .report(TaskProgressPatch {
-                        percent: p.percent,
-                        speed_bytes_per_second: p.speed_bytes_per_second.map(|s| s as f64),
-                        message: Some(p.message.clone().or(Some(stage))),
-                        ..TaskProgressPatch::default()
-                    })
-                    .await;
-
-                if let Ok(Some(r)) = sqlx::query("SELECT * FROM acquisition_jobs WHERE id = ?")
-                    .bind(&prog_job_id)
-                    .fetch_optional(prog_pool.inner())
+        let config = self.library.as_ref().map(|library| {
+            library
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        let default_stage = config
+            .as_ref()
+            .map(|cfg| std::path::PathBuf::from(&cfg.acquisition_tmp_dir))
+            .unwrap_or_else(|| std::env::temp_dir().join("musicdeck-acquisitions"));
+        let attempt = format!("{id}-{}", context.task_id());
+        let staging_dir = staging_path(output_dir.unwrap_or(&default_stage), &attempt);
+        let result = match &staging_dir {
+            Ok(stage) => {
+                self.execute_media_job(pool, &job, context, downloader, stage, config.as_deref())
                     .await
+            }
+            Err(err) => Err(TaskError::ExecutionFailed(format!(
+                "Could not open acquisition staging: {err}"
+            ))),
+        };
+        if let Err(err) = &result {
+            let cancelled =
+                matches!(err, TaskError::Cancelled) || context.cancel_token().is_cancelled();
+            let (status, code) = if cancelled {
+                ("cancelled", "CANCELLED")
+            } else {
+                ("failed", "ACQUISITION_FAILED")
+            };
+            let now = Utc::now().to_rfc3339();
+            sqlx::query("UPDATE acquisition_jobs SET status=?, stage=?, error_code=?, error_message=?, updated_at=?, completed_at=?
+                WHERE id=? AND active_task_id=? AND status IN ('downloading','importing')")
+                .bind(status).bind(status).bind(code).bind(err.to_string()).bind(&now).bind(&now)
+                .bind(id).bind(context.task_id()).execute(pool.inner()).await.map_err(task_db_error)?;
+            if let Ok(stage) = &staging_dir {
+                if scan_downloaded_audio_files(stage)
+                    .await
+                    .is_ok_and(|files| files.is_empty())
                 {
-                    if let Some(j) = Self::map_row(&r) {
-                        let _ = prog_events.send(AcquisitionEvent {
-                            event: String::from("job.progress"),
-                            job: j,
-                        });
-                    }
+                    cleanup_staging(stage).await;
                 }
             }
-        });
-
-        let download_result = downloader
-            .download(&request, move |prog| {
-                let _ = prog_tx.send(prog);
-            })
-            .await;
-
-        let _ = progress_worker.await;
-
-        if context.cancel_token().is_cancelled() {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            let cancel_now = Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                r"
-                UPDATE acquisition_jobs
-                SET status = 'cancelled',
-                    stage = 'cancelled',
-                    error_code = 'CANCELLED',
-                    error_message = 'Cancelled by user',
-                    updated_at = ?,
-                    completed_at = ?
-                WHERE id = ?
-                ",
+            self.emit_job(
+                pool,
+                id,
+                if cancelled {
+                    "job.cancelled"
+                } else {
+                    "job.failed"
+                },
             )
-            .bind(&cancel_now)
-            .bind(&cancel_now)
-            .bind(id)
-            .execute(pool.inner())
             .await;
-            return Err(TaskError::Cancelled);
         }
+        result?;
+        self.get_job_from_pool(pool, id)
+            .await
+            .ok_or(TaskError::NotFound)
+    }
 
-        let downloaded_paths = match download_result {
-            Ok(paths) => paths,
-            Err(err_msg) => {
-                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-                self.fail_job_in_db(&pool, id, "ACQUISITION_FAILED", &err_msg)
-                    .await;
-                return Err(TaskError::ExecutionFailed(err_msg));
-            }
+    async fn execute_media_job(
+        &self,
+        pool: &DbPool,
+        job: &AcquisitionJob,
+        context: &TaskRunContext,
+        downloader: &SpotDLDownloaderAdapter,
+        stage: &Path,
+        config: Option<&AppConfig>,
+    ) -> Result<(), TaskError> {
+        context.checkpoint().await?;
+        let input: Option<String> =
+            sqlx::query_scalar("SELECT input_json FROM acquisition_job_inputs WHERE job_id=?")
+                .bind(&job.id)
+                .fetch_optional(pool.inner())
+                .await
+                .map_err(task_db_error)?;
+        let target = input
+            .as_deref()
+            .and_then(ValidatedTarget::decode_saved)
+            .ok_or_else(|| {
+                TaskError::Validation(
+                    "Saved download target is unavailable. Submit the download again.".into(),
+                )
+            })?;
+        let job_id = &job.id;
+        let request = TrackImportRequest {
+            output_directory: stage.to_path_buf(),
+            playlist_m3u_name: Some(format!("musicdeck-{job_id}.m3u8")),
+            operands: target.operands,
+            ..Default::default()
         };
+        tokio::fs::create_dir_all(stage)
+            .await
+            .map_err(task_db_error)?;
+        if !tokio::fs::symlink_metadata(stage)
+            .await
+            .map_err(task_db_error)?
+            .is_dir()
+        {
+            return Err(TaskError::Validation(
+                "Acquisition staging must be a regular directory".into(),
+            ));
+        }
+        let batch = download_manifest(context, downloader, &request, job_id).await?;
+        let (library, config) = self.library.as_ref().zip(config).ok_or_else(|| {
+            TaskError::ExecutionFailed("Shared Navidrome library is not configured".into())
+        })?;
+        let backend = library.providers.get_primary().map_err(task_db_error)?;
+        if backend.provider_type != "navidrome" {
+            return Err(TaskError::ExecutionFailed(
+                "Downloads require Navidrome as the primary backend".into(),
+            ));
+        }
+        let stage_root = tokio::fs::canonicalize(stage)
+            .await
+            .map_err(task_db_error)?;
+        let music_root = tokio::fs::canonicalize(&config.music_root)
+            .await
+            .map_err(task_db_error)?;
+        let collection = Path::new(&config.spotify_import_subdir).join(job_id);
+        let expected = batch
+            .expected_count
+            .max(target.expected_count.unwrap_or(0))
+            .max(batch.entries.len());
+        let mut published = Vec::new();
+        let mut failure = None;
+        for entry in batch.entries {
+            context.checkpoint().await?;
+            let Some(source) = entry.file_path.as_deref().map(std::path::PathBuf::from) else {
+                failure = failure.or(entry.error);
+                continue;
+            };
+            match publish_staged_track(&music_root, &collection, &stage_root, &source).await {
+                Ok(relative) => published.push((source, relative, entry.source)),
+                Err(err) => {
+                    tracing::warn!(job_id, error = %err, "Could not publish downloaded audio");
+                    failure.get_or_insert_with(|| {
+                        format!("Could not publish downloaded audio: {err}")
+                    });
+                }
+            }
+        }
+        if published.is_empty() {
+            return Err(TaskError::ExecutionFailed(
+                failure.unwrap_or_else(|| "No usable tracks were downloaded".into()),
+            ));
+        }
 
         context.checkpoint().await?;
-
-        let mut files: Vec<AcquiredFileRecord> = Vec::new();
-        for path in &downloaded_paths {
-            let size = tokio::fs::metadata(path).await.ok().map(|m| m.len());
-            files.push(AcquiredFileRecord {
-                path: path.to_string_lossy().into_owned(),
-                title: job.requested_title.clone(),
-                artist: job.requested_artist.clone(),
-                album: None,
-                size,
-                status: String::from("imported"),
-            });
+        let phase = sqlx::query("UPDATE acquisition_jobs SET status='importing', stage='indexing', percent=85,
+            expected_count=?, imported_count=0, updated_at=? WHERE id=? AND active_task_id=? AND status='downloading'")
+            .bind(expected as i64).bind(Utc::now().to_rfc3339()).bind(job_id).bind(context.task_id())
+            .execute(pool.inner()).await.map_err(task_db_error)?;
+        if phase.rows_affected() != 1 {
+            return Err(TaskError::Cancelled);
         }
-        let files_json = serde_json::to_string(&files).unwrap_or_else(|_| String::from("[]"));
-        let done_now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'completed',
-                stage = 'completed',
-                percent = 100.0,
-                files_json = ?,
-                error_code = NULL,
-                error_message = NULL,
-                updated_at = ?,
-                completed_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&files_json)
-        .bind(&done_now)
-        .bind(&done_now)
-        .bind(id)
-        .execute(pool.inner())
-        .await
-        .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
-
-        if let Some(ref container_key) = job.container_id {
-            let provider_id = job
-                .source_provider
-                .as_deref()
-                .unwrap_or("spotdl");
-            let _ = sqlx::query(
-                r"
-                INSERT INTO acquisition_containers (
-                    container_key, provider_id, job_id, status, files_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, 'ready', ?, ?, ?)
-                ON CONFLICT(container_key) DO UPDATE SET
-                    status = 'ready',
-                    files_json = excluded.files_json,
-                    updated_at = excluded.updated_at
-                ",
-            )
-            .bind(container_key)
-            .bind(provider_id)
-            .bind(id)
-            .bind(&files_json)
-            .bind(&done_now)
-            .bind(&done_now)
-            .execute(pool.inner())
+        self.emit_job(pool, job_id, "job.updated").await;
+        context
+            .report(TaskProgressPatch {
+                percent: Some(85.0),
+                message: Some(Some("Indexing downloaded tracks in Navidrome".into())),
+                ..Default::default()
+            })
             .await;
+        let cancel = context.cancel_token();
+        tokio::select! {
+            () = cancel.cancelled() => return Err(TaskError::Cancelled),
+            scan = backend.provider.scan_library() => scan.map_err(|err| TaskError::ExecutionFailed(format!("Navidrome scan failed: {err}")))?,
+        };
+        let mut indexed = std::collections::HashSet::new();
+        let mut files = Vec::new();
+        for (staged, relative, source) in published {
+            context.checkpoint().await?;
+            let Some(path) = navidrome_path(&relative) else {
+                failure.get_or_insert_with(|| {
+                    "An imported path could not be read by Navidrome".into()
+                });
+                continue;
+            };
+            let lookup = tokio::select! {
+                () = cancel.cancelled() => return Err(TaskError::Cancelled),
+                result = backend.provider.find_imported_track(&path, &source.title) => result,
+            };
+            match lookup {
+                Ok(Some(track)) => {
+                    let destination = music_root.join(&relative);
+                    let size = tokio::fs::metadata(&destination)
+                        .await
+                        .map_err(task_db_error)?
+                        .len();
+                    if size == 0 {
+                        failure.get_or_insert_with(|| "Published audio is empty".into());
+                        continue;
+                    }
+                    indexed.insert(staged);
+                    files.push(AcquiredFileRecord {
+                        path: destination.to_string_lossy().into_owned(),
+                        title: Some(source.title),
+                        artist: Some(source.artist),
+                        album: source.album,
+                        size: Some(size),
+                        provider_track_id: Some(track.provider_id),
+                        connection_id: Some(backend.connection_id.clone()),
+                        status: "imported".into(),
+                    });
+                }
+                result => {
+                    let message = match result {
+                        Ok(None) => format!(
+                            "Navidrome did not index {path}. Check the shared music mount and Report Real Path."
+                        ),
+                        Err(err) => format!("Could not resolve {path} in Navidrome: {err}"),
+                        _ => unreachable!(),
+                    };
+                    tracing::warn!(job_id, %message, "Downloaded track could not be indexed");
+                    failure.get_or_insert(message);
+                }
+            }
         }
 
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-
+        if files.is_empty() {
+            return Err(TaskError::ExecutionFailed(
+                failure.unwrap_or_else(|| "No downloaded tracks were indexed".into()),
+            ));
+        }
+        context.checkpoint().await?;
+        let count = files.len();
+        let status = if count == expected {
+            "completed"
+        } else {
+            "partial"
+        };
+        let error = (count != expected).then(|| {
+            format!(
+                "Imported {count} of {expected} tracks. {}",
+                failure
+                    .as_deref()
+                    .unwrap_or("Some tracks were unavailable.")
+            )
+        });
+        let files_json = serde_json::to_string(&files).map_err(task_db_error)?;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.inner().begin().await.map_err(task_db_error)?;
+        let updated = sqlx::query("UPDATE acquisition_jobs SET status=?, stage=?, percent=100, files_json=?,
+            imported_count=?, expected_count=?, error_message=?, updated_at=?, completed_at=?
+            WHERE id=? AND active_task_id=? AND status='importing'
+            AND EXISTS(SELECT 1 FROM background_tasks WHERE id=? AND state IN ('PROCESSING','PAUSED'))")
+            .bind(status).bind(status).bind(&files_json).bind(count as i64).bind(expected as i64).bind(error)
+            .bind(&now).bind(&now).bind(job_id).bind(context.task_id()).bind(context.task_id())
+            .execute(&mut *tx).await.map_err(task_db_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(TaskError::Cancelled);
+        }
+        if let Some(container) = &job.container_id {
+            sqlx::query("INSERT INTO acquisition_containers (container_key, provider_id, job_id, status, files_json, created_at, updated_at)
+                VALUES (?, 'spotdl', ?, ?, ?, ?, ?) ON CONFLICT(container_key) DO UPDATE SET job_id=excluded.job_id,
+                status=excluded.status, files_json=excluded.files_json, updated_at=excluded.updated_at")
+                .bind(container).bind(job_id).bind(if status == "completed" { "ready" } else { "partial" })
+                .bind(&files_json).bind(&now).bind(&now).execute(&mut *tx).await.map_err(task_db_error)?;
+        }
+        tx.commit().await.map_err(task_db_error)?;
+        if scan_downloaded_audio_files(&stage_root)
+            .await
+            .is_ok_and(|paths| paths.iter().all(|path| indexed.contains(path)))
+        {
+            cleanup_staging(stage).await;
+        }
+        self.emit_job(
+            pool,
+            job_id,
+            if status == "completed" {
+                "job.completed"
+            } else {
+                "job.partial"
+            },
+        )
+        .await;
         context
             .report(TaskProgressPatch {
                 percent: Some(100.0),
-                items_processed: Some(files.len() as u64),
-                total_items: Some(Some(files.len() as u64)),
-                message: Some(Some(String::from("Import completed"))),
-                ..TaskProgressPatch::default()
+                items_processed: Some(count as u64),
+                total_items: Some(Some(expected as u64)),
+                message: Some(Some(format!("Imported {count} of {expected} tracks"))),
+                ..Default::default()
             })
             .await;
-
-        let completed = self
-            .get_job_from_pool(&pool, id)
-            .await
-            .ok_or(TaskError::NotFound)?;
-
-        let _ = self.events_tx.send(AcquisitionEvent {
-            event: String::from("job.completed"),
-            job: completed.clone(),
-        });
-
-        Ok(completed)
+        Ok(())
     }
 
     async fn get_job_from_pool(&self, pool: &DbPool, id: &str) -> Option<AcquisitionJob> {
@@ -995,130 +1005,114 @@ impl AcquisitionService {
         Self::map_row(&row)
     }
 
-    async fn fail_job_in_db(&self, pool: &DbPool, id: &str, error_code: &str, error_message: &str) {
-        let now = Utc::now().to_rfc3339();
-        let _ = sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'failed',
-                stage = 'failed',
-                error_code = ?,
-                error_message = ?,
-                updated_at = ?,
-                completed_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(error_code)
-        .bind(error_message)
-        .bind(&now)
-        .bind(&now)
-        .bind(id)
-        .execute(pool.inner())
-        .await;
-
-        if let Some(failed_job) = self.get_job_from_pool(pool, id).await {
+    async fn emit_job(&self, pool: &DbPool, id: &str, event: &str) {
+        if let Some(job) = self.get_job_from_pool(pool, id).await {
             let _ = self.events_tx.send(AcquisitionEvent {
-                event: String::from("job.failed"),
-                job: failed_job,
+                event: event.into(),
+                job,
             });
         }
     }
 
-    /// Cancels an active acquisition job.
-    pub async fn cancel_job(&self, id: &str, user_id: &str, is_admin: bool) -> bool {
-        let Some(existing) = self.get_job(id, user_id, is_admin).await else {
-            return false;
-        };
-        if !existing.status.is_active() {
-            return false;
-        }
-        let Some(pool) = &self.db else {
-            return false;
-        };
-
+    /// Cancels the acquisition and its active task in the same transaction.
+    pub async fn cancel_job(
+        &self,
+        id: &str,
+        user_id: &str,
+        is_admin: bool,
+        tasks: &TaskManager,
+    ) -> Result<bool, TaskError> {
+        let pool = self.db.as_ref().ok_or(TaskError::NotFound)?;
+        let mut tx = pool.inner().begin().await.map_err(task_db_error)?;
         let now = Utc::now().to_rfc3339();
-        let res = sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'cancelled',
-                error_code = 'CANCELLED',
-                error_message = 'Cancelled by user',
-                updated_at = ?,
-                completed_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(id)
-        .execute(pool.inner())
-        .await;
-
-        if res.is_ok_and(|r| r.rows_affected() > 0) {
-            if let Some(updated) = self.get_job(id, user_id, true).await {
-                let _ = self.events_tx.send(AcquisitionEvent {
-                    event: String::from("job.cancelled"),
-                    job: updated,
-                });
-            }
-            true
-        } else {
-            false
+        let row: Option<(Option<String>,)> = sqlx::query_as("UPDATE acquisition_jobs
+            SET status='cancelled', stage='cancelled', error_code='CANCELLED', error_message='Cancelled by user',
+                updated_at=?, completed_at=?
+            WHERE id=? AND (user_id=? OR ?) AND status IN ('queued','discovering','downloading','processing','importing')
+            RETURNING active_task_id")
+            .bind(&now).bind(&now).bind(id).bind(user_id).bind(is_admin)
+            .fetch_optional(&mut *tx).await.map_err(task_db_error)?;
+        let Some((task_id,)) = row else {
+            return Ok(false);
+        };
+        let cancelled = match task_id {
+            Some(task_id) => tasks.cancel_on(&mut tx, &task_id).await?,
+            None => None,
+        };
+        tx.commit().await.map_err(task_db_error)?;
+        if let Some(task) = cancelled {
+            tasks.notify_cancelled(&task);
         }
+        self.emit_job(pool, id, "job.cancelled").await;
+        Ok(true)
     }
 
-    /// Retries a settled `failed` or `cancelled` acquisition job.
+    /// Atomically claims a retry and creates its new task.
     pub async fn retry_job(
         &self,
         id: &str,
         user_id: &str,
         is_admin: bool,
+        tasks: &TaskManager,
     ) -> Result<AcquisitionJob, AcquisitionJobError> {
-        let existing = self
+        let job = self
             .get_job(id, user_id, is_admin)
             .await
             .ok_or(AcquisitionJobError::NotFound)?;
-
-        if !matches!(
-            existing.status,
-            AcquisitionJobStatus::Failed | AcquisitionJobStatus::Cancelled
-        ) {
+        let pool = self.db.as_ref().ok_or(AcquisitionJobError::NotFound)?;
+        let storage = |err: sqlx::Error| AcquisitionJobError::Storage(err.to_string());
+        let saved: Option<String> =
+            sqlx::query_scalar("SELECT input_json FROM acquisition_job_inputs WHERE job_id=?")
+                .bind(id)
+                .fetch_optional(pool.inner())
+                .await
+                .map_err(storage)?;
+        if saved
+            .as_deref()
+            .and_then(ValidatedTarget::decode_saved)
+            .is_none()
+        {
             return Err(AcquisitionJobError::NotRetryable);
         }
-
-        let Some(pool) = &self.db else {
-            return Err(AcquisitionJobError::NotFound);
-        };
+        let mut tx = pool.inner().begin().await.map_err(storage)?;
         let now = Utc::now().to_rfc3339();
-
-        sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'queued',
-                error_code = NULL,
-                error_message = NULL,
-                completed_at = NULL,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&now)
-        .bind(id)
-        .execute(pool.inner())
-        .await
-        .map_err(|_| AcquisitionJobError::NotFound)?;
-
-        let updated = self
-            .get_job(id, user_id, true)
+        let claimed = sqlx::query("UPDATE acquisition_jobs SET status='queued', stage='queued',
+            error_code=NULL, error_message=NULL, completed_at=NULL, percent=0, updated_at=?, imported_count=0
+            WHERE id=? AND user_id=? AND status IN ('failed','cancelled')
+            AND EXISTS(SELECT 1 FROM acquisition_job_inputs WHERE job_id=?)")
+            .bind(&now).bind(id).bind(&job.user_id).bind(id)
+            .execute(&mut *tx).await.map_err(storage)?;
+        if claimed.rows_affected() != 1 {
+            return Err(AcquisitionJobError::NotRetryable);
+        }
+        let task = tasks
+            .enqueue_on(
+                &mut tx,
+                TaskType::SpotdlDownload,
+                json!({ "kind": "acquisition", "jobId": id }),
+                &job.user_id,
+                None,
+            )
             .await
-            .ok_or(AcquisitionJobError::NotFound)?;
-
+            .map_err(|err| AcquisitionJobError::Storage(err.to_string()))?;
+        let row =
+            sqlx::query("UPDATE acquisition_jobs SET active_task_id=? WHERE id=? RETURNING *")
+                .bind(&task.id)
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        let updated = Self::map_row(&row).ok_or(AcquisitionJobError::NotFound)?;
+        tx.commit().await.map_err(storage)?;
         let _ = self.events_tx.send(AcquisitionEvent {
-            event: String::from("job.updated"),
+            event: "job.updated".into(),
             job: updated.clone(),
         });
-
+        tasks.notify_committed(&task);
         Ok(updated)
     }
+}
+
+fn task_db_error(err: impl std::fmt::Display) -> TaskError {
+    TaskError::ExecutionFailed(err.to_string())
 }

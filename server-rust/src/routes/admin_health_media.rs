@@ -512,17 +512,20 @@ async fn post_admin_acquisitions_cleanup_handler(_admin: RequireAdmin) -> Respon
         .into_response()
 }
 
-async fn post_admin_acquisitions_scan_handler(_admin: RequireAdmin) -> Response {
-    (StatusCode::OK, Json(json!({ "scanned": true }))).into_response()
+async fn post_admin_acquisitions_scan_handler(State(state): State<AppState>, _admin: RequireAdmin) -> Result<Response, ServerError> {
+    let backend = state.providers().get_primary().map_err(|err| ServerError::ServiceUnavailable(err.to_string()))?;
+    let scan = backend.provider.scan_library().await.map_err(|err| ServerError::BadGateway(err.to_string()))?;
+    Ok(Json(json!({ "scanned": !scan.scanning, "count": scan.count })).into_response())
 }
 
-async fn get_downloader_diagnostics_handler(_admin: RequireAdmin) -> Response {
-    let adapter = SpotDLDownloaderAdapter::new();
+async fn get_downloader_diagnostics_handler(State(state): State<AppState>, _admin: RequireAdmin) -> Result<Response, ServerError> {
+    let adapter = SpotDLDownloaderAdapter::new().with_saved_settings(state.db()).await;
+    adapter.tool_paths().map_err(|err| ServerError::ServiceUnavailable(err.to_owned()))?;
     let diag = adapter.detect_binaries().await;
     let downloaders: Vec<Value> = vec![json!({
         "id": "spotdl",
         "name": "spotDL Downloader",
         "diagnostics": diag,
     })];
-    (StatusCode::OK, Json(json!({ "downloaders": downloaders }))).into_response()
+    Ok(Json(json!({ "downloaders": downloaders })).into_response())
 }

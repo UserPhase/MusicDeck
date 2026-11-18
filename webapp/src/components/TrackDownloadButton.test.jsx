@@ -82,13 +82,12 @@ describe("TrackDownloadButton", () => {
         title: "Bohemian Rhapsody",
         artist: "Queen",
         album: "A Night at the Opera",
-        provider: "library",
-        source: { kind: "library", count: 1 },
-        metadata: {
-          spotifyTrackUrl: "https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv",
-        },
+        provider: "external",
+        source: { kind: "external", count: 0 },
+        metadata: {},
       },
       trackId: "track-123",
+      spotifyUrl: "https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv",
       sourceProvider: "spotdl",
     });
 

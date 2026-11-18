@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
 
-import { createAcquisition, getAcquisition, getAcquisitions } from "../api/musicdeck";
+import { createAcquisition, getAcquisition, getAcquisitions, retryAcquisition } from "../api/musicdeck";
 import { isBrowserIntegrationAllowed } from "./privacyPolicy";
 
 /**
@@ -13,8 +13,8 @@ import { isBrowserIntegrationAllowed } from "./privacyPolicy";
  * State is keyed per item (`album:<id>` / `track:<id>`), so every card showing
  * the same item agrees, and only cards for that key re-render on change.
  */
-export type ExternalActionState = "IDLE" | "QUEUED" | "IMPORTING" | "IN_LIBRARY" | "FAILED";
-export type ExternalItemKind = "album" | "track";
+export type ExternalActionState = "IDLE" | "QUEUED" | "IMPORTING" | "IN_LIBRARY" | "PARTIAL" | "FAILED";
+export type ExternalItemKind = "album" | "track" | "artist";
 
 export type ExternalActionSnapshot = {
   state: ExternalActionState;
@@ -33,6 +33,10 @@ export type ExternalMetadataItem = {
   name?: string | null;
   artist?: string | null;
   album?: string | null;
+  spotifyUrl?: string | null;
+  spotifyTrackUrl?: string | null;
+  spotifyAlbumUrl?: string | null;
+  spotifyArtistUrl?: string | null;
   provider?: string | null;
   source?: { kind?: string; count?: number } | null;
   metadata?: Record<string, unknown> | null;
@@ -51,6 +55,7 @@ type CreateResponse = { jobId?: string; status?: string; job?: AcquisitionJobLik
 
 export type ExternalActionDeps = {
   create: (payload: unknown) => Promise<CreateResponse>;
+  retry?: (jobId: string) => Promise<CreateResponse>;
   get: (jobId: string) => Promise<AcquisitionJobLike | null | undefined>;
   list: () => Promise<AcquisitionJobLike[]>;
   isOnline: () => boolean;
@@ -70,8 +75,7 @@ const ACTIVE_STATES = new Set<ExternalActionState>(["QUEUED", "IMPORTING"]);
 const POLL_BASE_MS = 1500;
 const POLL_MAX_MS = 15000;
 const MAX_POLL_FAILURES = 6;
-const PROVIDERS = new Set(["library", "musicdeck", "plugin", "external", "deezer", "itunes", "spotify"]);
-// Mirrors the server's strict acquisition metadata schema; anything else would be rejected.
+const PROVIDERS = new Set(["library", "musicdeck", "plugin", "external"]);
 const METADATA_KEYS = ["durationSeconds", "artistId", "albumId", "isrc", "year", "songCount", "deezerTrackId", "itunesTrackId"];
 
 export const OFFLINE_MESSAGE = "You're offline. Reconnect, then try again.";
@@ -92,6 +96,8 @@ export function stateForJobStatus(status: string | undefined): ExternalActionSta
       return "IMPORTING";
     case "completed":
       return "IN_LIBRARY";
+    case "partial":
+      return "PARTIAL";
     case "failed":
       return "FAILED";
     default:
@@ -110,6 +116,7 @@ function snapshotForJob(job: AcquisitionJobLike, title: string): ExternalActionS
     QUEUED: `${title} is queued for import.`,
     IMPORTING: progress === null ? `Importing ${title}…` : `Importing ${title}… ${progress}%`,
     IN_LIBRARY: `${title} is in your library.`,
+    PARTIAL: job.errorMessage || `Part of ${title} was imported.`,
     FAILED: job.errorMessage ? `Import failed: ${job.errorMessage}` : `Import of ${title} failed. Try again.`,
   };
   return { state, jobId: job.id ?? null, progress, message: messages[state], connectionLost: false };
@@ -127,16 +134,22 @@ function titleOf(item: ExternalMetadataItem) {
   return item.title || item.name || "This item";
 }
 
-export function acquisitionPayload(kind: ExternalItemKind, item: ExternalMetadataItem) {
+function acquisitionResult(kind: ExternalItemKind, item: ExternalMetadataItem) {
+  const id = String(item.id);
   const provider = item.provider && PROVIDERS.has(item.provider) ? item.provider : "external";
   const metadata: Record<string, unknown> = {};
   for (const key of METADATA_KEYS) {
     const value = item.metadata?.[key];
     if (value !== undefined) metadata[key] = value;
   }
+  const urlKey = kind === "album" ? "spotifyAlbumUrl" : kind === "artist" ? "spotifyArtistUrl" : "spotifyTrackUrl";
+  const trackId = item.metadata?.spotifyTrackId;
+  const trackUrl = kind === "track" && typeof trackId === "string" && /^[a-zA-Z0-9]{1,64}$/.test(trackId)
+    ? `https://open.spotify.com/track/${trackId}` : undefined;
+  const spotifyUrl = [item[urlKey], item.metadata?.[urlKey], item.spotifyUrl, item.metadata?.spotifyUrl, trackUrl]
+    .find((url) => typeof url === "string" && url.trim());
   return {
-    result: {
-      id: item.id,
+      id,
       type: kind,
       title: titleOf(item),
       artist: item.artist || "",
@@ -144,14 +157,26 @@ export function acquisitionPayload(kind: ExternalItemKind, item: ExternalMetadat
       provider,
       source: { kind: "external", count: Math.max(0, Number(item.source?.count) || 0) },
       metadata,
-    },
-    ...(kind === "album" ? { albumId: item.id } : { trackId: item.id }),
+      ...(typeof spotifyUrl === "string" ? { spotifyUrl: spotifyUrl.trim() } : {}),
+  };
+}
+
+export function acquisitionPayload(kind: ExternalItemKind, item: ExternalMetadataItem, albums: ExternalMetadataItem[] = []) {
+  const { spotifyUrl, ...result } = acquisitionResult(kind, item);
+  return {
+    result,
+    ...(kind === "album" ? { albumId: result.id } : kind === "track" ? { trackId: result.id } : {}),
+    ...(spotifyUrl ? { spotifyUrl } : {}),
+    ...(kind === "artist" && !spotifyUrl && albums.length > 0 ? {
+      albums: albums.map((album) => acquisitionResult("album", { ...album, artist: album.artist || item.name || item.title })),
+    } : {}),
     sourceProvider: "spotdl",
   };
 }
 
 const defaultDeps: ExternalActionDeps = {
   create: createAcquisition,
+  retry: retryAcquisition,
   get: getAcquisition,
   list: getAcquisitions,
   isOnline: () => typeof navigator === "undefined" || navigator.onLine !== false,
@@ -238,7 +263,7 @@ export function createExternalActions(deps: ExternalActionDeps = defaultDeps) {
     titles.set(key, titleOf(item));
     const current = getSnapshot(key);
     // Duplicate clicks and other cards for the same item join the active job.
-    if (ACTIVE_STATES.has(current.state) || current.state === "IN_LIBRARY") return Promise.resolve(current);
+    if (ACTIVE_STATES.has(current.state) || current.state === "IN_LIBRARY" || current.state === "PARTIAL") return Promise.resolve(current);
     const pending = starting.get(key);
     if (pending) return pending;
 
@@ -250,7 +275,17 @@ export function createExternalActions(deps: ExternalActionDeps = defaultDeps) {
 
     set(key, { ...IDLE, state: "QUEUED", message: `Sending ${titleOf(item)} to the import queue…` });
     const request = Promise.resolve()
-      .then(() => deps.create(acquisitionPayload(kind, item)))
+      .then(async () => {
+        if (current.state === "FAILED" && current.jobId) {
+          if (current.connectionLost) {
+            const job = await deps.get(current.jobId);
+            if (!job) throw new Error("The previous import could not be found.");
+            return { job };
+          }
+          if (deps.retry) return deps.retry(current.jobId);
+        }
+        return deps.create(acquisitionPayload(kind, item));
+      })
       .then(
         (response) => {
           const job = response?.job ?? { id: response?.jobId, status: response?.status };
@@ -259,7 +294,8 @@ export function createExternalActions(deps: ExternalActionDeps = defaultDeps) {
         },
       )
       .catch((error: unknown) => {
-        const failed = { ...IDLE, state: "FAILED" as const, message: friendlyError(error, deps.isOnline()) };
+        const failed = { ...IDLE, jobId: current.jobId, connectionLost: current.connectionLost,
+          state: "FAILED" as const, message: friendlyError(error, deps.isOnline()) };
         set(key, failed);
         return failed;
       })
@@ -282,15 +318,16 @@ export function createExternalActions(deps: ExternalActionDeps = defaultDeps) {
         // Jobs are newest first, so the first match per key wins.
         const seen = new Set<string>();
         for (const job of jobs || []) {
-          const kind: ExternalItemKind | null = job.requestedTrackId ? "track" : job.requestedAlbumId ? "album" : null;
-          const id = job.requestedTrackId || job.requestedAlbumId;
+          const albumJob = job.requestedAlbumId && (!job.requestedTrackId || job.requestedTrackId === job.requestedAlbumId);
+          const kind = albumJob ? "album" : job.requestedTrackId ? "track" : null;
+          const id = albumJob ? job.requestedAlbumId : job.requestedTrackId;
           if (!kind || !id) continue;
           const key = externalActionKey(kind, id);
           if (seen.has(key)) continue;
           seen.add(key);
           const state = stateForJobStatus(job.status);
           if (getSnapshot(key).state !== "IDLE" || starting.has(key)) continue;
-          if (ACTIVE_STATES.has(state) || state === "IN_LIBRARY") track(key, job);
+          if (ACTIVE_STATES.has(state) || state === "IN_LIBRARY" || state === "PARTIAL") track(key, job);
         }
       })
       .catch(() => {
@@ -326,7 +363,7 @@ export const externalActions = createExternalActions();
 
 /** Subscribes a component to one item's lifecycle only. */
 export function useExternalAction(
-  kind: ExternalItemKind,
+  kind: "album" | "track",
   item: ExternalMetadataItem,
   actions: ExternalActions = externalActions,
 ) {

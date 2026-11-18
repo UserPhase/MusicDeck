@@ -44,6 +44,7 @@ test("maps every server job status onto the card lifecycle", () => {
   expect(stateForJobStatus("queued")).toBe("QUEUED");
   for (const status of ["discovering", "downloading", "processing", "importing"]) expect(stateForJobStatus(status)).toBe("IMPORTING");
   expect(stateForJobStatus("completed")).toBe("IN_LIBRARY");
+  expect(stateForJobStatus("partial")).toBe("PARTIAL");
   expect(stateForJobStatus("failed")).toBe("FAILED");
   expect(stateForJobStatus("cancelled")).toBe("IDLE");
 });
@@ -55,7 +56,7 @@ test("builds a payload the strict server schema accepts", () => {
       type: "album",
       title: "Chart Album",
       artist: "Chart Artist",
-      provider: "deezer",
+      provider: "external",
       source: { kind: "external", count: 0 },
       metadata: { songCount: 10 },
     },
@@ -139,9 +140,11 @@ test("a server-side failure shows the job's error and allows retry", async () =>
   await flushTimer();
   expect(actions.getSnapshot(key)).toMatchObject({ state: "FAILED", message: "Import failed: No matching release found" });
 
-  deps.create.mockResolvedValue({ job: { id: "job-2", status: "queued" } });
+  deps.retry = jest.fn().mockResolvedValue({ job: { id: "job-1", status: "queued" } });
   await actions.saveExternalAlbum(album);
-  expect(actions.getSnapshot(key)).toMatchObject({ state: "QUEUED", jobId: "job-2" });
+  expect(actions.getSnapshot(key)).toMatchObject({ state: "QUEUED", jobId: "job-1" });
+  expect(deps.retry).toHaveBeenCalledWith("job-1");
+  expect(deps.create).toHaveBeenCalledTimes(1);
 });
 
 test("a network drop while importing keeps the job, backs off, then asks for a safe retry", async () => {
@@ -160,12 +163,11 @@ test("a network drop while importing keeps the job, backs off, then asks for a s
   expect(actions.getSnapshot(key).message).toMatch(/won't start a duplicate/);
   expect(timers).toHaveLength(0);
 
-  // The server reuses the unfinished job, so Retry rejoins it.
-  deps.create.mockResolvedValue({ job: { id: "job-1", status: "importing" } });
   deps.get.mockResolvedValue({ id: "job-1", status: "completed" });
   await actions.saveExternalAlbum(album);
-  await flushTimer();
   expect(actions.getSnapshot(key).state).toBe("IN_LIBRARY");
+  expect(deps.create).toHaveBeenCalledTimes(1);
+  expect(timers).toHaveLength(0);
 });
 
 test("hydrates in-flight and completed imports from the server once", async () => {

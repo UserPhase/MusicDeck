@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { createAcquisition } from "../api/musicdeck";
+import { acquisitionPayload } from "../services/externalActions";
 import { usePrivacy } from "../context/PrivacyContext";
 
 const LABELS = {
@@ -26,20 +27,7 @@ export function usePreviewImport(currentSong) {
     if (!canImport || !currentSong || importState === "loading") return;
     setImportState("loading");
     try {
-      await createAcquisition({
-        result: {
-          id: currentSong.id,
-          type: "track",
-          title: currentSong.title || "",
-          artist: currentSong.artist || "",
-          album: currentSong.album || "",
-          provider: currentSong.provider || "external",
-          source: currentSong.source || { kind: "external", count: 0 },
-          metadata: currentSong.metadata || {},
-        },
-        trackId: currentSong.id,
-        sourceProvider: "spotdl",
-      });
+      await createAcquisition(acquisitionPayload("track", currentSong));
       setImportState("queued");
     } catch {
       setImportState("error");

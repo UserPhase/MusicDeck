@@ -119,12 +119,9 @@ impl SystemHealthWizard {
         let artwork_dir = db_dir.join("artwork");
         let backup_dir = db_dir.join("backups");
 
-        let spotdl_bin = self
-            .resolve_tool_path("spotdlPath", "spotdl")
-            .await;
-        let ffmpeg_bin = self
-            .resolve_tool_path("ffmpegPath", "ffmpeg")
-            .await;
+        let adapter = crate::acquisition::SpotDLDownloaderAdapter::new()
+            .with_saved_settings(self.db.as_ref()).await;
+        let paths = adapter.tool_paths();
 
         let spotdl_args = [String::from("--version")];
         let ffmpeg_args = [String::from("-version")];
@@ -166,8 +163,8 @@ impl SystemHealthWizard {
                 false
             ),
             Self::check_directory("backup-directory", "Backup directory", &backup_dir, false),
-            self.check_dependency("spotdl", "spotDL", &spotdl_bin, &spotdl_args),
-            self.check_dependency("ffmpeg", "FFmpeg", &ffmpeg_bin, &ffmpeg_args),
+            self.check_configured_dependency(paths.map(|(spotdl, _)| spotdl), "spotdl", "spotDL", &spotdl_args),
+            self.check_configured_dependency(paths.map(|(_, ffmpeg)| ffmpeg), "ffmpeg", "FFmpeg", &ffmpeg_args),
             self.check_database()
         );
 
@@ -201,29 +198,16 @@ impl SystemHealthWizard {
         }
     }
 
-    async fn resolve_tool_path(&self, key: &str, fallback: &str) -> String {
-        if let Some(pool) = &self.db {
-            if let Ok(Some(row)) = sqlx::query(
-                "SELECT config_json FROM plugin_configs WHERE plugin_id = 'spotdl-downloader'",
-            )
-            .fetch_optional(pool.inner())
-            .await
-            {
-                if let Ok(cfg_str) = row.try_get::<String, _>("config_json") {
-                    if let Ok(val) = serde_json::from_str::<Value>(&cfg_str) {
-                        if let Some(path_str) = val
-                            .get(key)
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            return path_str.to_owned();
-                        }
-                    }
-                }
-            }
+    async fn check_configured_dependency(&self, path: Result<&str, &str>, id: &str, name: &str, args: &[String]) -> DiagnosticCheck {
+        match path {
+            Ok(path) => self.check_dependency(id, name, path, args).await,
+            Err(message) => DiagnosticCheck {
+                id: id.into(), category: DiagnosticCategory::Dependencies, title: name.into(),
+                status: DiagnosticStatus::Warning, message: message.into(),
+                fix: "Review the spotDL Downloader plugin settings.".into(), duration_ms: 0,
+            },
         }
-        fallback.to_owned()
+
     }
 
     async fn check_connection(&self) -> DiagnosticCheck {

@@ -507,6 +507,7 @@ pub struct SpotdlRunner {
     spotify_imports: Option<SpotifyPlaylistImportService>,
     downloader: Arc<SpotDLDownloaderAdapter>,
     output_dir: Option<PathBuf>,
+    privacy: Option<crate::services::privacy::PrivacyManager>,
 }
 
 impl std::fmt::Debug for SpotdlRunner {
@@ -534,6 +535,7 @@ impl SpotdlRunner {
             spotify_imports: None,
             downloader: Arc::new(SpotDLDownloaderAdapter::new()),
             output_dir: None,
+            privacy: None,
         }
     }
 
@@ -550,6 +552,7 @@ impl SpotdlRunner {
             spotify_imports,
             downloader: Arc::new(SpotDLDownloaderAdapter::new()),
             output_dir: None,
+            privacy: None,
         }
     }
 
@@ -566,6 +569,7 @@ impl SpotdlRunner {
             spotify_imports: Some(spotify_imports),
             downloader: Arc::new(SpotDLDownloaderAdapter::new()),
             output_dir: None,
+            privacy: None,
         }
     }
 
@@ -581,6 +585,11 @@ impl SpotdlRunner {
     #[must_use]
     pub fn with_downloader(mut self, downloader: Arc<SpotDLDownloaderAdapter>) -> Self {
         self.downloader = downloader;
+        self
+    }
+
+    pub(crate) fn with_privacy(mut self, privacy: crate::services::privacy::PrivacyManager) -> Self {
+        self.privacy = Some(privacy);
         self
     }
 
@@ -636,6 +645,8 @@ impl TaskDefinition for SpotdlRunner {
             .or_else(|| context.db().cloned())
             .ok_or(TaskError::NotFound)?;
 
+        let downloader = self.downloader.as_ref().clone().with_saved_settings(Some(&pool)).await
+            .with_privacy(self.privacy.clone());
         match kind {
             "acquisition" => {
                 let acquisitions = self
@@ -658,7 +669,7 @@ impl TaskDefinition for SpotdlRunner {
                     .run_managed_job(
                         job_id,
                         &context,
-                        &self.downloader,
+                        &downloader,
                         self.output_dir.as_deref(),
                     )
                     .await?;
@@ -684,7 +695,7 @@ impl TaskDefinition for SpotdlRunner {
                     .run_managed_job(
                         job_id,
                         &context,
-                        &self.downloader,
+                        &downloader,
                         self.output_dir.as_deref(),
                     )
                     .await?;

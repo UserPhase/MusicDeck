@@ -1,3 +1,4 @@
+import { acquisitionPayload } from "../services/externalActions";
 import TrackActionScope from "../components/TrackActionScope";
 import { EditionBadges } from "../components/common/EditionBadges";
 import { usePrivacy } from "../context/PrivacyContext";
@@ -105,6 +106,7 @@ function Artist() {
   const [error, setError] =
     useState(null);
   const [isImportingArtist, setIsImportingArtist] = useState(false);
+  const [importNotice, setImportNotice] = useState(null);
   const { canImport } = usePrivacy();
 
   const {
@@ -151,19 +153,12 @@ function Artist() {
   async function importArtistDiscography() {
     if (!canImport || !artist) return;
     setIsImportingArtist(true);
+    setImportNotice(null);
     try {
-      await createAcquisition({
-        result: {
-          id: artist.id,
-          type: "artist",
-          title: artist.name,
-          artist: artist.name,
-          provider: "external",
-          source: { kind: "external", count: 0 },
-          metadata: {},
-        },
-        sourceProvider: "spotdl",
-      });
+      await createAcquisition(acquisitionPayload("artist", artist, mergedAlbums));
+      setImportNotice({ message: "Discography import queued." });
+    } catch (error) {
+      setImportNotice({ message: error.message, error: true });
     } finally {
       setIsImportingArtist(false);
     }
@@ -315,6 +310,7 @@ function Artist() {
                 {universalArtist.isExternal ? (isImportingArtist ? "Adding…" : "Import Discography") : "Play"}
               </span>
             </button>}
+            {importNotice && <p role={importNotice.error ? "alert" : "status"}>{importNotice.message}</p>}
             <button
               type="button"
               className={`detail-secondary-action${isShuffleEnabled ? " is-active" : ""}`}

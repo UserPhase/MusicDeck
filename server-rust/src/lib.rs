@@ -227,7 +227,7 @@ pub mod state {
         /// Initial application configuration context.
         pub config: Arc<AppConfig>,
         /// Live runtime configuration updated by setup completion and backup restoration.
-        pub runtime_config: std::sync::RwLock<Arc<AppConfig>>,
+        pub runtime_config: Arc<std::sync::RwLock<Arc<AppConfig>>>,
         runtime_gate: Arc<AsyncRwLock<()>>,
         runtime_updates: Arc<AsyncMutex<()>>,
         runtime_ready: AtomicBool,
@@ -331,6 +331,10 @@ pub mod state {
 
         /// Loads persisted privacy policy before constructing database-backed services.
         pub async fn with_database(config: AppConfig, db: DbPool) -> Result<Self, PrivacyError> {
+            Self::with_database_dispatch(config, db, true).await
+        }
+
+        pub async fn with_database_dispatch(config: AppConfig, db: DbPool, dispatch: bool) -> Result<Self, PrivacyError> {
             let privacy = PrivacyManager::from_database(db.clone(), &config).await?;
             let arc_cfg = Arc::new(config);
             let sessions = SessionStore::new(db.clone(), arc_cfg.auth.session_secret.clone());
@@ -361,7 +365,7 @@ pub mod state {
                 inner.recommendations = RecommendationService::new(Some(db.clone()));
                 inner.sonic = SonicRecommendationService::new(Some(db.clone()));
                 inner.similar_mixes = SimilarMixEngine::new(Some(db.clone()));
-                let tasks = TaskManager::new(Some(db.clone()));
+                let tasks = TaskManager::new_with_dispatch(Some(db.clone()), dispatch);
                 tasks.register(
                     TaskType::LibraryScan,
                     Arc::new(LibraryScanRunner::new(
@@ -377,14 +381,16 @@ pub mod state {
                     TaskType::SonicAudioAnalysis,
                     Arc::new(SonicAnalysisRunner::new(inner.sonic.clone())),
                 );
-                let acquisitions = AcquisitionService::new(Some(db.clone()));
-                let spotify_imports = SpotifyPlaylistImportService::new(Some(db.clone()));
+                let acquisitions = AcquisitionService::new(Some(db.clone()))
+                    .with_library(inner.runtime_config.clone(), inner.providers.clone());
+                let spotify_imports = SpotifyPlaylistImportService::new(Some(db.clone()))
+                    .with_library(inner.runtime_config.clone(), inner.providers.clone());
                 let spotdl_runner: Arc<dyn crate::tasks::TaskDefinition> =
                     Arc::new(SpotdlRunner::with_services(
                         Some(db.clone()),
                         acquisitions.clone(),
                         spotify_imports.clone(),
-                    ));
+                    ).with_privacy(inner.privacy.clone()));
                 tasks.register(TaskType::SpotdlImport, Arc::clone(&spotdl_runner));
                 tasks.register(TaskType::SpotdlDownload, spotdl_runner);
                 inner.tasks = tasks;
@@ -468,7 +474,7 @@ pub mod state {
             let extensions = ExtensionManager::new(None, &config.extensions_dir);
             let library_health_scan = LibraryHealthScanService::new(None, providers.clone());
 
-            let runtime_config = std::sync::RwLock::new(Arc::clone(&config));
+            let runtime_config = Arc::new(std::sync::RwLock::new(Arc::clone(&config)));
             Self {
                 inner: Arc::new(AppStateInner {
                     config,

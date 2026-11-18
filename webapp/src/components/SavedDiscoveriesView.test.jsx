@@ -124,7 +124,7 @@ test("saved shelf imports only selected items through the existing coordinated a
   await waitFor(() => expect(createAcquisition).toHaveBeenCalledTimes(1));
   expect(createAcquisition).toHaveBeenCalledWith(expect.objectContaining({
     albumId: "external_deezer_album_7", sourceProvider: "spotdl",
-    result: expect.objectContaining({ type: "album", title: "Night Drive", provider: "deezer" }),
+    result: expect.objectContaining({ type: "album", title: "Night Drive", provider: "external" }),
   }));
   expect(await screen.findByRole("button", { name: "Queued" })).toBeDisabled();
   expect(removeSavedDiscovery).not.toHaveBeenCalled();

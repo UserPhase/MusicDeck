@@ -120,8 +120,7 @@ impl TaskType {
     /// Returns `true` for background tasks that yield to active HTTP audio streams.
     #[must_use]
     pub const fn is_background_task(self) -> bool {
-        self.is_analysis_task()
-            || matches!(self, Self::LibraryScan | Self::NewReleasesScan)
+        self.is_analysis_task() || matches!(self, Self::LibraryScan | Self::NewReleasesScan)
     }
 }
 
@@ -421,7 +420,9 @@ impl FiveFieldCron {
                 } else {
                     (cursor.year(), cursor.month() + 1)
                 };
-                cursor = Utc.with_ymd_and_hms(next_year, next_month, 1, 0, 0, 0).single()?;
+                cursor = Utc
+                    .with_ymd_and_hms(next_year, next_month, 1, 0, 0, 0)
+                    .single()?;
                 continue;
             }
 
@@ -435,10 +436,7 @@ impl FiveFieldCron {
             };
 
             if !day_ok {
-                let next_day = cursor
-                    .with_hour(0)?
-                    .with_minute(0)?
-                    .with_second(0)?
+                let next_day = cursor.with_hour(0)?.with_minute(0)?.with_second(0)?
                     + chrono::Duration::days(1);
                 cursor = next_day;
                 continue;
@@ -520,11 +518,7 @@ fn parse_cron_field_bits(
             current = current.saturating_add(step);
         }
     }
-    if mask == 0 {
-        None
-    } else {
-        Some(mask)
-    }
+    if mask == 0 { None } else { Some(mask) }
 }
 
 pub(crate) async fn upsert_schedule(
@@ -589,8 +583,9 @@ async fn write_library_schedule_setting(
 }
 
 fn serialize_task_payload(payload: &Value) -> Result<String, TaskError> {
-    let serialized = serde_json::to_string(payload)
-        .map_err(|_| TaskError::Validation(String::from("Task payload must be JSON serializable")))?;
+    let serialized = serde_json::to_string(payload).map_err(|_| {
+        TaskError::Validation(String::from("Task payload must be JSON serializable"))
+    })?;
     if serialized.is_empty() || serialized.len() > MAX_TASK_PAYLOAD_BYTES {
         return Err(TaskError::Validation(String::from(
             "Task payload must not exceed 64 KiB",
@@ -660,7 +655,9 @@ impl TaskRunContext {
 
     /// Appends a credential-redacted diagnostic log line (`"stdout"` or `"stderr"`).
     pub async fn log(&self, source: &str, message: &str) {
-        self.manager.append_log(&self.task_id, source, message).await;
+        self.manager
+            .append_log(&self.task_id, source, message)
+            .await;
     }
 
     /// Cooperatively pauses execution when manually paused, while media is streaming,
@@ -730,6 +727,8 @@ pub struct TaskManager {
     media_streams: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     pumping: Arc<AtomicBool>,
+    dispatch_enabled: Arc<AtomicBool>,
+    pump_requested: Arc<AtomicBool>,
     scheduler_running: Arc<AtomicBool>,
     cron_tick_interval_ms: Arc<AtomicU64>,
     schedule_notify: Arc<Notify>,
@@ -754,6 +753,10 @@ impl TaskManager {
     /// Creates a new [`TaskManager`].
     #[must_use]
     pub fn new(db: Option<DbPool>) -> Self {
+        Self::new_with_dispatch(db, true)
+    }
+
+    pub(crate) fn new_with_dispatch(db: Option<DbPool>, enabled: bool) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         let mgr = Self {
             db,
@@ -762,6 +765,8 @@ impl TaskManager {
             media_streams: Arc::new(AtomicUsize::new(0)),
             stopping: Arc::new(AtomicBool::new(false)),
             pumping: Arc::new(AtomicBool::new(false)),
+            dispatch_enabled: Arc::new(AtomicBool::new(enabled)),
+            pump_requested: Arc::new(AtomicBool::new(false)),
             scheduler_running: Arc::new(AtomicBool::new(false)),
             cron_tick_interval_ms: Arc::new(AtomicU64::new(DEFAULT_CRON_TICK_INTERVAL_MS)),
             schedule_notify: Arc::new(Notify::new()),
@@ -802,8 +807,17 @@ impl TaskManager {
         self.schedule_notify.notify_one();
     }
 
+    pub fn enable_dispatch(&self) {
+        self.dispatch_enabled.store(true, Ordering::Release);
+        self.start_scheduler();
+        self.spawn_pump();
+    }
+
     fn ensure_scheduler_running(&self) {
-        if self.stopping.load(Ordering::Acquire) || self.db.is_none() {
+        if self.stopping.load(Ordering::Acquire)
+            || !self.dispatch_enabled.load(Ordering::Acquire)
+            || self.db.is_none()
+        {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -987,8 +1001,7 @@ impl TaskManager {
                 Ok(None) => {}
             }
 
-            let payload =
-                serde_json::from_str::<Value>(&payload_str).unwrap_or_else(|_| json!({}));
+            let payload = serde_json::from_str::<Value>(&payload_str).unwrap_or_else(|_| json!({}));
             let owner = if created_by.trim().is_empty() {
                 "system:scheduler"
             } else {
@@ -1084,6 +1097,25 @@ impl TaskManager {
             return;
         };
         let now = Utc::now().to_rfc3339();
+        // A job may have committed while its task was still being finalized at shutdown.
+        let reconciled = sqlx::query(
+            "UPDATE background_tasks SET state='FINISHED', error=NULL, finished_at=?, updated_at=?,
+                progress_json=json_set(progress_json,'$.percent',100.0)
+             WHERE state IN ('PROCESSING','PAUSED') AND (
+                (type='SPOTDL_DOWNLOAD' AND EXISTS(SELECT 1 FROM acquisition_jobs
+                    WHERE active_task_id=background_tasks.id AND status IN ('completed','partial')))
+                OR (type='SPOTDL_IMPORT' AND EXISTS(SELECT 1 FROM import_jobs
+                    WHERE id=json_extract(background_tasks.payload_json,'$.jobId')
+                      AND json_extract(manifest_json,'$.job.status') IN ('completed','partial')))
+             )",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(pool.inner())
+        .await;
+        if let Err(err) = reconciled {
+            tracing::error!(error=%err, "Could not reconcile completed import tasks");
+        }
         let _ = sqlx::query(
             r"
             UPDATE background_tasks
@@ -1091,7 +1123,7 @@ impl TaskManager {
                 error = 'Task was interrupted by a server restart',
                 finished_at = ?,
                 updated_at = ?
-            WHERE state = 'PROCESSING'
+            WHERE state = 'PROCESSING' OR (state='PAUSED' AND type IN ('SPOTDL_DOWNLOAD','SPOTDL_IMPORT'))
             ",
         )
         .bind(&now)
@@ -1204,8 +1236,7 @@ impl TaskManager {
         let progress_str: String = row.try_get("progress_json").unwrap_or_default();
 
         let payload = serde_json::from_str::<Value>(&payload_str).unwrap_or_else(|_| json!({}));
-        let progress =
-            serde_json::from_str::<TaskProgress>(&progress_str).unwrap_or_default();
+        let progress = serde_json::from_str::<TaskProgress>(&progress_str).unwrap_or_default();
 
         Some(Task {
             id: row.try_get("id").ok()?,
@@ -1268,6 +1299,33 @@ impl TaskManager {
         created_by: &str,
         priority: Option<i32>,
     ) -> Result<Task, TaskError> {
+        let pool = self
+            .db
+            .as_ref()
+            .ok_or_else(|| TaskError::Conflict("Database is unavailable".into()))?;
+        let mut tx = pool
+            .inner()
+            .begin()
+            .await
+            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        let task = self
+            .enqueue_on(&mut tx, task_type, payload, created_by, priority)
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        self.notify_committed(&task);
+        Ok(task)
+    }
+
+    pub(crate) async fn enqueue_on(
+        &self,
+        connection: &mut SqliteConnection,
+        task_type: TaskType,
+        payload: Value,
+        created_by: &str,
+        priority: Option<i32>,
+    ) -> Result<Task, TaskError> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(TaskError::Conflict(String::from(
                 "Task manager is shutting down",
@@ -1307,32 +1365,24 @@ impl TaskManager {
         }
 
         if task_type == TaskType::SonicAudioAnalysis
-            && self.find_pending(task_type, &json!({})).await.is_some()
+            && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM background_tasks WHERE type = ? AND state IN ('QUEUED','PROCESSING','PAUSED'))")
+                .bind(task_type.as_str()).fetch_one(&mut *connection).await.map_err(|e| TaskError::ExecutionFailed(e.to_string()))?
         {
-            return Err(TaskError::Conflict(String::from(
-                "Sonic analysis is already queued or running",
-            )));
+            return Err(TaskError::Conflict("Sonic analysis is already queued or running".into()));
         }
-
-        let pool = self
-            .db
-            .as_ref()
-            .ok_or_else(|| TaskError::Conflict(String::from("Database is unavailable")))?;
-
         let id = format!("task_{}", nanoid!(16));
         let now = Utc::now().to_rfc3339();
         let payload_json = serialize_task_payload(&payload)?;
         let progress = TaskProgress::default();
-        let progress_json =
-            serde_json::to_string(&progress).unwrap_or_else(|_| String::from("{}"));
+        let progress_json = serde_json::to_string(&progress).unwrap_or_else(|_| String::from("{}"));
 
-        sqlx::query(
+        let row = sqlx::query(
             r"
             INSERT INTO background_tasks (
                 id, type, state, priority, payload_json, progress_json,
                 created_by, created_at, updated_at
             )
-            VALUES (?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?) RETURNING *
             ",
         )
         .bind(&id)
@@ -1343,14 +1393,47 @@ impl TaskManager {
         .bind(created_by)
         .bind(&now)
         .bind(&now)
-        .execute(pool.inner())
+        .fetch_one(connection)
         .await
         .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        Self::map_row(&row)
+            .ok_or_else(|| TaskError::ExecutionFailed("Could not read queued task".into()))
+    }
 
-        let task = self.require_task(&id).await?;
+    pub(crate) fn notify_committed(&self, task: &Task) {
         let _ = self.events_tx.send(TaskEvent::State(task.clone()));
         self.spawn_pump();
-        Ok(task)
+    }
+
+    pub(crate) async fn cancel_on(
+        &self,
+        connection: &mut SqliteConnection,
+        id: &str,
+    ) -> Result<Option<Task>, TaskError> {
+        let now = Utc::now().to_rfc3339();
+        let row = sqlx::query("UPDATE background_tasks SET state='CANCELLED', error='Cancelled', updated_at=?, finished_at=?
+             WHERE id=? AND state IN ('QUEUED','PROCESSING','PAUSED')
+             AND NOT (type='SPOTDL_DOWNLOAD' AND EXISTS(SELECT 1 FROM acquisition_jobs
+                 WHERE active_task_id=background_tasks.id AND status IN ('completed','partial')))
+             AND NOT (type='SPOTDL_IMPORT' AND EXISTS(SELECT 1 FROM import_jobs
+                 WHERE id=json_extract(background_tasks.payload_json,'$.jobId')
+                 AND json_extract(manifest_json,'$.job.status') IN ('completed','partial')))
+             RETURNING *")
+            .bind(&now).bind(&now).bind(id).fetch_optional(connection).await
+            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        Ok(row.as_ref().and_then(Self::map_row))
+    }
+
+    pub(crate) fn notify_cancelled(&self, task: &Task) {
+        if let Some(handle) = self
+            .registry
+            .read()
+            .ok()
+            .and_then(|g| g.active.get(&task.id).cloned())
+        {
+            handle.cancel_token.cancel();
+        }
+        self.notify_committed(task);
     }
 
     /// Lists tasks (`limit` in `1..=500`).
@@ -1524,37 +1607,40 @@ impl TaskManager {
     }
 
     /// Cancels a non-terminal task, triggering its [`CancellationToken`].
+
     pub async fn cancel(&self, id: &str) -> Result<Task, TaskError> {
-        let task = self.require_task(id).await?;
-        if task.state.is_terminal() {
-            return Err(TaskError::Conflict(String::from(
-                "Finished tasks cannot be cancelled",
-            )));
-        }
-
-        let has_active = {
-            let guard = self.registry.read().ok();
-            guard.and_then(|g| g.active.get(id).cloned())
-        };
-
-        if let Some(handle) = has_active {
-            handle.cancel_token.cancel();
-        }
-
+        let pool = self.db.as_ref().ok_or(TaskError::NotFound)?;
+        let mut tx = pool
+            .inner()
+            .begin()
+            .await
+            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        let task = self
+            .cancel_on(&mut tx, id)
+            .await?
+            .ok_or_else(|| TaskError::Conflict("Only an active task can be cancelled".into()))?;
         let now = Utc::now().to_rfc3339();
-        let updated = self
-            .update_task_fields(
-                id,
-                Some(TaskStatus::Cancelled),
-                None,
-                Some(Some(String::from("Cancelled"))),
-                None,
-                Some(Some(now)),
-                None,
-            )
-            .await?;
-        self.spawn_pump();
-        Ok(updated)
+        if task.task_type == TaskType::SpotdlDownload {
+            sqlx::query("UPDATE acquisition_jobs SET status='cancelled', stage='cancelled',
+                error_code='CANCELLED', error_message='Cancelled by user', updated_at=?, completed_at=?
+                WHERE active_task_id=? AND status IN ('queued','discovering','downloading','processing','importing')")
+                .bind(&now).bind(&now).bind(id).execute(&mut *tx).await
+                .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        }
+        if task.task_type == TaskType::SpotdlImport
+            && let Some(job_id) = task.payload["jobId"].as_str()
+        {
+            sqlx::query("UPDATE import_jobs SET status='FAILED', updated_at=?,
+                manifest_json=json_set(manifest_json,'$.job.status','failed','$.job.stage','completed','$.job.error','Playlist import cancelled')
+                WHERE id=? AND status IN ('PENDING','PROCESSING') AND json_valid(manifest_json)")
+                .bind(&now).bind(job_id).execute(&mut *tx).await
+                .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
+        self.notify_cancelled(&task);
+        Ok(task)
     }
 
     /// Updates a non-terminal task's priority (`0..=1000`).
@@ -1704,14 +1790,16 @@ impl TaskManager {
             .as_ref()
             .ok_or_else(|| TaskError::Conflict(String::from("Database is unavailable")))?;
 
+        if current.state == TaskStatus::Cancelled {
+            return Ok(current);
+        }
         let state = next_state.unwrap_or(current.state);
         let priority = next_priority.unwrap_or(current.priority);
         let error = next_error.unwrap_or(current.error.clone());
         let started_at = next_started_at.unwrap_or(current.started_at.clone());
         let finished_at = next_finished_at.unwrap_or(current.finished_at.clone());
         let progress = next_progress.unwrap_or_else(|| current.progress.clone());
-        let progress_json =
-            serde_json::to_string(&progress).unwrap_or_else(|_| String::from("{}"));
+        let progress_json = serde_json::to_string(&progress).unwrap_or_else(|_| String::from("{}"));
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -1724,7 +1812,7 @@ impl TaskManager {
                 finished_at = ?,
                 progress_json = ?,
                 updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND state != 'CANCELLED'
             ",
         )
         .bind(state.as_str())
@@ -1951,9 +2039,10 @@ impl TaskManager {
     }
 
     fn spawn_pump(&self) {
-        if self.stopping.load(Ordering::Acquire) {
+        if self.stopping.load(Ordering::Acquire) || !self.dispatch_enabled.load(Ordering::Acquire) {
             return;
         }
+        self.pump_requested.store(true, Ordering::Release);
         let mgr = self.clone();
         tokio::spawn(async move {
             mgr.pump().await;
@@ -1972,6 +2061,7 @@ impl TaskManager {
             return;
         }
 
+        self.pump_requested.store(false, Ordering::Release);
         if let Some(pool) = &self.db {
             let rows = sqlx::query(
                 r"
@@ -2023,6 +2113,9 @@ impl TaskManager {
         }
 
         self.pumping.store(false, Ordering::Release);
+        if self.pump_requested.swap(false, Ordering::AcqRel) {
+            self.spawn_pump();
+        }
     }
 
     fn start_task(&self, task: Task, definition: Arc<dyn TaskDefinition>) {
@@ -2050,7 +2143,7 @@ impl TaskManager {
                 .started_at
                 .clone()
                 .unwrap_or_else(|| Utc::now().to_rfc3339());
-            let _ = mgr
+            let started = mgr
                 .update_task_fields(
                     &task.id,
                     Some(TaskStatus::Processing),
@@ -2063,6 +2156,9 @@ impl TaskManager {
                 .await;
 
             let outcome = async {
+                if started?.state == TaskStatus::Cancelled {
+                    return Err(TaskError::Cancelled);
+                }
                 ctx.checkpoint().await?;
                 definition.run(task.payload.clone(), ctx.clone()).await?;
                 ctx.throw_if_cancelled()?;

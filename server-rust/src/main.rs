@@ -56,7 +56,7 @@ async fn run_server() -> Result<(), ServerError> {
 
     let db = open_database(&config).await?;
 
-    let state = AppState::with_database(config, db.clone())
+    let state = AppState::with_database_dispatch(config, db.clone(), false)
         .await
         .map_err(|err| ServerError::Internal(err.to_string()))?;
     if !state.config().setup_required {
@@ -73,7 +73,9 @@ async fn run_server() -> Result<(), ServerError> {
     }
 
     state.tasks().recover_interrupted_tasks().await;
-    state.acquisitions().recover_interrupted_jobs().await;
+    state.acquisitions().recover_interrupted_jobs().await.map_err(|err| ServerError::Internal(err.to_string()))?;
+    state.spotify_imports().recover_interrupted_jobs().await.map_err(ServerError::Internal)?;
+    state.tasks().enable_dispatch();
 
     let scrobbles = state.scrobble_queue().clone();
     let router = create_router(state);

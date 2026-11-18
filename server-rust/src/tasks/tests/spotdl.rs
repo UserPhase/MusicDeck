@@ -1,5 +1,21 @@
 use super::*;
 use crate::acquisition::{SpotDLDownloaderAdapter, SqliteImportJobRepository, StoredImportJob};
+use crate::config::AppConfig;
+use crate::providers::{BackendRegistry, NavidromeClient, RegisteredProvider};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{Path as AxumPath, State},
+    routing::any,
+};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
+
+const FIXTURE_ALBUM: &str = "Fixture Artist/Fixture Album";
+const FIXTURE_NAME: &str = "Imported Fixture Playlist";
 
 /// Explicit success fixture, injected only by tests; production always spawns spotDL.
 pub(super) struct SuccessfulProcessRunner;
@@ -9,7 +25,7 @@ impl ProcessRunner for SuccessfulProcessRunner {
     async fn run(
         &self,
         _command: &str,
-        _args: &[String],
+        args: &[String],
         options: ProcessOptions,
     ) -> Result<ProcessExecutionResult, ProcessError> {
         let directory = options.cwd.expect("download output directory");
@@ -28,15 +44,284 @@ impl ProcessRunner for SuccessfulProcessRunner {
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&320_u32.to_le_bytes());
         wav.resize(364, 0);
-        tokio::fs::write(directory.join("fixture.wav"), wav)
+        if let Some(m3u) = args.windows(2).find(|pair| pair[0] == "--m3u") {
+            tokio::fs::create_dir_all(directory.join(FIXTURE_ALBUM))
+                .await
+                .unwrap();
+            let single = args.last().is_some_and(|target| target.contains("/track/"));
+            let titles: &[&str] = if single {
+                &["First"]
+            } else {
+                &["Second", "First", "Second"]
+            };
+            for title in titles {
+                tokio::fs::write(directory.join(fixture_path(title)), &wav)
+                    .await
+                    .unwrap();
+            }
+            // Alphabetical order differs from playlist order and a repeated song stays repeated.
+            let manifest = titles
+                .iter()
+                .map(|title| fixture_path(title))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let metadata = titles
+                .iter()
+                .map(|title| {
+                    json!({
+                        "name": title, "list_name": FIXTURE_NAME, "list_length": titles.len()
+                    })
+                })
+                .collect::<Vec<_>>();
+            tokio::fs::write(directory.join(&m3u[1]), format!("#EXTM3U\n{manifest}\n"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                directory.join("musicdeck-source.spotdl"),
+                json!(metadata).to_string(),
+            )
             .await
-            .expect("write fixture audio");
+            .unwrap();
+        } else {
+            tokio::fs::write(directory.join("fixture.wav"), wav)
+                .await
+                .unwrap();
+        }
         Ok(ProcessExecutionResult {
             exit_code: Some(0),
             stdout: String::new(),
             stderr: String::new(),
             signal: None,
         })
+    }
+}
+
+fn fixture_path(title: &str) -> String {
+    format!("{FIXTURE_ALBUM}/Fixture Artist - {title}.wav")
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NavidromeResult {
+    Success,
+    MissingTrack,
+    RejectPlaylist,
+}
+
+struct MockNavidrome {
+    music_root: PathBuf,
+    scans: AtomicUsize,
+    result: NavidromeResult,
+}
+
+async fn navidrome_request(
+    State(mock): State<Arc<MockNavidrome>>,
+    AxumPath(endpoint): AxumPath<String>,
+    uri: axum::http::Uri,
+    method: axum::http::Method,
+    body: Bytes,
+) -> Json<Value> {
+    let imports = mock.music_root.join("Spotify Imports");
+    let job_path = std::fs::read_dir(&imports)
+        .unwrap()
+        .filter_map(Result::ok)
+        .max_by_key(|entry| entry.file_name().to_string_lossy().starts_with("spimp"))
+        .unwrap()
+        .path();
+    assert!(job_path.join(fixture_path("First")).is_file());
+    for title in ["First", "Second"] {
+        let path = job_path.join(fixture_path(title));
+        if !path.exists() {
+            continue;
+        }
+        let file = std::fs::read(path).unwrap();
+        assert_eq!(file.len(), 364);
+        assert_eq!(&file[..4], b"RIFF");
+    }
+    let query: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    let result = match endpoint.as_str() {
+        "startScan.view" => {
+            mock.scans.store(0, Ordering::SeqCst);
+            json!({"status":"ok", "scanStatus":{"scanning":true}})
+        }
+        "getScanStatus.view" => {
+            let poll = mock.scans.fetch_add(1, Ordering::SeqCst);
+            json!({"status":"ok", "scanStatus":{"scanning":poll == 0, "count":2}})
+        }
+        "search3.view" => {
+            assert!(mock.scans.load(Ordering::SeqCst) >= 2);
+            let title = &query["query"];
+            let job_id = job_path.file_name().unwrap().to_str().unwrap();
+            let mut songs = vec![
+                json!({"id":"wrong-path", "title":title, "path":format!("/music/Existing/{}", fixture_path(title))}),
+            ];
+            if !(matches!(mock.result, NavidromeResult::MissingTrack) && title == "First") {
+                songs.push(json!({"id":format!("nav-{title}"), "title":title,
+                    "path":format!("/music/Spotify Imports/{job_id}/{}", fixture_path(title))}));
+            }
+            json!({"status":"ok", "searchResult3":{"song":songs}})
+        }
+        "createPlaylist.view" => {
+            assert_eq!(method, axum::http::Method::POST);
+            let params: Vec<_> = url::form_urlencoded::parse(&body).collect();
+            assert!(
+                params
+                    .iter()
+                    .any(|(key, value)| key == "name" && value == FIXTURE_NAME)
+            );
+            let ids: Vec<_> = params
+                .iter()
+                .filter(|(key, _)| key == "songId")
+                .map(|(_, value)| value.as_ref())
+                .collect();
+            let expected = if matches!(mock.result, NavidromeResult::MissingTrack) {
+                vec!["nav-Second", "nav-Second"]
+            } else {
+                vec!["nav-Second", "nav-First", "nav-Second"]
+            };
+            assert_eq!(ids, expected);
+            if matches!(mock.result, NavidromeResult::RejectPlaylist) {
+                json!({"status":"failed", "error":{"code":0, "message":"fixture rejected playlist"}})
+            } else {
+                let entries: Vec<_> = ids.iter().map(|id| json!({"id":id})).collect();
+                json!({"status":"ok", "playlist":{"id":"nav-playlist", "entry":entries}})
+            }
+        }
+        "updatePlaylist.view" => {
+            assert_eq!(query["playlistId"], "nav-playlist");
+            assert_eq!(query["public"], "false");
+            assert!(query["comment"].contains("Imported from Spotify:"));
+            json!({"status":"ok"})
+        }
+        _ => panic!("unexpected import endpoint {endpoint}"),
+    };
+    Json(json!({"subsonic-response":result}))
+}
+
+pub(super) async fn import_fixture(
+    pool: DbPool,
+    music_root: &Path,
+    result: NavidromeResult,
+) -> (
+    SpotifyPlaylistImportService,
+    AcquisitionService,
+    tokio::task::JoinHandle<()>,
+) {
+    let server = Router::new()
+        .route("/rest/:endpoint", any(navidrome_request))
+        .with_state(Arc::new(MockNavidrome {
+            music_root: music_root.into(),
+            scans: AtomicUsize::new(0),
+            result,
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = AppConfig::default();
+    config.music_root = music_root.to_string_lossy().into_owned();
+    config.navidrome.url = format!("http://{}", listener.local_addr().unwrap());
+    let providers = BackendRegistry::new(vec![RegisteredProvider {
+        connection_id: "env-navidrome".into(),
+        provider_type: "navidrome".into(),
+        name: "Navidrome".into(),
+        enabled: true,
+        provider: Arc::new(NavidromeClient::new(config.navidrome.clone()).unwrap()),
+    }]);
+    let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let config = Arc::new(RwLock::new(Arc::new(config)));
+    (
+        SpotifyPlaylistImportService::new(Some(pool.clone()))
+            .with_library(config.clone(), providers.clone()),
+        AcquisitionService::new(Some(pool)).with_library(config, providers),
+        task,
+    )
+}
+
+#[tokio::test]
+async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_every_track() {
+    for (case, status, imported) in [
+        (NavidromeResult::MissingTrack, "partial", 2),
+        (NavidromeResult::RejectPlaylist, "failed", 0),
+    ] {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        seed_test_user(&db).await;
+        let music = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let (imports, _, mock) = import_fixture(db.clone(), music.path(), case).await;
+        let mut record: StoredImportJob = serde_json::from_value(json!({
+            "job": {"id":"spimp_fixture", "userId":"alice", "status":"queued", "stage":"queued"},
+            "playlistUrl":"https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
+            "user":{"id":"alice", "disabled":false}
+        }))
+        .unwrap();
+        record.job.playlist_description = Some("Original description".into());
+        SqliteImportJobRepository::new(db.clone())
+            .save(&record)
+            .await
+            .unwrap();
+        let manager = TaskManager::new(Some(db.clone()));
+        manager.initialize_tables().await;
+        manager.register(
+            TaskType::SpotdlImport,
+            Arc::new(
+                SpotdlRunner::with_services(
+                    Some(db.clone()),
+                    AcquisitionService::new(Some(db.clone())),
+                    imports.clone(),
+                )
+                .with_downloader(Arc::new(SpotDLDownloaderAdapter::with_runner(Arc::new(
+                    SuccessfulProcessRunner,
+                ))))
+                .with_output_dir(stage.path()),
+            ),
+        );
+        let task = manager
+            .enqueue(
+                TaskType::SpotdlImport,
+                json!({"kind":"playlist", "jobId":"spimp_fixture"}),
+                "alice",
+                None,
+            )
+            .await
+            .unwrap();
+        let settled = manager
+            .wait_for_settlement(&task.id, Duration::from_secs(8))
+            .await
+            .unwrap();
+        let job = imports.get("spimp_fixture", "alice").await.unwrap();
+        assert_eq!(job.status, status, "{:?}", job.error);
+        assert_eq!(job.imported_count, Some(imported));
+        assert_eq!(job.failed_count, Some(3 - imported));
+        assert!(
+            job.playlist_description
+                .unwrap()
+                .starts_with("Original description")
+        );
+        let error = job.error.unwrap();
+        if imported == 0 {
+            assert_eq!(settled.state, TaskStatus::Failed);
+            assert!(job.playlist_id.is_none());
+            assert!(error.contains("fixture rejected playlist"), "{error}");
+        } else {
+            assert_eq!(settled.state, TaskStatus::Finished);
+            assert!(job.playlist_id.is_some());
+            assert!(error.contains("Navidrome did not index"), "{error}");
+        }
+        let playlists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playlists")
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+        assert_eq!(playlists, i64::from(imported > 0));
+        assert!(
+            music
+                .path()
+                .join("Spotify Imports/spimp_fixture")
+                .join(fixture_path("First"))
+                .is_file()
+        );
+        assert!(stage.path().join("spimp_fixture").exists());
+        mock.abort();
     }
 }
 
@@ -58,6 +343,106 @@ impl ProcessRunner for SpawnFailureRunner {
 }
 
 struct NoOutputRunner;
+
+struct EmptyAudioRunner;
+
+#[async_trait::async_trait]
+impl ProcessRunner for EmptyAudioRunner {
+    async fn run(
+        &self,
+        _: &str,
+        _: &[String],
+        options: ProcessOptions,
+    ) -> Result<ProcessExecutionResult, ProcessError> {
+        tokio::fs::write(options.cwd.unwrap().join("empty.wav"), [])
+            .await
+            .unwrap();
+        Ok(ProcessExecutionResult {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: "AudioProviderError".into(),
+            signal: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn zero_byte_audio_fails_even_if_spotdl_exits_zero() {
+    assert_failed_downloads(
+        SpotDLDownloaderAdapter::with_runner(Arc::new(EmptyAudioRunner)),
+        "spotDL produced no usable audio (no-match)",
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn album_acquisition_reports_partial_and_preserves_unindexed_staging() {
+    let db = DbPool::connect_memory().await.unwrap();
+    run_migrations(&db, None).await.unwrap();
+    seed_test_user(&db).await;
+    let music = tempfile::tempdir().unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    let (playlists, acquisitions, mock) =
+        import_fixture(db.clone(), music.path(), NavidromeResult::MissingTrack).await;
+    let manager = TaskManager::new(Some(db.clone()));
+    manager.initialize_tables().await;
+    manager.register(
+        TaskType::SpotdlDownload,
+        Arc::new(
+            SpotdlRunner::with_services(Some(db.clone()), acquisitions.clone(), playlists)
+                .with_downloader(Arc::new(SpotDLDownloaderAdapter::with_runner(Arc::new(
+                    SuccessfulProcessRunner,
+                ))))
+                .with_output_dir(stage.path()),
+        ),
+    );
+    let mut options: AcquisitionCreateOptions = serde_json::from_value(json!({
+        "spotifyUrl": "https://open.spotify.com/intl-nl/album/FixtureAlbum",
+        "albumId": "external_itunes_album_101",
+        "result": {"type":"album", "id":"external_itunes_album_101", "provider":"itunes", "metadata":{"durationSeconds":3.5}}
+    })).unwrap();
+    options.user_id = "alice".into();
+    let job = acquisitions
+        .create_job(options, Some(&manager))
+        .await
+        .unwrap();
+    let task_id: String =
+        sqlx::query_scalar("SELECT active_task_id FROM acquisition_jobs WHERE id=?")
+            .bind(&job.id)
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+    manager
+        .wait_for_settlement(&task_id, Duration::from_secs(8))
+        .await
+        .unwrap();
+    let job = acquisitions.get_job(&job.id, "alice", false).await.unwrap();
+    assert_eq!(
+        job.status,
+        AcquisitionJobStatus::Partial,
+        "{:?}",
+        job.error_message
+    );
+    assert_eq!(job.requested_track_id, None);
+    assert_eq!(job.expected_count, Some(3));
+    assert_eq!(job.imported_count, Some(2));
+    assert!(
+        job.files
+            .unwrap()
+            .iter()
+            .all(|file| file.provider_track_id.as_deref() == Some("nav-Second"))
+    );
+    assert!(
+        stage
+            .path()
+            .join(format!("{}-{task_id}", job.id))
+            .join(fixture_path("First"))
+            .is_file()
+    );
+    mock.abort();
+}
 
 #[async_trait::async_trait]
 impl ProcessRunner for NoOutputRunner {
