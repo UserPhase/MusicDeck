@@ -1,4 +1,5 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook as renderTestHook, type RenderHookOptions } from "@testing-library/react";
+import { createElement, StrictMode, type ReactNode } from "react";
 import { useRemoteSession } from "./useRemoteSession";
 import { setDesktopForeground } from "../services/visualActivity";
 import type { RemotePlaybackSnapshot, RemotePlayerAdapter, RemotePlayerState } from "../types/remoteSession";
@@ -37,6 +38,44 @@ afterEach(() => {
   jest.useRealTimers(); Object.defineProperty(global, "WebSocket", { configurable: true, value: original });
 });
 async function receive(ws: FakeSocket, message: object) { await act(async () => { ws.message(message); }); }
+
+function renderHook<Result, Props>(callback: (props: Props) => Result, options?: RenderHookOptions<Props>) {
+  const rendered = renderTestHook(callback, options);
+  act(() => { jest.advanceTimersByTime(0); });
+  return rendered;
+}
+
+test("opens a single socket when Strict Mode replays the startup effect", () => {
+  const player = adapter();
+  renderTestHook(() => useRemoteSession("user", player), {
+    wrapper: ({ children }: { children: ReactNode }) => createElement(StrictMode, null, children),
+  });
+  expect(FakeSocket.instances).toHaveLength(0);
+  act(() => { jest.advanceTimersByTime(0); });
+  expect(FakeSocket.instances).toHaveLength(1);
+});
+
+test("a local pause failure cannot interrupt socket cleanup and reconnect", () => {
+  const player = adapter();
+  player.state.mockReturnValue({ ...initial, playing: true });
+  const failure = new DOMException("Audio automation failed");
+  player.pause.mockImplementationOnce(() => { throw failure; });
+  const log = jest.spyOn(console, "error").mockImplementation(() => {});
+  const { result, unmount } = renderHook(() => useRemoteSession("user", player));
+  try {
+    const ws = FakeSocket.instances[0];
+    act(() => ws.open());
+    act(() => ws.close(1006));
+    expect(log).toHaveBeenCalledWith("Remote session:", failure);
+    expect(result.current.status).toBe("reconnecting");
+    act(() => jest.advanceTimersByTime(800));
+    expect(FakeSocket.instances).toHaveLength(2);
+  } finally {
+    unmount();
+    log.mockRestore();
+  }
+});
+
 test("registers same-origin cookies-only control, publishes explicit playback claims and reconnects cleanly", async () => {
   const player = adapter();
   const { result, rerender, unmount } = renderHook(() => useRemoteSession("user", player));

@@ -29,10 +29,35 @@ test("does not inspect previews or separate normalized files as library streams"
   expect(result.current.note).toMatch(/separate processed/);
 });
 test("exposes network failures instead of presenting source metadata as verified output", async () => {
-  const log = jest.spyOn(console, "error").mockImplementation(() => {});
   inspect.mockRejectedValueOnce(new Error("Inspection offline"));
   const { result } = renderHook(useStreamQualityDetails, { initialProps: props });
   await waitFor(() => expect(result.current.error).toBe("Inspection offline"));
   expect(result.current.output).toBeNull();
-  log.mockRestore();
+});
+
+test("backs off on gateway failures, retains the request ID, and resumes normal polling after recovery", async () => {
+  jest.useFakeTimers();
+  inspect.mockRejectedValueOnce(Object.assign(new Error("Gateway offline"), { status: 502, requestId: "gateway-1" }))
+    .mockRejectedValueOnce(new Error("Still offline"))
+    .mockResolvedValue({ source: { codec: "FLAC" }, output: null, delivery: null });
+  const { result, unmount } = renderHook(useStreamQualityDetails, { initialProps: props });
+  const advance = (ms: number) => act(async () => { jest.advanceTimersByTime(ms); });
+  try {
+    await advance(0);
+    expect(result.current.error).toContain("gateway-1");
+    await advance(2000);
+    expect(inspect).toHaveBeenCalledTimes(1);
+    await advance(2000);
+    expect(inspect).toHaveBeenCalledTimes(2);
+    await advance(6000);
+    expect(inspect).toHaveBeenCalledTimes(2);
+    await advance(2000);
+    expect(result.current.error).toBe("");
+    expect(result.current.source?.codec).toBe("FLAC");
+    await advance(2000);
+    expect(inspect).toHaveBeenCalledTimes(4);
+  } finally {
+    unmount();
+    jest.useRealTimers();
+  }
 });

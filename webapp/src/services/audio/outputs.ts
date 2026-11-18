@@ -1,8 +1,8 @@
 import type { CrossfadeCurve, PlayableTrack, TrackAudioSettings } from "./types";
 import { EqualizerEngine } from "./EqualizerEngine";
 
-const CURVE_POINTS = 64;
-const LEVEL_CURVE_POINTS = 129;
+const CROSSFADE_SEGMENTS = 63;
+const LEVEL_TRANSITION_SEGMENTS = 128;
 const FALLBACK_RAMP_INTERVAL_MS = 40;
 const MAX_TRACK_LEVEL = 4;
 const MIN_LEVEL = 0.000001;
@@ -205,7 +205,7 @@ export class WebAudioGain implements GainControl {
 
   setLevel(value: number, smooth = false): void {
     const level = trackLevel(value);
-    if (level === this.level) return;
+    if (level === this.level && (smooth || !this.levelChange)) return;
     const now = this.ctx.currentTime;
     const current = this.levelChange?.valueAt(now) ?? this.level;
     this.level = level;
@@ -219,14 +219,11 @@ export class WebAudioGain implements GainControl {
     const transition = levelTransition(current, level, now);
     this.levelChange = transition;
     param.setValueAtTime(current, now);
-    const curve = new Float32Array(LEVEL_CURVE_POINTS);
-    for (let index = 0; index < LEVEL_CURVE_POINTS; index += 1) {
-      curve[index] = transition.valueAt(now + (transition.duration * index) / (LEVEL_CURVE_POINTS - 1));
-    }
-    try {
-      param.setValueCurveAtTime(curve, now, transition.duration);
-    } catch {
-      param.linearRampToValueAtTime(level, now + transition.duration);
+    // Individual ramps can be replaced at any sample. Firefox can reject
+    // changes inside a value-curve event that has already started.
+    for (let segment = 1; segment <= LEVEL_TRANSITION_SEGMENTS; segment += 1) {
+      const time = now + (transition.duration * segment) / LEVEL_TRANSITION_SEGMENTS;
+      param.linearRampToValueAtTime(transition.valueAt(time), time);
     }
   }
 
@@ -249,15 +246,10 @@ export class WebAudioGain implements GainControl {
       param.linearRampToValueAtTime(to, now + seconds);
       return;
     }
-    const values = new Float32Array(CURVE_POINTS);
-    for (let index = 0; index < CURVE_POINTS; index += 1) {
-      values[index] = curveValue(from, to, index / (CURVE_POINTS - 1), curve);
-    }
-    try {
-      param.setValueCurveAtTime(values, now, seconds);
-    } catch {
-      param.setValueAtTime(from, now);
-      param.linearRampToValueAtTime(to, now + seconds);
+    param.setValueAtTime(from, now);
+    for (let segment = 1; segment <= CROSSFADE_SEGMENTS; segment += 1) {
+      const progress = segment / CROSSFADE_SEGMENTS;
+      param.linearRampToValueAtTime(curveValue(from, to, progress, curve), now + seconds * progress);
     }
   }
 
@@ -266,8 +258,7 @@ export class WebAudioGain implements GainControl {
   }
 
   reset(): void {
-    this.node.gain.cancelScheduledValues(0);
-    this.node.gain.setValueAtTime(1, this.ctx.currentTime);
+    this.set(1);
   }
 
   dispose(): void {
@@ -408,7 +399,7 @@ export function playableEnd(output: PlaybackOutput): number | null {
 /** One HTMLAudioElement, optionally routed through its own GainNode into the master bus. */
 export class MediaDeck implements PlaybackOutput {
   readonly kind = "media" as const;
-  readonly gain: GainControl;
+  private gainControl: GainControl;
   private trackKey: string | null = null;
   private source: string | null = null;
   private hint: number | null = null;
@@ -423,21 +414,45 @@ export class MediaDeck implements PlaybackOutput {
     masterVolume: () => number
   ) {
     element.preload = "auto";
-    let gain: GainControl | null = null;
-    if (graph) {
-      try {
-        this.sourceNode = graph.ctx.createMediaElementSource(element);
-        const webGain = new WebAudioGain(graph.ctx, graph.master);
-        this.sourceNode.connect(webGain.input);
-        element.volume = 1;
-        gain = webGain;
-      } catch {
-        this.sourceNode = null;
-      }
-    }
-    this.gain = gain ?? new ElementVolumeGain(element, masterVolume);
+    this.gainControl = new ElementVolumeGain(element, masterVolume);
+    if (graph) this.attachGraph(graph);
     // Registered before the engine's listeners so explicit resume positions win.
     element.addEventListener("loadedmetadata", this.onMetadata);
+  }
+
+  get gain(): GainControl {
+    return this.gainControl;
+  }
+
+  canAttachGraph(): boolean {
+    const src = this.element.currentSrc || this.source;
+    if (!src || this.element.crossOrigin !== null) return true;
+    // A resource already loaded without CORS would become silent in Web Audio.
+    try {
+      return new URL(src, window.location.href).origin === window.location.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  attachGraph(graph: AudioGraph): void {
+    const previous = this.gainControl;
+    if (!(previous instanceof ElementVolumeGain)) return;
+    let gain: WebAudioGain | undefined;
+    try {
+      gain = new WebAudioGain(graph.ctx, graph.master);
+      gain.setLevel(previous.getLevel());
+      gain.set(previous.value);
+      this.sourceNode = graph.ctx.createMediaElementSource(this.element);
+      this.sourceNode.connect(gain.input);
+    } catch {
+      this.sourceNode = null;
+      gain?.dispose();
+      return;
+    }
+    previous.dispose();
+    this.element.volume = 1;
+    this.gainControl = gain;
   }
 
   get key(): string {

@@ -1683,24 +1683,27 @@ test("a gateway error from optional loudness normalization leaves audio playing"
 });
 
 test("uses Web Audio for smooth boosts while keeping the volume slider and source intact", async () => {
-  const gain = { value: 1, cancelScheduledValues: jest.fn(), cancelAndHoldAtTime: jest.fn(), setValueAtTime: jest.fn(), setValueCurveAtTime: jest.fn() };
+  const gain = { value: 1, cancelScheduledValues: jest.fn(), setValueAtTime: jest.fn(), linearRampToValueAtTime: jest.fn() };
   const node = { gain, connect: jest.fn(), disconnect: jest.fn() };
   const context = { state: "running", currentTime: 10, destination: {}, createGain: jest.fn(() => node), createMediaElementSource: jest.fn(() => ({ connect: jest.fn(), disconnect: jest.fn() })), close: jest.fn(async () => {}) };
   window.AudioContext = jest.fn(() => context);
+  const originalActivation = Object.getOwnPropertyDescriptor(navigator, "userActivation");
+  const activation = { hasBeenActive: false };
+  Object.defineProperty(navigator, "userActivation", { configurable: true, value: activation });
   try {
     const { container } = renderPlayer({ normalize: true });
     let finish;
     prepareNormalizedPlayback.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    activation.hasBeenActive = true;
     fireEvent.click(screen.getByText("direct"));
     const audio = container.querySelector("audio");
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
     audio.currentTime = 17;
     await act(async () => finish({ status: "ready", streamUrl: normalizedUrl(), gainDb: 6 }));
-    const [curve, start, duration] = gain.setValueCurveAtTime.mock.calls[0];
-    expect(curve[0]).toBe(1);
-    expect(curve[curve.length - 1]).toBeCloseTo(10 ** (6 / 20));
-    expect(start).toBe(10);
-    expect(duration).toBeCloseTo(12);
+    expect(gain.setValueAtTime).toHaveBeenLastCalledWith(1, 10);
+    const [target, end] = gain.linearRampToValueAtTime.mock.calls.at(-1);
+    expect(target).toBeCloseTo(10 ** (6 / 20));
+    expect(end).toBeCloseTo(22);
     expect(audio.volume).toBe(1);
     fireEvent.click(screen.getByText("volume-half"));
     // The master GainNode carries the slider level; the element stays at unity.
@@ -1710,7 +1713,11 @@ test("uses Web Audio for smooth boosts while keeping the volume slider and sourc
     expect(audio).toHaveAttribute("src", "/stream/song-1");
     // One source node per deck, each created once and never re-created on reloads.
     expect(context.createMediaElementSource).toHaveBeenCalledTimes(2);
-  } finally { delete window.AudioContext; }
+  } finally {
+    delete window.AudioContext;
+    if (originalActivation) Object.defineProperty(navigator, "userActivation", originalActivation);
+    else Reflect.deleteProperty(navigator, "userActivation");
+  }
 });
 
 test("a late analysis for a previous song cannot change the current deck's gain", async () => {

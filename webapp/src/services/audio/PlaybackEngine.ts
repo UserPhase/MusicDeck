@@ -139,7 +139,8 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   private sleepStoppedKey: string | null = null;
   private fallbackFade: { start: number; end: number; from: number; to: number } | null = null;
   private fallbackFadeTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly graph: AudioGraph | null;
+  private graph: AudioGraph | null;
+  private createAudioContext: (() => AudioContext | null) | null;
   private readonly decks: readonly [MediaDeck, MediaDeck];
   private readonly detachers: Array<() => void> = [];
   private readonly listeners = new Map<PlaybackEngineEvent, Set<AnyListener>>();
@@ -178,9 +179,9 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.crossfadeCurve = options.crossfadeCurve ?? "equal-power";
     this.volume = clamp(options.volume ?? 1, 0, 1);
 
-    const ownsContext = options.audioContext === undefined;
-    const ctx = ownsContext ? createDefaultAudioContext() : options.audioContext ?? null;
-    this.graph = ctx ? new AudioGraph(ctx, ownsContext) : null;
+    this.createAudioContext = options.audioContext === undefined ? createDefaultAudioContext : null;
+    const ctx = options.audioContext;
+    this.graph = ctx ? new AudioGraph(ctx, false) : null;
     this.graph?.setVolume(this.volume);
 
     const createElement = options.createAudioElement ?? (() => new Audio());
@@ -260,17 +261,48 @@ export class PlaybackEngine implements QueuePlaybackEngine {
         this.emit("sleepStop", { key: this.sleepStoppedKey });
       },
     });
-    const realign = () => {
-      this.sleepTimer.realignClock();
-      this.sleepTimer.resetBoundaryFade();
-      this.updateSleepBoundary();
-    };
     if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", realign);
-      this.detachers.push(() => document.removeEventListener("visibilitychange", realign));
+      document.addEventListener("visibilitychange", this.realignSleepClock);
+      this.detachers.push(() => document.removeEventListener("visibilitychange", this.realignSleepClock));
     }
-    ctx?.addEventListener?.("statechange", realign);
-    if (ctx) this.detachers.push(() => ctx.removeEventListener?.("statechange", realign));
+    if (ctx) this.watchAudioClock(ctx);
+  }
+
+  private readonly realignSleepClock = () => {
+    this.sleepTimer.realignClock();
+    this.sleepTimer.resetBoundaryFade();
+    this.updateSleepBoundary();
+  };
+
+  private watchAudioClock(ctx: AudioContext): void {
+    ctx.addEventListener?.("statechange", this.realignSleepClock);
+    this.detachers.push(() => ctx.removeEventListener?.("statechange", this.realignSleepClock));
+  }
+
+  private initializeAudioGraph(): void {
+    if (!this.createAudioContext || this.destroyed || this.remoteOutput ||
+      typeof navigator === "undefined" || !navigator.userActivation?.hasBeenActive) return;
+    // Keep the current audio path through a transition or a sleep fade.
+    if (this.transition || this.active?.isPlaying() ||
+      (this.fallbackFade && (this.fallbackFade.to !== 1 || this.fallbackFade.end > Date.now())) ||
+      !this.decks.every(deck => deck.canAttachGraph())) return;
+
+    const context = this.createAudioContext();
+    this.createAudioContext = null;
+    if (!context) return;
+    let graph: AudioGraph;
+    try {
+      graph = new AudioGraph(context, true);
+    } catch {
+      void context.close().catch(() => undefined);
+      return;
+    }
+    this.graph = graph;
+    graph.setVolume(this.volume);
+    graph.equalizer?.setSettings(this.equalizerSettings);
+    this.decks.forEach(deck => deck.attachGraph(graph));
+    this.watchAudioClock(context);
+    this.realignSleepClock();
   }
 
   get equalizerAvailable(): boolean {
@@ -506,6 +538,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.gapless.discardPrepared();
     this.crossfade.discardPrepared();
     if (previous && previous !== adopted) previous.release();
+    if (autoplay) this.initializeAudioGraph();
 
     let output: PlaybackOutput;
     if (adopted) {
@@ -561,6 +594,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   }
 
   async unlock(): Promise<void> {
+    this.initializeAudioGraph();
     if (this.graph?.ctx.state === "suspended") await this.graph.ctx.resume();
   }
 
@@ -852,6 +886,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
 
   private async startOutput(output: PlaybackOutput): Promise<void> {
     const key = output.key;
+    this.initializeAudioGraph();
     this.graph?.resume();
     try {
       await output.play();
@@ -962,8 +997,9 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   }
 
   private createTransitionHost(): TransitionHost {
+    const engine = this;
     return {
-      graph: this.graph,
+      get graph() { return engine.graph; },
       activeOutput: () => this.active,
       upcomingTrack: () => this.upcoming,
       idleDeck: () => (this.active === this.decks[0] ? this.decks[1] : this.decks[0]),

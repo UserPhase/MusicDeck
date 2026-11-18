@@ -3,6 +3,9 @@ import { startVisualPolling } from "../services/visualActivity";
 import { inspectAudioStream } from "../api/musicdeck";
 import type { PlaybackEngine } from "../services/audio/PlaybackEngine";
 
+const INSPECTION_INTERVAL_MS = 2000;
+const MAX_INSPECTION_RETRY_MS = 30_000;
+
 export interface AudioProperties {
   codec: string | null; container: string | null; bitrateKbps: number | null;
   sampleRateHz: number | null; bitDepth: number | null; channels: number | null; lossless: boolean | null;
@@ -32,31 +35,38 @@ export function useStreamQualityDetails({
   let inspectionId: string | null = null;
   if (streamUrl?.startsWith("/api/tracks/")) inspectionId = new URL(streamUrl, window.location.origin).searchParams.get("inspectionId");
   useEffect(() => {
+    const pipeline = engine?.getAudioDiagnostics() ?? null;
+    setState({ key, source: null, output: null, delivery: null, loading: Boolean(inspectionId && trackId && userId), error: "", pipeline });
+    if (!trackId || !userId || !inspectionId) return;
     let controller: AbortController | null = null;
     let cancelled = false;
+    let retryDelay = INSPECTION_INTERVAL_MS;
+    let retryAt = 0;
     const update = async () => {
-      if (controller || cancelled) return;
+      if (controller || cancelled || Date.now() < retryAt) return;
       const pipeline = engine?.getAudioDiagnostics() ?? null;
-      if (!trackId || !userId || !inspectionId) {
-        setState({ key, source: null, output: null, delivery: null, loading: false, error: "", pipeline });
-        return;
-      }
       controller = new AbortController();
       const signal = controller.signal;
       try {
         const data: Pick<StreamQualityDetails, "source" | "output" | "delivery" | "sourceError"> =
           await inspectAudioStream(trackId, inspectionId, signal);
-        if (!cancelled) setState({ key, ...data, loading: false, error: "", pipeline });
+        if (!cancelled) {
+          retryDelay = INSPECTION_INTERVAL_MS;
+          retryAt = 0;
+          setState({ key, ...data, loading: false, error: "", pipeline });
+        }
       } catch (error) {
         if (!signal.aborted && !cancelled) {
-          console.error("Could not inspect active audio stream:", error);
-          setState((previous) => ({ ...previous, key, loading: false, error: error instanceof Error ? error.message : "Audio inspection failed.", pipeline }));
+          retryDelay = Math.min(retryDelay * 2, MAX_INSPECTION_RETRY_MS);
+          retryAt = Date.now() + retryDelay;
+          const requestId = (error as { requestId?: unknown } | null)?.requestId;
+          const message = error instanceof Error ? error.message : "Audio inspection failed.";
+          setState((previous) => ({ ...previous, key, loading: false, pipeline,
+            error: typeof requestId === "string" ? `${message} Request ID: ${requestId}.` : message }));
         }
       } finally { controller = null; }
     };
-    setState({ key, source: null, output: null, delivery: null, loading: Boolean(inspectionId), error: "", pipeline: engine?.getAudioDiagnostics() ?? null });
-    if (!trackId) return;
-    const stopPolling = startVisualPolling(update, 2000);
+    const stopPolling = startVisualPolling(update, INSPECTION_INTERVAL_MS);
     return () => { cancelled = true; controller?.abort(); stopPolling(); };
   }, [engine, key, userId, trackId, inspectionId]);
   const current = state.key === key ? state : { source: null, output: null, delivery: null, pipeline: null, loading: Boolean(inspectionId), error: "" };

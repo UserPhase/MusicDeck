@@ -201,18 +201,23 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     const cancelPreparation = () => {
       const transfer = prepared.current;
       if (!transfer) return;
+      prepared.current = null;
       transfer.controller.abort();
       if (transfer.role === "target") adapterRef.current.pause();
-      prepared.current = null;
     };
     const stopControlledPlayback = () => {
       if (connectionLifetime.signal.aborted) return;
-      if (executing || synced?.device_id === deviceId || selectedDevice.current === deviceId || localPlaying) {
-        adapterRef.current.pause();
+      try {
+        if (executing || synced?.device_id === deviceId || selectedDevice.current === deviceId || localPlaying) {
+          adapterRef.current.pause();
+        }
+      } catch (failure) {
+        fail(failure);
+      } finally {
+        executing?.abort();
+        connectionLifetime.abort();
+        try { cancelPreparation(); } catch (failure) { fail(failure); }
       }
-      executing?.abort();
-      connectionLifetime.abort();
-      cancelPreparation();
     };
     const armWatchdog = () => {
       window.clearTimeout(watchdog);
@@ -524,7 +529,8 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (getVisualActivity() && ownsPlayingOutput()) publishState();
       else schedulePositionSample();
     });
-    connect();
+    // Let an immediately cleaned-up effect cancel startup before opening a socket.
+    reconnect = window.setTimeout(connect, 0);
     return () => {
       closed = true; window.clearTimeout(reconnect); unsubscribeVisibility();
       publish.current = null;

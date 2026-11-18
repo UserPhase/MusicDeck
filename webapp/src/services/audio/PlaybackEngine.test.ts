@@ -147,6 +147,41 @@ class FakeAudioContext {
 
 const track = (name: string, durationHint?: number) => ({ key: name, src: `/stream/${name}`, durationHint });
 
+test("defers Web Audio until user activation and routes a restored track without reloading it", async () => {
+  const activation = { hasBeenActive: false };
+  const audioContext = jest.fn(() => new FakeAudioContext());
+  const originalContext = Object.getOwnPropertyDescriptor(window, "AudioContext");
+  const originalActivation = Object.getOwnPropertyDescriptor(navigator, "userActivation");
+  Object.defineProperty(window, "AudioContext", { configurable: true, value: audioContext });
+  Object.defineProperty(navigator, "userActivation", { configurable: true, value: activation });
+  const { engine, audios } = setup({ audioContext: undefined });
+  try {
+    expect(audioContext).not.toHaveBeenCalled();
+    await engine.load(track("restored"), { startAt: 24, autoplay: false });
+    audios[0].loaded(120);
+    await engine.play();
+    expect(audioContext).not.toHaveBeenCalled();
+    expect(audios[0].currentTime).toBe(24);
+    expect(audios[0].paused).toBe(false);
+
+    engine.pause();
+    activation.hasBeenActive = true;
+    await engine.play();
+    await engine.unlock();
+    expect(audioContext).toHaveBeenCalledTimes(1);
+    expect(engine.usesWebAudio).toBe(true);
+    expect(audios[0].load).toHaveBeenCalledTimes(1);
+    expect(audios[0].currentTime).toBe(24);
+    expect(audios[0].paused).toBe(false);
+  } finally {
+    engine.destroy();
+    if (originalContext) Object.defineProperty(window, "AudioContext", originalContext);
+    else Reflect.deleteProperty(window, "AudioContext");
+    if (originalActivation) Object.defineProperty(navigator, "userActivation", originalActivation);
+    else Reflect.deleteProperty(navigator, "userActivation");
+  }
+});
+
 describe("sleep automation", () => {
   test("schedules the five-second master fade on the audio clock and pauses at the deadline", async () => {
     jest.useFakeTimers();
@@ -539,6 +574,39 @@ describe("crossfade path", () => {
     jest.advanceTimersByTime(5000);
     expect(of("transitionCommit")).toEqual([]);
     engine.destroy();
+  });
+
+  test("Web Audio cancels both active fades at the current sample when playback stops", async () => {
+    const ctx = new FakeAudioContext();
+    const { engine, audios, of } = setup({ audioContext: ctx as unknown as AudioContext,
+      transitionMode: "crossfade", crossfadeSeconds: 4 });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      outgoing.fire("playing");
+      engine.setUpcoming(track("b"));
+      outgoing.progress(96);
+      await flush();
+
+      const outgoingEnvelope = ctx.gains[2].gain;
+      const incomingEnvelope = ctx.gains[4].gain;
+      const [outgoingEvent, outgoingTarget, outgoingTime] = outgoingEnvelope.calls.at(-1)!;
+      expect(outgoingEvent).toBe("linear");
+      expect(outgoingTarget).toBeCloseTo(0);
+      expect(outgoingTime).toBe(4);
+      expect(incomingEnvelope.calls.at(-1)).toEqual(["linear", 1, 4]);
+      ctx.currentTime = 1;
+      engine.pause();
+
+      for (const envelope of [outgoingEnvelope, incomingEnvelope]) {
+        expect(envelope.calls.slice(-2)).toEqual([["cancel", 1], ["set", 1, 1]]);
+      }
+      expect(audios.every(audio => audio.paused)).toBe(true);
+      expect(incoming.src).toBe("");
+      jest.advanceTimersByTime(5000);
+      expect(of("transitionCommit")).toEqual([]);
+    } finally { engine.destroy(); }
   });
 });
 
