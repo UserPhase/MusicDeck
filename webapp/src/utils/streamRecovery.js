@@ -10,8 +10,8 @@ const PROGRESS_EPSILON_SECONDS = 0.25;
 const HAVE_FUTURE_DATA = 3;
 
 export function createPlaybackSessionId() {
-  return typeof globalThis.crypto?.randomUUID === "function"
-    ? globalThis.crypto.randomUUID()
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
