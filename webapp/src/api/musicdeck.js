@@ -42,12 +42,17 @@ function parseErrorBody(text, contentType) {
     return { data: JSON.parse(text) };
   } catch {
     const message = text.trim();
-    if ((!contentType || contentType.toLowerCase().startsWith("text/plain")) &&
-        message.length > 0 && message.length <= MAX_PLAIN_ERROR_LENGTH &&
-        !/[<>\u0000-\u0008\u000e-\u001f\u007f]/.test(message)) {
-      return { message: message.replace(/\s+/g, " ") };
+    if ((contentType && !contentType.toLowerCase().startsWith("text/plain")) ||
+        !message || message.length > MAX_PLAIN_ERROR_LENGTH) {
+      return {};
     }
-    return {};
+    for (const character of message) {
+      const code = character.charCodeAt(0);
+      // ASCII whitespace is allowed and collapsed below.
+      if (character === "<" || character === ">" || code === 127 ||
+          (code < 32 && (code < 9 || code > 13))) return {};
+    }
+    return { message: message.replace(/\s+/g, " ") };
   }
 }
 

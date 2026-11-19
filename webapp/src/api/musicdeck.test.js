@@ -77,9 +77,12 @@ test("request merges caller headers with JSON defaults and omits the default for
 test.each([
   ["application/json", '{"error":{"message":"Invalid ID","code":"INVALID_JSON_DATA","requestId":"from-body"}}',
     { message: "Invalid ID", code: "INVALID_JSON_DATA", requestId: "from-body" }],
-  ["text/plain", " Gateway unavailable\nPlease retry. ",
+  ["text/plain", " Gateway unavailable\n\tPlease retry. ",
     { message: "Gateway unavailable Please retry.", requestId: "from-header" }],
   ["text/html", "<html>gateway error</html>", { message: "MusicDeck returned 502" }],
+  ["text/plain", "<html>gateway error</html>", { message: "MusicDeck returned 502" }],
+  ["text/plain", "Gate\u0000way error", { message: "MusicDeck returned 502" }],
+  ["text/plain", "Gate\u007fway error", { message: "MusicDeck returned 502" }],
   ["text/plain", "x".repeat(257), { message: "MusicDeck returned 502" }],
   ["application/json", "null", { message: "MusicDeck returned 502" }],
 ])("request handles %s error responses safely", async (contentType, text, expected) => {
