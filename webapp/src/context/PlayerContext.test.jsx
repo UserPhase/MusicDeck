@@ -1791,11 +1791,20 @@ test("import-analyzed tracks start at the measured gain and skip repeat preparat
 
 test("already prepared upcoming tracks start from the normalized cache without double gain", async () => {
   const { container } = renderPlayer({ normalize: true });
-  prepareNormalizedPlayback.mockResolvedValue({ status: "ready", streamUrl: normalizedUrl(), gainDb: -6 });
+  const upcomingUrl = normalizedUrl("b");
+  let finishUpcoming;
+  prepareNormalizedPlayback.mockImplementation(id => id === "song-2"
+    ? new Promise(resolve => { finishUpcoming = resolve; })
+    : Promise.resolve({ status: "unavailable" }));
+  await playerReady();
+
   fireEvent.click(screen.getByText("album-start"));
-  await waitFor(() => expect(prepareNormalizedPlayback).toHaveBeenCalledWith("song-3", null, null, expect.anything(), "original", -16));
+  await waitFor(() => expect(prepareNormalizedPlayback).toHaveBeenCalledWith("song-2", null, null, expect.any(AbortSignal), "original", -16));
+  await act(async () => finishUpcoming({ status: "ready", streamUrl: upcomingUrl, gainDb: -6 }));
+  expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1");
+
   fireEvent.click(screen.getByText("next"));
-  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", normalizedUrl()));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", upcomingUrl));
   expect(activeAudio(container).volume).toBe(1);
 });
 
