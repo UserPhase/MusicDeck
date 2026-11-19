@@ -61,3 +61,26 @@ test("backs off on gateway failures, retains the request ID, and resumes normal 
     jest.useRealTimers();
   }
 });
+
+test("aborts a hung inspection and recovers on the next attempt", async () => {
+  jest.useFakeTimers();
+  inspect.mockImplementationOnce((_trackId, _inspectionId, signal: AbortSignal) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+  })).mockResolvedValue({ source: { codec: "FLAC" }, output: null, delivery: null });
+  const { result, unmount } = renderHook(useStreamQualityDetails, { initialProps: props });
+  const advance = (ms: number) => act(async () => { jest.advanceTimersByTime(ms); });
+  try {
+    await advance(8000);
+    expect(inspect).toHaveBeenCalledTimes(1);
+    await advance(2000);
+    expect(inspect.mock.calls[0][2].aborted).toBe(true);
+    expect(result.current.error).toMatch(/timed out/);
+    await advance(4000);
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(result.current.source?.codec).toBe("FLAC");
+    expect(result.current.error).toBe("");
+  } finally {
+    unmount();
+    jest.useRealTimers();
+  }
+});

@@ -28,9 +28,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 
@@ -50,6 +48,45 @@ pub const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// Default maximum connections in the asynchronous SQLite pool.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+
+pub(crate) fn temporary_sqlite_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+        || error
+            .as_database_error()
+            .and_then(|err| err.code())
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
+/// Acquire SQLite's writer lock before taking a read snapshot. SQLx 0.8.3
+/// starts a deferred transaction, so the first statement is a zero-row write.
+pub(crate) async fn begin_sqlite_write(
+    pool: &SqlitePool,
+    lock_statement: &'static str,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+    for attempt in 0..3 {
+        let acquire = async {
+            let mut tx = pool.begin().await?;
+            if let Err(error) = sqlx::query(lock_statement).execute(&mut *tx).await {
+                tx.rollback().await?;
+                return Err(error);
+            }
+            Ok(tx)
+        };
+        match acquire.await {
+            Err(error)
+                if attempt < 2
+                    && temporary_sqlite_error(&error)
+                    && !matches!(error, sqlx::Error::PoolClosed) =>
+            {
+                let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % 20);
+                tokio::time::sleep(Duration::from_millis(20 * (1 << attempt) + jitter)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final write-lock attempt always returns")
+}
 
 /// Error taxonomy for SQLite initialization, permission enforcement, and query execution.
 #[derive(Debug, Error)]
@@ -93,6 +130,15 @@ pub enum DbError {
     /// Underlying `sqlx` connection or query error.
     #[error("SQLite error: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    /// An individual schema migration failed.
+    #[error("SQLite migration {id} ({name}) failed: {source}")]
+    Migration {
+        id: u32,
+        name: &'static str,
+        #[source]
+        source: Box<DbError>,
+    },
 }
 
 /// Configurable `PRAGMA synchronous` durability level.
@@ -244,9 +290,7 @@ impl DbPool {
             .await?;
 
         if let Some(ref db_file) = resolved_path {
-            let mode_row = sqlx::query("PRAGMA journal_mode;")
-                .fetch_one(&pool)
-                .await?;
+            let mode_row = sqlx::query("PRAGMA journal_mode;").fetch_one(&pool).await?;
             let current_mode: String = mode_row.try_get(0)?;
             if !current_mode.eq_ignore_ascii_case("wal") {
                 pool.close().await;
@@ -336,10 +380,7 @@ mod tests {
             .await
             .expect("open persistent WAL database");
 
-        assert_eq!(
-            db.journal_mode().await.expect("query journal mode"),
-            "wal"
-        );
+        assert_eq!(db.journal_mode().await.expect("query journal mode"), "wal");
 
         sqlx::query("CREATE TABLE permission_fixture (value TEXT NOT NULL);")
             .execute(db.inner())
@@ -387,10 +428,7 @@ mod tests {
     async fn supports_in_memory_database_and_rejects_empty_paths() {
         let mem_db = DbPool::connect_memory().await.expect("open memory pool");
         assert!(mem_db.ping().await.is_ok());
-        assert_eq!(
-            mem_db.journal_mode().await.expect("journal mode"),
-            "memory"
-        );
+        assert_eq!(mem_db.journal_mode().await.expect("journal mode"), "memory");
         mem_db.close().await;
 
         let empty_err = DbPool::connect(Path::new("   ")).await.unwrap_err();

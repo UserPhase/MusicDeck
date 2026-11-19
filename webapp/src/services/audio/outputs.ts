@@ -285,6 +285,10 @@ export class ElementVolumeGain implements GainControl {
     return this.factor;
   }
 
+  get targetLevel(): number {
+    return this.levelTarget;
+  }
+
   getLevel(): number {
     return this.level;
   }
@@ -442,6 +446,7 @@ export class MediaDeck implements PlaybackOutput {
     try {
       gain = new WebAudioGain(graph.ctx, graph.master);
       gain.setLevel(previous.getLevel());
+      gain.setLevel(previous.targetLevel, true);
       gain.set(previous.value);
       this.sourceNode = graph.ctx.createMediaElementSource(this.element);
       this.sourceNode.connect(gain.input);
@@ -512,7 +517,11 @@ export class MediaDeck implements PlaybackOutput {
 
   /** Reload the stream or a verified local replacement without changing queue identity. */
   reloadSource(replacement?: string): void {
-    if (replacement) this.source = replacement;
+    if (replacement && replacement !== this.source) {
+      this.pause();
+      this.source = replacement;
+      this.seekedSinceLoad = false;
+    }
     if (!this.source) return;
     this.element.src = this.source;
     this.element.load();

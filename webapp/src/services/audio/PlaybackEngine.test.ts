@@ -12,6 +12,7 @@ class FakeAudio extends EventTarget {
   currentTime = 0;
   duration = Number.NaN;
   readyState = 0;
+  seeking = false;
   paused = true;
   ended = false;
   error: { code: number } | null = null;
@@ -165,6 +166,7 @@ test("defers Web Audio until user activation and routes a restored track without
     expect(audios[0].paused).toBe(false);
 
     engine.pause();
+    engine.updateTrack("restored", { gain: .5 });
     activation.hasBeenActive = true;
     await engine.play();
     await engine.unlock();
@@ -173,6 +175,9 @@ test("defers Web Audio until user activation and routes a restored track without
     expect(audios[0].load).toHaveBeenCalledTimes(1);
     expect(audios[0].currentTime).toBe(24);
     expect(audios[0].paused).toBe(false);
+    const context = audioContext.mock.results[0].value as FakeAudioContext;
+    context.currentTime += 20;
+    expect(engine.getAudioDiagnostics().gainDb).toBeCloseTo(-6.02);
   } finally {
     engine.destroy();
     if (originalContext) Object.defineProperty(window, "AudioContext", originalContext);
@@ -807,6 +812,47 @@ describe("stall recovery", () => {
     engine.destroy();
   });
 
+  test("fails over with a fresh playback URL and waits for the new time seek", async () => {
+    const { engine, audios, of } = setup();
+    const original = "http://localhost:4535/proxy-fixture/api/tracks/one/stream?source=primary&maxBitRate=192&inspectionId=first";
+    await engine.load({ ...track("a"), src: original });
+    const deck = audios[0];
+    deck.loaded(200);
+    deck.fire("playing");
+    deck.progress(42);
+
+    deck.error = { code: 2 };
+    deck.fire("error");
+    expect(deck.src).toBe(original);
+    expect(engine.getPosition()).toBe(42);
+    deck.error = { code: 2 };
+    deck.fire("error");
+    jest.advanceTimersByTime(1000);
+
+    const replacement = new URL(deck.src);
+    expect(replacement.pathname).toBe("/proxy-fixture/api/tracks/one/stream");
+    expect(replacement.searchParams.get("inspectionId")).not.toBe("first");
+    expect(replacement.searchParams.get("retryFrom")).toBe("first");
+    expect(replacement.searchParams.get("source")).toBe("primary");
+    expect(replacement.searchParams.get("maxBitRate")).toBe("192");
+    expect(deck.currentTime).toBe(0);
+    const playCalls = deck.play.mock.calls.length;
+    deck.seeking = true;
+    deck.loaded(190);
+    expect(deck.currentTime).toBe(42);
+    expect(deck.play).toHaveBeenCalledTimes(playCalls);
+    expect(of("streamRecovered")).toEqual([]);
+    deck.seeking = false;
+    deck.fire("seeked");
+    await flush();
+    expect(deck.play).toHaveBeenCalledTimes(playCalls + 1);
+    expect(of("streamRecovered")).toEqual([{
+      key: "a", position: 42, attempts: 2, restartedFromBeginning: false, streamUrl: deck.src,
+    }]);
+    expect(engine.getSnapshot().state).toBe("playing");
+    engine.destroy();
+  });
+
   test("restores the last position when a media error resets time and seekable ranges arrive late", async () => {
     const { engine, deck, of } = await playing();
     deck.currentTime = 0;
@@ -907,6 +953,31 @@ describe("stall recovery", () => {
     expect(of("streamRecovered")[0]).toEqual(expect.objectContaining({ position: 60 }));
     expect(engine.getSnapshot().state).toBe("paused");
     engine.destroy();
+  });
+
+  test("pauses a pending reconnect play and keeps the newest seek position", async () => {
+    const { engine, deck, of } = await playing();
+    try {
+      deck.fire("waiting");
+      jest.advanceTimersByTime(3500);
+      let resolvePlay!: () => void;
+      deck.playResult = () => new Promise<void>((resolve) => { resolvePlay = resolve; });
+      deck.loaded(200);
+      expect(deck.paused).toBe(false);
+
+      engine.pause();
+      engine.seek(0);
+      expect(deck.paused).toBe(true);
+      // Simulate a play completion already queued when pause was requested.
+      deck.paused = false;
+      resolvePlay();
+      await flush();
+
+      expect(deck.paused).toBe(true);
+      expect(deck.currentTime).toBe(0);
+      expect(of("streamRecovered")).toEqual([expect.objectContaining({ position: 0 })]);
+      expect(engine.getSnapshot().state).toBe("paused");
+    } finally { engine.destroy(); }
   });
 });
 

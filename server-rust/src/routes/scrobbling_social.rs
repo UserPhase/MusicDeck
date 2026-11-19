@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -317,7 +318,7 @@ async fn put_scrobble_connection_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(provider_raw): Path<String>,
-    Json(body): Json<Value>,
+    ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let Some(provider) = ScrobbleProvider::parse(&provider_raw) else {
         return (
@@ -560,7 +561,7 @@ async fn get_new_releases_handler(
 async fn follow_artist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(mut body): Json<FollowArtistRequestBody>,
+    ApiJson(mut body): ApiJson<FollowArtistRequestBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -626,7 +627,7 @@ async fn unfollow_artist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(key): Path<String>,
-    Json(body): Json<UnfollowArtistRequestBody>,
+    ApiJson(body): ApiJson<UnfollowArtistRequestBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id.trim().is_empty() {
         return Err(ServerError::BadRequest(String::from(

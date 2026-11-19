@@ -103,6 +103,7 @@ mod tests {
             playlist_url: String::from("https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM"),
             user: json!({ "id": "alice", "role": "user", "disabled": false }),
             unreadable_manifest: None,
+            playlist_intent: None,
         };
 
         repo.save(&stored).await.expect("save import checkpoint");

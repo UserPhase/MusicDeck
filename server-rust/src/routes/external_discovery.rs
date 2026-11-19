@@ -3,6 +3,7 @@
 //! Complete Rust port of `server/src/routes/saved-discoveries.ts` plus external
 //! discovery and artwork proxy endpoints from `server/src/routes/music-routes.ts`.
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -117,14 +118,11 @@ fn with_no_store(mut response: Response) -> Response {
 async fn post_save_discovery_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SaveDiscoveryInput>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SaveDiscoveryInput>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(input)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid saved discovery",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(input) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -306,7 +304,7 @@ async fn get_itunes_preview_handler(
 async fn post_external_previews_handler(
     State(state): State<AppState>,
     _auth: AuthenticatedUser,
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Response {
     let Some(tracks_arr) = body.get("tracks").and_then(serde_json::Value::as_array) else {
         return send_error_response(

@@ -17,7 +17,7 @@
 //! 2. **Bounded Circular Log Buffer ([`LogBuffer`])**:
 //!    - Enforces both an entry count limit (`DEFAULT_LOG_CAPACITY = 1_000`) and a total
 //!      heap byte ceiling (`DEFAULT_LOG_MAX_BYTES = 2 MiB`) inside a thread-safe
-//!      [`tokio::sync::RwLock<VecDeque<LogSlot>>`].
+//!      [`std::sync::RwLock`] around the ring state.
 //!    - Publishes real-time [`LogStreamEvent`] notifications over a `tokio::sync::broadcast`
 //!      channel for administrative SSE tailing (`/api/admin/logs/stream`).
 //! 3. **Custom `tracing` Subscriber Layer ([`RedactingLayer`], [`RedactingVisitor`])**:
@@ -28,14 +28,14 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::Write;
-use std::sync::{Arc, LazyLock, Once, RwLock as StdRwLock};
+use std::sync::{Arc, LazyLock, Once, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
 use memchr::memchr3;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
@@ -212,8 +212,8 @@ pub enum LogStreamEvent {
 // Compiled Regex Set & Registered Secret Store
 // ============================================================================
 
-static KNOWN_SECRETS: LazyLock<StdRwLock<HashSet<String>>> =
-    LazyLock::new(|| StdRwLock::new(HashSet::new()));
+static KNOWN_SECRETS: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 struct CompiledRedactionRules {
     ansi: Regex,
@@ -503,8 +503,7 @@ impl LogBufferState {
         }
     }
 
-    fn append(&mut self, input: LogInput) -> LogEntry {
-        self.seq += 1;
+    fn sanitize(input: LogInput) -> LogEntry {
         let timestamp = input
             .time
             .unwrap_or_else(Utc::now)
@@ -537,17 +536,22 @@ impl LogBufferState {
             }
         });
 
-        let entry = LogEntry {
-            id: self.seq.to_string(),
-            seq: self.seq,
+        LogEntry {
+            id: String::new(),
+            seq: 0,
             timestamp,
             level: input.level,
             source: input.source,
             message,
             stack,
             meta,
-        };
+        }
+    }
 
+    fn append(&mut self, mut entry: LogEntry) -> LogEntry {
+        self.seq += 1;
+        entry.id = self.seq.to_string();
+        entry.seq = self.seq;
         let entry_bytes = serde_json::to_vec(&entry).map_or(128, |v| v.len());
 
         if self.slots.len() >= self.capacity {
@@ -576,6 +580,7 @@ impl LogBufferState {
         let mut filtered: Vec<LogEntry> = self
             .slots
             .iter()
+            .rev()
             .filter(|slot| {
                 if let Some(after) = options.after
                     && slot.entry.seq <= after
@@ -589,16 +594,10 @@ impl LogBufferState {
                 }
                 true
             })
+            .take(options.limit.unwrap_or(usize::MAX))
             .map(|slot| slot.entry.clone())
             .collect();
-
-        if let Some(limit) = options.limit
-            && filtered.len() > limit
-        {
-            let drop_count = filtered.len() - limit;
-            filtered.drain(0..drop_count);
-        }
-
+        filtered.reverse();
         filtered
     }
 
@@ -646,97 +645,70 @@ impl LogBuffer {
     /// Asynchronously pushes a [`LogInput`] into the ring buffer, applying full secret redaction
     /// and size/count eviction.
     pub async fn push_async(&self, input: LogInput) -> LogEntry {
-        let entry = {
-            let mut guard = self.state.write().await;
-            guard.append(input)
-        };
-        let _ = self.tx.send(LogStreamEvent::Entry(entry.clone()));
-        entry
+        self.record(input)
     }
 
     /// Synchronously pushes a [`LogInput`] into the ring buffer.
     ///
     /// Used by synchronous `tracing::Layer::on_event` callbacks and non-async callers.
     pub fn push(&self, input: LogInput) -> Option<LogEntry> {
-        let mut guard = match self.state.try_write() {
-            Ok(g) => g,
-            Err(_) => {
-                // Fallback to blocking_write when called outside an active lock holder.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.state.blocking_write()
-                })) {
-                    Ok(g) => g,
-                    Err(_) => return None,
-                }
-            }
-        };
-        let entry = guard.append(input);
-        drop(guard);
+        Some(self.record(input))
+    }
+
+    fn record(&self, input: LogInput) -> LogEntry {
+        let entry = LogBufferState::sanitize(input);
+        // Tracing callbacks are synchronous even on Tokio workers. This lock
+        // covers only in-memory bookkeeping, with redaction and I/O outside it.
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        let entry = state.append(entry);
+        // Publish under the sequence lock so live readers see the same order as replay.
         let _ = self.tx.send(LogStreamEvent::Entry(entry.clone()));
-        Some(entry)
+        entry
     }
 
     /// Asynchronously retrieves a filtered slice of buffered log entries (oldest to newest).
     pub async fn list_async(&self, options: LogListOptions) -> Vec<LogEntry> {
-        let guard = self.state.read().await;
-        guard.list(options)
+        self.list(options)
     }
 
     /// Synchronously retrieves a filtered slice of buffered log entries.
     #[must_use]
     pub fn list(&self, options: LogListOptions) -> Vec<LogEntry> {
-        if let Ok(guard) = self.state.try_read() {
-            return guard.list(options);
-        }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.state.blocking_read().list(options)
-        }))
-        .unwrap_or_default()
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .list(options)
     }
 
     /// Asynchronously clears all buffered log entries and notifies SSE subscribers.
     pub async fn clear_async(&self) {
-        {
-            let mut guard = self.state.write().await;
-            guard.clear();
-        }
-        let _ = self.tx.send(LogStreamEvent::Cleared);
+        self.clear();
     }
 
     /// Synchronously clears all buffered log entries and notifies SSE subscribers.
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.state.try_write() {
-            guard.clear();
-        } else if let Ok(mut guard) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.state.blocking_write()
-        })) {
-            guard.clear();
-        }
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        state.clear();
         let _ = self.tx.send(LogStreamEvent::Cleared);
     }
 
     /// Asynchronously returns current buffer utilization statistics.
     pub async fn stats_async(&self) -> LogBufferStats {
-        let guard = self.state.read().await;
-        guard.stats()
+        self.stats()
     }
 
     /// Synchronously returns current buffer utilization statistics.
     #[must_use]
     pub fn stats(&self) -> LogBufferStats {
-        if let Ok(guard) = self.state.try_read() {
-            return guard.stats();
-        }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.state.blocking_read().stats()
-        }))
-        .unwrap_or(LogBufferStats {
-            size: 0,
-            capacity: DEFAULT_LOG_CAPACITY,
-            bytes: 0,
-            max_bytes: DEFAULT_LOG_MAX_BYTES,
-            last_seq: 0,
-        })
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stats()
+    }
+
+    /// Returns diagnostic counters without waiting for a concurrent log writer.
+    pub(crate) fn try_stats(&self) -> Option<LogBufferStats> {
+        self.state.try_read().ok().map(|state| state.stats())
     }
 
     /// Subscribes to live [`LogStreamEvent`] broadcasts for `/api/admin/logs/stream`.
@@ -960,6 +932,70 @@ pub fn init_tracing_with_buffer(buffer: LogBuffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_publish_in_replay_order() {
+        let buffer = LogBuffer::default();
+        let mut events = buffer.subscribe();
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0..8 {
+            let buffer = buffer.clone();
+            writers.spawn(async move {
+                for message in 0..32 {
+                    buffer.push(LogInput::new(LogLevel::Info, format!("{writer}/{message}")));
+                }
+            });
+        }
+        while let Some(result) = writers.join_next().await {
+            result.unwrap();
+        }
+        for saved in buffer.list(LogListOptions::default()) {
+            let LogStreamEvent::Entry(live) = events.try_recv().unwrap() else {
+                panic!("expected live entry");
+            };
+            assert_eq!(live.seq, saved.seq);
+            assert_eq!(live.message, saved.message);
+        }
+        assert_eq!(buffer.stats().size, 256);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracing_on_a_tokio_worker_survives_log_buffer_contention() {
+        use std::time::Duration;
+
+        let buffer = LogBuffer::default();
+        let mut events = buffer.subscribe();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader_buffer = buffer.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let _guard = reader_buffer.state.read().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let layer = RedactingLayer::new(buffer.clone(), false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut writer = tokio::spawn(async move {
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                started_tx.send(()).unwrap();
+                tracing::info!("Event from a contending Tokio worker");
+            });
+        });
+        started_rx.await.unwrap();
+        let completed = tokio::time::timeout(Duration::from_millis(50), &mut writer).await;
+        release_tx.send(()).unwrap();
+        reader.await.unwrap();
+
+        assert!(completed.is_err(), "the write should wait for the reader");
+        writer.await.expect("worker did not panic");
+        let LogStreamEvent::Entry(event) = events.try_recv().expect("buffer published the event") else {
+            panic!("expected log entry");
+        };
+        assert_eq!(event.message, "Event from a contending Tokio worker");
+        assert_eq!(buffer.stats().size, 1);
+    }
 
     #[tokio::test]
     async fn ring_buffer_enforces_entry_capacity_and_byte_budget() {

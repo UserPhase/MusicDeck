@@ -87,6 +87,9 @@ pub struct HealthStatus {
     pub timestamp: String,
     /// Database subsystem connectivity report.
     pub database: DatabaseHealth,
+    /// Optional capabilities that failed their container startup checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_capabilities: Vec<String>,
     /// Process and buffer memory metrics.
     pub memory: MemoryMetrics,
 }
@@ -121,17 +124,23 @@ pub async fn health_check(State(state): State<AppState>) -> Response {
         String::from("memory")
     };
 
+    let degraded_capabilities = [
+        ("MUSICDECK_DOWNLOADER_HEALTH", "downloader"),
+        ("MUSICDECK_MUSIC_STORAGE_HEALTH", "musicStorage"),
+    ]
+    .into_iter()
+    .filter(|(key, _)| std::env::var(key).as_deref() == Ok("degraded"))
+    .map(|(_, name)| name.to_owned())
+    .collect::<Vec<_>>();
     let (http_status, status) = if !db_healthy {
         (StatusCode::SERVICE_UNAVAILABLE, ServiceHealthState::Unhealthy)
-    } else if config.setup_required {
+    } else if config.setup_required || !degraded_capabilities.is_empty() {
         (StatusCode::OK, ServiceHealthState::Degraded)
     } else {
         (StatusCode::OK, ServiceHealthState::Healthy)
     };
 
-    let log_stats = tokio::time::timeout(Duration::from_millis(100), state.logs().stats_async())
-        .await
-        .ok();
+    let log_stats = state.logs().try_stats();
     let payload = HealthStatus {
         ok: db_healthy,
         service: String::from(SERVICE_NAME),
@@ -144,6 +153,7 @@ pub async fn health_check(State(state): State<AppState>) -> Response {
             mode: db_mode,
             message: db_message.map(str::to_owned),
         },
+        degraded_capabilities,
         memory: MemoryMetrics {
             resident_set_bytes: sample_process_rss_bytes(),
             log_buffer_bytes: log_stats.map_or(0, |stats| stats.bytes),

@@ -729,6 +729,8 @@ pub struct TaskManager {
     pumping: Arc<AtomicBool>,
     dispatch_enabled: Arc<AtomicBool>,
     pump_requested: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(super) pump_query_failed: Arc<Notify>,
     scheduler_running: Arc<AtomicBool>,
     cron_tick_interval_ms: Arc<AtomicU64>,
     schedule_notify: Arc<Notify>,
@@ -767,6 +769,8 @@ impl TaskManager {
             pumping: Arc::new(AtomicBool::new(false)),
             dispatch_enabled: Arc::new(AtomicBool::new(enabled)),
             pump_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            pump_query_failed: Arc::default(),
             scheduler_running: Arc::new(AtomicBool::new(false)),
             cron_tick_interval_ms: Arc::new(AtomicU64::new(DEFAULT_CRON_TICK_INTERVAL_MS)),
             schedule_notify: Arc::new(Notify::new()),
@@ -1100,13 +1104,13 @@ impl TaskManager {
         // A job may have committed while its task was still being finalized at shutdown.
         let reconciled = sqlx::query(
             "UPDATE background_tasks SET state='FINISHED', error=NULL, finished_at=?, updated_at=?,
-                progress_json=json_set(progress_json,'$.percent',100.0)
+                progress_json=json_set(CASE WHEN json_valid(progress_json) THEN progress_json ELSE '{}' END,'$.percent',100.0)
              WHERE state IN ('PROCESSING','PAUSED') AND (
                 (type='SPOTDL_DOWNLOAD' AND EXISTS(SELECT 1 FROM acquisition_jobs
                     WHERE active_task_id=background_tasks.id AND status IN ('completed','partial')))
                 OR (type='SPOTDL_IMPORT' AND EXISTS(SELECT 1 FROM import_jobs
-                    WHERE id=json_extract(background_tasks.payload_json,'$.jobId')
-                      AND json_extract(manifest_json,'$.job.status') IN ('completed','partial')))
+                    WHERE id=json_extract(CASE WHEN json_valid(background_tasks.payload_json) THEN background_tasks.payload_json END,'$.jobId')
+                      AND json_extract(CASE WHEN json_valid(manifest_json) THEN manifest_json END,'$.job.status') IN ('completed','partial')))
              )",
         )
         .bind(&now)
@@ -1116,7 +1120,7 @@ impl TaskManager {
         if let Err(err) = reconciled {
             tracing::error!(error=%err, "Could not reconcile completed import tasks");
         }
-        let _ = sqlx::query(
+        let failed = sqlx::query(
             r"
             UPDATE background_tasks
             SET state = 'FAILED',
@@ -1130,6 +1134,9 @@ impl TaskManager {
         .bind(&now)
         .execute(pool.inner())
         .await;
+        if let Err(err) = failed {
+            tracing::error!(error=%err, "Could not mark interrupted background tasks as failed");
+        }
         if let Err(err) = self.restore_library_scan_schedule(pool).await {
             tracing::error!(error = %err, "Could not load the saved library scan schedule");
         }
@@ -1790,11 +1797,14 @@ impl TaskManager {
             .as_ref()
             .ok_or_else(|| TaskError::Conflict(String::from("Database is unavailable")))?;
 
-        if current.state == TaskStatus::Cancelled {
+        if current.state.is_terminal() {
             return Ok(current);
         }
         let state = next_state.unwrap_or(current.state);
-        let priority = next_priority.unwrap_or(current.priority);
+        let write_error = next_error.is_some();
+        let write_started_at = next_started_at.is_some();
+        let write_finished_at = next_finished_at.is_some();
+        let write_progress = next_progress.is_some();
         let error = next_error.unwrap_or(current.error.clone());
         let started_at = next_started_at.unwrap_or(current.started_at.clone());
         let finished_at = next_finished_at.unwrap_or(current.finished_at.clone());
@@ -1805,24 +1815,30 @@ impl TaskManager {
         sqlx::query(
             r"
             UPDATE background_tasks
-            SET state = ?,
-                priority = ?,
-                error = ?,
-                started_at = ?,
-                finished_at = ?,
-                progress_json = ?,
+            SET state = COALESCE(?, state),
+                priority = COALESCE(?, priority),
+                error = CASE WHEN ? THEN ? ELSE error END,
+                started_at = CASE WHEN ? THEN ? ELSE started_at END,
+                finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+                progress_json = COALESCE(?, progress_json),
                 updated_at = ?
-            WHERE id = ? AND state != 'CANCELLED'
+            WHERE id = ? AND state NOT IN ('FINISHED','FAILED','CANCELLED')
+                AND (NOT ? OR state = ?)
             ",
         )
-        .bind(state.as_str())
-        .bind(priority)
+        .bind(next_state.map(TaskStatus::as_str))
+        .bind(next_priority)
+        .bind(write_error)
         .bind(error)
+        .bind(write_started_at)
         .bind(started_at)
+        .bind(write_finished_at)
         .bind(finished_at)
-        .bind(progress_json)
+        .bind(write_progress.then_some(progress_json))
         .bind(&now)
         .bind(id)
+        .bind(next_state.is_some())
+        .bind(current.state.as_str())
         .execute(pool.inner())
         .await
         .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
@@ -1992,6 +2008,9 @@ impl TaskManager {
             return Err(TaskError::Cancelled);
         }
         let task = self.require_task(id).await?;
+        if task.state == TaskStatus::Cancelled {
+            return Err(TaskError::Cancelled);
+        }
         let blocked = self.is_blocked(task.task_type).await;
         handle.resource_pause.store(blocked, Ordering::Release);
 
@@ -2063,16 +2082,31 @@ impl TaskManager {
 
         self.pump_requested.store(false, Ordering::Release);
         if let Some(pool) = &self.db {
-            let rows = sqlx::query(
-                r"
-                SELECT id, type FROM background_tasks
-                WHERE state = 'QUEUED'
-                ORDER BY priority DESC, created_at, rowid
-                ",
-            )
-            .fetch_all(pool.inner())
-            .await
-            .unwrap_or_default();
+            let mut retry_delay = Duration::from_millis(100);
+            let rows = loop {
+                match sqlx::query(
+                    r"
+                    SELECT id, type FROM background_tasks
+                    WHERE state = 'QUEUED'
+                    ORDER BY priority DESC, created_at, rowid
+                    ",
+                )
+                .fetch_all(pool.inner())
+                .await
+                {
+                    Ok(rows) => break rows,
+                    Err(error) => {
+                        tracing::warn!(%error, retry_ms = retry_delay.as_millis(), "Could not read the task queue; retrying dispatch");
+                        #[cfg(test)]
+                        self.pump_query_failed.notify_one();
+                        tokio::time::sleep(retry_delay).await;
+                        if self.stopping.load(Ordering::Acquire) {
+                            break Vec::new();
+                        }
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+                    }
+                }
+            };
 
             for row in rows {
                 if self.active_slots.load(Ordering::Acquire) >= self.max_concurrent {
@@ -2105,10 +2139,31 @@ impl TaskManager {
                     continue;
                 }
 
-                let Ok(task) = self.require_task(&id).await else {
-                    continue;
-                };
-                self.start_task(task, def);
+                let now = Utc::now().to_rfc3339();
+                match sqlx::query(
+                    "UPDATE background_tasks SET state='PROCESSING', error=NULL,
+                    started_at=COALESCE(started_at, ?), updated_at=?
+                    WHERE id=? AND state='QUEUED' RETURNING *",
+                )
+                .bind(&now)
+                .bind(&now)
+                .bind(&id)
+                .fetch_optional(pool.inner())
+                .await
+                {
+                    Ok(Some(row)) => {
+                        if let Some(task) = Self::map_row(&row) {
+                            self.start_task(task, def);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(task_id=%id, %error, "Could not claim a queued task");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        self.pump_requested.store(true, Ordering::Release);
+                        break;
+                    }
+                }
             }
         }
 
@@ -2139,26 +2194,9 @@ impl TaskManager {
                 handle: handle.clone(),
             };
 
-            let started_at = task
-                .started_at
-                .clone()
-                .unwrap_or_else(|| Utc::now().to_rfc3339());
-            let started = mgr
-                .update_task_fields(
-                    &task.id,
-                    Some(TaskStatus::Processing),
-                    None,
-                    Some(None),
-                    Some(Some(started_at)),
-                    None,
-                    None,
-                )
-                .await;
-
+            let _ = mgr.events_tx.send(TaskEvent::State(task.clone()));
+            mgr.append_log(&task.id, "state", "PROCESSING").await;
             let outcome = async {
-                if started?.state == TaskStatus::Cancelled {
-                    return Err(TaskError::Cancelled);
-                }
                 ctx.checkpoint().await?;
                 definition.run(task.payload.clone(), ctx.clone()).await?;
                 ctx.throw_if_cancelled()?;
@@ -2166,51 +2204,11 @@ impl TaskManager {
             }
             .await;
 
-            let now = Utc::now().to_rfc3339();
-            match outcome {
-                Ok(()) => {
-                    if let Ok(curr) = mgr.require_task(&task.id).await {
-                        let mut final_prog = curr.progress;
-                        final_prog.percent = 100.0;
-                        final_prog.memory_bytes = sample_process_rss_bytes();
-                        let _ = mgr
-                            .update_task_fields(
-                                &task.id,
-                                Some(TaskStatus::Finished),
-                                None,
-                                None,
-                                None,
-                                Some(Some(now)),
-                                Some(final_prog),
-                            )
-                            .await;
-                    }
-                }
-                Err(TaskError::Cancelled) => {
-                    let _ = mgr
-                        .update_task_fields(
-                            &task.id,
-                            Some(TaskStatus::Cancelled),
-                            None,
-                            Some(Some(String::from("Cancelled"))),
-                            None,
-                            Some(Some(now)),
-                            None,
-                        )
-                        .await;
-                }
+            let (state, error) = match outcome {
+                Ok(()) => (TaskStatus::Finished, None),
+                Err(TaskError::Cancelled) => (TaskStatus::Cancelled, Some("Cancelled".into())),
                 Err(_) if handle.cancel_token.is_cancelled() => {
-                    let _ = mgr
-                        .update_task_fields(
-                            &task.id,
-                            Some(TaskStatus::Cancelled),
-                            None,
-                            Some(Some(String::from("Cancelled"))),
-                            None,
-                            Some(Some(now)),
-                            None,
-                        )
-                        .await;
+                    (TaskStatus::Cancelled, Some("Cancelled".into()))
                 }
                 Err(err) => {
                     let err_msg = err.to_string();
@@ -2220,36 +2218,57 @@ impl TaskManager {
                         error = %err_msg,
                         "Background task failed"
                     );
-                    if let Err(persist_error) = mgr
-                        .update_task_fields(
-                            &task.id,
-                            Some(TaskStatus::Failed),
-                            None,
-                            Some(Some(err_msg.clone())),
-                            None,
-                            Some(Some(now)),
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            task_id = %task.id,
-                            error = %persist_error,
-                            original_error = %err_msg,
-                            "Could not persist failed task state"
-                        );
-                    }
+                    (TaskStatus::Failed, Some(err_msg))
                 }
-            }
+            };
 
             if handle.slot_held.swap(false, Ordering::AcqRel) {
                 mgr.active_slots.fetch_sub(1, Ordering::AcqRel);
             }
+            // Disk contention during finalization must neither occupy a worker slot nor rerun the job.
+            mgr.spawn_pump();
+            mgr.persist_terminal_state(&task.id, state, error.as_deref())
+                .await;
             if let Ok(mut guard) = mgr.registry.write() {
                 guard.active.remove(&task.id);
             }
             mgr.spawn_pump();
         });
+    }
+
+    async fn persist_terminal_state(&self, id: &str, state: TaskStatus, error: Option<&str>) {
+        let Some(pool) = &self.db else { return };
+        let now = Utc::now().to_rfc3339();
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            match sqlx::query("UPDATE background_tasks SET state=?, error=?, finished_at=?, updated_at=?,
+                progress_json=CASE WHEN ? THEN json_set(CASE WHEN json_valid(progress_json) THEN progress_json ELSE '{}' END,
+                    '$.percent',100.0,'$.memoryBytes',?) ELSE progress_json END
+                WHERE id=? AND state IN ('PROCESSING','PAUSED') RETURNING *")
+                .bind(state.as_str()).bind(error).bind(&now).bind(&now)
+                .bind(state == TaskStatus::Finished).bind(sample_process_rss_bytes() as i64)
+                .bind(id).fetch_optional(pool.inner()).await
+            {
+                Ok(row) => {
+                    if let Some(task) = row.as_ref().and_then(Self::map_row) {
+                        let message = error.map_or_else(|| state.as_str().to_owned(), |error| format!("{}: {error}", state.as_str()));
+                        self.append_log(id, "state", &message).await;
+                        let _ = self.events_tx.send(TaskEvent::State(task));
+                        self.prune_history().await;
+                    }
+                    return;
+                }
+                Err(error) if self.stopping.load(Ordering::Acquire) => {
+                    tracing::warn!(task_id=%id, %error, "Task finalization deferred to startup recovery");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(task_id=%id, %error, "Could not persist task outcome; retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+            }
+        }
     }
 
     /// Waits until task `id` reaches a terminal state (`FINISHED`, `FAILED`, `CANCELLED`),

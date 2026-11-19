@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -890,7 +891,7 @@ async fn post_system_configuration_handler(
 async fn patch_backup_policy_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    Json(body): Json<BackupPolicyBody>,
+    ApiJson(body): ApiJson<BackupPolicyBody>,
 ) -> Result<Response, ServerError> {
     let pool = state
         .db()

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -140,6 +141,7 @@ fn map_queue_error(err: QueueSyncError) -> Response {
         status,
         Json(ApiErrorEnvelope {
             error: ApiErrorBody {
+                request_id: crate::error::current_request_id(),
                 code: String::from("QUEUE_SYNC_ERROR"),
                 message: err.message,
             },
@@ -216,14 +218,11 @@ async fn get_media_sessions_handler(
 async fn post_media_session_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<MediaCheckpointInput>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<MediaCheckpointInput>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(input)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid media checkpoint payload.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(input) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -324,7 +323,7 @@ async fn post_queue_content_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Query(params): Query<HashMap<String, String>>,
-    payload_res: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<Value>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let Some(owner_id) = params.get("ownerId") else {
         return send_error_response(
@@ -348,11 +347,9 @@ async fn post_queue_content_handler(
         );
     }
 
-    let Ok(Json(raw_body)) = payload_res else {
-        return map_queue_error(QueueSyncError::new(
-            "The queue contains invalid tracks or duplicate occurrence IDs.",
-            400,
-        ));
+    let ApiJson(raw_body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -403,14 +400,11 @@ async fn get_queue_content_handler(
 async fn put_queue_session_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SyncPayload>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SyncPayload>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid queue session checkpoint.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.device_id.is_empty()
@@ -465,14 +459,11 @@ async fn put_queue_session_handler(
 async fn delete_queue_session_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<DeleteDeviceSessionBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<DeleteDeviceSessionBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid queue device.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.device_id.is_empty() || body.device_id.len() > 300 {
@@ -507,14 +498,11 @@ async fn delete_queue_session_handler(
 async fn post_named_queue_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SaveNamedQueueBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SaveNamedQueueBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid named queue.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.name.trim().is_empty()
@@ -564,14 +552,11 @@ async fn delete_named_queue_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(queue_id): Path<String>,
-    payload_res: Result<Json<DeleteNamedQueueBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<DeleteNamedQueueBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid named queue revision.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -599,14 +584,11 @@ async fn delete_named_queue_handler(
 async fn post_queue_as_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SaveQueueAsPlaylistBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SaveQueueAsPlaylistBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid queue playlist save.",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.name.trim().is_empty()

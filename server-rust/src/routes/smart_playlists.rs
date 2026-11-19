@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -130,6 +131,7 @@ fn map_smart_error(err: SmartPlaylistError) -> Response {
                 StatusCode::BAD_REQUEST,
                 Json(ApiErrorEnvelope {
                     error: ApiErrorBody {
+                        request_id: crate::error::current_request_id(),
                         code: String::from("VALIDATION_ERROR"),
                         message: msg,
                     },
@@ -285,14 +287,11 @@ async fn list_smart_playlists_handler(
 async fn preview_smart_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SmartPlaylistPreviewBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SmartPlaylistPreviewBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid preview request",
-            "VALIDATION_ERROR",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if !(1..=500).contains(&body.limit) || body.offset > 1_000_000 {
@@ -343,14 +342,11 @@ async fn preview_smart_playlist_handler(
 async fn snapshot_smart_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SmartPlaylistSnapshotBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SmartPlaylistSnapshotBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "A mix name and valid settings are required",
-            "VALIDATION_ERROR",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let trimmed_name = body.name.trim();
@@ -458,14 +454,11 @@ async fn snapshot_smart_playlist_handler(
 async fn create_smart_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SmartPlaylistUpsertBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SmartPlaylistUpsertBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "A playlist name and rules are required",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let trimmed_name = body.name.trim();
@@ -550,7 +543,7 @@ async fn update_smart_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(id): Path<String>,
-    payload_res: Result<Json<SmartPlaylistUpsertBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SmartPlaylistUpsertBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let Ok(db) = require_db(&state) else {
         return ServerError::Internal(String::from("Database unavailable")).into_response();
@@ -562,12 +555,9 @@ async fn update_smart_playlist_handler(
         Err(err) => return map_smart_error(err),
     };
 
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "A playlist name and rules are required",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let trimmed_name = body.name.trim();

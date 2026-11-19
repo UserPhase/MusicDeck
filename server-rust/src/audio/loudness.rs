@@ -251,8 +251,8 @@ pub fn loudness_stream_cache_key(
 #[derive(Clone)]
 pub struct LoudnessService {
     db: Option<DbPool>,
-    runner: Arc<dyn ProcessRunner>,
-    ffmpeg_bin: String,
+    pub(super) runner: Arc<dyn ProcessRunner>,
+    pub(super) ffmpeg_bin: String,
 }
 
 impl std::fmt::Debug for LoudnessService {
@@ -296,21 +296,7 @@ impl LoudnessService {
         target_lufs: f64,
     ) -> Option<LoudnessMetadata> {
         let pool = self.db.as_ref()?;
-        let key = loudness_measurement_key(identity, external_tag);
-        let now = Utc::now().timestamp_millis();
-
-        let row = sqlx::query(
-            "SELECT measurement_json FROM playback_loudness_measurements WHERE cache_key = ? AND expires_at > ?",
-        )
-        .bind(key)
-        .bind(now)
-        .fetch_optional(pool.inner())
-        .await
-        .ok()
-        .flatten()?;
-
-        let json_str: String = row.try_get("measurement_json").ok()?;
-        let m = parse_loudness(&json_str).ok()?;
+        let m = read_measurement(pool, identity, external_tag).await.ok().flatten()?;
         let i_lufs = m.integrated_lufs()?;
         let tp_db = m.true_peak_db()?;
 
@@ -380,28 +366,8 @@ impl LoudnessService {
             .ok_or_else(|| String::from("Audio has no measurable loudness"))?;
 
         if let Some(pool) = &self.db {
-            let key = loudness_measurement_key(identity, external_tag);
-            let now = Utc::now().timestamp_millis();
-            let expires_at = now + LOUDNESS_CACHE_TTL_MS;
-            let m_json = serde_json::to_string(&measurement).unwrap_or_default();
-
-            let _ = sqlx::query(
-                r"
-                INSERT INTO playback_loudness_measurements (
-                    cache_key, measurement_json, created_at, expires_at
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    measurement_json = excluded.measurement_json,
-                    expires_at = excluded.expires_at
-                ",
-            )
-            .bind(key)
-            .bind(m_json)
-            .bind(now)
-            .bind(expires_at)
-            .execute(pool.inner())
-            .await;
+            store_measurement(pool, identity, external_tag, &measurement).await
+                .map_err(|error| error.to_string())?;
         }
 
         Ok(LoudnessMetadata {
@@ -441,6 +407,30 @@ impl LoudnessService {
         .flatten()?;
         row.try_get("content_revision").ok()
     }
+}
+
+pub(super) async fn read_measurement(
+    pool: &DbPool, identity: &str, tag: &str,
+) -> Result<Option<LoudnessMeasurement>, sqlx::Error> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT measurement_json FROM playback_loudness_measurements WHERE cache_key = ? AND expires_at > ?",
+    ).bind(loudness_measurement_key(identity, tag)).bind(Utc::now().timestamp_millis())
+        .fetch_optional(pool.inner()).await?;
+    Ok(raw.and_then(|raw| parse_loudness(&raw).ok()))
+}
+
+pub(super) async fn store_measurement(
+    pool: &DbPool, identity: &str, tag: &str, measurement: &LoudnessMeasurement,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO playback_loudness_measurements (cache_key, measurement_json, expires_at)
+         VALUES (?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET
+         measurement_json=excluded.measurement_json, expires_at=excluded.expires_at",
+    ).bind(loudness_measurement_key(identity, tag))
+        .bind(serde_json::to_string(measurement).expect("loudness measurement only contains strings"))
+        .bind(now + LOUDNESS_CACHE_TTL_MS).execute(pool.inner()).await?;
+    Ok(())
 }
 
 // ============================================================================

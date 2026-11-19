@@ -171,9 +171,20 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
     async fn create_imported_playlist(
         &self,
         _name: &str,
-        _description: &str,
         _track_ids: &[String],
     ) -> Result<String, ProviderError> {
+        Err(ProviderError::Configuration(
+            "Upstream playlist import requires Navidrome".into(),
+        ))
+    }
+
+    /// Finalizes a marked import as private and reads its actual ordered tracks.
+    async fn finalize_imported_playlist(
+        &self,
+        _playlist_id: &str,
+        _name: &str,
+        _description: &str,
+    ) -> Result<Option<Playlist>, ProviderError> {
         Err(ProviderError::Configuration(
             "Upstream playlist import requires Navidrome".into(),
         ))

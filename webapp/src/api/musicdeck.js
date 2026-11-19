@@ -5,32 +5,78 @@ import {
   normalizeTrackData,
 } from "../utils/normalizeTrackData";
 
+const MAX_ERROR_BODY_BYTES = 8192;
+const MAX_PLAIN_ERROR_LENGTH = 256;
+
+async function readErrorBody(response) {
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    if (typeof response.text !== "function") return { data: await response.json() };
+    const text = await response.text();
+    if (text.length > MAX_ERROR_BODY_BYTES) return {};
+    return parseErrorBody(text, response.headers?.get?.("content-type"));
+  }
+
+  const decoder = new TextDecoder();
+  let text = "";
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_ERROR_BODY_BYTES) {
+        void reader.cancel().catch(() => {});
+        return {};
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return parseErrorBody(text + decoder.decode(), response.headers?.get?.("content-type"));
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseErrorBody(text, contentType) {
+  try {
+    return { data: JSON.parse(text) };
+  } catch {
+    const message = text.trim();
+    if ((!contentType || contentType.toLowerCase().startsWith("text/plain")) &&
+        message.length > 0 && message.length <= MAX_PLAIN_ERROR_LENGTH &&
+        !/[<>\u0000-\u0008\u000e-\u001f\u007f]/.test(message)) {
+      return { message: message.replace(/\s+/g, " ") };
+    }
+    return {};
+  }
+}
+
 export async function request(path, options = {}) {
+  const { headers: headerOverrides, ...init } = options;
+  const headers = new Headers(headerOverrides);
+  if (typeof init.body === "string" && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
   const response = await fetch(resolveDesktopApiUrl(path), {
     credentials: "include",
-    headers: {
-      // Only send a JSON content-type when there's actually a JSON body —
-      // Fastify's strict JSON parser rejects an empty body sent with this
-      // header (FST_ERR_CTP_EMPTY_JSON_BODY), which surfaced as a 500 on
-      // no-body POSTs like plugin test/enable/disable requests.
-      ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
-    },
-    ...options,
+    ...init,
+    headers,
   });
 
   if (!response.ok) {
     let message = `MusicDeck returned ${response.status}`;
     let code;
-    let requestId;
+    let requestId = response.headers?.get?.("x-request-id") || undefined;
 
     try {
-      const data = await response.json();
-      message = data.error?.message || message;
-      code = data.error?.code;
-      requestId = data.error?.requestId;
+      const body = await readErrorBody(response);
+      const error = body.data?.error;
+      if (typeof error?.message === "string" && error.message) message = error.message;
+      else if (body.message) message = body.message;
+      if (typeof error?.code === "string") code = error.code;
+      if (typeof error?.requestId === "string" && error.requestId) requestId = error.requestId;
     } catch {
-      // Keep the status-based message when the body is not JSON.
+      // The status and correlation header are still available if the error body is unreadable.
     }
 
     throw Object.assign(new Error(message), { status: response.status, code, requestId });

@@ -55,7 +55,7 @@ test("opens a single socket when Strict Mode replays the startup effect", () => 
   expect(FakeSocket.instances).toHaveLength(1);
 });
 
-test("a local pause failure cannot interrupt socket cleanup and reconnect", () => {
+test("a local pause failure cannot interrupt cleanup after explicit revocation", () => {
   const player = adapter();
   player.state.mockReturnValue({ ...initial, playing: true });
   const failure = new DOMException("Audio automation failed");
@@ -65,7 +65,7 @@ test("a local pause failure cannot interrupt socket cleanup and reconnect", () =
   try {
     const ws = FakeSocket.instances[0];
     act(() => ws.open());
-    act(() => ws.close(1006));
+    act(() => ws.close(4002));
     expect(log).toHaveBeenCalledWith("Remote session:", failure);
     expect(result.current.status).toBe("reconnecting");
     act(() => jest.advanceTimersByTime(800));
@@ -227,7 +227,7 @@ test("source keeps playing until PAUSE_FOR_TRANSFER and captures before pausing"
   expect(player.command).toHaveBeenCalledWith({ type: "PLAY" }, expect.any(AbortSignal));
 });
 
-test("expires queued executions and pauses the output when its socket closes", async () => {
+test("expires queued executions and preserves the output on a transient close", async () => {
   const player = adapter();
   let complete!: () => void;
   player.command.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
@@ -251,7 +251,7 @@ test("expires queued executions and pauses the output when its socket closes", a
     message: "Playback command expired before execution",
   });
   act(() => ws.close(1006));
-  expect(player.pause).toHaveBeenCalledTimes(1);
+  expect(player.pause).not.toHaveBeenCalled();
 });
 
 test("only resets reconnect backoff after the application handshake", async () => {
@@ -297,24 +297,137 @@ test("a wall clock jump does not move the remote playhead", async () => {
   expect(result.current.readPosition?.()).toBeCloseTo(1.1);
 });
 
-test("stops an active output that no longer receives control heartbeats", async () => {
+function ownedState(deviceId: string, now: number, revision = 1) {
+  return { device_id: deviceId, track: initial.current_track, position_ms: 1000,
+    duration_ms: 60000, is_playing: true, volume: 1, updated_at: now, revision };
+}
+
+async function acknowledgeLease(ws: FakeSocket) {
+  const probe = ws.sent.filter(frame => frame.type === "RENEW_PLAYBACK_LEASE").at(-1);
+  expect(probe).toBeDefined();
+  await receive(ws, { type: "PLAYBACK_LEASE", sequence: probe?.sequence, leaseMs: 5_000,
+    device_id: probe?.device_id, leaseGeneration: probe?.leaseGeneration });
+}
+
+test("rejoins the same owner after a socket error and pauses on authoritative takeover", async () => {
   const player = adapter();
+  player.state.mockReturnValue({ ...initial, playing: true });
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const first = FakeSocket.instances[0];
+  act(() => first.open());
+  const device = result.current.deviceId;
+  await receive(first, { type: "INITIAL_STATE", server_time: Date.now(), playbackLeaseProtocol: 1, playbackLeaseMs: 5_000, leaseGeneration: "lease-one",
+    state: ownedState(device, Date.now()) });
+  await acknowledgeLease(first);
+  act(() => jest.advanceTimersByTime(2_000));
+  const delayed = first.sent.filter(frame => frame.type === "RENEW_PLAYBACK_LEASE").at(-1);
+  act(() => jest.advanceTimersByTime(2_200));
+  await receive(first, { type: "PLAYBACK_LEASE", sequence: delayed?.sequence, leaseMs: 5_000,
+    device_id: device, leaseGeneration: "lease-one" });
+  act(() => jest.advanceTimersByTime(800));
+  expect(player.pause).not.toHaveBeenCalled();
+  let command!: Promise<void>;
+  act(() => { command = result.current.command({ type: "PLAY" }); });
+  const rejected = expect(command).rejects.toThrow("disconnected");
+  act(() => first.onerror?.());
+  await rejected;
+  expect(player.pause).not.toHaveBeenCalled();
+
+  act(() => jest.advanceTimersByTime(0));
+  const rejoined = FakeSocket.instances[1];
+  act(() => rejoined.open());
+  expect(rejoined.sent[0]).toMatchObject({ type: "REGISTER", device_id: device, leaseGeneration: "lease-one" });
+  await receive(rejoined, { type: "INITIAL_STATE", server_time: Date.now(), playbackLeaseProtocol: 1, playbackLeaseMs: 5_000, leaseGeneration: "lease-one",
+    state: ownedState(device, Date.now()) });
+  await acknowledgeLease(rejoined);
+  expect(result.current.status).toBe("connected");
+  expect(player.pause).not.toHaveBeenCalled();
+
+  await receive(rejoined, { type: "STATE_SYNC", server_time: Date.now(), state: ownedState("phone", Date.now(), 2) });
+  expect(player.pause).toHaveBeenCalledTimes(1);
+});
+
+test("a watchdog miss reconnects immediately and pauses only when the last ownership lease expires", async () => {
+  const player = adapter();
+  player.state.mockReturnValue({ ...initial, playing: true });
   const { result } = renderHook(() => useRemoteSession("user", player));
   const ws = FakeSocket.instances[0];
   act(() => ws.open());
   const now = Date.now();
-  await receive(ws, { type: "INITIAL_STATE", server_time: now, controlTimeoutMs: 25_000, state: {
-    device_id: result.current.deviceId, track: initial.current_track, position_ms: 1000,
-    duration_ms: 60000, is_playing: true, volume: 1, updated_at: now, revision: 1,
-  }});
-  act(() => jest.advanceTimersByTime(15_000));
-  await receive(ws, { type: "REMOTE_HEARTBEAT", server_time: now + 15_000 });
-  act(() => jest.advanceTimersByTime(24_999));
+  await receive(ws, { type: "INITIAL_STATE", server_time: now, controlTimeoutMs: 25_000, playbackLeaseProtocol: 1, playbackLeaseMs: 5_000, leaseGeneration: "lease-one",
+    state: ownedState(result.current.deviceId, now) });
+  await acknowledgeLease(ws);
+  for (let elapsed = 2_000; elapsed <= 24_000; elapsed += 2_000) {
+    act(() => jest.advanceTimersByTime(2_000));
+    await acknowledgeLease(ws);
+  }
+  act(() => jest.advanceTimersByTime(1_000));
+  expect(ws.readyState).toBe(3);
+  expect(result.current.status).toBe("reconnecting");
+  expect(player.pause).not.toHaveBeenCalled();
+  act(() => jest.advanceTimersByTime(3_899));
+  expect(FakeSocket.instances).toHaveLength(2);
   expect(player.pause).not.toHaveBeenCalled();
   act(() => jest.advanceTimersByTime(1));
   expect(player.pause).toHaveBeenCalledTimes(1);
-  expect(ws.readyState).toBe(3);
-  expect(result.current.status).toBe("reconnecting");
+});
+
+test("an older server keeps playback working without a generation-based lease", async () => {
+  const player = adapter();
+  player.state.mockReturnValue({ ...initial, playing: true });
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  await receive(ws, { type: "INITIAL_STATE", server_time: Date.now(), playbackLeaseMs: 5_000,
+    state: ownedState(result.current.deviceId, Date.now()) });
+  act(() => jest.advanceTimersByTime(6_000));
+  expect(ws.sent.some(frame => frame.type === "RENEW_PLAYBACK_LEASE")).toBe(false);
+  expect(player.pause).not.toHaveBeenCalled();
+});
+
+test.each(["wrong-device", "stale-generation"])("a %s renewal cannot extend playback after a 1011 close", async (failure) => {
+  const player = adapter();
+  player.state.mockReturnValue({ ...initial, playing: true });
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const device = result.current.deviceId;
+  await receive(ws, { type: "INITIAL_STATE", server_time: Date.now(), playbackLeaseProtocol: 1, playbackLeaseMs: 5_000, leaseGeneration: "owner",
+    state: ownedState(device, Date.now()) });
+  await acknowledgeLease(ws);
+  act(() => jest.advanceTimersByTime(2_000));
+  const probe = ws.sent.filter(frame => frame.type === "RENEW_PLAYBACK_LEASE").at(-1);
+  await receive(ws, { type: "PLAYBACK_LEASE", sequence: probe?.sequence, leaseMs: 5_000,
+    device_id: failure === "wrong-device" ? "phone" : device,
+    leaseGeneration: failure === "stale-generation" ? "stale" : "owner" });
+  act(() => ws.close(1011, "Session storage temporarily unavailable"));
+  expect(player.pause).not.toHaveBeenCalled();
+  act(() => jest.advanceTimersByTime(0));
+  expect(FakeSocket.instances).toHaveLength(2);
+  act(() => jest.advanceTimersByTime(2_899));
+  expect(player.pause).not.toHaveBeenCalled();
+  act(() => jest.advanceTimersByTime(1));
+  expect(player.pause).toHaveBeenCalledTimes(1);
+});
+
+test("a disconnected handoff target stops provisional output and suppresses late STARTED", async () => {
+  const player = adapter();
+  let finish!: () => void;
+  player.start.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const { result } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  await act(async () => { await result.current.enable(); });
+  await receive(ws, { type: "INITIALIZE_PLAYER", transferId: "handoff", snapshot });
+  await receive(ws, { type: "START_TRANSFER", transferId: "handoff", snapshot, playbackLeaseMs: 5_000 });
+  const signal = player.prepare.mock.calls[0][1];
+  act(() => ws.close(1006));
+  expect(signal.aborted).toBe(true);
+  expect(player.pause).toHaveBeenCalledTimes(1);
+  await act(async () => { finish(); });
+  expect(ws.sent.some(frame => frame.type === "STARTED")).toBe(false);
+  act(() => jest.advanceTimersByTime(0));
+  expect(FakeSocket.instances).toHaveLength(2);
 });
 
 test("aborts a target start before confirming rollback and suppresses its late success", async () => {

@@ -62,6 +62,7 @@ pub enum SessionEvent {
 #[derive(Debug, Clone)]
 pub struct SessionEventBus {
     tx: broadcast::Sender<SessionEvent>,
+    remote_hub: Option<crate::remote::RemoteControlHub>,
 }
 
 impl Default for SessionEventBus {
@@ -75,11 +76,29 @@ impl SessionEventBus {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity.max(16));
-        Self { tx }
+        Self { tx, remote_hub: None }
+    }
+
+    pub(crate) fn with_remote_hub(mut self, hub: crate::remote::RemoteControlHub) -> Self {
+        self.remote_hub = Some(hub);
+        self
     }
 
     /// Publishes a [`SessionEvent`] to all active WebSocket and SSE listeners.
     pub fn publish(&self, event: SessionEvent) {
+        if let Some(hub) = &self.remote_hub {
+            match &event {
+                SessionEvent::SessionRevoked { session_id } => {
+                    hub.revoke_sessions(None, |session| session == session_id);
+                }
+                SessionEvent::UserSessionsRevoked { user_id, except_session_id } => {
+                    hub.revoke_sessions(Some(user_id), |session| {
+                        except_session_id.as_deref() != Some(session)
+                    });
+                }
+                _ => {}
+            }
+        }
         let _ = self.tx.send(event);
     }
 

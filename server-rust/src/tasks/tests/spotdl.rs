@@ -209,13 +209,23 @@ async fn navidrome_request(
             }
             json!({"status":"ok", "searchResult3":{"song":songs}})
         }
+        "getPlaylists.view" => json!({"status":"ok", "playlists":{"playlist":[]}}),
+        "getPlaylist.view" => {
+            let ids = if matches!(mock.result, NavidromeResult::MissingTrack) {
+                vec!["nav-Second", "nav-Second"]
+            } else {
+                vec!["nav-Second", "nav-First", "nav-Second"]
+            };
+            let entries: Vec<_> = ids.iter().map(|id| json!({"id":id, "title":id})).collect();
+            json!({"status":"ok", "playlist":{"id":"nav-playlist","name":FIXTURE_NAME,"entry":entries}})
+        }
         "createPlaylist.view" => {
             assert_eq!(method, axum::http::Method::POST);
             let params: Vec<_> = url::form_urlencoded::parse(&body).collect();
             assert!(
                 params
                     .iter()
-                    .any(|(key, value)| key == "name" && value == FIXTURE_NAME)
+                    .any(|(key, value)| key == "name" && value.starts_with("MusicDeck import spimp_"))
             );
             let ids: Vec<_> = params
                 .iter()
@@ -238,6 +248,7 @@ async fn navidrome_request(
         "updatePlaylist.view" => {
             assert_eq!(query["playlistId"], "nav-playlist");
             assert_eq!(query["public"], "false");
+            assert_eq!(query["name"], FIXTURE_NAME);
             assert!(query["comment"].contains("Imported from Spotify:"));
             json!({"status":"ok"})
         }

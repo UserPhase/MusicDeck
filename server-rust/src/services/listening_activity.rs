@@ -19,7 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Acquire, Row};
+use sqlx::Row;
 use thiserror::Error;
 
 use crate::db::{DbError, DbPool, create_id};
@@ -329,8 +329,9 @@ pub async fn record_playback_with_scrobbles(
     }
 
     let threshold_cfg = listening_threshold(pool).await?;
-    let mut conn = pool.inner().acquire().await?;
-    let mut tx = conn.begin().await?;
+    let mut tx =
+        crate::db::begin_sqlite_write(pool.inner(), "UPDATE listening_events SET id = id WHERE 0")
+            .await?;
 
     let prev_row = sqlx::query(
         r"

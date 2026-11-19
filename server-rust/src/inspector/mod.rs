@@ -45,7 +45,9 @@
 //!        frame's bitrate as the track average.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -568,6 +570,7 @@ struct ThroughputSample {
 
 #[derive(Debug, Clone)]
 struct StreamObservation {
+    generation: u64,
     updated_at_ms: u64,
     bytes: u64,
     state: DeliveryState,
@@ -580,12 +583,18 @@ struct StreamObservation {
     source_failed: bool,
 }
 
+type SourceMetadata = Result<Option<AudioMetadataSummary>, ()>;
+type MetadataEntry = Arc<tokio::sync::OnceCell<(Instant, SourceMetadata)>>;
+type SourceMetadataCache = HashMap<(String, AudioStreamInfo), (Instant, MetadataEntry)>;
+
 /// Bounded in-memory stream observation registry tracking active audio streams
 /// for the Now Playing Audio Signal Inspector (`/api/v1/playback/inspect`).
 #[derive(Clone)]
 pub struct AudioMetadataInspector {
     observations: Arc<Mutex<HashMap<(String, String, String), StreamObservation>>>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    next_generation: Arc<AtomicU64>,
+    source_metadata: Arc<Mutex<SourceMetadataCache>>,
 }
 
 impl std::fmt::Debug for AudioMetadataInspector {
@@ -617,6 +626,8 @@ impl AudioMetadataInspector {
         Self {
             observations: Arc::new(Mutex::new(HashMap::new())),
             clock,
+            next_generation: Arc::default(),
+            source_metadata: Arc::default(),
         }
     }
 
@@ -630,11 +641,12 @@ impl AudioMetadataInspector {
         range_header: Option<&str>,
         content_range_header: Option<&str>,
         pipe: Option<AudioStreamInfo>,
-    ) {
+    ) -> u64 {
         if !matches!(status_code, 200 | 206) {
-            return;
+            return 0;
         }
 
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let now = (self.clock)();
         let key = (
             user_id.to_owned(),
@@ -642,14 +654,14 @@ impl AudioMetadataInspector {
             inspection_id.to_owned(),
         );
 
-        let from_start = range_header.is_none_or(|r| {
-            let lower = r.trim().to_ascii_lowercase();
-            lower.starts_with("bytes=0-")
-        }) && content_range_header.is_none_or(|cr| {
-            let lower = cr.trim().to_ascii_lowercase();
-            !lower.starts_with("bytes ")
-                || lower.starts_with("bytes 0-")
-        });
+        let from_start = status_code == 200
+            || range_header.is_none_or(|r| {
+                let lower = r.trim().to_ascii_lowercase();
+                lower.starts_with("bytes=0-")
+            }) && content_range_header.is_none_or(|cr| {
+                let lower = cr.trim().to_ascii_lowercase();
+                !lower.starts_with("bytes ") || lower.starts_with("bytes 0-")
+            });
 
         let mut guard = self
             .observations
@@ -661,11 +673,7 @@ impl AudioMetadataInspector {
         let same_pipe = status_code == 206
             && old
                 .and_then(|o| o.pipe.as_ref().zip(pipe.as_ref()))
-                .is_some_and(|(old_p, new_p)| {
-                    old_p.source_connection_id == new_p.source_connection_id
-                        && old_p.direct == new_p.direct
-                        && old_p.requested_bitrate_kbps == new_p.requested_bitrate_kbps
-                });
+                .is_some_and(|(old_p, new_p)| old_p == new_p);
 
         let preserved_props = if same_pipe {
             old.and_then(|o| o.observed_properties.clone())
@@ -673,15 +681,13 @@ impl AudioMetadataInspector {
             None
         };
         let preserved_source = old
-            .filter(|o| {
-                o.pipe.as_ref().map(|p| &p.source_connection_id)
-                    == pipe.as_ref().map(|p| &p.source_connection_id)
-            })
+            .filter(|o| o.pipe == pipe)
             .and_then(|o| o.source.clone());
 
         guard.insert(
             key,
             StreamObservation {
+                generation,
                 updated_at_ms: now,
                 bytes: 0,
                 state: DeliveryState::Streaming,
@@ -698,27 +704,101 @@ impl AudioMetadataInspector {
             },
         );
         Self::prune_locked(&mut guard, now);
+        generation
+    }
+
+    pub(crate) fn source_descriptor(
+        &self,
+        user: &str,
+        track: &str,
+        inspection: &str,
+    ) -> Option<AudioStreamInfo> {
+        self.observations
+            .lock()
+            .ok()?
+            .get(&(user.to_owned(), track.to_owned(), inspection.to_owned()))?
+            .pipe
+            .clone()
+    }
+
+    pub(crate) async fn cached_source_metadata(
+        &self,
+        track: &str,
+        pipe: &AudioStreamInfo,
+        load: impl Future<Output = SourceMetadata>,
+    ) -> SourceMetadata {
+        let key = (track.to_owned(), pipe.clone());
+        let entry = {
+            let mut cache = self
+                .source_metadata
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            if let Some((_, cached)) = cache.get(&key) {
+                if cached.get().is_some_and(|(loaded, result)| {
+                    now.duration_since(*loaded)
+                        >= Duration::from_secs(if result.is_ok() { 300 } else { 10 })
+                }) {
+                    cache.remove(&key);
+                }
+            }
+            if cache.len() >= 1024 && !cache.contains_key(&key) {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (created, _))| *created)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            Arc::clone(&cache.entry(key).or_insert_with(|| (now, Arc::default())).1)
+        };
+        entry
+            .get_or_init(|| async {
+                let result = tokio::time::timeout(Duration::from_secs(3), load)
+                    .await
+                    .unwrap_or(Err(()));
+                (Instant::now(), result)
+            })
+            .await
+            .1
+            .clone()
     }
 
     /// Feeds a delivered byte chunk into the observation for header parsing and bitrate tracking.
     pub fn record_chunk(&self, user_id: &str, track_id: &str, inspection_id: &str, chunk: &[u8]) {
-        let now = (self.clock)();
-        let key = (
-            user_id.to_owned(),
-            track_id.to_owned(),
-            inspection_id.to_owned(),
+        self.record_sample(
+            &(
+                user_id.to_owned(),
+                track_id.to_owned(),
+                inspection_id.to_owned(),
+            ),
+            None,
+            chunk.len() as u64,
+            chunk,
         );
+    }
 
+    pub(crate) fn record_sample(
+        &self,
+        key: &(String, String, String),
+        generation: Option<u64>,
+        bytes: u64,
+        prefix: &[u8],
+    ) {
+        let now = (self.clock)();
         let mut guard = self
             .observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(obs) = guard.get_mut(&key) else {
+        let Some(obs) = guard
+            .get_mut(key)
+            .filter(|obs| generation.is_none_or(|id| obs.generation == id))
+        else {
             return;
         };
-
         obs.updated_at_ms = now;
-        obs.bytes = obs.bytes.saturating_add(chunk.len() as u64);
+        obs.bytes = obs.bytes.saturating_add(bytes);
 
         let has_multiple = obs.samples.len() > 1;
         if let Some(last) = obs.samples.last_mut()
@@ -739,11 +819,12 @@ impl AudioMetadataInspector {
 
         if obs.from_start
             && obs.observed_properties.is_none()
+            && !prefix.is_empty()
             && obs.header_buf.len() < MAX_HEADER_INSPECTION_BYTES
         {
             let remaining = MAX_HEADER_INSPECTION_BYTES - obs.header_buf.len();
-            let take = chunk.len().min(remaining);
-            obs.header_buf.extend_from_slice(&chunk[..take]);
+            let take = prefix.len().min(remaining);
+            obs.header_buf.extend_from_slice(&prefix[..take]);
             obs.observed_properties = inspect_audio_header(&obs.header_buf);
             if obs.observed_properties.is_some() {
                 obs.header_buf.clear();
@@ -759,14 +840,28 @@ impl AudioMetadataInspector {
         inspection_id: &str,
         state: DeliveryState,
     ) {
-        let now = (self.clock)();
-        let key = (
-            user_id.to_owned(),
-            track_id.to_owned(),
-            inspection_id.to_owned(),
+        self.finish_generation(
+            &(
+                user_id.to_owned(),
+                track_id.to_owned(),
+                inspection_id.to_owned(),
+            ),
+            None,
+            state,
         );
+    }
+
+    pub(crate) fn finish_generation(
+        &self,
+        key: &(String, String, String),
+        generation: Option<u64>,
+        state: DeliveryState,
+    ) {
+        let now = (self.clock)();
         if let Ok(mut guard) = self.observations.lock()
-            && let Some(obs) = guard.get_mut(&key)
+            && let Some(obs) = guard
+                .get_mut(key)
+                .filter(|obs| generation.is_none_or(|id| obs.generation == id))
         {
             obs.state = state;
             obs.updated_at_ms = now;
@@ -798,10 +893,12 @@ impl AudioMetadataInspector {
 
         if let Some(obs) = guard.get_mut(&key)
             && obs.source.is_none()
-            && !obs.source_failed
         {
             match source_meta {
-                Ok(summary) => obs.source = Some(source_properties(summary.as_ref())),
+                Ok(summary) => {
+                    obs.source = Some(source_properties(summary.as_ref()));
+                    obs.source_failed = false;
+                }
                 Err(()) => obs.source_failed = true,
             }
         }

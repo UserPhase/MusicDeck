@@ -253,18 +253,22 @@ pub async fn ensure_master_admin_on_conn(conn: &mut SqliteConnection) -> Result<
     Ok(())
 }
 
-/// Updates `users.last_login_at` and returns the recorded ISO-8601 timestamp.
+/// Records a login only while the verified password hash is current and the account is active.
 pub async fn record_login_on_conn(
     conn: &mut SqliteConnection,
     user_id: &str,
-) -> Result<String, UserError> {
+    verified_password_hash: &str,
+) -> Result<Option<String>, UserError> {
     let logged_in_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?;")
-        .bind(&logged_in_at)
-        .bind(user_id)
-        .execute(&mut *conn)
-        .await?;
-    Ok(logged_in_at)
+    let updated = sqlx::query(
+        "UPDATE users SET last_login_at = ? WHERE id = ? AND password_hash = ? AND disabled = 0;",
+    )
+    .bind(&logged_in_at)
+    .bind(user_id)
+    .bind(verified_password_hash)
+    .execute(&mut *conn)
+    .await?;
+    Ok((updated.rows_affected() == 1).then_some(logged_in_at))
 }
 
 /// Creates a new user account, hashes their password with `Argon2id`, and ensures

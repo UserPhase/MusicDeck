@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
+use crate::error::ApiJson;
 use axum::Router;
-use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,7 +32,6 @@ use crate::acquisition::{
 };
 use crate::auth::AuthenticatedUser;
 use crate::error::ServerError;
-use crate::streaming::http::send_error_response;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,7 +72,7 @@ pub fn acquisition_routes() -> Router<AppState> {
 async fn create_acquisition_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload: Result<Json<AcquisitionCreateOptions>, JsonRejection>,
+    payload: Result<ApiJson<AcquisitionCreateOptions>, crate::error::ApiJsonRejection>,
 ) -> Result<Response, ServerError> {
     if !auth.user.is_admin() && !auth.user.external_playback_enabled {
         return Err(ServerError::Forbidden(String::from(
@@ -81,15 +80,9 @@ async fn create_acquisition_handler(
         )));
     }
 
-    let Json(mut body) = match payload {
+    let ApiJson(mut body) = match payload {
         Ok(body) => body,
-        Err(err) => {
-            return Ok(send_error_response(
-                err.status(),
-                "Invalid download request. Check the track or album details and try again.",
-                "INVALID_ACQUISITION_REQUEST",
-            ));
-        }
+        Err(rejection) => return Ok(rejection.into_response()),
     };
     body.user_id = auth.user.id.clone();
     match state
@@ -255,11 +248,11 @@ async fn stream_acquisition_events_handler(
 async fn start_spotify_playlist_import_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload: Result<Json<StartSpotifyImportBody>, JsonRejection>,
+    payload: Result<ApiJson<StartSpotifyImportBody>, crate::error::ApiJsonRejection>,
 ) -> Result<Response, ServerError> {
-    let Json(body) = match payload {
+    let ApiJson(body) = match payload {
         Ok(body) => body,
-        Err(err) => return Ok(send_error_response(err.status(), "Provide a valid Spotify playlist URL.", "INVALID_PLAYLIST_IMPORT")),
+        Err(rejection) => return Ok(rejection.into_response()),
     };
     if !auth.user.is_admin() && !auth.user.external_playback_enabled {
         return Err(ServerError::Forbidden(String::from(
@@ -385,7 +378,8 @@ mod tests {
                 assert_eq!(body["job"]["userId"], "alice");
                 assert_eq!(body["job"]["requestedTrackId"], "external_deezer_track_123");
             } else {
-                assert_eq!(body["error"]["code"], "INVALID_ACQUISITION_REQUEST");
+                assert_eq!(body["error"]["code"], "INVALID_JSON_DATA");
+                assert!(body["error"]["requestId"].as_str().is_some());
             }
         }
     }

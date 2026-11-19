@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -256,7 +257,7 @@ async fn get_taste_profile_handler(
 async fn post_taste_private_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SetPrivateBody>,
+    ApiJson(body): ApiJson<SetPrivateBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -285,7 +286,7 @@ async fn post_taste_private_handler(
 async fn post_taste_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SetPlaylistBody>,
+    ApiJson(body): ApiJson<SetPlaylistBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -314,7 +315,7 @@ async fn post_taste_playlist_handler(
 async fn post_taste_track_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SetTrackBody>,
+    ApiJson(body): ApiJson<SetTrackBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -355,7 +356,7 @@ async fn post_taste_track_handler(
 async fn post_taste_restore_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<RestoreTasteBody>,
+    ApiJson(body): ApiJson<RestoreTasteBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -389,7 +390,7 @@ async fn post_taste_restore_handler(
 async fn post_taste_reset_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<ResetTasteBody>,
+    ApiJson(body): ApiJson<ResetTasteBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -487,7 +488,7 @@ async fn get_recommendations_handler(
 async fn post_recommendation_feedback_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<RecommendationFeedbackBody>,
+    ApiJson(body): ApiJson<RecommendationFeedbackBody>,
 ) -> Result<Response, ServerError> {
     let Some(action) = FeedbackAction::parse(&body.action) else {
         return Err(ServerError::BadRequest(String::from(
@@ -640,7 +641,7 @@ async fn get_playlist_recommendations_handler(
 async fn post_radio_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Response, ServerError> {
     let Some(pool) = state.db() else {
         return Err(ServerError::ServiceUnavailable(String::from(
@@ -750,7 +751,7 @@ async fn get_saved_filters_handler(
 async fn post_saved_filters_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Response, ServerError> {
     let Some(pool) = state.db() else {
         return Err(ServerError::ServiceUnavailable(String::from(

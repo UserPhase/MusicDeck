@@ -15,7 +15,7 @@
 //!   - [`SpotDLDownloaderPlugin`] (`id = "spotdl-downloader"`)
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,13 +23,14 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
+use tokio::sync::Mutex;
 
 use crate::acquisition::SpotDLOutputFormat;
-use crate::db::DbPool;
+use crate::db::{DbPool, begin_sqlite_write};
 use crate::plugins::manifest::{
     PluginConfigField, PluginConfigOption, PluginConfigSpec, PluginErrorClassification,
-    PluginErrorStatus, PluginManifest, UIExtension, classify_plugin_error, validate_manifest,
+    PluginErrorStatus, PluginManifest, classify_plugin_error, validate_manifest,
 };
 use crate::scrobbling::{LastFmCredentials, LastFmScrobbler, ListenBrainzScrobbler};
 
@@ -84,10 +85,7 @@ pub trait MusicDeckPlugin: Send + Sync {
                 });
             }
         }
-        Ok((
-            true,
-            format!("{} is configured", self.manifest().name),
-        ))
+        Ok((true, format!("{} is configured", self.manifest().name)))
     }
 }
 
@@ -103,13 +101,64 @@ impl MusicDeckPlugin for CustomManifestPlugin {
 }
 
 #[derive(Clone)]
+struct PluginSettings {
+    enabled: bool,
+    config: Value,
+    permissions: Vec<String>,
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            config: json!({}),
+            permissions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PluginRuntimeState {
     plugin: Arc<dyn MusicDeckPlugin>,
     origin: PluginOrigin,
-    status: String,
-    error: Option<String>,
-    logs: Vec<PluginLog>,
-    ui_extensions: Vec<UIExtension>,
+    settings: Option<PluginSettings>,
+}
+
+impl PluginRuntimeState {
+    fn new(plugin: Arc<dyn MusicDeckPlugin>, origin: PluginOrigin) -> Self {
+        Self {
+            plugin,
+            origin,
+            settings: Some(PluginSettings::default()),
+        }
+    }
+}
+
+/// A plugin registry operation that could not be completed.
+#[derive(Debug, thiserror::Error)]
+pub enum PluginRegistryError {
+    #[error("Unknown plugin")]
+    Unknown,
+    #[error("Plugin is already registered")]
+    AlreadyRegistered,
+    #[error("Only custom plugins can be uninstalled")]
+    NotUninstallable,
+    #[error(transparent)]
+    InvalidManifest(#[from] super::manifest::ManifestValidationError),
+    #[error("Plugin configuration must be a JSON object")]
+    InvalidConfiguration,
+    #[error("Stored plugin configuration is invalid")]
+    InvalidStoredConfiguration,
+    #[error("Plugin operation failed")]
+    Rejected(PluginErrorClassification),
+    #[error("Plugin database operation failed: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<PluginErrorClassification> for PluginRegistryError {
+    fn from(error: PluginErrorClassification) -> Self {
+        Self::Rejected(error)
+    }
 }
 
 fn missing_required_fields<'a>(
@@ -178,7 +227,7 @@ fn redact_plugin_config(manifest: &PluginManifest, config: &Value) -> Value {
 #[derive(Clone)]
 pub struct PluginRegistry {
     db: Option<DbPool>,
-    plugins: Arc<RwLock<Vec<PluginRuntimeState>>>,
+    plugins: Arc<Mutex<Vec<PluginRuntimeState>>>,
 }
 
 impl std::fmt::Debug for PluginRegistry {
@@ -188,527 +237,463 @@ impl std::fmt::Debug for PluginRegistry {
 }
 
 impl PluginRegistry {
-    /// Creates a new [`PluginRegistry`] pre-populated with the 5 built-in first-party plugins.
+    /// Creates a registry pre-populated with first-party plugins.
     #[must_use]
     pub fn new(db: Option<DbPool>) -> Self {
-        let registry = Self {
+        let builtins: Vec<Arc<dyn MusicDeckPlugin>> = vec![
+            Arc::new(ListenBrainzPlugin::new()),
+            Arc::new(LastFmPlugin::new()),
+            Arc::new(MusicBrainzPlugin::new()),
+            Arc::new(ExternalArtworkPlugin::new()),
+            Arc::new(SpotDLDownloaderPlugin::new()),
+        ];
+        let states = builtins
+            .into_iter()
+            .map(|plugin| {
+                validate_manifest(plugin.manifest()).expect("valid built-in plugin manifest");
+                PluginRuntimeState::new(plugin, PluginOrigin::FirstParty)
+            })
+            .collect();
+        Self {
             db,
-            plugins: Arc::new(RwLock::new(Vec::new())),
-        };
-        let _ = registry.register_sync(Arc::new(ListenBrainzPlugin::new()), PluginOrigin::FirstParty);
-        let _ = registry.register_sync(Arc::new(LastFmPlugin::new()), PluginOrigin::FirstParty);
-        let _ = registry.register_sync(Arc::new(MusicBrainzPlugin::new()), PluginOrigin::FirstParty);
-        let _ = registry.register_sync(Arc::new(ExternalArtworkPlugin::new()), PluginOrigin::FirstParty);
-        let _ = registry.register_sync(Arc::new(SpotDLDownloaderPlugin::new()), PluginOrigin::FirstParty);
-        registry
+            plugins: Arc::new(Mutex::new(states)),
+        }
     }
 
-    fn register_sync(
+    /// Rehydrates registered manifests and settings from a consistent SQLite snapshot.
+    pub async fn reload_installed(&self) -> Result<(), PluginRegistryError> {
+        let mut states = self.plugins.lock().await;
+        self.refresh_locked(&mut states).await
+    }
+
+    async fn refresh_locked(
         &self,
-        plugin: Arc<dyn MusicDeckPlugin>,
-        origin: PluginOrigin,
-    ) -> Result<(), String> {
-        validate_manifest(plugin.manifest()).map_err(|e| e.0)?;
-        let mut guard = self
-            .plugins
-            .write()
-            .map_err(|_| String::from("Lock poisoned"))?;
-        if guard
-            .iter()
-            .any(|p| p.plugin.manifest().id == plugin.manifest().id)
-        {
-            return Err(String::from("Plugin is already registered"));
-        }
-        guard.push(PluginRuntimeState {
-            plugin,
-            origin,
-            status: String::from("disabled"),
-            error: None,
-            logs: Vec::new(),
-            ui_extensions: Vec::new(),
-        });
+        states: &mut Vec<PluginRuntimeState>,
+    ) -> Result<(), PluginRegistryError> {
+        let Some(pool) = &self.db else {
+            return Ok(());
+        };
+        let mut tx = pool.inner().begin().await?;
+        let snapshot = Self::read_snapshot(&mut tx, states).await?;
+        tx.commit().await?;
+        *states = snapshot;
         Ok(())
     }
 
-    async fn load_db_rows(&self) -> HashMap<String, (bool, Value, Vec<String>)> {
-        let Some(pool) = &self.db else {
-            return HashMap::new();
-        };
-        let rows = sqlx::query(
-            "SELECT plugin_id, enabled, config_json, permissions_json FROM plugin_configs",
+    async fn read_snapshot(
+        conn: &mut SqliteConnection,
+        previous: &[PluginRuntimeState],
+    ) -> Result<Vec<PluginRuntimeState>, sqlx::Error> {
+        let mut states: Vec<_> = previous
+            .iter()
+            .filter(|state| state.origin == PluginOrigin::FirstParty)
+            .cloned()
+            .collect();
+        let manifests: Vec<(String, String)> = sqlx::query_as(
+            "SELECT plugin_id, manifest_json FROM custom_plugins ORDER BY installed_at, plugin_id",
         )
-        .fetch_all(pool.inner())
-        .await
-        .unwrap_or_default();
-
-        rows.into_iter()
-            .filter_map(|r| {
-                let id: String = r.try_get("plugin_id").ok()?;
-                let enabled = r.try_get::<i64, _>("enabled").unwrap_or(0) != 0;
-                let cfg_str: String = r.try_get("config_json").unwrap_or_default();
-                let perms_str: String = r.try_get("permissions_json").unwrap_or_default();
-                let cfg = serde_json::from_str::<Value>(&cfg_str).unwrap_or_else(|_| json!({}));
-                let perms =
-                    serde_json::from_str::<Vec<String>>(&perms_str).unwrap_or_default();
-                Some((id, (enabled, cfg, perms)))
-            })
-            .collect()
-    }
-
-    fn append_log(&self, plugin_id: &str, level: &str, message: &str) {
-        if let Ok(mut guard) = self.plugins.write() {
-            if let Some(state) = guard
-                .iter_mut()
-                .find(|s| s.plugin.manifest().id == plugin_id)
-            {
-                state.logs.push(PluginLog {
-                    level: level.to_owned(),
-                    message: message.chars().take(300).collect(),
-                    created_at: Utc::now().to_rfc3339(),
+        .fetch_all(&mut *conn)
+        .await?;
+        for (id, raw) in manifests {
+            let manifest = serde_json::from_str::<PluginManifest>(&raw)
+                .ok()
+                .filter(|manifest| {
+                    manifest.id == id
+                        && validate_manifest(manifest).is_ok()
+                        && !states.iter().any(|state| state.plugin.manifest().id == id)
                 });
-                if state.logs.len() > 50 {
-                    let drop_n = state.logs.len() - 50;
-                    state.logs.drain(0..drop_n);
-                }
+            if let Some(manifest) = manifest {
+                states.push(PluginRuntimeState::new(
+                    Arc::new(CustomManifestPlugin { manifest }),
+                    PluginOrigin::ThirdParty,
+                ));
+            } else {
+                tracing::warn!(plugin_id = %id, "Skipping invalid persisted custom plugin manifest");
             }
         }
+
+        let settings = sqlx::query(
+            "SELECT plugin_id, enabled, config_json, permissions_json FROM plugin_configs",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut settings_by_id = HashMap::with_capacity(settings.len());
+        for row in settings {
+            let id: String = row.try_get("plugin_id")?;
+            let enabled = row.try_get::<i64, _>("enabled")? != 0;
+            let config: String = row.try_get("config_json")?;
+            let permissions: String = row.try_get("permissions_json")?;
+            let decoded = serde_json::from_str::<Value>(&config)
+                .ok()
+                .filter(Value::is_object)
+                .zip(serde_json::from_str::<Vec<String>>(&permissions).ok())
+                .map(|(config, permissions)| PluginSettings {
+                    enabled,
+                    config,
+                    permissions,
+                });
+            settings_by_id.insert(id, decoded);
+        }
+        for state in &mut states {
+            state.settings = settings_by_id
+                .remove(&state.plugin.manifest().id)
+                .unwrap_or_else(|| Some(PluginSettings::default()));
+            if let Some(settings) = &mut state.settings {
+                let declared = state
+                    .plugin
+                    .manifest()
+                    .permissions
+                    .as_deref()
+                    .unwrap_or(&[]);
+                settings
+                    .permissions
+                    .retain(|permission| declared.contains(permission));
+            }
+        }
+        Ok(states)
     }
 
-    /// Installs a custom third-party plugin from a validated [`PluginManifest`].
-    pub async fn install_custom_plugin(&self, manifest: PluginManifest) -> Result<Value, String> {
-        validate_manifest(&manifest).map_err(|e| e.0)?;
-        let id = manifest.id.clone();
-        self.register_sync(
+    async fn begin_update(
+        &self,
+        states: &[PluginRuntimeState],
+    ) -> Result<
+        (
+            Vec<PluginRuntimeState>,
+            Option<Transaction<'static, Sqlite>>,
+        ),
+        PluginRegistryError,
+    > {
+        let Some(pool) = &self.db else {
+            return Ok((states.to_vec(), None));
+        };
+        // Reserve the SQLite writer before reading settings used by a partial patch.
+        let mut tx = begin_sqlite_write(
+            pool.inner(),
+            "UPDATE plugin_configs SET enabled = enabled WHERE 0",
+        )
+        .await?;
+        let snapshot = Self::read_snapshot(&mut tx, states).await?;
+        Ok((snapshot, Some(tx)))
+    }
+
+    /// Installs a custom plugin disabled and without permission grants.
+    pub async fn install_custom_plugin(
+        &self,
+        manifest: PluginManifest,
+    ) -> Result<Value, PluginRegistryError> {
+        validate_manifest(&manifest)?;
+        let mut states = self.plugins.lock().await;
+        let (mut snapshot, tx) = self.begin_update(&states).await?;
+        let id = &manifest.id;
+        if snapshot
+            .iter()
+            .any(|state| state.plugin.manifest().id == *id)
+        {
+            return Err(PluginRegistryError::AlreadyRegistered);
+        }
+        let mut installed = PluginRuntimeState::new(
             Arc::new(CustomManifestPlugin {
                 manifest: manifest.clone(),
             }),
             PluginOrigin::ThirdParty,
-        )?;
-
-        if let Some(pool) = &self.db {
+        );
+        if let Some(mut tx) = tx {
             let now = Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                r"
-                INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
-                VALUES (?, 0, '{}', '[]', ?)
-                ON CONFLICT(plugin_id) DO UPDATE SET
-                    enabled = 0,
-                    permissions_json = '[]',
-                    updated_at = excluded.updated_at
-                ",
-            )
-            .bind(&id)
-            .bind(&now)
-            .execute(pool.inner())
-            .await;
-
-            let manifest_json =
-                serde_json::to_string(&manifest).unwrap_or_else(|_| String::from("{}"));
-            let _ = sqlx::query(
-                r"
-                INSERT INTO custom_plugins (plugin_id, manifest_json, installed_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(plugin_id) DO UPDATE SET manifest_json = excluded.manifest_json
-                ",
-            )
-            .bind(&id)
-            .bind(manifest_json)
-            .bind(&now)
-            .execute(pool.inner())
-            .await;
+            let inserted = sqlx::query(
+                "INSERT INTO custom_plugins (plugin_id, manifest_json, installed_at) VALUES (?, ?, ?)
+                 ON CONFLICT(plugin_id) DO NOTHING",
+            ).bind(id).bind(json!(manifest).to_string()).bind(&now).execute(&mut *tx).await?;
+            if inserted.rows_affected() != 1 {
+                return Err(PluginRegistryError::AlreadyRegistered);
+            }
+            let config: Option<String> =
+                sqlx::query_scalar("SELECT config_json FROM plugin_configs WHERE plugin_id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let config = config
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let settings = PluginSettings {
+                config,
+                ..PluginSettings::default()
+            };
+            Self::store_settings(&mut tx, id, &settings).await?;
+            tx.commit().await?;
+            installed.settings = Some(settings);
         }
-
-        self.get(&id, true)
-            .await
-            .ok_or_else(|| String::from("Unknown plugin"))
+        let description = describe_plugin(&installed, true);
+        snapshot.push(installed);
+        *states = snapshot;
+        Ok(description)
     }
 
-    /// Uninstalls a third-party custom plugin.
-    pub async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), String> {
-        {
-            let mut guard = self
-                .plugins
-                .write()
-                .map_err(|_| String::from("Lock poisoned"))?;
-            let Some(pos) = guard
-                .iter()
-                .position(|p| p.plugin.manifest().id == plugin_id)
-            else {
-                return Err(String::from("Unknown plugin"));
-            };
-            if guard[pos].origin != PluginOrigin::ThirdParty {
-                return Err(String::from("Only custom plugins can be uninstalled"));
+    /// Removes a custom plugin and its configuration together.
+    pub async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), PluginRegistryError> {
+        let mut states = self.plugins.lock().await;
+        let (mut snapshot, tx) = self.begin_update(&states).await?;
+        let index = snapshot
+            .iter()
+            .position(|state| state.plugin.manifest().id == plugin_id)
+            .ok_or(PluginRegistryError::Unknown)?;
+        if snapshot[index].origin != PluginOrigin::ThirdParty {
+            return Err(PluginRegistryError::NotUninstallable);
+        }
+        if let Some(mut tx) = tx {
+            sqlx::query("DELETE FROM plugin_configs WHERE plugin_id = ?")
+                .bind(plugin_id)
+                .execute(&mut *tx)
+                .await?;
+            let removed = sqlx::query("DELETE FROM custom_plugins WHERE plugin_id = ?")
+                .bind(plugin_id)
+                .execute(&mut *tx)
+                .await?;
+            if removed.rows_affected() != 1 {
+                return Err(sqlx::Error::RowNotFound.into());
             }
-            guard.remove(pos);
+            tx.commit().await?;
         }
-
-        if let Some(pool) = &self.db {
-            let _ = sqlx::query("DELETE FROM plugin_configs WHERE plugin_id = ?")
-                .bind(plugin_id)
-                .execute(pool.inner())
-                .await;
-            let _ = sqlx::query("DELETE FROM custom_plugins WHERE plugin_id = ?")
-                .bind(plugin_id)
-                .execute(pool.inner())
-                .await;
-        }
+        snapshot.remove(index);
+        *states = snapshot;
         Ok(())
     }
 
-    /// Configures `plugin_id`'s settings and approved permissions in `plugin_configs`.
+    /// Merges an admin patch and commits configuration, approvals and enabled state together.
     pub async fn configure(
         &self,
         plugin_id: &str,
         enabled: Option<bool>,
         config: Option<Value>,
         permissions: Option<Vec<String>>,
-    ) -> Result<(), PluginErrorClassification> {
-        let plugin = {
-            let guard = self.plugins.read().ok();
-            guard
-                .and_then(|g| {
-                    g.iter()
-                        .find(|s| s.plugin.manifest().id == plugin_id)
-                        .map(|s| s.plugin.clone())
-                })
-                .ok_or_else(|| PluginErrorClassification {
-                    status: PluginErrorStatus::PluginError,
-                    message: String::from("Unknown plugin"),
-                })?
-        };
-
-        let manifest = plugin.manifest();
-        let declared_perms: HashSet<&str> = manifest
-            .permissions
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .collect();
-
-        if let Some(ref req_perms) = permissions {
-            for p in req_perms {
-                if !declared_perms.contains(p.as_str()) {
-                    return Err(PluginErrorClassification {
-                        status: PluginErrorStatus::PermissionDenied,
-                        message: String::from("Plugin is missing an approved permission"),
-                    });
-                }
-            }
-        }
-
-        let db_rows = self.load_db_rows().await;
-        let (prev_enabled, prev_cfg, prev_perms) = db_rows
-            .get(plugin_id)
-            .cloned()
-            .unwrap_or((false, json!({}), Vec::new()));
-
-        let next_cfg = config.unwrap_or(prev_cfg);
-        plugin.validate_config(&next_cfg)?;
-        let next_perms = permissions.unwrap_or(prev_perms);
-        let next_enabled = enabled.unwrap_or(prev_enabled);
-
-        if let Some(pool) = &self.db {
-            let now = Utc::now().to_rfc3339();
-            let cfg_str =
-                serde_json::to_string(&next_cfg).unwrap_or_else(|_| String::from("{}"));
-            let perms_str =
-                serde_json::to_string(&next_perms).unwrap_or_else(|_| String::from("[]"));
-
-            let _ = sqlx::query(
-                r"
-                INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(plugin_id) DO UPDATE SET
-                    enabled = excluded.enabled,
-                    config_json = excluded.config_json,
-                    permissions_json = excluded.permissions_json,
-                    updated_at = excluded.updated_at
-                ",
-            )
-            .bind(plugin_id)
-            .bind(i64::from(next_enabled))
-            .bind(cfg_str)
-            .bind(perms_str)
-            .bind(now)
-            .execute(pool.inner())
-            .await;
-        }
-
-        Ok(())
-    }
-
-    /// Enables `plugin_id` after verifying all required configuration fields.
-    pub async fn enable(&self, plugin_id: &str) -> Result<(), PluginErrorClassification> {
-        let plugin = {
-            let guard = self.plugins.read().ok();
-            guard
-                .and_then(|g| {
-                    g.iter()
-                        .find(|s| s.plugin.manifest().id == plugin_id)
-                        .map(|s| s.plugin.clone())
-                })
-                .ok_or_else(|| PluginErrorClassification {
-                    status: PluginErrorStatus::PluginError,
-                    message: String::from("Unknown plugin"),
-                })?
-        };
-
-        let db_rows = self.load_db_rows().await;
-        let (_, cfg, perms) = db_rows
-            .get(plugin_id)
-            .cloned()
-            .unwrap_or((false, json!({}), Vec::new()));
-
-        if !missing_required_fields(plugin.manifest(), &cfg).is_empty() {
-            if let Ok(mut guard) = self.plugins.write() {
-                if let Some(st) = guard
-                    .iter_mut()
-                    .find(|s| s.plugin.manifest().id == plugin_id)
-                {
-                    st.status = String::from("error");
-                    st.error = Some(String::from("not_configured"));
-                }
-            }
-            return Err(PluginErrorClassification {
-                status: PluginErrorStatus::NotConfigured,
-                message: String::from("Plugin is misconfigured"),
-            });
-        }
-
-        let approved: HashSet<String> = perms.into_iter().collect();
-        if let Err(err) = plugin.on_enable(&cfg, &approved).await {
-            if let Ok(mut guard) = self.plugins.write() {
-                if let Some(st) = guard
-                    .iter_mut()
-                    .find(|s| s.plugin.manifest().id == plugin_id)
-                {
-                    st.status = String::from("error");
-                    st.error = Some(err.status.as_str().to_owned());
-                }
-            }
-            self.append_log(plugin_id, "error", &format!("enable failed: {}", err.message));
-            return Err(err);
-        }
-
-        if let Ok(mut guard) = self.plugins.write() {
-            if let Some(st) = guard
-                .iter_mut()
-                .find(|s| s.plugin.manifest().id == plugin_id)
-            {
-                st.status = String::from("enabled");
-                st.error = None;
-            }
-        }
-
-        if let Some(pool) = &self.db {
-            let now = Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                r"
-                INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
-                VALUES (?, 1, '{}', '[]', ?)
-                ON CONFLICT(plugin_id) DO UPDATE SET
-                    enabled = 1,
-                    updated_at = excluded.updated_at
-                ",
-            )
-            .bind(plugin_id)
-            .bind(now)
-            .execute(pool.inner())
-            .await;
-        }
-
-        Ok(())
-    }
-
-    /// Disables `plugin_id`.
-    pub async fn disable(&self, plugin_id: &str) -> Result<(), String> {
-        {
-            let mut guard = self
-                .plugins
-                .write()
-                .map_err(|_| String::from("Lock poisoned"))?;
-            let Some(st) = guard
-                .iter_mut()
-                .find(|s| s.plugin.manifest().id == plugin_id)
-            else {
-                return Err(String::from("Unknown plugin"));
+    ) -> Result<Value, PluginRegistryError> {
+        let mut states = self.plugins.lock().await;
+        let (mut snapshot, tx) = self.begin_update(&states).await?;
+        let state = snapshot
+            .iter_mut()
+            .find(|state| state.plugin.manifest().id == plugin_id)
+            .ok_or(PluginRegistryError::Unknown)?;
+        let manifest = state.plugin.manifest();
+        let mut settings = state
+            .settings
+            .take()
+            .ok_or(PluginRegistryError::InvalidStoredConfiguration)?;
+        if let Some(config) = config {
+            let Value::Object(patch) = config else {
+                return Err(PluginRegistryError::InvalidConfiguration);
             };
-            st.status = String::from("disabled");
-            st.ui_extensions.clear();
+            settings
+                .config
+                .as_object_mut()
+                .expect("stored configuration is an object")
+                .extend(patch);
+            state.plugin.validate_config(&settings.config)?;
         }
-
-        if let Some(pool) = &self.db {
-            let now = Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                r"
-                INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
-                VALUES (?, 0, '{}', '[]', ?)
-                ON CONFLICT(plugin_id) DO UPDATE SET
-                    enabled = 0,
-                    updated_at = excluded.updated_at
-                ",
-            )
-            .bind(plugin_id)
-            .bind(now)
-            .execute(pool.inner())
-            .await;
+        if let Some(permissions) = permissions {
+            let declared = manifest.permissions.as_deref().unwrap_or(&[]);
+            if permissions
+                .iter()
+                .any(|permission| !declared.contains(permission))
+            {
+                return Err(PluginErrorClassification {
+                    status: PluginErrorStatus::PermissionDenied,
+                    message: String::from("Plugin is missing an approved permission"),
+                }
+                .into());
+            }
+            settings.permissions = permissions;
         }
+        if let Some(enabled) = enabled {
+            settings.enabled = enabled;
+        }
+        if settings.enabled {
+            if !missing_required_fields(manifest, &settings.config).is_empty() {
+                return Err(PluginErrorClassification {
+                    status: PluginErrorStatus::NotConfigured,
+                    message: String::from("Plugin is misconfigured"),
+                }
+                .into());
+            }
+            state.plugin.validate_config(&settings.config)?;
+            if enabled == Some(true) {
+                let approved = settings.permissions.iter().cloned().collect();
+                state.plugin.on_enable(&settings.config, &approved).await?;
+            }
+        }
+        if let Some(mut tx) = tx {
+            Self::store_settings(&mut tx, plugin_id, &settings).await?;
+            tx.commit().await?;
+        }
+        state.settings = Some(settings);
+        let description = describe_plugin(state, true);
+        *states = snapshot;
+        Ok(description)
+    }
 
+    async fn store_settings(
+        conn: &mut SqliteConnection,
+        plugin_id: &str,
+        settings: &PluginSettings,
+    ) -> Result<(), sqlx::Error> {
+        let changed = sqlx::query(
+            "INSERT INTO plugin_configs (plugin_id, enabled, config_json, permissions_json, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(plugin_id) DO UPDATE SET enabled = excluded.enabled, config_json = excluded.config_json,
+               permissions_json = excluded.permissions_json, updated_at = excluded.updated_at",
+        ).bind(plugin_id).bind(settings.enabled).bind(settings.config.to_string())
+            .bind(json!(settings.permissions).to_string()).bind(Utc::now().to_rfc3339())
+            .execute(conn).await?;
+        if changed.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
-    /// Lists all registered plugins (`admin == true` includes redacted config, logs, and errors).
-    pub async fn list(&self, admin: bool) -> Vec<Value> {
-        let db_rows = self.load_db_rows().await;
-        let states: Vec<PluginRuntimeState> = self
-            .plugins
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-
-        states
-            .into_iter()
-            .map(|st| {
-                let m = st.plugin.manifest();
-                let (db_enabled, cfg, approved_perms) = db_rows
-                    .get(&m.id)
-                    .cloned()
-                    .unwrap_or((false, json!({}), Vec::new()));
-
-                let missing = missing_required_fields(m, &cfg);
-                let status = if db_enabled && st.status == "disabled" {
-                    "enabled"
-                } else {
-                    st.status.as_str()
-                };
-                let health = if status == "error" {
-                    "error"
-                } else if status == "enabled" {
-                    "healthy"
-                } else if !missing.is_empty() {
-                    "unconfigured"
-                } else {
-                    "disabled"
-                };
-
-                let config_fields: Vec<Value> = m
-                    .config
-                    .as_ref()
-                    .map(|c| {
-                        c.fields
-                            .iter()
-                            .map(|f| {
-                                let val_opt = cfg.as_object().and_then(|o| o.get(&f.key));
-                                let configured = match val_opt {
-                                    None | Some(Value::Null) => false,
-                                    Some(Value::String(s)) => !s.is_empty(),
-                                    _ => true,
-                                };
-                                let mut obj = json!({
-                                    "key": f.key,
-                                    "label": f.label.as_deref().unwrap_or(&f.key),
-                                    "type": f.field_type,
-                                    "options": f.options,
-                                    "description": f.description,
-                                    "secret": f.secret,
-                                    "required": f.required,
-                                    "configured": configured,
-                                });
-                                if !f.secret {
-                                    if let Some(ref def) = f.default {
-                                        obj["default"] = def.clone();
-                                    }
-                                }
-                                obj
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let mut item = json!({
-                    "id": m.id,
-                    "name": m.name,
-                    "version": m.version,
-                    "description": m.description,
-                    "author": m.author,
-                    "origin": st.origin,
-                    "capabilities": m.capabilities,
-                    "permissions": m.permissions.clone().unwrap_or_default(),
-                    "approvedPermissions": approved_perms,
-                    "enabled": db_enabled,
-                    "status": status,
-                    "health": health,
-                    "config": if admin { redact_plugin_config(m, &cfg) } else { json!({}) },
-                    "configFields": config_fields,
-                    "configRequired": missing.iter().map(|f| &f.key).collect::<Vec<_>>(),
-                    "uiExtensions": st.ui_extensions,
-                });
-
-                if admin {
-                    let recent_logs: Vec<&PluginLog> =
-                        st.logs.iter().rev().take(10).rev().collect();
-                    item["logs"] = json!(recent_logs);
-                    item["error"] = json!(st.error);
-                }
-
-                item
-            })
-            .collect()
+    /// Enables a plugin after checking its configuration.
+    pub async fn enable(&self, plugin_id: &str) -> Result<(), PluginRegistryError> {
+        self.configure(plugin_id, Some(true), None, None)
+            .await
+            .map(|_| ())
     }
 
-    /// Retrieves a single plugin descriptor by `plugin_id`.
-    pub async fn get(&self, plugin_id: &str, admin: bool) -> Option<Value> {
-        self.list(admin)
+    /// Disables a plugin and preserves its saved configuration.
+    pub async fn disable(&self, plugin_id: &str) -> Result<(), PluginRegistryError> {
+        self.configure(plugin_id, Some(false), None, None)
             .await
-            .into_iter()
-            .find(|item| item.get("id").and_then(Value::as_str) == Some(plugin_id))
+            .map(|_| ())
+    }
+
+    /// Lists registered plugins from committed state.
+    pub async fn list(&self, admin: bool) -> Result<Vec<Value>, PluginRegistryError> {
+        let mut states = self.plugins.lock().await;
+        // Refresh from SQLite even after an abandoned request or runtime restore.
+        self.refresh_locked(&mut states).await?;
+        Ok(states
+            .iter()
+            .map(|state| describe_plugin(state, admin))
+            .collect())
+    }
+
+    /// Retrieves the committed descriptor for one plugin.
+    pub async fn get(
+        &self,
+        plugin_id: &str,
+        admin: bool,
+    ) -> Result<Option<Value>, PluginRegistryError> {
+        let mut states = self.plugins.lock().await;
+        self.refresh_locked(&mut states).await?;
+        Ok(states
+            .iter()
+            .find(|state| state.plugin.manifest().id == plugin_id)
+            .map(|state| describe_plugin(state, admin)))
     }
 
     /// Runs the connectivity/configuration test for `plugin_id`.
-    pub async fn test(&self, plugin_id: &str) -> Result<Value, String> {
-        let plugin = {
-            let guard = self.plugins.read().ok();
-            guard
-                .and_then(|g| {
-                    g.iter()
-                        .find(|s| s.plugin.manifest().id == plugin_id)
-                        .map(|s| s.plugin.clone())
-                })
-                .ok_or_else(|| String::from("Unknown plugin"))?
+    pub async fn test(&self, plugin_id: &str) -> Result<Value, PluginRegistryError> {
+        let state = {
+            let mut states = self.plugins.lock().await;
+            self.refresh_locked(&mut states).await?;
+            states
+                .iter()
+                .find(|state| state.plugin.manifest().id == plugin_id)
+                .cloned()
+                .ok_or(PluginRegistryError::Unknown)?
         };
-
-        let db_rows = self.load_db_rows().await;
-        let (_, cfg, perms) = db_rows
-            .get(plugin_id)
-            .cloned()
-            .unwrap_or((false, json!({}), Vec::new()));
-
-        if !missing_required_fields(plugin.manifest(), &cfg).is_empty() {
+        let settings = state
+            .settings
+            .ok_or(PluginRegistryError::InvalidStoredConfiguration)?;
+        if !missing_required_fields(state.plugin.manifest(), &settings.config).is_empty() {
             return Ok(json!({
-                "id": plugin_id,
-                "ok": false,
-                "status": "not_configured",
+                "id": plugin_id, "ok": false, "status": "not_configured",
                 "message": "Plugin is not fully configured",
             }));
         }
-
-        let approved: HashSet<String> = perms.into_iter().collect();
-        match plugin.test(&cfg, &approved).await {
-            Ok((ok, msg)) => Ok(json!({
-                "id": plugin_id,
-                "ok": ok,
-                "status": if ok { "success" } else { "provider_unavailable" },
-                "message": msg,
+        let approved = settings.permissions.into_iter().collect();
+        match state.plugin.test(&settings.config, &approved).await {
+            Ok((ok, message)) => Ok(json!({
+                "id": plugin_id, "ok": ok, "status": if ok { "success" } else { "provider_unavailable" }, "message": message,
             })),
-            Err(classified) => Ok(json!({
-                "id": plugin_id,
-                "ok": false,
-                "status": classified.status.as_str(),
-                "message": classified.message,
+            Err(error) => Ok(json!({
+                "id": plugin_id, "ok": false, "status": error.status.as_str(), "message": error.message,
             })),
         }
     }
+}
+
+fn describe_plugin(st: &PluginRuntimeState, admin: bool) -> Value {
+    let m = st.plugin.manifest();
+    let defaults = PluginSettings::default();
+    let settings = st.settings.as_ref().unwrap_or(&defaults);
+    let cfg = &settings.config;
+    let missing = missing_required_fields(m, cfg);
+    let (status, health) = if st.settings.is_none() {
+        ("error", "error")
+    } else if settings.enabled {
+        ("enabled", "healthy")
+    } else if !missing.is_empty() {
+        ("disabled", "unconfigured")
+    } else {
+        ("disabled", "disabled")
+    };
+    let config_fields: Vec<Value> = m
+        .config
+        .as_ref()
+        .map(|c| {
+            c.fields
+                .iter()
+                .map(|f| {
+                    let val_opt = cfg.as_object().and_then(|o| o.get(&f.key));
+                    let configured = match val_opt {
+                        None | Some(Value::Null) => false,
+                        Some(Value::String(s)) => !s.is_empty(),
+                        _ => true,
+                    };
+                    let mut obj = json!({
+                        "key": f.key,
+                        "label": f.label.as_deref().unwrap_or(&f.key),
+                        "type": f.field_type,
+                        "options": f.options,
+                        "description": f.description,
+                        "secret": f.secret,
+                        "required": f.required,
+                        "configured": configured,
+                    });
+                    if !f.secret {
+                        if let Some(ref def) = f.default {
+                            obj["default"] = def.clone();
+                        }
+                    }
+                    obj
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut item = json!({
+        "id": m.id,
+        "name": m.name,
+        "version": m.version,
+        "description": m.description,
+        "author": m.author,
+        "origin": st.origin,
+        "capabilities": m.capabilities,
+        "permissions": m.permissions.clone().unwrap_or_default(),
+        "approvedPermissions": settings.permissions,
+        "enabled": settings.enabled,
+        "status": status,
+        "health": health,
+        "config": if admin { redact_plugin_config(m, cfg) } else { json!({}) },
+        "configFields": config_fields,
+        "configRequired": missing.iter().map(|f| &f.key).collect::<Vec<_>>(),
+        "uiExtensions": [],
+    });
+
+    if admin {
+        item["logs"] = json!([]);
+        item["error"] = json!(st.settings.is_none().then_some("invalid_configuration"));
+    }
+    item
 }
 
 // ============================================================================
@@ -1244,5 +1229,225 @@ impl MusicDeckPlugin for SpotDLDownloaderPlugin {
             message: msg,
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use crate::plugins::parse_custom_manifest;
+    use crate::{AppConfig, AppState};
+
+    fn manifest(id: &str) -> PluginManifest {
+        parse_custom_manifest(&json!({
+            "manifestVersion": 1, "id": id, "name": "Fixture plugin", "version": "1.0.0",
+            "capabilities": ["lyrics"], "permissions": ["network.request"],
+            "configuration": {"token": {"type": "secret", "required": true}},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_rehydrates_valid_custom_plugins_with_committed_settings() {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        let plugins = PluginRegistry::new(Some(db.clone()));
+        plugins
+            .install_custom_plugin(manifest("fixture.lyrics"))
+            .await
+            .unwrap();
+        plugins
+            .configure(
+                "fixture.lyrics",
+                Some(true),
+                Some(json!({"token": "secret", "region": "nl"})),
+                Some(vec!["network.request".into()]),
+            )
+            .await
+            .unwrap();
+        for (id, value) in [
+            ("wrong-row-id", json!(manifest("embedded-id")).to_string()),
+            ("invalid", "{}".into()),
+            ("lastfm", json!(manifest("lastfm")).to_string()),
+        ] {
+            sqlx::query("INSERT INTO custom_plugins (plugin_id, manifest_json, installed_at) VALUES (?, ?, '2026')")
+                .bind(id).bind(value).execute(db.inner()).await.unwrap();
+        }
+
+        let state = AppState::with_database(AppConfig::default(), db.clone())
+            .await
+            .unwrap();
+        {
+            let loaded = state.plugins().plugins.lock().await;
+            assert!(loaded.iter().any(|state| {
+                state.origin == PluginOrigin::ThirdParty
+                    && state.plugin.manifest().id == "fixture.lyrics"
+                    && state
+                        .settings
+                        .as_ref()
+                        .is_some_and(|settings| settings.enabled)
+            }));
+            assert_eq!(
+                loaded
+                    .iter()
+                    .filter(|state| state.origin == PluginOrigin::ThirdParty)
+                    .count(),
+                1
+            );
+        }
+        let installed = state
+            .plugins()
+            .get("fixture.lyrics", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed["enabled"], true);
+        assert_eq!(installed["config"], json!({"token": true, "region": "nl"}));
+        assert_eq!(installed["approvedPermissions"], json!(["network.request"]));
+        assert_eq!(
+            state.plugins().get("lastfm", true).await.unwrap().unwrap()["origin"],
+            "first-party"
+        );
+
+        sqlx::query("DROP TABLE custom_plugins")
+            .execute(db.inner())
+            .await
+            .unwrap();
+        let error = AppState::with_database(AppConfig::default(), db)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::state::AppStateInitError::Plugins(PluginRegistryError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_plugin_writes_leave_the_prior_manifest_and_configuration_intact() {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        let registry = PluginRegistry::new(Some(db.clone()));
+        sqlx::query("CREATE TRIGGER fail_install BEFORE INSERT ON plugin_configs BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+            .execute(db.inner()).await.unwrap();
+        assert!(matches!(
+            registry
+                .install_custom_plugin(manifest("fixture.lyrics"))
+                .await,
+            Err(PluginRegistryError::Database(_))
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM custom_plugins")
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            registry
+                .get("fixture.lyrics", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        sqlx::query("DROP TRIGGER fail_install")
+            .execute(db.inner())
+            .await
+            .unwrap();
+        registry
+            .install_custom_plugin(manifest("fixture.lyrics"))
+            .await
+            .unwrap();
+        registry
+            .configure(
+                "fixture.lyrics",
+                Some(true),
+                Some(json!({"token": "secret"})),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = registry.get("fixture.lyrics", true).await.unwrap().unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER fail_config BEFORE UPDATE ON plugin_configs BEGIN SELECT RAISE(ABORT, 'fixture'); END;
+             CREATE TRIGGER fail_removal BEFORE DELETE ON custom_plugins BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+        ).execute(db.inner()).await.unwrap();
+
+        assert!(
+            registry
+                .configure("fixture.lyrics", None, Some(json!({"region": "nl"})), None)
+                .await
+                .is_err()
+        );
+        assert!(registry.disable("fixture.lyrics").await.is_err());
+        assert!(registry.uninstall_plugin("fixture.lyrics").await.is_err());
+        assert_eq!(
+            registry.get("fixture.lyrics", true).await.unwrap().unwrap(),
+            before
+        );
+
+        sqlx::raw_sql("DROP TRIGGER fail_config; DROP TRIGGER fail_removal;")
+            .execute(db.inner())
+            .await
+            .unwrap();
+        registry.disable("fixture.lyrics").await.unwrap();
+        registry.enable("fixture.lyrics").await.unwrap();
+        registry.uninstall_plugin("fixture.lyrics").await.unwrap();
+        assert!(
+            registry
+                .get("fixture.lyrics", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let configs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM plugin_configs WHERE plugin_id = 'fixture.lyrics'",
+        )
+        .fetch_one(db.inner())
+        .await
+        .unwrap();
+        assert_eq!(configs, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_wal_patches_merge_under_the_database_writer_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DbPool::connect(&temp.path().join("plugins.sqlite"))
+            .await
+            .unwrap();
+        run_migrations(&db, None).await.unwrap();
+        let first = PluginRegistry::new(Some(db.clone()));
+        let second = PluginRegistry::new(Some(db.clone()));
+        first
+            .install_custom_plugin(manifest("fixture.lyrics"))
+            .await
+            .unwrap();
+        first
+            .configure(
+                "fixture.lyrics",
+                Some(true),
+                Some(json!({"token": "retained"})),
+                None,
+            )
+            .await
+            .unwrap();
+        let (first_result, second_result) = tokio::join!(
+            first.configure("fixture.lyrics", None, Some(json!({"region": "nl"})), None),
+            second.configure(
+                "fixture.lyrics",
+                None,
+                Some(json!({"limit": 12})),
+                Some(vec!["network.request".into()])
+            ),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        let committed = first.get("fixture.lyrics", true).await.unwrap().unwrap();
+        assert_eq!(
+            committed["config"],
+            json!({"token": true, "region": "nl", "limit": 12})
+        );
+        assert_eq!(committed["enabled"], true);
+        assert_eq!(committed["approvedPermissions"], json!(["network.request"]));
+        db.close().await;
     }
 }

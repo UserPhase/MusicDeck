@@ -461,15 +461,9 @@ async fn delete_admin_album_handler(
 async fn get_admin_acquisitions_summary_handler(
     State(state): State<AppState>,
     admin: RequireAdmin,
-) -> Response {
-    let recent_jobs = state
-        .acquisitions()
-        .list_jobs(&admin.user.id, true)
-        .await;
-    let active_jobs = recent_jobs
-        .iter()
-        .filter(|j| j.status.is_active())
-        .count();
+) -> Result<Response, ServerError> {
+    let recent_jobs = state.acquisitions().list_jobs(&admin.user.id, true).await;
+    let active_jobs = recent_jobs.iter().filter(|j| j.status.is_active()).count();
     let queued_jobs = recent_jobs
         .iter()
         .filter(|j| j.status == crate::acquisition::AcquisitionJobStatus::Queued)
@@ -483,7 +477,19 @@ async fn get_admin_acquisitions_summary_handler(
         .filter(|j| j.status == crate::acquisition::AcquisitionJobStatus::Failed)
         .count();
 
-    (
+    let config = state.config();
+    let staging_root = canonical_staging_root(
+        Path::new(&config.acquisition_tmp_dir),
+        Path::new(&config.music_root),
+    )
+    .await?;
+    let bytes = if let Some(root) = staging_root {
+        staging_usage(&root, false).await.map_err(staging_error)?.1
+    } else {
+        0
+    };
+
+    Ok((
         StatusCode::OK,
         Json(json!({
             "activeJobs": active_jobs,
@@ -491,25 +497,196 @@ async fn get_admin_acquisitions_summary_handler(
             "completedJobs": completed_jobs,
             "failedJobs": failed_jobs,
             "totalJobs": recent_jobs.len(),
-            "storageUsedBytes": 0,
-            "tempStorageUsedBytes": 0,
+            "storageUsedBytes": bytes,
+            "tempStorageUsedBytes": bytes,
             "musicRoot": state.config().music_root,
-            "downloadDirectory": state.config().music_root,
+            "downloadDirectory": config.acquisition_tmp_dir,
             "maxConcurrentDownloads": 1,
             "autoScanLibrary": true,
             "cleanupPolicy": "on_completion",
             "recentJobs": recent_jobs,
         })),
     )
-        .into_response()
+        .into_response())
 }
 
-async fn post_admin_acquisitions_cleanup_handler(_admin: RequireAdmin) -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({ "filesRemoved": 0, "bytesFreed": 0 })),
+async fn post_admin_acquisitions_cleanup_handler(
+    State(state): State<AppState>,
+    _admin: RequireAdmin,
+) -> Result<Json<Value>, ServerError> {
+    let config = state.config();
+    let Some(root) = canonical_staging_root(
+        Path::new(&config.acquisition_tmp_dir),
+        Path::new(&config.music_root),
     )
-        .into_response()
+    .await?
+    else {
+        return Ok(Json(json!({ "filesRemoved": 0, "bytesFreed": 0 })));
+    };
+    let db = state.db().ok_or_else(|| {
+        ServerError::ServiceUnavailable("Acquisition storage is unavailable".into())
+    })?;
+    // Completed jobs are immutable. Failed, partial and cancelled attempts can
+    // still have inputs needed for a retry, including stages from older attempts.
+    let completed: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM acquisition_jobs WHERE status='completed'
+           AND NOT EXISTS (SELECT 1 FROM background_tasks
+                WHERE id=acquisition_jobs.active_task_id AND state IN ('QUEUED','PROCESSING','PAUSED'))
+         UNION ALL
+         SELECT id FROM import_jobs WHERE status='COMPLETED'
+           AND NOT EXISTS (SELECT 1 FROM background_tasks
+                WHERE type='SPOTDL_IMPORT' AND state IN ('QUEUED','PROCESSING','PAUSED')
+                  AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json END, '$.jobId')=import_jobs.id)",
+    )
+    .fetch_all(db.inner()).await.map_err(|err| {
+        tracing::warn!(error = %err, "Could not verify eligibility for staging cleanup");
+        ServerError::ServiceUnavailable("Acquisition storage is unavailable".into())
+    })?;
+    let (files, bytes) = cleanup_staging_usage(&root, &completed.into_iter().collect())
+        .await
+        .map_err(staging_error)?;
+    Ok(Json(json!({ "filesRemoved": files, "bytesFreed": bytes })))
+}
+
+fn staging_error(err: std::io::Error) -> ServerError {
+    tracing::warn!(error = %err, "Could not access acquisition staging");
+    ServerError::ServiceUnavailable("Acquisition staging is unavailable".into())
+}
+
+async fn canonical_staging_root(
+    staging: &Path,
+    music: &Path,
+) -> Result<Option<PathBuf>, ServerError> {
+    let root = match tokio::fs::canonicalize(staging).await {
+        Ok(root) => root,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(staging_error(err)),
+    };
+    match tokio::fs::canonicalize(music).await {
+        Ok(music) if music.starts_with(&root) => {
+            return Err(ServerError::ServiceUnavailable(
+                "The staging directory overlaps the music library".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(staging_error(err)),
+    }
+    if root.parent().is_none() {
+        return Err(ServerError::ServiceUnavailable(
+            "The staging directory must be a dedicated directory".into(),
+        ));
+    }
+    Ok(Some(root))
+}
+
+fn staging_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    metadata.is_symlink()
+}
+
+async fn cleanup_staging_usage(
+    root: &Path,
+    completed: &HashSet<String>,
+) -> std::io::Result<(u64, u64)> {
+    let mut entries = tokio::fs::read_dir(root).await?;
+    let (mut files, mut bytes) = (0_u64, 0_u64);
+    while let Some(entry) = entries.next_entry().await? {
+        let basename = entry.file_name();
+        let Some(name) = basename.to_str() else {
+            continue;
+        };
+        let job = if name.starts_with("spimp_") {
+            name
+        } else if name.starts_with("acq_") {
+            let Some((job, task)) = name.rsplit_once("-task_") else {
+                continue;
+            };
+            if task.len() != 16 {
+                continue;
+            }
+            job
+        } else {
+            continue;
+        };
+        if !completed.contains(job) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if metadata.is_dir() && !staging_link(&metadata) {
+            let (removed, reclaimed) = staging_usage(&path, true).await?;
+            files = files.saturating_add(removed);
+            bytes = bytes.saturating_add(reclaimed);
+        }
+    }
+    Ok((files, bytes))
+}
+
+async fn staging_usage(root: &Path, remove: bool) -> std::io::Result<(u64, u64)> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut dirs = Vec::new();
+    let (mut files, mut bytes) = (0_u64, 0_u64);
+    while let Some(path) = pending.pop() {
+        match tokio::fs::canonicalize(&path).await {
+            Ok(canonical) if canonical == path => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        }
+        let children = tokio::fs::read_dir(&path).await;
+        let mut children = match children {
+            Ok(children) => children,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if remove {
+            dirs.push(path);
+        }
+        while let Some(entry) = children.next_entry().await? {
+            let path = entry.path();
+            let metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if staging_link(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                if remove {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "Could not remove a completed staging file");
+                            continue;
+                        }
+                    }
+                    files = files.saturating_add(1);
+                }
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    for path in dirs.into_iter().rev() {
+        // Any retained symlink or concurrent file leaves its parent in place.
+        let _ = tokio::fs::remove_dir(path).await;
+    }
+    Ok((files, bytes))
 }
 
 async fn post_admin_acquisitions_scan_handler(State(state): State<AppState>, _admin: RequireAdmin) -> Result<Response, ServerError> {
@@ -528,4 +705,54 @@ async fn get_downloader_diagnostics_handler(State(state): State<AppState>, _admi
         "diagnostics": diag,
     })];
     Ok(Json(json!({ "downloaders": downloaders })).into_response())
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn staging_counts_and_cleanup_keep_active_inputs_and_skip_links() {
+        let staging = tempfile::tempdir().unwrap();
+        let music = tempfile::tempdir().unwrap();
+        let root = canonical_staging_root(staging.path(), music.path())
+            .await
+            .unwrap()
+            .unwrap();
+        for (name, bytes) in [
+            ("spimp_finished", 20),
+            ("spimp_active", 31),
+            ("acq_failed-task_0123456789abcdef", 43),
+            ("ordinary-folder", 59),
+        ] {
+            let nested = root.join(name).join("nested");
+            tokio::fs::create_dir_all(&nested).await.unwrap();
+            tokio::fs::write(nested.join("audio.flac"), vec![0; bytes])
+                .await
+                .unwrap();
+        }
+        let outside_file = music.path().join("original.flac");
+        tokio::fs::write(&outside_file, [1, 2, 3]).await.unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(music.path(), root.join("spimp_finished").join("outside"))
+            .unwrap();
+
+        assert_eq!(staging_usage(&root, false).await.unwrap().1, 153);
+        let completed = HashSet::from(["spimp_finished".to_owned(), "ordinary-folder".to_owned()]);
+        assert_eq!(
+            cleanup_staging_usage(&root, &completed).await.unwrap(),
+            (1, 20)
+        );
+        assert_eq!(
+            cleanup_staging_usage(&root, &completed).await.unwrap(),
+            (0, 0)
+        );
+        assert_eq!(staging_usage(&root, false).await.unwrap().1, 133);
+        assert_eq!(tokio::fs::read(outside_file).await.unwrap(), [1, 2, 3]);
+        assert!(
+            canonical_staging_root(music.path(), music.path())
+                .await
+                .is_err()
+        );
+    }
 }

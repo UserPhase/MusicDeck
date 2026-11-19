@@ -281,16 +281,17 @@ impl LibraryService {
 
     /// Reads the current `content_revision` token for a track.
     pub async fn get_content_revision(&self, track_id: &str) -> Result<Option<String>, DbError> {
-        let row = sqlx::query(
+        Ok(self.track_content_revision(track_id).await?.filter(|revision| !revision.is_empty()))
+    }
+
+    /// An empty revision is valid for an older row. `None` means the track does not exist.
+    pub(crate) async fn track_content_revision(&self, track_id: &str) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
             "SELECT content_revision FROM library_items WHERE id = ? AND type = 'track';",
         )
         .bind(track_id)
         .fetch_optional(self.db.inner())
-        .await?;
-
-        Ok(row
-            .and_then(|r| r.try_get::<String, _>("content_revision").ok())
-            .filter(|s| !s.is_empty()))
+        .await?)
     }
 
     /// Rotates `content_revision` and invalidates cached silence analyses for all tracks

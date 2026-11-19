@@ -24,7 +24,7 @@ pub use manifest::{
 };
 pub use registry::{
     ExternalArtworkPlugin, LastFmPlugin, ListenBrainzPlugin, MusicBrainzPlugin, MusicDeckPlugin,
-    PluginLog, PluginOrigin, PluginRegistry, SpotDLDownloaderPlugin,
+    PluginLog, PluginOrigin, PluginRegistry, PluginRegistryError, SpotDLDownloaderPlugin,
 };
 
 #[cfg(test)]

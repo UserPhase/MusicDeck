@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -170,7 +171,7 @@ async fn get_task_logs_handler(
 async fn enqueue_task_handler(
     State(state): State<AppState>,
     admin: RequireAdmin,
-    Json(body): Json<EnqueueTaskBody>,
+    ApiJson(body): ApiJson<EnqueueTaskBody>,
 ) -> Result<Response, ServerError> {
     let task = state
         .tasks()
@@ -229,7 +230,7 @@ async fn reprioritize_task_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(task_id): Path<String>,
-    Json(body): Json<PatchPriorityBody>,
+    ApiJson(body): ApiJson<PatchPriorityBody>,
 ) -> Result<Response, ServerError> {
     let task = state
         .tasks()
@@ -250,7 +251,7 @@ async fn list_schedules_handler(
 async fn put_schedule_handler(
     State(state): State<AppState>,
     admin: RequireAdmin,
-    Json(body): Json<PutScheduleBody>,
+    ApiJson(body): ApiJson<PutScheduleBody>,
 ) -> Result<Response, ServerError> {
     let schedule = state
         .tasks()

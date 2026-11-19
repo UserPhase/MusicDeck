@@ -211,6 +211,9 @@ export class PlaybackEngine implements QueuePlaybackEngine {
           this.emit("bufferStall", info);
         },
         onRecovered: (info) => {
+          if (info.streamUrl && this.activeSourceTrack?.key === info.key) {
+            this.activeSourceTrack = { ...this.activeSourceTrack, src: info.streamUrl };
+          }
           this.emit("streamRecovered", info);
           this.setState(this.wantsPlayback ? "playing" : "paused");
           this.emitTime();
@@ -613,8 +616,8 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       void this.remoteOutput.pause().catch((error) => this.remoteFailure(error));
       return;
     }
+    this.active?.pause();
     this.cancelTransition("paused");
-    if (!this.recovery.isRecovering()) this.active?.pause();
     this.setState(this.active ? "paused" : "idle");
   }
 

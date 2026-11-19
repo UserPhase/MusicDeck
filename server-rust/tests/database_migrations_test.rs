@@ -62,6 +62,50 @@ impl FileDbFixture {
 // ============================================================================
 
 #[tokio::test]
+async fn concurrent_migrators_apply_each_pending_schema_version_once() {
+    let fixture = FileDbFixture::new();
+    let pool = DbPool::connect(&fixture.db_path).await.unwrap();
+    run_migrations(&pool, Some(50)).await.unwrap();
+    let other_pool = DbPool::connect(&fixture.db_path).await.unwrap();
+
+    let (first, second) = tokio::join!(run_migrations(&pool, None), run_migrations(&other_pool, None));
+    let first = first.expect("first migrator");
+    let second = second.expect("second migrator");
+    assert_eq!(first.total_applied, LATEST_SCHEMA_VERSION as usize);
+    assert_eq!(second.total_applied, LATEST_SCHEMA_VERSION as usize);
+    let mut applied: Vec<_> = first.newly_applied.into_iter().chain(second.newly_applied).collect();
+    applied.sort_unstable();
+    assert_eq!(applied, (51..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>());
+    other_pool.close().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn failed_migration_reports_its_version_and_rolls_back_its_schema_and_ledger() {
+    let pool = DbPool::connect_memory().await.unwrap();
+    run_migrations(&pool, Some(50)).await.unwrap();
+    sqlx::query("ALTER TABLE acquisition_jobs ADD COLUMN expected_count INTEGER;")
+        .execute(pool.inner())
+        .await
+        .unwrap();
+
+    let error = run_migrations(&pool, Some(51)).await.unwrap_err();
+    assert!(matches!(error, DbError::Migration { id: 51, name: "acquisition-execution-checkpoints", .. }));
+    let applied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE id = 51)")
+        .fetch_one(pool.inner())
+        .await
+        .unwrap();
+    assert!(!applied);
+    let has_checkpoint_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('acquisition_jobs') WHERE name = 'active_task_id')",
+    )
+    .fetch_one(pool.inner())
+    .await
+    .unwrap();
+    assert!(!has_checkpoint_column);
+}
+
+#[tokio::test]
 async fn fresh_in_memory_database_applies_all_50_migrations_and_uses_catalog_indexes() {
     let pool = DbPool::connect_memory().await.expect("open in-memory pool");
 

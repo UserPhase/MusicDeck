@@ -281,7 +281,7 @@ pub struct LibraryScanResult {
 }
 
 /// Metadata describing how an audio stream was negotiated with the upstream provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioStreamInfo {
     /// `true` when streaming raw/direct source bytes without server-side transcoding.
@@ -291,6 +291,9 @@ pub struct AudioStreamInfo {
     /// Source connection ID that served the stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_connection_id: Option<String>,
+    /// Provider-native ID of the exact item used for the audio representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_item_id: Option<String>,
 }
 
 /// Upstream HTTP stream or artwork response returned by [`crate::providers::MusicBackend`].
@@ -329,10 +332,9 @@ pub type AudioMetadata = AudioMetadataSummary;
 /// Type alias for [`LoudnessMetadata`].
 pub type Loudness = LoudnessMetadata;
 
-/// Buffered upstream stream response returned by preview and external source providers.
-#[derive(Debug, Clone)]
+/// Capped upstream response returned before any media body is read.
+#[derive(Debug)]
 pub struct UpstreamStreamResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub bytes: bytes::Bytes,
+    pub(crate) response: reqwest::Response,
+    pub(crate) max_bytes: u64,
 }

@@ -5,6 +5,7 @@
 //! and provenance-verified FLAC-to-MP3 library shrinkage (`shrink`).
 
 pub mod loudness;
+pub(crate) mod prepared;
 pub mod shrink;
 pub mod silence;
 pub mod tagger;

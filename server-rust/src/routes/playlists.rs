@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -170,6 +171,7 @@ fn map_playlist_error(err: PlaylistError) -> Response {
         status,
         Json(ApiErrorEnvelope {
             error: ApiErrorBody {
+                request_id: crate::error::current_request_id(),
                 code: String::from(code),
                 message,
             },
@@ -198,14 +200,11 @@ async fn list_playlists_handler(
 async fn create_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<CreatePlaylistBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CreatePlaylistBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist request",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let service = match build_playlist_service(&state) {
@@ -248,7 +247,7 @@ async fn patch_playlist_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<PlaylistUpdatePayload>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PlaylistUpdatePayload>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let service = match build_playlist_service(&state) {
         Ok(s) => s,
@@ -267,12 +266,9 @@ async fn patch_playlist_handler(
         );
     }
 
-    let Ok(Json(payload)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist update request",
-            "BAD_REQUEST",
-        );
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     match service.update(&playlist_id, payload, &auth.user).await {
@@ -308,7 +304,7 @@ async fn add_playlist_track_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<AddTrackBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<AddTrackBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let service = match build_playlist_service(&state) {
         Ok(s) => s,
@@ -327,12 +323,9 @@ async fn add_playlist_track_handler(
         );
     }
 
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist track request",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     match service
@@ -385,7 +378,7 @@ async fn reorder_playlist_tracks_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<LegacyReorderBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<LegacyReorderBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let service = match build_playlist_service(&state) {
         Ok(s) => s,
@@ -404,12 +397,9 @@ async fn reorder_playlist_tracks_handler(
         );
     }
 
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist reorder request",
-            "BAD_REQUEST",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.track_ids.iter().any(|id| id.trim().is_empty()) {
@@ -435,7 +425,7 @@ async fn cas_reorder_playlist_items_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<CasReorderBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CasReorderBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let service = match build_playlist_service(&state) {
         Ok(s) => s,
@@ -454,12 +444,9 @@ async fn cas_reorder_playlist_items_handler(
         );
     }
 
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist entry reorder",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.item_ids.len() > 20_000
@@ -497,7 +484,7 @@ async fn batch_edit_playlist_tracks_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<PlaylistBatchEdit>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PlaylistBatchEdit>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let service = match build_playlist_service(&state) {
         Ok(s) => s,
@@ -516,12 +503,9 @@ async fn batch_edit_playlist_tracks_handler(
         );
     }
 
-    let Ok(Json(edit)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist batch edit",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(edit) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     match service.edit_tracks(&playlist_id, edit, &auth.user).await {

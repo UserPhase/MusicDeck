@@ -5,6 +5,10 @@ import { getVisualActivity, subscribeVisualActivity } from "../services/visualAc
 import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
 import { DESKTOP_CONFIG_CHANGED_EVENT, isDesktopRuntime, resolveRemoteSocketUrl } from "../services/desktop/desktopRuntime";
 
+const PLAYBACK_LEASE_MS = 5_000;
+const LEASE_RENEWAL_MS = 2_000;
+const LEASE_CLOCK_MARGIN_MS = 100;
+
 function deviceKind(): RemoteDevice["device_type"] {
   if (/iPad|Tablet/i.test(navigator.userAgent)) return "tablet";
   if (/Mobi|iPhone|Android/i.test(navigator.userAgent)) return "phone";
@@ -120,7 +124,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   const timeOrigin = useRef(Number.isFinite(performance.timeOrigin) ? performance.timeOrigin : Date.now() - performance.now());
   const continuous = useRef(new Map<string, { command: RemoteCommand; timer: number; send(): void;
     waiters: Array<{ resolve(): void; reject(error: unknown): void }> }>());
-  const prepared = useRef<{ id: string; controller: AbortController; role: "source" | "target"; paused: boolean } | null>(null);
+  const prepared = useRef<{ id: string; controller: AbortController; role: "source" | "target"; paused: boolean;
+    readyAt?: number; deadline?: number } | null>(null);
+  const leaseGeneration = useRef<string | null>(null);
   const send = useCallback((payload: object) => {
     const ws = socket.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("Device control is disconnected. Reconnect and retry.");
@@ -132,7 +138,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
   const registration = useCallback(() => {
     const state = adapterRef.current.state();
     send({ type: "REGISTER", device_id: deviceId, device_name: metadata.current.name, queue_device_id: queueDeviceId(),
-      device_type: deviceKind(), can_receive: metadata.current.enabled, state, live_sync: true, command_deadlines: true });
+      device_type: deviceKind(), can_receive: metadata.current.enabled, state, live_sync: true, command_deadlines: true,
+      playback_lease: true, playbackLeaseProtocol: 1,
+      ...(leaseGeneration.current ? { leaseGeneration: leaseGeneration.current } : {}) });
     return state;
   }, [deviceId, send]);
   const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object): Promise<void> => new Promise((resolve, reject) => {
@@ -157,6 +165,14 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     let handshake: number | undefined;
     let watchdog: number | undefined;
     let controlTimeout = 0;
+    let leaseDuration: number | undefined;
+    let leaseExpires: number | undefined;
+    let leaseDeadline = 0;
+    let leaseRenewal: number | undefined;
+    let leaseSequence = 0;
+    const leaseProbes = new Map<number, number>();
+    let leasedOutput = false;
+    let lastOwnershipReport = 0;
     let executing: AbortController | null = null;
     let connectionLifetime = new AbortController();
     let attempt = 0;
@@ -202,29 +218,86 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       const transfer = prepared.current;
       if (!transfer) return;
       prepared.current = null;
+      window.clearTimeout(transfer.deadline);
       transfer.controller.abort();
       if (transfer.role === "target") adapterRef.current.pause();
     };
+    const abortSocketOperations = () => {
+      executing?.abort();
+      executing = null;
+      connectionLifetime.abort();
+      try { cancelPreparation(); } catch (failure) { fail(failure); }
+    };
+    const clearOwnershipLease = () => {
+      leasedOutput = false;
+      leaseGeneration.current = null;
+      window.clearTimeout(leaseExpires);
+      window.clearTimeout(leaseRenewal);
+      leaseExpires = undefined;
+      leaseRenewal = undefined;
+      leaseDeadline = 0;
+      leaseProbes.clear();
+    };
+    const pauseOutput = () => {
+      clearOwnershipLease();
+      try { adapterRef.current.pause(); return true; } catch (failure) { fail(failure); return false; }
+    };
     const stopControlledPlayback = () => {
-      if (connectionLifetime.signal.aborted) return;
-      try {
-        if (executing || synced?.device_id === deviceId || selectedDevice.current === deviceId || localPlaying) {
-          adapterRef.current.pause();
-        }
-      } catch (failure) {
-        fail(failure);
-      } finally {
-        executing?.abort();
-        connectionLifetime.abort();
-        try { cancelPreparation(); } catch (failure) { fail(failure); }
+      let stopped = true;
+      if (leasedOutput || executing || synced?.device_id === deviceId ||
+          selectedDevice.current === deviceId || adapterRef.current.state().playing) {
+        stopped = pauseOutput();
       }
+      abortSocketOperations();
+      return stopped;
+    };
+    const releaseSocketOwnership = () => {
+      const generation = leaseGeneration.current;
+      if (stopControlledPlayback() && generation && socket.current?.readyState === WebSocket.OPEN) {
+        try { send({ type: "RELEASE_PLAYBACK_LEASE", device_id: deviceId, leaseGeneration: generation }); }
+        catch (failure) { fail(failure); }
+      }
+    };
+    const armLeaseExpiry = (deadline: number) => {
+      if (deadline <= leaseDeadline) return;
+      leaseDeadline = deadline;
+      window.clearTimeout(leaseExpires);
+      leaseExpires = window.setTimeout(() => {
+        if (!leasedOutput && !leaseGeneration.current) return;
+        executing?.abort();
+        if (leasedOutput || adapterRef.current.state().playing) pauseOutput();
+        else clearOwnershipLease();
+      }, Math.max(0, deadline - performance.now()));
+    };
+    const reportPlayingOwnership = () => {
+      lastOwnershipReport = performance.now();
+      if (leaseDuration !== 0 && !leasedOutput && (!synced?.device_id || synced.device_id === deviceId)) {
+        // A socket can disappear before we receive the first ownership frame.
+        leasedOutput = true;
+        armLeaseExpiry(lastOwnershipReport + PLAYBACK_LEASE_MS - LEASE_CLOCK_MARGIN_MS);
+      }
+    };
+    const renewLease = () => {
+      window.clearTimeout(leaseRenewal);
+      leaseRenewal = undefined;
+      const generation = leaseGeneration.current;
+      if (!generation || !leaseDuration || socket.current?.readyState !== WebSocket.OPEN) return;
+      const sequence = ++leaseSequence;
+      const now = performance.now();
+      for (const [probe, sent] of leaseProbes) {
+        if (now - sent >= leaseDuration) leaseProbes.delete(probe);
+      }
+      leaseProbes.set(sequence, now);
+      try { send({ type: "RENEW_PLAYBACK_LEASE", sequence, device_id: deviceId, leaseGeneration: generation }); }
+      catch (failure) { fail(failure); }
+      leaseRenewal = window.setTimeout(renewLease, LEASE_RENEWAL_MS);
     };
     const armWatchdog = () => {
       window.clearTimeout(watchdog);
-      if (!controlTimeout) return;
+      const ws = socket.current;
+      if (!controlTimeout || !ws) return;
       watchdog = window.setTimeout(() => {
-        stopControlledPlayback();
-        socket.current?.close(4003, "Device control heartbeat timed out");
+        disconnect(ws, 4003, "Device control heartbeat timed out");
       }, controlTimeout);
     };
     const settle = (message: Record<string, unknown>) => {
@@ -241,6 +314,26 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       }
     };
     const handle = async (message: Record<string, unknown>) => {
+      if (message.type === "PLAYBACK_LEASE") {
+        const sequence = typeof message.sequence === "number" ? message.sequence : -1;
+        const sentAt = leaseProbes.get(sequence);
+        if (leaseGeneration.current && message.leaseGeneration === leaseGeneration.current &&
+            message.device_id === deviceId && leaseDuration && sentAt !== undefined && message.leaseMs === leaseDuration) {
+          // Use the send time as the lower bound on when the server granted the lease.
+          leaseProbes.delete(sequence);
+          armLeaseExpiry(sentAt + leaseDuration - LEASE_CLOCK_MARGIN_MS);
+        }
+        return;
+      }
+      if (message.type === "PLAYBACK_LEASE_EXPIRED") {
+        if (leaseGeneration.current && message.leaseGeneration === leaseGeneration.current) {
+          executing?.abort();
+          cancelPreparation();
+          if (leasedOutput || adapterRef.current.state().playing) pauseOutput();
+          else clearOwnershipLease();
+        }
+        return;
+      }
       if (message.type === "REMOTE_HEARTBEAT" && typeof message.server_time === "number" && Number.isFinite(message.server_time)) {
         observeClock(message.server_time);
         armWatchdog();
@@ -266,17 +359,41 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         playbackClock.current = { position: state.position_ms / 1000, sampledAt: sampledAt - age,
           duration: state.duration_ms / 1000, playing: state.is_playing };
         setPlayback(synced);
-        if (message.type === "INITIAL_STATE") {
+        const initialState = message.type === "INITIAL_STATE";
+        if (initialState) {
           window.clearTimeout(handshake);
           attempt = 0;
           setError("");
           controlTimeout = message.controlTimeoutMs === 25_000 ? 25_000 : 0;
+          leaseDuration = message.playbackLeaseProtocol === 1 && message.playbackLeaseMs === PLAYBACK_LEASE_MS
+            ? PLAYBACK_LEASE_MS : 0;
           armWatchdog();
           setStatus("connected");
-          publish.current?.();
-        } else if (samplingChanged) {
-          schedulePositionSample();
         }
+        if (state.device_id === deviceId) {
+          const generation = typeof message.leaseGeneration === "string" ? message.leaseGeneration : null;
+          if (leaseDuration && generation) {
+            const changed = generation !== leaseGeneration.current;
+            if (changed && leaseGeneration.current) clearOwnershipLease();
+            leaseGeneration.current = generation;
+            if (state.is_playing && !leasedOutput) {
+              leasedOutput = true;
+              armLeaseExpiry(lastOwnershipReport + leaseDuration - LEASE_CLOCK_MARGIN_MS);
+            }
+            if (changed || initialState || leaseRenewal === undefined) renewLease();
+          } else if (initialState && !leaseDuration) {
+            clearOwnershipLease();
+          }
+        } else if (leasedOutput || leaseGeneration.current) {
+          if (leasedOutput || adapterRef.current.state().playing) {
+            executing?.abort();
+            pauseOutput();
+          } else {
+            clearOwnershipLease();
+          }
+        }
+        if (initialState) publish.current?.();
+        else if (samplingChanged) schedulePositionSample();
         return;
       }
       if (message.type === "QUEUE_CHANGED") {
@@ -288,6 +405,8 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         selectedDevice.current = message.devices.find(item => item.is_active_player)?.device_id;
         setDevices(message.devices);
         if (message.live_state_protocol !== true) {
+          leaseDuration = 0;
+          clearOwnershipLease();
           window.clearTimeout(handshake);
           setError("");
           setStatus("connected");
@@ -303,7 +422,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       if (message.type === "DEACTIVATE") {
         executing?.abort();
         cancelPreparation();
-        adapterRef.current.pause();
+        pauseOutput();
         return;
       }
       if (message.type === "EXECUTE" && typeof message.requestId === "string" && remoteCommand(message.command)) {
@@ -335,7 +454,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
                 controller.abort();
                 adapterRef.current.pause();
               } else {
-                send({ type: "COMMAND_RESULT", requestId, expiresAt, ok: true, state: adapterRef.current.state() });
+                const state = adapterRef.current.state();
+                if (state.playing) reportPlayingOwnership();
+                send({ type: "COMMAND_RESULT", requestId, expiresAt, ok: true, state });
               }
             }
           }
@@ -363,7 +484,10 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         try {
           if (!metadata.current.enabled) throw new Error("Enable playback on the target device first");
           await adapterRef.current.prepare(message.snapshot, controller.signal);
-          if (!controller.signal.aborted && prepared.current?.id === transferId) send({ type: "READY", transferId });
+          if (!controller.signal.aborted && prepared.current?.id === transferId) {
+            prepared.current.readyAt = performance.now();
+            send({ type: "READY", transferId });
+          }
         } catch (failure) {
           if (controller.signal.aborted) return;
           adapterRef.current.pause(); fail(failure);
@@ -379,11 +503,26 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
           send({ type: "TRANSFER_FAILED", transferId, message: failure instanceof Error ? failure.message : "Could not pause the source" });
         }
       } else if (message.type === "START_TRANSFER" && prepared.current?.id === transferId && prepared.current.role === "target" && snapshot(message.snapshot)) {
-        const signal = prepared.current.controller.signal;
+        const transfer = prepared.current;
+        const signal = transfer.controller.signal;
+        if (message.playbackLeaseMs === PLAYBACK_LEASE_MS) {
+          const expire = () => {
+            if (prepared.current !== transfer) return;
+            cancelPreparation();
+            if (socket.current?.readyState === WebSocket.OPEN) {
+              try { send({ type: "TRANSFER_FAILED", transferId, message: "Playback handoff lease expired" }); }
+              catch (failure) { fail(failure); }
+            }
+          };
+          const remaining = (transfer.readyAt ?? -Infinity) + PLAYBACK_LEASE_MS - LEASE_CLOCK_MARGIN_MS - performance.now();
+          if (remaining <= 0) { expire(); return; }
+          transfer.deadline = window.setTimeout(expire, remaining);
+        }
         try {
           await adapterRef.current.start(message.snapshot, signal);
           if (signal.aborted || prepared.current?.id !== transferId) return;
           const queue = adapterRef.current.queue?.();
+          lastOwnershipReport = performance.now();
           send({ type: "STARTED", transferId,
             queue: queue && new Blob([JSON.stringify(queue)]).size < 1000 * 1024 ? queue : undefined });
         } catch (failure) {
@@ -399,12 +538,51 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         if (target) send({ type: "TRANSFER_ROLLED_BACK", transferId });
         if (resume && !connectionLifetime.signal.aborted) await adapterRef.current.command({ type: "PLAY" }, connectionLifetime.signal);
       } else if (message.type === "TRANSFER_COMPLETE" && prepared.current?.id === transferId) {
+        const target = prepared.current.role === "target";
+        window.clearTimeout(prepared.current.deadline);
         adapterRef.current.commitTransfer?.(prepared.current.controller.signal);
         prepared.current.controller.abort(); prepared.current = null;
+        if (target && leaseDuration && adapterRef.current.state().playing && !leasedOutput) {
+          leasedOutput = true;
+          armLeaseExpiry(lastOwnershipReport + leaseDuration - LEASE_CLOCK_MARGIN_MS);
+        }
       } else throw new Error("Invalid or stale playback transfer message");
     };
-    const scheduleReconnect = () => {
-      if (!closed) reconnect = window.setTimeout(connect, Math.min(30000, 500 * 2 ** Math.min(attempt++, 6)) + Math.random() * 200);
+    const scheduleReconnect = (immediate = false) => {
+      if (closed) return;
+      const delay = immediate && attempt === 0 ? 0 : Math.min(30_000, 500 * 2 ** Math.min(attempt, 6)) + Math.random() * 200;
+      attempt++;
+      reconnect = window.setTimeout(connect, delay);
+    };
+    const disconnect = (ws: WebSocket, code: number, reason: string, closeSocket = true) => {
+      if (closed || socket.current !== ws) return;
+      const revoked = code === 4001 || code === 4002 || code === 4009;
+      if (revoked) stopControlledPlayback();
+      else abortSocketOperations();
+      socket.current = null;
+      if (closeSocket) ws.close(4003, "Reconnecting device control");
+      window.clearTimeout(leaseRenewal);
+      leaseRenewal = undefined;
+      leaseProbes.clear();
+      selectedDevice.current = undefined;
+      resetPlayback();
+      const error = new Error("Device control disconnected. Check playback before retrying.");
+      for (const operation of operations.values()) {
+        window.clearTimeout(operation.timer); operation.reject(error);
+      }
+      operations.clear();
+      for (const operation of controlWindows.values()) {
+        window.clearTimeout(operation.timer);
+        operation.waiters.forEach(waiter => waiter.reject(error));
+      }
+      controlWindows.clear();
+      setDevices([]);
+      if (code === 4001 || code === 4009) {
+        setStatus("unavailable"); setError(reason || "Remote session ended"); return;
+      }
+      setError(error.message);
+      setStatus("reconnecting");
+      scheduleReconnect(code !== 4000);
     };
     const connect = () => {
       if (closed) return;
@@ -414,7 +592,10 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         scheduleReconnect();
         return;
       }
-      const ws = new WebSocket(url); socket.current = ws;
+      let ws: WebSocket;
+      try { ws = new WebSocket(url); }
+      catch (failure) { fail(failure); scheduleReconnect(); return; }
+      socket.current = ws;
       commandChain = Promise.resolve();
       connectionLifetime = new AbortController();
       handshake = window.setTimeout(() => {
@@ -426,7 +607,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         queueDirty.current = true;
         reportedQueue = undefined;
         try {
+          lastOwnershipReport = performance.now();
           const state = registration();
+          if (state.playing) reportPlayingOwnership();
           lastPlaying = state.playing;
           lastState = JSON.stringify(state);
           publishState();
@@ -440,43 +623,20 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
           void handle(message).catch(fail);
         } catch (failure) { fail(failure); }
       };
-      ws.onerror = () => {
-        if (!closed && socket.current === ws) {
-          stopControlledPlayback();
-          setError("Device control connection failed. Reconnecting automatically.");
-        }
-      };
-      ws.onclose = (event) => {
-        if (closed || socket.current !== ws) return;
-        stopControlledPlayback();
-        socket.current = null;
-        selectedDevice.current = undefined;
-        resetPlayback();
-        for (const operation of operations.values()) {
-          window.clearTimeout(operation.timer); operation.reject(new Error("Device control disconnected. Check playback before retrying."));
-        }
-        pending.current.clear();
-        for (const operation of controlWindows.values()) {
-          window.clearTimeout(operation.timer);
-          operation.waiters.forEach(waiter => waiter.reject(new Error("Device control disconnected")));
-        }
-        controlWindows.clear();
-        if (closed) return;
-        setError("Device control disconnected. Check playback before retrying.");
-        setDevices([]);
-        if (event.code === 4001 || event.code === 4009) { setStatus("unavailable"); setError(event.reason || "Remote session ended"); return; }
-        setStatus("reconnecting");
-        scheduleReconnect();
-      };
+      ws.onerror = () => disconnect(ws, 1006, "");
+      ws.onclose = (event) => disconnect(ws, event.code, event.reason, false);
     };
     const reconnectForServerChange = () => {
       window.clearTimeout(reconnect);
-      if (socket.current) socket.current.close(1000, "Server connection changed");
+      if (socket.current) {
+        releaseSocketOwnership();
+        socket.current.close(1000, "Server connection changed");
+      }
       else connect();
     };
     window.addEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
     const pageHidden = () => {
-      stopControlledPlayback();
+      releaseSocketOwnership();
       socket.current?.close(1000, "Player view closed");
     };
     window.addEventListener("pagehide", pageHidden);
@@ -496,6 +656,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       }
       try {
         const payload = { type: "STATE", state, claim };
+        if (state.playing && claim) reportPlayingOwnership();
         // Very large queues can still be followed through the saved account queue.
         const fits = updatedQueue && new Blob([JSON.stringify(updatedQueue)]).size < 1000 * 1024;
         send(fits ? { ...payload, queue: updatedQueue } : updatedQueue ? { ...payload, clear_queue: true } : payload);
@@ -536,7 +697,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       publish.current = null;
       window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
       window.removeEventListener("pagehide", pageHidden);
-      stopControlledPlayback(); socket.current?.close(1000, "Account or view closed"); socket.current = null;
+      releaseSocketOwnership();
+      clearOwnershipLease();
+      socket.current?.close(1000, "Account or view closed"); socket.current = null;
       for (const operation of operations.values()) {
         window.clearTimeout(operation.timer); operation.reject(new Error("Remote session closed"));
       }

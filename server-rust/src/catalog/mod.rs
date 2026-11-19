@@ -10,6 +10,7 @@ pub mod library;
 pub mod merge;
 pub mod resolver;
 pub mod service;
+pub(crate) mod snapshot;
 
 pub use identity::{
     CanonicalIdentity, CatalogEntityType, ContainerFileMetadata, IdentityStrength,

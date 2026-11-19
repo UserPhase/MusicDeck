@@ -4,8 +4,71 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
+
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTORE_HEADER_TIMEOUT: Duration = Duration::from_secs(300);
+const UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
+const MEDIA_HEADER_TIMEOUT: Duration = Duration::from_secs(12);
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const PREBUFFER_BYTES: usize = 64 * 1024;
+
+fn upload_limit(path: &str) -> usize {
+    const MIB: usize = 1024 * 1024;
+    match path {
+        "/api/v1/admin/system/restore" => 256 * MIB,
+        "/api/v1/user/queue-session/content" => 32 * MIB,
+        "/api/users/profile/avatar" | "/api/user/avatar" => 8 * MIB,
+        path if path.starts_with("/api/playlists/") && path.ends_with("/artwork") => 8 * MIB,
+        path if path.starts_with("/api/v1/playlists/")
+            && (path.ends_with("/commands") || path.ends_with("/tracks")) =>
+        {
+            3 * MIB
+        }
+        _ => 2 * MIB,
+    }
+}
+
+fn upload_chunks(
+    reader: impl AsyncRead + Unpin,
+    prefix: Vec<u8>,
+    length: usize,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> {
+    let remaining = length - prefix.len();
+    futures_util::stream::try_unfold(
+        (reader, prefix, remaining),
+        |(mut reader, prefix, mut remaining)| async move {
+            if !prefix.is_empty() {
+                return Ok(Some((prefix, (reader, Vec::new(), remaining))));
+            }
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let mut chunk = vec![0; remaining.min(PREBUFFER_BYTES)];
+            let len = tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, reader.read(&mut chunk)).await??;
+            if len == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Desktop upload ended early",
+                ));
+            }
+            remaining -= len;
+            chunk.truncate(len);
+            Ok(Some((chunk, (reader, Vec::new(), remaining))))
+        },
+    )
+}
+
+async fn request_socket_closed(reader: &mut Option<OwnedReadHalf>) {
+    if let Some(reader) = reader {
+        let _ = reader.read(&mut [0]).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
 
 struct ProxySharedState {
     connection: Arc<Mutex<DesktopConnection>>,
@@ -17,6 +80,7 @@ struct ProxySharedState {
 pub(crate) enum UpstreamFailure {
     Request(reqwest::Error),
     HeaderTimeout,
+    UploadTimeout,
 }
 
 impl UpstreamFailure {
@@ -27,14 +91,23 @@ impl UpstreamFailure {
     pub(crate) fn status(&self) -> reqwest::StatusCode {
         match self {
             Self::HeaderTimeout => reqwest::StatusCode::GATEWAY_TIMEOUT,
+            Self::UploadTimeout => reqwest::StatusCode::REQUEST_TIMEOUT,
             Self::Request(error) if error.is_timeout() => reqwest::StatusCode::GATEWAY_TIMEOUT,
             Self::Request(_) => reqwest::StatusCode::BAD_GATEWAY,
         }
     }
 
     pub(crate) fn details(&self) -> (&'static str, &'static str) {
-        if self.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
-            ("DESKTOP_UPSTREAM_TIMEOUT", "The desktop proxy timed out waiting for the MusicDeck server.")
+        if matches!(self, Self::UploadTimeout) {
+            (
+                "DESKTOP_UPLOAD_TIMEOUT",
+                "The desktop proxy timed out receiving the upload.",
+            )
+        } else if self.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
+            (
+                "DESKTOP_UPSTREAM_TIMEOUT",
+                "The desktop proxy timed out waiting for the MusicDeck server.",
+            )
         } else if self.can_try_alternate() {
             ("DESKTOP_UPSTREAM_CONNECT", "The desktop proxy could not connect to the MusicDeck server. Check Server Connection settings.")
         } else {
@@ -42,12 +115,20 @@ impl UpstreamFailure {
         }
     }
 
-    fn log_transport(&self, method: &reqwest::Method, origin: &str, elapsed: Duration, retrying: bool) {
+    fn log_transport(
+        &self,
+        method: &reqwest::Method,
+        origin: &str,
+        elapsed: Duration,
+        retrying: bool,
+    ) {
         // Lower-level error strings can contain URLs with capability tokens.
         let io_error = match self {
-            Self::Request(error) => std::iter::successors(error.source(), |source| (*source).source())
-                .find_map(|source| source.downcast_ref::<std::io::Error>()),
-            Self::HeaderTimeout => None,
+            Self::Request(error) => {
+                std::iter::successors(error.source(), |source| (*source).source())
+                    .find_map(|source| source.downcast_ref::<std::io::Error>())
+            }
+            Self::HeaderTimeout | Self::UploadTimeout => None,
         };
         let io_kind = io_error.map(std::io::Error::kind);
         let os_error = io_error.and_then(std::io::Error::raw_os_error);
@@ -76,7 +157,12 @@ pub(crate) async fn send_upstream(
             // valid HTTP error response never enters this retry branch.
             Err(error) if error.is_request() && !error.is_timeout() => {
                 if let Some(retry) = retry {
-                    UpstreamFailure::Request(error).log_transport(method, origin, started.elapsed(), true);
+                    UpstreamFailure::Request(error).log_transport(
+                        method,
+                        origin,
+                        started.elapsed(),
+                        true,
+                    );
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     retry.send().await
                 } else {
@@ -93,6 +179,27 @@ pub(crate) async fn send_upstream(
         failure.log_transport(method, origin, started.elapsed(), false);
     }
     result
+}
+
+async fn send_upload(
+    request: reqwest::RequestBuilder,
+    upload_status: tokio::sync::oneshot::Receiver<Result<(), std::io::ErrorKind>>,
+    header_timeout: Duration,
+) -> Result<reqwest::Response, UpstreamFailure> {
+    let response = request.send();
+    tokio::pin!(response);
+    tokio::select! {
+        biased;
+        status = upload_status => match status {
+            Ok(Ok(())) => tokio::time::timeout(header_timeout, response)
+                .await.map_err(|_| UpstreamFailure::HeaderTimeout)?
+                .map_err(UpstreamFailure::Request),
+            Ok(Err(std::io::ErrorKind::TimedOut)) => Err(UpstreamFailure::UploadTimeout),
+            _ => response.await.map_err(UpstreamFailure::Request),
+        },
+        result = &mut response => result.map_err(UpstreamFailure::Request),
+        _ = tokio::time::sleep(UPLOAD_TOTAL_TIMEOUT) => Err(UpstreamFailure::UploadTimeout),
+    }
 }
 
 pub(crate) fn upstream_redirect_policy() -> reqwest::redirect::Policy {
@@ -112,15 +219,21 @@ pub(crate) fn upstream_redirect_policy() -> reqwest::redirect::Policy {
 }
 
 async fn write_proxy_error(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     status: &str,
     cors: &str,
     code: &str,
     message: String,
 ) {
-    let body = serde_json::json!({ "error": { "code": code, "message": message } }).to_string();
+    static NEXT_ERROR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_ERROR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let request_id = format!("desktop-{}-{sequence}", std::process::id());
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "requestId": request_id }
+    })
+    .to_string();
     let reply = format!(
-        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\nX-Request-Id: {request_id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(reply.as_bytes()).await;
@@ -130,21 +243,25 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     let mut buf = Vec::with_capacity(8192);
     let mut temp = [0u8; 4096];
     let header_end;
+    let incoming_deadline = tokio::time::Instant::now() + REQUEST_HEADER_TIMEOUT;
 
     loop {
-        match stream.read(&mut temp).await {
-            Ok(0) => return,
-            Ok(n) => {
+        match tokio::time::timeout_at(incoming_deadline, stream.read(&mut temp)).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(n)) => {
                 buf.extend_from_slice(&temp[..n]);
                 if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     header_end = pos + 4;
+                    if header_end > PREBUFFER_BYTES {
+                        return;
+                    }
                     break;
                 }
-                if buf.len() > 65536 {
+                if buf.len() > PREBUFFER_BYTES {
                     return;
                 }
             }
-            Err(_) => return,
+            Ok(Err(_)) | Err(_) => return,
         }
     }
 
@@ -161,7 +278,9 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         return;
     };
 
-    let mut content_length: usize = 0;
+    let mut content_length = None;
+    let mut invalid_framing = false;
+    let mut expect_continue = false;
     let mut request_origin = None;
     let mut request_host = None;
     let mut duplicate_authority_header = false;
@@ -178,7 +297,16 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             let value = val.trim();
             let lower = key.to_ascii_lowercase();
             if lower == "content-length" {
-                content_length = value.parse::<usize>().unwrap_or(0);
+                match value.parse::<usize>() {
+                    Ok(len) if value.bytes().all(|byte| byte.is_ascii_digit()) => {
+                        invalid_framing |= content_length.replace(len).is_some();
+                    }
+                    _ => invalid_framing = true,
+                }
+            } else if lower == "transfer-encoding" {
+                invalid_framing = true;
+            } else if lower == "expect" {
+                expect_continue = value.eq_ignore_ascii_case("100-continue");
             } else if lower == "origin" {
                 duplicate_authority_header |= request_origin.replace(value).is_some();
             } else if lower == "host" {
@@ -206,6 +334,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         }
     }
 
+    let content_length = content_length.unwrap_or(0);
     let method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
         Ok(method) => method,
         Err(_) => return,
@@ -238,7 +367,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     let audio_stream = path.starts_with("/api/stream/")
         || (path.starts_with("/api/tracks/") && path.ends_with("/stream"))
         || path.starts_with("/api/playback/normalized/")
-        || path == "/api/v1/cast/stream";
+        || matches!(path, "/api/v1/cast/stream" | "/api/playback/preview");
     let mut cors = String::from("Vary: Origin\r\n");
     if let Some(origin) = authorized_origin {
         cors.push_str(&format!(
@@ -260,15 +389,62 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         return;
     }
 
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        match stream.read(&mut temp).await {
-            Ok(0) => return,
-            Ok(n) => body.extend_from_slice(&temp[..n]),
-            Err(_) => return,
-        }
+    let body = buf.split_off(header_end);
+    if invalid_framing || body.len() > content_length {
+        write_proxy_error(
+            &mut stream,
+            "400 Bad Request",
+            &cors,
+            "DESKTOP_INVALID_BODY",
+            "The desktop request body must specify a valid Content-Length.".into(),
+        )
+        .await;
+        return;
     }
-    body.truncate(content_length);
+    if content_length > upload_limit(path) {
+        write_proxy_error(
+            &mut stream,
+            "413 Payload Too Large",
+            &cors,
+            "DESKTOP_UPLOAD_TOO_LARGE",
+            "This upload exceeds the size limit for the selected route.".into(),
+        )
+        .await;
+        return;
+    }
+    if expect_continue
+        && content_length > 0
+        && stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = Some(reader);
+    let mut upload = (content_length > 0).then(|| {
+        let (sender, status) = tokio::sync::oneshot::channel();
+        let mut sender = Some(sender);
+        let mut remaining = content_length;
+        let chunks =
+            upload_chunks(reader.take().unwrap(), body, content_length).map(move |result| {
+                let status = match &result {
+                    Ok(chunk) => {
+                        remaining -= chunk.len();
+                        (remaining == 0).then_some(Ok(()))
+                    }
+                    Err(err) => Some(Err(err.kind())),
+                };
+                if let Some(status) = status {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(status);
+                    }
+                }
+                result
+            });
+        (reqwest::Body::wrap_stream(chunks), status)
+    });
 
     let upstream = shared
         .connection
@@ -280,7 +456,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     };
     let Ok(candidates) = upstream.candidate_urls() else {
         write_proxy_error(
-            &mut stream,
+            &mut writer,
             "500 Internal Server Error",
             &cors,
             "DESKTOP_INVALID_SERVER_CONFIG",
@@ -293,6 +469,9 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     let mut upstream_response = None;
     let mut active_base_url = upstream.server_url.clone();
     let mut last_failure = None;
+    let safe_read =
+        matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) && content_length == 0;
+    let media_deadline = tokio::time::Instant::now() + MEDIA_HEADER_TIMEOUT;
 
     for candidate_base in &candidates {
         let Ok(target_url) = reqwest::Url::parse(&format!("{candidate_base}{path_and_query}"))
@@ -328,24 +507,33 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             }
         }
 
-        if !body.is_empty() {
-            req_builder = req_builder.body(body.clone());
-        }
-
-        // Keep the upload budget for large archive imports that use this proxy.
-        let header_timeout = if matches!(method, reqwest::Method::GET | reqwest::Method::HEAD) {
-            Duration::from_secs(60)
+        let header_timeout = if audio_stream {
+            let remaining = media_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                last_failure = Some(UpstreamFailure::HeaderTimeout);
+                break;
+            }
+            remaining
+        } else if path == "/api/v1/admin/system/restore" {
+            RESTORE_HEADER_TIMEOUT
         } else {
-            Duration::from_secs(3600)
+            UPSTREAM_HEADER_TIMEOUT
         };
-        let send = send_upstream(req_builder, &method, &origin, header_timeout);
-        let result = if websocket_upgrade {
-            send.await
+        let result = if let Some((body, upload_status)) = upload.take() {
+            req_builder = req_builder
+                .header(reqwest::header::CONTENT_LENGTH, content_length)
+                .body(body);
+            send_upload(req_builder, upload_status, header_timeout).await
         } else {
-            tokio::select! {
-                biased;
-                _ = stream.read(&mut temp[..1]) => return,
-                result = send => result,
+            let send = send_upstream(req_builder, &method, &origin, header_timeout);
+            if websocket_upgrade {
+                send.await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = request_socket_closed(&mut reader) => return,
+                    result = send => result,
+                }
             }
         };
         match result {
@@ -357,7 +545,9 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             Err(failure) => {
                 let can_try_alternate = failure.can_try_alternate();
                 last_failure = Some(failure);
-                if !can_try_alternate {
+                // A connect failure occurred before any request was transmitted.
+                // A streaming upload owns its input reader and cannot be replayed.
+                if !safe_read || !can_try_alternate {
                     break;
                 }
             }
@@ -367,12 +557,16 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     let Some(resp) = upstream_response else {
         if let Some(failure) = last_failure {
             let status = failure.status();
-            let status = format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+            let status = format!(
+                "{} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            );
             let (code, message) = failure.details();
-            write_proxy_error(&mut stream, &status, &cors, code, message.into()).await;
+            write_proxy_error(&mut writer, &status, &cors, code, message.into()).await;
         } else {
             write_proxy_error(
-                &mut stream,
+                &mut writer,
                 "500 Internal Server Error",
                 &cors,
                 "DESKTOP_INVALID_SERVER_CONFIG",
@@ -397,7 +591,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         });
     if let Err(error) = accepted {
         write_proxy_error(
-            &mut stream,
+            &mut writer,
             "409 Conflict",
             &cors,
             "DESKTOP_CONNECTION_CHANGED",
@@ -417,6 +611,9 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         };
         let response = format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
         if let Ok(mut upgraded) = resp.upgrade().await {
+            let Ok(mut stream) = reader.take().unwrap().reunite(writer) else {
+                return;
+            };
             if stream.write_all(response.as_bytes()).await.is_ok() {
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut upgraded).await;
             }
@@ -433,7 +630,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
 
     let mut response_head = format!(
         "HTTP/1.1 {status_code} {reason}\r\n\
-         {cors}Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, Retry-After\r\n\
+         {cors}Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, Retry-After, X-Request-Id\r\n\
          Connection: close\r\n"
     );
     if chunked {
@@ -454,6 +651,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
                 | "last-modified"
                 | "content-disposition"
                 | "retry-after"
+                | "x-request-id"
         ) {
             if let Ok(v) = value.to_str() {
                 response_head.push_str(&format!("{}: {v}\r\n", name.as_str()));
@@ -462,21 +660,27 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
     }
     response_head.push_str("\r\n");
 
-    if stream.write_all(response_head.as_bytes()).await.is_err() {
+    if writer.write_all(response_head.as_bytes()).await.is_err() {
         return;
     }
 
+    let event_stream = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
     let mut body_stream = resp.bytes_stream();
     let mut delivered_bytes = 0_u64;
     loop {
         let next = tokio::select! {
             biased;
-            _ = stream.read(&mut temp[..1]) => return,
+            _ = request_socket_closed(&mut reader) => return,
             chunk = async {
-                if audio_stream {
-                    tokio::time::timeout(Duration::from_secs(45), body_stream.next()).await
-                } else {
+                if event_stream {
                     Ok(body_stream.next().await)
+                } else {
+                    let idle = if audio_stream { Duration::from_secs(45) } else { UPSTREAM_HEADER_TIMEOUT };
+                    tokio::time::timeout(idle, body_stream.next()).await
                 }
             } => chunk,
         };
@@ -484,7 +688,7 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(_) => {
-                eprintln!("MusicDeck desktop media read timed out after headers: status={status_code} delivered_bytes={delivered_bytes}");
+                eprintln!("MusicDeck desktop upstream body timed out after headers: status={status_code} delivered_bytes={delivered_bytes}");
                 // Leave the response incomplete so the media element can recover.
                 return;
             }
@@ -495,18 +699,18 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
                     continue;
                 }
                 if chunked
-                    && stream
+                    && writer
                         .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
                         .await
                         .is_err()
                 {
                     return;
                 }
-                if stream.write_all(&chunk).await.is_err() {
+                if writer.write_all(&chunk).await.is_err() {
                     return;
                 }
                 delivered_bytes += chunk.len() as u64;
-                if chunked && stream.write_all(b"\r\n").await.is_err() {
+                if chunked && writer.write_all(b"\r\n").await.is_err() {
                     return;
                 }
             }
@@ -517,10 +721,10 @@ async fn handle_proxy_connection(mut stream: TcpStream, shared: Arc<ProxySharedS
         }
     }
     if chunked {
-        let _ = stream.write_all(b"0\r\n\r\n").await;
+        let _ = writer.write_all(b"0\r\n\r\n").await;
     }
-    let _ = stream.flush().await;
-    let _ = stream.shutdown().await;
+    let _ = writer.flush().await;
+    let _ = writer.shutdown().await;
 }
 
 fn is_desktop_origin(origin: &str) -> bool {
@@ -629,7 +833,9 @@ mod tests {
             Duration::from_millis(100),
         )
         .await;
-        let Err(failure) = result else { panic!("expected the request to time out") };
+        let Err(failure) = result else {
+            panic!("expected the request to time out")
+        };
         assert!(matches!(failure, UpstreamFailure::HeaderTimeout));
         assert_eq!(failure.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(failure.details().0, "DESKTOP_UPSTREAM_TIMEOUT");
@@ -682,6 +888,72 @@ mod tests {
             assert_eq!(&payload, b"pong");
             drop(server);
             drop(desktop);
+            proxy_task.await.unwrap();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_chunks_forwards_prefix_and_rejects_early_end() {
+        let (mut browser, proxy) = tokio::io::duplex(64);
+        let chunks = upload_chunks(proxy, b"head".to_vec(), 10);
+        futures_util::pin_mut!(chunks);
+        assert_eq!(chunks.next().await.unwrap().unwrap(), b"head");
+        browser.write_all(b"body").await.unwrap();
+        browser.shutdown().await.unwrap();
+        assert_eq!(chunks.next().await.unwrap().unwrap(), b"body");
+        assert_eq!(
+            chunks.next().await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_upload_streams_before_the_full_body_arrives_and_rejects_over_limit() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy.local_addr().unwrap();
+            let shared = Arc::new(ProxySharedState {
+                connection: Arc::new(Mutex::new(DesktopConnection::new(DesktopConfig {
+                    server_url: format!("http://{}", upstream.local_addr().unwrap()),
+                    session_cookie: Some("fixture-session".into()),
+                    ..DesktopConfig::default()
+                }))),
+                config_dir: std::env::temp_dir(),
+                path_prefix: "/fixture".into(),
+                client: reqwest::Client::new(),
+            });
+            let proxy_task = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = proxy.accept().await.unwrap();
+                    handle_proxy_connection(stream, shared.clone()).await;
+                }
+            });
+            let request_head = |length| format!(
+                "POST /fixture/api/v1/admin/system/restore HTTP/1.1\r\nHost: {proxy_addr}\r\nOrigin: http://tauri.localhost\r\nContent-Length: {length}\r\n\r\n"
+            );
+            let mut rejected = TcpStream::connect(proxy_addr).await.unwrap();
+            rejected.write_all(request_head(upload_limit("/api/v1/admin/system/restore") + 1).as_bytes()).await.unwrap();
+            assert!(read_head(&mut rejected).await.starts_with("HTTP/1.1 413"));
+
+            let length = PREBUFFER_BYTES + 17;
+            let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+            client.write_all(request_head(length).as_bytes()).await.unwrap();
+            client.write_all(b"fixture").await.unwrap();
+            let (mut server, _) = upstream.accept().await.unwrap();
+            let headers = read_head(&mut server).await.to_ascii_lowercase();
+            assert!(headers.contains(&format!("content-length: {length}\r\n")));
+            let mut prefix = [0; 7];
+            server.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(&prefix, b"fixture");
+
+            let remaining = vec![42; length - prefix.len()];
+            client.write_all(&remaining).await.unwrap();
+            let mut forwarded = vec![0; remaining.len()];
+            server.read_exact(&mut forwarded).await.unwrap();
+            assert_eq!(forwarded, remaining);
+            server.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            assert!(read_head(&mut client).await.starts_with("HTTP/1.1 202"));
             proxy_task.await.unwrap();
         }).await.unwrap();
     }

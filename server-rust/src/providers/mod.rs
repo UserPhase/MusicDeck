@@ -15,6 +15,9 @@ pub mod navidrome;
 pub mod registry;
 pub mod traits;
 
+#[cfg(test)]
+pub(crate) mod media_fixture;
+
 pub use jellyfin::{
     JELLYFIN_REQUEST_TIMEOUT_MS, JellyfinBackend, JellyfinClient,
     map_jellyfin_album, map_jellyfin_artist, map_jellyfin_track,
@@ -36,6 +39,54 @@ pub use registry::{
     create_provider_registry,
 };
 pub use traits::{MusicBackend, ProviderError};
+
+use std::time::Duration;
+
+const MEDIA_HEADER_TIMEOUT: Duration = Duration::from_millis(3_750);
+pub(crate) const MEDIA_HEADER_BUDGET: Duration = Duration::from_secs(8);
+pub(crate) const MEDIA_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn media_http_client() -> Result<reqwest::Client, ProviderError> {
+    media_http_builder()
+        .build()
+        .map_err(|error| ProviderError::Configuration(format!("Media client init failed: {error}")))
+}
+
+pub(crate) fn media_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(2))
+        .read_timeout(MEDIA_BODY_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(0)
+}
+
+async fn send_media_request(
+    request: reqwest::RequestBuilder,
+    provider: &'static str,
+) -> Result<reqwest::Response, ProviderError> {
+    // reqwest's read timeout also applies to the response body. Bound the
+    // header phase independently and leave the idle timeout in effect after it.
+    let retry = request.try_clone();
+    tokio::time::timeout(MEDIA_HEADER_TIMEOUT, async {
+        let first = request.send().await;
+        let retryable = match &first {
+            Ok(response) => matches!(response.status().as_u16(), 502..=504),
+            Err(error) => (error.is_connect() || error.is_request()) && !error.is_timeout(),
+        };
+        if let Some(retry) = retry.filter(|_| retryable) {
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return retry.send().await;
+        }
+        first
+    })
+    .await
+    .map_err(|_| ProviderError::Timeout { provider })?
+    .map_err(|error| ProviderError::Upstream {
+        provider,
+        message: error.without_url().to_string(),
+    })
+}
 
 #[cfg(test)]
 mod tests {

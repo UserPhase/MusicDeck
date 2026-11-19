@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
@@ -869,18 +868,13 @@ impl SourcePipelineRegistry {
 /// [`SourceProvider`] facade wrapping [`SourcePipelineRegistry`].
 pub struct SourcePipelineProvider {
     pipeline: SourcePipelineRegistry,
-    http: Client,
 }
 
 impl SourcePipelineProvider {
     /// Creates a new [`SourcePipelineProvider`].
     #[must_use]
     pub fn new(pipeline: SourcePipelineRegistry) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        Self { pipeline, http }
+        Self { pipeline }
     }
 }
 
@@ -921,47 +915,14 @@ impl SourceProvider for SourcePipelineProvider {
         source: &PlayableSource,
         range: Option<&str>,
     ) -> Result<UpstreamStreamResponse, String> {
-        let url = validated_playable_url(&source.id)
-            .ok_or_else(|| String::from("Playable source is unavailable"))?;
-
-        let mut req = self.http.get(&url);
-        if let Some(r) = range {
-            req = req.header("Range", r);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|_| String::from("Playable source is unavailable"))?;
-        if !resp.status().is_success() && resp.status().as_u16() != 206 {
-            return Err(String::from("Playable source is unavailable"));
-        }
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !content_type.starts_with("audio/") && !content_type.starts_with("application/octet-stream") {
-            return Err(String::from("Playable source is unavailable"));
-        }
-
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-            .collect();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|_| String::from("Playable source is unavailable"))?;
-
-        Ok(UpstreamStreamResponse {
-            status,
-            headers,
-            bytes,
-        })
+        let max_bytes = if source.source_type == PlayableSourceType::Preview {
+            crate::streaming::http::MAX_EXTERNAL_PREVIEW_BYTES
+        } else {
+            crate::streaming::http::MAX_EXTERNAL_MEDIA_BYTES
+        };
+        crate::streaming::http::fetch_external_media(
+            &source.id, range, None, max_bytes,
+            |url| validated_playable_url(url).is_some(),
+        ).await
     }
 }

@@ -50,6 +50,7 @@ import { useAuth } from "./AuthContext";
 import { tasteProfileStore, TASTE_CHANGED } from "../services/TasteProfileStore";
 import { DEFAULT_ACCENT_COLOR, normalizeAccentColor } from "../utils/accentColors";
 import { trustedPreviewUrl } from "../utils/previewPlayback";
+import { createPlaybackSessionId } from "../utils/streamRecovery";
 import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
 import type { AccountQueueSource } from "../services/QueueSyncClient";
 import { newestPeerQueue, useAccountQueue } from "../hooks/useAccountQueue";
@@ -725,7 +726,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     resolved = resolvePlaybackAudio(entry.track, source, previewUrl);
     if (resolved.url.startsWith("/api/tracks/")) {
       const url = new URL(resolved.url, window.location.origin);
-      url.searchParams.set("inspectionId", typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      url.searchParams.set("inspectionId", createPlaybackSessionId());
       resolved.url = url.pathname + url.search;
     }
     sourceCacheRef.current.set(entry.entryId, resolved);
@@ -1238,8 +1239,13 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         setPlaybackUnavailable(false);
         setPlaybackMessage(RECONNECTING_MESSAGE);
       }),
-      engine.on("streamRecovered", ({ key, restartedFromBeginning }) => {
+      engine.on("streamRecovered", ({ key, restartedFromBeginning, streamUrl }) => {
         if (key !== currentKey()) return;
+        const resolved = sourceCacheRef.current.get(key);
+        if (streamUrl && resolved) {
+          const query = new URL(streamUrl, window.location.origin).search;
+          sourceCacheRef.current.set(key, { ...resolved, url: resolved.url.split("?")[0] + query });
+        }
         setPlaybackUnavailable(false);
         if (restartedFromBeginning) {
           // Unseekable streams (live transcodes) cannot resume mid-track.

@@ -195,6 +195,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_queue_select_retries_without_another_enqueue() {
+        let pool = DbPool::connect_memory().await.unwrap();
+        run_migrations(&pool, None).await.unwrap();
+        let manager = TaskManager::new_with_dispatch(Some(pool.clone()), false);
+        manager.initialize_tables().await;
+        manager.register(TaskType::LibraryScan, Arc::new(NoopTaskRunner));
+        let job = manager
+            .enqueue(TaskType::LibraryScan, json!({}), "admin", None)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE background_tasks RENAME TO unavailable_tasks")
+            .execute(pool.inner())
+            .await
+            .unwrap();
+
+        manager.enable_dispatch();
+        tokio::time::timeout(Duration::from_secs(2), manager.pump_query_failed.notified())
+            .await
+            .expect("the first SELECT fails");
+        sqlx::query("ALTER TABLE unavailable_tasks RENAME TO background_tasks")
+            .execute(pool.inner())
+            .await
+            .unwrap();
+
+        let finished = manager
+            .wait_for_settlement(&job.id, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(finished.state, TaskStatus::Finished);
+        manager.close();
+    }
+
+    #[tokio::test]
+    async fn dispatch_claims_once_and_retries_failed_completion_without_rerunning() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRunner(AtomicUsize, tokio::sync::Notify);
+        #[async_trait::async_trait]
+        impl TaskDefinition for CountingRunner {
+            fn validate(&self, payload: &Value) -> bool {
+                payload.is_object()
+            }
+            async fn run(&self, _: Value, _: TaskRunContext) -> Result<(), TaskError> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                self.1.notify_one();
+                Ok(())
+            }
+        }
+
+        let pool = DbPool::connect_memory().await.unwrap();
+        run_migrations(&pool, None).await.unwrap();
+        let first = TaskManager::new_with_dispatch(Some(pool.clone()), false);
+        let second = TaskManager::new_with_dispatch(Some(pool.clone()), false);
+        first.initialize_tables().await;
+        let runner = Arc::new(CountingRunner(
+            AtomicUsize::new(0),
+            tokio::sync::Notify::new(),
+        ));
+        first.register(TaskType::LibraryScan, runner.clone());
+        second.register(TaskType::LibraryScan, runner.clone());
+        let task = first
+            .enqueue(TaskType::LibraryScan, json!({}), "admin", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_finish BEFORE UPDATE ON background_tasks
+                     WHEN NEW.state='FINISHED' BEGIN SELECT RAISE(ABORT, 'transient fixture'); END",
+        )
+        .execute(pool.inner())
+        .await
+        .unwrap();
+
+        first.enable_dispatch();
+        second.enable_dispatch();
+        tokio::time::timeout(Duration::from_secs(2), runner.1.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            first.get(&task.id).await.unwrap().state,
+            TaskStatus::Processing
+        );
+        assert_eq!(runner.0.load(Ordering::Acquire), 1);
+
+        sqlx::query("DROP TRIGGER fail_finish")
+            .execute(pool.inner())
+            .await
+            .unwrap();
+        let finished = first
+            .wait_for_settlement(&task.id, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(finished.state, TaskStatus::Finished);
+        assert_eq!(runner.0.load(Ordering::Acquire), 1);
+        first.close();
+        second.close();
+    }
+
+    #[tokio::test]
     async fn spotdl_runner_executes_valid_acquisition_and_playlist_jobs_and_rejects_missing_ids() {
         let pool = DbPool::connect_memory().await.expect("open memory db");
         run_migrations(&pool, None).await.expect("run migrations");
@@ -318,7 +417,12 @@ mod tests {
             .wait_for_settlement(&imp_task.id, Duration::from_secs(3))
             .await
             .expect("settle spotdl import");
-        assert_eq!(settled_imp.state, TaskStatus::Finished, "{:?}", settled_imp.error);
+        assert_eq!(
+            settled_imp.state,
+            TaskStatus::Finished,
+            "{:?}",
+            settled_imp.error
+        );
 
         let completed_imp = spotify_imports
             .get(&import_job.id, "alice")
@@ -526,12 +630,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_scheduler_worker_automatically_dispatches_scheduled_tasks_and_recovers_from_clock_skew() {
+    async fn cron_scheduler_worker_automatically_dispatches_scheduled_tasks_and_recovers_from_clock_skew()
+     {
         let pool = DbPool::connect_memory().await.expect("open memory db");
         run_migrations(&pool, None).await.expect("run migrations");
 
-        let manager = TaskManager::new(Some(pool.clone()))
-            .with_cron_tick_interval(Duration::from_millis(25));
+        let manager =
+            TaskManager::new(Some(pool.clone())).with_cron_tick_interval(Duration::from_millis(25));
         manager.initialize_tables().await;
         manager.register(TaskType::LibraryScan, Arc::new(NoopTaskRunner));
 
@@ -563,7 +668,10 @@ mod tests {
         assert_eq!(scheduled_tasks[0].state, TaskStatus::Finished);
 
         // 2. Deterministic timestamp evaluation & backward clock skew recovery
-        manager.remove_schedule(TaskType::LibraryScan).await.unwrap();
+        manager
+            .remove_schedule(TaskType::LibraryScan)
+            .await
+            .unwrap();
         manager.clear_history().await;
 
         manager.register(TaskType::NewReleasesScan, Arc::new(NoopTaskRunner));

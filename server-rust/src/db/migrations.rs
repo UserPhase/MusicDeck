@@ -10,7 +10,7 @@
 //!      (`up_to = Some(target_version)`) for testing legacy database upgrade paths.
 //!    - Wraps every individual migration step in an atomic SQLite transaction (`BEGIN` /
 //!      `COMMIT` / `ROLLBACK`), re-checking `schema_migrations` inside the write lock.
-//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=51) and
+//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=52) and
 //!      procedural data-transforming migrations (migration 39: `upgrade-legacy-smart-playlist-projection`).
 //! 2. **Transactional Initial Seeding ([`seed_initial_data`])**:
 //!    - Seeds `roles` (`admin`, `user`) and the primary `backend_connections` row matching
@@ -31,14 +31,14 @@ use chrono::Utc;
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Acquire, Row, SqliteConnection};
+use sqlx::{Row, SqliteConnection};
 
 use crate::config::{AppConfig, MusicBackendKind};
 use crate::db::migrations_sql::{RAW_MIGRATIONS, SMART_PLAYLIST_ACTIVITY_SCHEMA_BASE};
 use crate::db::{DbError, DbPool, protect_database_files};
 
 /// Total number of sequential migrations defined in the MusicDeck schema registry.
-pub const LATEST_SCHEMA_VERSION: u32 = 51;
+pub const LATEST_SCHEMA_VERSION: u32 = 52;
 
 /// Bcrypt work factor (`12`) matching `PASSWORD_COST` in `server/src/auth/passwords.ts`.
 pub const BCRYPT_PASSWORD_COST: u32 = 12;
@@ -62,7 +62,7 @@ pub enum MigrationKind {
 /// Metadata and execution hook for a single schema migration step.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    /// Monotonically increasing migration version identifier (`1..=51`).
+    /// Monotonically increasing migration version identifier (`1..=52`).
     pub id: u32,
     /// Descriptive kebab-case migration slug stored in `schema_migrations.name`.
     pub name: &'static str,
@@ -78,7 +78,7 @@ pub struct AppliedMigration {
     pub id: u32,
     /// Migration slug name.
     pub name: String,
-    /// ISO-8601 UTC timestamp when the migration was committed.
+    /// ISO-8601 UTC timestamp recorded by the migration transaction.
     pub applied_at: String,
 }
 
@@ -189,40 +189,16 @@ pub async fn run_migrations(
             continue;
         }
 
-        let mut conn = pool.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
-
-        // Re-check inside the transaction write lock in case another process migrated concurrently.
-        let already_exists = sqlx::query("SELECT 1 FROM schema_migrations WHERE id = ?;")
-            .bind(i64::from(migration.id))
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-
-        if !already_exists {
-            match migration.kind {
-                MigrationKind::Sql(sql_script) => {
-                    sqlx::raw_sql(sql_script).execute(&mut *tx).await?;
-                }
-                MigrationKind::UpgradeSmartPlaylistProjectionV39 => {
-                    apply_migration_39(&mut tx).await?;
-                }
-            }
-
-            let now_iso = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            sqlx::query(
-                "INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?);",
-            )
-            .bind(i64::from(migration.id))
-            .bind(migration.name)
-            .bind(now_iso)
-            .execute(&mut *tx)
-            .await?;
-
+        let applied = apply_migration(pool, migration)
+            .await
+            .map_err(|source| DbError::Migration {
+                id: migration.id,
+                name: migration.name,
+                source: Box::new(source),
+            })?;
+        if applied {
             newly_applied.push(migration.id);
         }
-
-        tx.commit().await?;
         applied_ids.insert(migration.id);
     }
 
@@ -231,6 +207,34 @@ pub async fn run_migrations(
         total_applied: applied_ids.len(),
         target_version: up_to,
     })
+}
+
+async fn apply_migration(pool: &DbPool, migration: Migration) -> Result<bool, DbError> {
+    let mut tx = pool.inner().begin().await?;
+    // Claim the version with a write as the first statement. The claim rolls
+    // back with the schema change on failure, and other migrators wait on it.
+    let claimed = sqlx::query(
+        "INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)
+         ON CONFLICT(id) DO NOTHING;",
+    )
+    .bind(i64::from(migration.id))
+    .bind(migration.name)
+    .bind(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() == 1;
+    if claimed {
+        match migration.kind {
+            MigrationKind::Sql(script) => {
+                sqlx::raw_sql(script).execute(&mut *tx).await?;
+            }
+            MigrationKind::UpgradeSmartPlaylistProjectionV39 => {
+                apply_migration_39(&mut tx).await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(claimed)
 }
 
 /// Procedural implementation of Migration 39 (`upgrade-legacy-smart-playlist-projection`).
@@ -513,6 +517,10 @@ pub async fn backfill_connection_scope(pool: &DbPool) -> Result<BackfillReport, 
     };
     report.primary_connection_id = Some(primary_id.clone());
 
+    if primary_id == "env-navidrome" {
+        return Ok(report);
+    }
+
     if table_has_column(pool.inner(), "favorites", "connection_id").await? {
         let res = sqlx::query(
             "UPDATE favorites SET connection_id = ? WHERE connection_id = 'env-navidrome';",
@@ -556,18 +564,14 @@ pub async fn backfill_connection_scope(pool: &DbPool) -> Result<BackfillReport, 
     Ok(report)
 }
 
-/// Creates stable `md_<nanoid>` MusicDeck library identities for legacy provider-scoped
-/// track references in `favorites`, `recently_played`, and `playlist_items` within a
-/// single atomic SQLite transaction.
+/// Creates stable MusicDeck identities for legacy provider references in resumable batches.
 pub async fn backfill_library_identities(pool: &DbPool) -> Result<BackfillReport, DbError> {
     let mut report = BackfillReport::default();
-
-    let has_migration_5 = sqlx::query("SELECT id FROM schema_migrations WHERE id = 5;")
+    let migrated = sqlx::query("SELECT id FROM schema_migrations WHERE id = 5;")
         .fetch_optional(pool.inner())
         .await?
         .is_some();
-
-    if !has_migration_5 {
+    if !migrated {
         return Ok(report);
     }
 
@@ -575,99 +579,75 @@ pub async fn backfill_library_identities(pool: &DbPool) -> Result<BackfillReport
         return Ok(report);
     };
     report.primary_connection_id = Some(primary_id.clone());
-
-    let has_item_type =
-        table_has_column(pool.inner(), "library_item_sources", "item_type").await?;
+    let has_item_type = table_has_column(pool.inner(), "library_item_sources", "item_type").await?;
     let has_external_track_json =
         table_has_column(pool.inner(), "playlist_items", "external_track_json").await?;
-
-    let mut conn = pool.inner().acquire().await?;
-    let mut tx = conn.begin().await?;
     let now_iso = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    // 1. Backfill `favorites`
-    let favorite_rows = sqlx::query("SELECT user_id, track_id FROM favorites;")
-        .fetch_all(&mut *tx)
-        .await?;
-    for row in favorite_rows {
-        let user_id: String = row.try_get("user_id")?;
-        let track_id: String = row.try_get("track_id")?;
-        if track_id.starts_with("md_") {
-            continue;
+    for (table, select, update, count) in [
+        (
+            "favorites",
+            "SELECT rowid AS row_key, track_id AS provider_id, NULL AS connection_id FROM favorites
+             WHERE rowid >= ? AND track_id NOT GLOB 'md_*' ORDER BY rowid LIMIT 256",
+            "UPDATE favorites AS legacy SET track_id = ?1 WHERE rowid = ?2
+             AND NOT EXISTS (
+                 SELECT 1 FROM favorites AS stable WHERE stable.user_id = legacy.user_id
+                 AND stable.track_id = ?1
+             )",
+            &mut report.favorites_rewritten,
+        ),
+        (
+            "recently_played",
+            "SELECT rowid AS row_key, track_id AS provider_id, NULL AS connection_id FROM recently_played
+             WHERE rowid >= ? AND track_id NOT GLOB 'md_*' ORDER BY rowid LIMIT 256",
+            "UPDATE recently_played SET track_id = ? WHERE rowid = ?",
+            &mut report.recently_played_rewritten,
+        ),
+        (
+            "playlist_items",
+            if has_external_track_json {
+                "SELECT rowid AS row_key, provider_track_id AS provider_id, connection_id FROM playlist_items
+                 WHERE rowid >= ? AND library_track_id IS NULL AND external_track_json IS NULL
+                 ORDER BY rowid LIMIT 256"
+            } else {
+                "SELECT rowid AS row_key, provider_track_id AS provider_id, connection_id FROM playlist_items
+                 WHERE rowid >= ? AND library_track_id IS NULL ORDER BY rowid LIMIT 256"
+            },
+            "UPDATE playlist_items SET library_track_id = ? WHERE rowid = ?",
+            &mut report.playlist_items_backfilled,
+        ),
+    ] {
+        let started = std::time::Instant::now();
+        let mut next_row = Some(i64::MIN);
+        while let Some(from) = next_row.take() {
+            let mut tx = super::begin_sqlite_write(
+                pool.inner(), "UPDATE library_items SET updated_at = updated_at WHERE 0",
+            ).await?;
+            let rows = sqlx::query(select).bind(from).fetch_all(&mut *tx).await?;
+            for row in rows {
+                let row_key: i64 = row.try_get("row_key")?;
+                let provider_id: String = row.try_get("provider_id")?;
+                let connection_id: Option<String> = row.try_get("connection_id")?;
+                let md_id = ensure_track_id(
+                    &mut tx,
+                    connection_id.as_deref().unwrap_or(&primary_id),
+                    &provider_id,
+                    &now_iso,
+                    has_item_type,
+                ).await?;
+                let result = sqlx::query(update).bind(md_id).bind(row_key).execute(&mut *tx).await?;
+                if table == "favorites" && result.rows_affected() == 0 {
+                    // The user already has the equivalent stable favorite.
+                    sqlx::query("DELETE FROM favorites WHERE rowid = ?")
+                        .bind(row_key).execute(&mut *tx).await?;
+                }
+                *count += 1;
+                next_row = row_key.checked_add(1);
+            }
+            tx.commit().await?;
         }
-        let md_id = ensure_track_id(
-            &mut tx,
-            &primary_id,
-            &track_id,
-            &now_iso,
-            has_item_type,
-        )
-        .await?;
-        let res = sqlx::query(
-            "UPDATE favorites SET track_id = ? WHERE user_id = ? AND track_id = ?;",
-        )
-        .bind(&md_id)
-        .bind(&user_id)
-        .bind(&track_id)
-        .execute(&mut *tx)
-        .await?;
-        report.favorites_rewritten += res.rows_affected();
+        tracing::info!(table, rows = *count, elapsed_ms = started.elapsed().as_millis(), "Legacy library identity backfill complete");
     }
-
-    // 2. Backfill `recently_played`
-    let recent_rows = sqlx::query("SELECT id, track_id FROM recently_played;")
-        .fetch_all(&mut *tx)
-        .await?;
-    for row in recent_rows {
-        let row_id: String = row.try_get("id")?;
-        let track_id: String = row.try_get("track_id")?;
-        if track_id.starts_with("md_") {
-            continue;
-        }
-        let md_id = ensure_track_id(
-            &mut tx,
-            &primary_id,
-            &track_id,
-            &now_iso,
-            has_item_type,
-        )
-        .await?;
-        let res = sqlx::query("UPDATE recently_played SET track_id = ? WHERE id = ?;")
-            .bind(&md_id)
-            .bind(&row_id)
-            .execute(&mut *tx)
-            .await?;
-        report.recently_played_rewritten += res.rows_affected();
-    }
-
-    // 3. Backfill `playlist_items.library_track_id`
-    let items_query = if has_external_track_json {
-        "SELECT id, connection_id, provider_track_id FROM playlist_items WHERE library_track_id IS NULL AND external_track_json IS NULL;"
-    } else {
-        "SELECT id, connection_id, provider_track_id FROM playlist_items WHERE library_track_id IS NULL;"
-    };
-    let item_rows = sqlx::query(items_query).fetch_all(&mut *tx).await?;
-    for row in item_rows {
-        let item_id: String = row.try_get("id")?;
-        let connection_id: String = row.try_get("connection_id")?;
-        let provider_track_id: String = row.try_get("provider_track_id")?;
-        let md_id = ensure_track_id(
-            &mut tx,
-            &connection_id,
-            &provider_track_id,
-            &now_iso,
-            has_item_type,
-        )
-        .await?;
-        let res = sqlx::query("UPDATE playlist_items SET library_track_id = ? WHERE id = ?;")
-            .bind(&md_id)
-            .bind(&item_id)
-            .execute(&mut *tx)
-            .await?;
-        report.playlist_items_backfilled += res.rows_affected();
-    }
-
-    tx.commit().await?;
     Ok(report)
 }
 
@@ -678,9 +658,15 @@ pub async fn open_database(config: &AppConfig) -> Result<DbPool, DbError> {
     let pool = DbPool::connect(db_path).await?;
 
     if let Err(err) = async {
-        run_migrations(&pool, None).await?;
+        let started = std::time::Instant::now();
+        let migrations = run_migrations(&pool, None).await?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis(), applied = migrations.newly_applied.len(), "Database schema checked");
+        let started = std::time::Instant::now();
         seed_initial_data(&pool, config).await?;
-        backfill_connection_scope(&pool).await?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis(), "Database seed data checked");
+        let started = std::time::Instant::now();
+        let scope = backfill_connection_scope(&pool).await?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis(), rows = scope.connection_scope_rows_updated, "Legacy connection scope backfill complete");
         backfill_library_identities(&pool).await?;
         if config.database.is_persistent() {
             protect_database_files(db_path)?;

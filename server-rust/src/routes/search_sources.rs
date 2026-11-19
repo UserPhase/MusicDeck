@@ -9,6 +9,7 @@
 //! - `PATCH /api/admin/source-providers/:provider_id`
 //! - `POST /api/admin/source-providers/:provider_id/test`
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -108,7 +109,7 @@ pub fn search_sources_routes() -> Router<AppState> {
 async fn resolve_playable_sources_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(payload): Json<SourceResolutionRequestPayload>,
+    ApiJson(payload): ApiJson<SourceResolutionRequestPayload>,
 ) -> Result<Response, ServerError> {
     if payload.result.id.trim().is_empty() || payload.result.title.trim().is_empty() {
         return Err(ServerError::BadRequest(String::from(
@@ -220,7 +221,7 @@ async fn patch_search_provider_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(provider_id): Path<String>,
-    Json(body): Json<PatchSearchProviderBody>,
+    ApiJson(body): ApiJson<PatchSearchProviderBody>,
 ) -> Result<Response, ServerError> {
     state
         .search_providers()
@@ -264,7 +265,7 @@ async fn patch_source_provider_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(provider_id): Path<String>,
-    Json(body): Json<PatchSourceProviderBody>,
+    ApiJson(body): ApiJson<PatchSourceProviderBody>,
 ) -> Result<Response, ServerError> {
     state
         .source_providers()

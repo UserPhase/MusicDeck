@@ -13,6 +13,7 @@
 //! - `PATCH /api/v1/admin/extensions/:extension_id`
 //! - `/api/v1/admin/extensions/:extension_id/routes/*path`
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -23,9 +24,9 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::auth::{AuthenticatedUser, RequireAdmin};
-use crate::error::ServerError;
 use crate::plugins::{
-    ExtensionError, ExtensionErrorCode, http_status_for_plugin_error, parse_custom_manifest,
+    ExtensionError, ExtensionErrorCode, PluginRegistryError, http_status_for_plugin_error,
+    parse_custom_manifest,
 };
 
 fn no_store_headers() -> HeaderMap {
@@ -112,76 +113,98 @@ pub fn plugins_and_extensions_routes() -> Router<AppState> {
         )
 }
 
+fn plugin_error_response(error: PluginRegistryError) -> Response {
+    let (status, code, message) = match error {
+        PluginRegistryError::Unknown => (
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND".into(),
+            "Plugin not found".into(),
+        ),
+        PluginRegistryError::AlreadyRegistered => (
+            StatusCode::CONFLICT,
+            "ALREADY_INSTALLED".into(),
+            "A plugin with this ID is already installed".into(),
+        ),
+        PluginRegistryError::NotUninstallable => (
+            StatusCode::BAD_REQUEST,
+            "NOT_UNINSTALLABLE".into(),
+            error.to_string(),
+        ),
+        PluginRegistryError::InvalidManifest(_) => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_MANIFEST".into(),
+            error.to_string(),
+        ),
+        PluginRegistryError::InvalidConfiguration => (
+            StatusCode::BAD_REQUEST,
+            "INVALID_CONFIG".into(),
+            error.to_string(),
+        ),
+        PluginRegistryError::Rejected(classified) => (
+            http_status_for_plugin_error(classified.status),
+            classified.status.as_str().to_ascii_uppercase(),
+            classified.message,
+        ),
+        other => {
+            tracing::warn!(error = %other, "Plugin storage operation failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR".into(),
+                "Plugin storage operation failed".into(),
+            )
+        }
+    };
+    (
+        status,
+        Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
 async fn list_public_plugins_handler(
     State(state): State<AppState>,
     _auth: AuthenticatedUser,
 ) -> Response {
-    let plugins = state.plugins().list(false).await;
-    (StatusCode::OK, Json(json!({ "plugins": plugins }))).into_response()
+    match state.plugins().list(false).await {
+        Ok(plugins) => Json(json!({ "plugins": plugins })).into_response(),
+        Err(error) => plugin_error_response(error),
+    }
 }
 
 async fn list_admin_plugins_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
 ) -> Response {
-    let plugins = state.plugins().list(true).await;
-    (StatusCode::OK, Json(json!({ "plugins": plugins }))).into_response()
+    match state.plugins().list(true).await {
+        Ok(plugins) => Json(json!({ "plugins": plugins })).into_response(),
+        Err(error) => plugin_error_response(error),
+    }
 }
 
 async fn get_admin_plugin_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(plugin_id): Path<String>,
-) -> Result<Response, ServerError> {
-    let Some(plugin) = state.plugins().get(&plugin_id, true).await else {
-        return Err(ServerError::NotFound(String::from("Plugin not found")));
-    };
-    Ok((StatusCode::OK, Json(json!({ "plugin": plugin }))).into_response())
+) -> Response {
+    match state.plugins().get(&plugin_id, true).await {
+        Ok(Some(plugin)) => Json(json!({ "plugin": plugin })).into_response(),
+        Ok(None) => plugin_error_response(PluginRegistryError::Unknown),
+        Err(error) => plugin_error_response(error),
+    }
 }
 
 async fn install_custom_plugin_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    Json(body): Json<InstallPluginBody>,
+    ApiJson(body): ApiJson<InstallPluginBody>,
 ) -> Response {
     let manifest = match parse_custom_manifest(&body.manifest) {
-        Ok(m) => m,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "code": "INVALID_MANIFEST",
-                        "message": err.0,
-                    }
-                })),
-            )
-                .into_response();
-        }
+        Ok(manifest) => manifest,
+        Err(error) => return plugin_error_response(error.into()),
     };
-
     match state.plugins().install_custom_plugin(manifest).await {
         Ok(plugin) => (StatusCode::CREATED, Json(json!({ "plugin": plugin }))).into_response(),
-        Err(msg) if msg == "Plugin is already registered" => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": {
-                    "code": "ALREADY_INSTALLED",
-                    "message": "A plugin with this ID is already installed",
-                }
-            })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": "Could not install plugin",
-                }
-            })),
-        )
-            .into_response(),
+        Err(error) => plugin_error_response(error),
     }
 }
 
@@ -192,16 +215,7 @@ async fn delete_admin_plugin_handler(
 ) -> Response {
     match state.plugins().uninstall_plugin(&plugin_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(msg) if msg == "Unknown plugin" => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "code": "NOT_FOUND", "message": "Plugin not found" } })),
-        )
-            .into_response(),
-        Err(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "code": "NOT_UNINSTALLABLE", "message": msg } })),
-        )
-            .into_response(),
+        Err(error) => plugin_error_response(error),
     }
 }
 
@@ -209,52 +223,16 @@ async fn patch_admin_plugin_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(plugin_id): Path<String>,
-    Json(body): Json<PatchPluginBody>,
+    ApiJson(body): ApiJson<PatchPluginBody>,
 ) -> Response {
-    if state.plugins().get(&plugin_id, true).await.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "code": "NOT_FOUND", "message": "Plugin not found" } })),
-        )
-            .into_response();
-    }
-
-    if let Err(classified) = state
+    match state
         .plugins()
-        .configure(&plugin_id, Some(false), body.config, body.permissions)
+        .configure(&plugin_id, body.enabled, body.config, body.permissions)
         .await
     {
-        return (
-            http_status_for_plugin_error(classified.status),
-            Json(json!({
-                "error": {
-                    "code": classified.status.as_str().to_ascii_uppercase(),
-                    "message": classified.message,
-                }
-            })),
-        )
-            .into_response();
+        Ok(plugin) => Json(json!({ "plugin": plugin })).into_response(),
+        Err(error) => plugin_error_response(error),
     }
-
-    if body.enabled == Some(true) {
-        if let Err(classified) = state.plugins().enable(&plugin_id).await {
-            return (
-                http_status_for_plugin_error(classified.status),
-                Json(json!({
-                    "error": {
-                        "code": classified.status.as_str().to_ascii_uppercase(),
-                        "message": classified.message,
-                    }
-                })),
-            )
-                .into_response();
-        }
-    } else if body.enabled == Some(false) {
-        let _ = state.plugins().disable(&plugin_id).await;
-    }
-
-    let plugin = state.plugins().get(&plugin_id, true).await;
-    (StatusCode::OK, Json(json!({ "plugin": plugin }))).into_response()
 }
 
 async fn test_admin_plugin_handler(
@@ -263,12 +241,8 @@ async fn test_admin_plugin_handler(
     Path(plugin_id): Path<String>,
 ) -> Response {
     match state.plugins().test(&plugin_id).await {
-        Ok(test) => (StatusCode::OK, Json(json!({ "test": test }))).into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "code": "NOT_FOUND", "message": "Plugin not found" } })),
-        )
-            .into_response(),
+        Ok(test) => Json(json!({ "test": test })).into_response(),
+        Err(error) => plugin_error_response(error),
     }
 }
 
@@ -309,7 +283,7 @@ async fn patch_extension_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(extension_id): Path<String>,
-    Json(body): Json<PatchExtensionBody>,
+    ApiJson(body): ApiJson<PatchExtensionBody>,
 ) -> Response {
     match state
         .extensions()
@@ -339,5 +313,98 @@ async fn dispatch_extension_route_handler(
     {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err(err) => extension_error_response(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn plugin_patch_reports_failure_and_keeps_the_previous_settings() {
+        let db = crate::db::DbPool::connect_memory().await.unwrap();
+        crate::db::run_migrations(&db, None).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT OR IGNORE INTO roles (name, description) VALUES ('admin', 'Administrator');
+             INSERT INTO users (id, username, password_hash, display_name, role, disabled, created_at, updated_at)
+             VALUES ('admin', 'admin', 'unused', 'Admin', 'admin', 0, '2026-01-01', '2026-01-01');",
+        ).execute(db.inner()).await.unwrap();
+        let state = AppState::with_database(crate::AppConfig::default(), db.clone())
+            .await
+            .unwrap();
+        let session = state
+            .session_store()
+            .unwrap()
+            .create_session("admin", false)
+            .await
+            .unwrap();
+        let router = plugins_and_extensions_routes().with_state(state.clone());
+        let request = |method: &str, path: &str, body: Value| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::COOKIE, format!("musicdeck_session={}", session.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let manifest = json!({"manifestVersion": 1, "id": "fixture", "name": "Fixture", "version": "1",
+            "capabilities": ["lyrics"], "configuration": {"secret": {"type": "secret", "required": true}}});
+        let response = request(
+            "POST",
+            "/api/admin/plugins/install",
+            json!({"manifest": manifest}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let path = "/api/admin/plugins/fixture";
+        let response = request(
+            "PATCH",
+            path,
+            json!({"enabled": true, "config": {"region": "nl"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.plugins().get("fixture", true).await.unwrap().unwrap()["config"],
+            json!({})
+        );
+
+        sqlx::query("CREATE TRIGGER fail_settings BEFORE UPDATE ON plugin_configs BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+            .execute(db.inner()).await.unwrap();
+        let patch = json!({"enabled": true, "config": {"secret": "sample"}});
+        let response = request("PATCH", path, patch.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state.plugins().get("fixture", true).await.unwrap().unwrap()["enabled"],
+            false
+        );
+        sqlx::query("DROP TRIGGER fail_settings")
+            .execute(db.inner())
+            .await
+            .unwrap();
+
+        let response = request("PATCH", path, patch).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = request("PATCH", path, json!({"config": {"region": "nl"}}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["plugin"]["enabled"], true);
+        assert_eq!(
+            body["plugin"]["config"],
+            json!({"secret": true, "region": "nl"})
+        );
     }
 }

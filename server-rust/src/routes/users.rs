@@ -19,6 +19,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -31,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::{
-    AuthenticatedUser, OptionalUser, RequireAdmin, append_set_cookie, build_session_sse_stream,
+    AuthenticatedUser, OptionalUser, RequireAdmin, Session, append_set_cookie, build_session_sse_stream,
+    create_session_on_conn,
     extract_session_cookie, format_clear_session_cookie, format_set_session_cookie, hash_password,
     revoke_user_sessions_tx, verify_password,
 };
@@ -149,6 +151,7 @@ fn map_user_error(err: UserError) -> Response {
         status,
         Json(ApiErrorEnvelope {
             error: ApiErrorBody {
+                request_id: crate::error::current_request_id(),
                 code: String::from(code),
                 message,
             },
@@ -166,12 +169,11 @@ async fn get_me(auth: AuthenticatedUser) -> Json<SingleUserResponse> {
 async fn patch_me(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-     payload_res: Result<Json<UpdateOwnProfilePayload>, axum::extract::rejection::JsonRejection>,
+     payload_res: Result<ApiJson<UpdateOwnProfilePayload>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(payload)) = payload_res else {
-        return map_user_error(UserError::Validation(String::from(
-            "Invalid profile update request",
-        )));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -405,10 +407,11 @@ async fn admin_list_users(
 async fn admin_create_user(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    payload_res: Result<Json<CreateUserPayload>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CreateUserPayload>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(payload)) = payload_res else {
-        return map_user_error(UserError::Validation(String::from("Invalid user request")));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -436,12 +439,11 @@ async fn admin_update_user(
     State(state): State<AppState>,
     admin: RequireAdmin,
     Path(user_id): Path<String>,
-    payload_res: Result<Json<UserUpdatePayload>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<UserUpdatePayload>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(payload)) = payload_res else {
-        return map_user_error(UserError::Validation(String::from(
-            "Invalid user update request",
-        )));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -514,14 +516,11 @@ async fn auth_login_handler(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    payload_res: Result<Json<LoginRequestBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<LoginRequestBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "code": "BAD_REQUEST", "message": "Invalid login request" } })),
-        )
-            .into_response();
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
     if body.username.trim().is_empty() || body.password.is_empty() {
         return (
@@ -545,63 +544,48 @@ async fn auth_login_handler(
         )
             .into_response();
         if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, val);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, val);
         }
         return resp;
     }
 
-    let (Ok(db), Some(sessions)) = (require_db(&state), state.session_store()) else {
+    let Ok(db) = require_db(&state) else {
         return ServerError::Internal(String::from("Database unavailable")).into_response();
     };
 
     let stored = match get_user_by_username(db, &body.username).await {
-        Ok(Some(u)) if !u.disabled => u,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "error": {
-                        "code": "UNAUTHORIZED",
-                        "message": "Invalid username or password"
-                    }
-                })),
-            )
+        Ok(Some(user)) if !user.disabled => user,
+        Ok(_) => return invalid_login(),
+        Err(_) => {
+            return ServerError::ServiceUnavailable("Login temporarily unavailable".into())
                 .into_response();
         }
     };
-
-    let valid = verify_password(&body.password, &stored.password_hash)
+    if !verify_password(&body.password, &stored.password_hash)
         .await
-        .unwrap_or(false);
-    if !valid {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": {
-                    "code": "UNAUTHORIZED",
-                    "message": "Invalid username or password"
-                }
-            })),
-        )
-            .into_response();
+        .unwrap_or(false)
+    {
+        return invalid_login();
     }
 
-    let remember_me = body.remember_me.unwrap_or(true);
-    let Ok(session) = sessions.create_session(&stored.id, remember_me).await else {
-        return ServerError::Internal(String::from("Could not create session")).into_response();
+    let (session, logged_in_at) = match commit_verified_login(
+        db,
+        &stored.id,
+        &stored.password_hash,
+        body.remember_me.unwrap_or(true),
+    )
+    .await
+    {
+        Ok(Some(login)) => login,
+        Ok(None) => return invalid_login(),
+        Err(_) => {
+            return ServerError::ServiceUnavailable("Login temporarily unavailable".into())
+                .into_response();
+        }
     };
-
-    let mut conn = match db.inner().acquire().await {
-        Ok(c) => c,
-        Err(_) => return ServerError::Internal(String::from("Database unavailable")).into_response(),
-    };
-    let last_login_at = record_login_on_conn(&mut conn, &stored.id).await.ok();
-    drop(conn);
-
     let mut user = stored.public_user;
-    if last_login_at.is_some() {
-        user.last_login_at = last_login_at;
-    }
+    user.last_login_at = Some(logged_in_at);
 
     let cookie = format_set_session_cookie(
         &session.id,
@@ -615,19 +599,55 @@ async fn auth_login_handler(
     resp
 }
 
+fn invalid_login() -> Response {
+    ServerError::Unauthorized("Invalid username or password".into()).into_response()
+}
+
+async fn commit_verified_login(
+    db: &DbPool,
+    user_id: &str,
+    verified_hash: &str,
+    remember_me: bool,
+) -> Result<Option<(Session, String)>, UserError> {
+    let mut tx = db.inner().begin().await?;
+    // Password verification happens before taking the SQLite writer lock. The
+    // first write rechecks the credential and account at the serialization point.
+    let Some(logged_in_at) = record_login_on_conn(&mut tx, user_id, verified_hash).await? else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let session = create_session_on_conn(&mut tx, user_id, remember_me).await?;
+    tx.commit().await?;
+    Ok(Some((session, logged_in_at)))
+}
+
 /// `POST /api/auth/logout`
-async fn auth_logout_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(sessions) = state.session_store() {
-        let sid = extract_session_cookie(&headers);
-        let _ = sessions.delete_session(sid.as_deref()).await;
+async fn auth_logout_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(sid) = extract_session_cookie(&headers) {
+        let deletion = match state.session_store() {
+            Some(sessions) => sessions.delete_session(Some(&sid)).await,
+            None => return logout_unavailable(),
+        };
+        if let Err(error) = deletion {
+            tracing::warn!(%error, "Could not delete session during logout");
+            return logout_unavailable();
+        }
     }
     let clear_cookie = format_clear_session_cookie(state.config().auth.secure_cookies);
     let mut resp = Json(json!({ "ok": true })).into_response();
     append_set_cookie(resp.headers_mut(), clear_cookie);
     resp
+}
+
+fn logout_unavailable() -> Response {
+    let mut response =
+        ServerError::ServiceUnavailable("Could not end session. Retry logout.".into())
+            .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    response
 }
 
 /// `GET /api/auth/session`
@@ -642,15 +662,16 @@ async fn auth_session_handler(
     }))
     .into_response();
 
-    if opt_user.0.is_some() {
-        if let (Some(sessions), Some(sid)) = (state.session_store(), extract_session_cookie(&headers)) {
-            if let Ok(Some(refreshed_cookie)) = sessions
-                .refresh_session_if_remembered(&sid, state.config().auth.secure_cookies)
-                .await
-            {
-                append_set_cookie(resp.headers_mut(), refreshed_cookie);
-            }
-        }
+    if let (Some(user), Some(sessions), Some(sid)) = (
+        &opt_user.0,
+        state.session_store(),
+        extract_session_cookie(&headers),
+    ) && sid == user.session_id
+        && let Ok(Some(refreshed_cookie)) = sessions
+            .refresh_session_if_remembered(&sid, state.config().auth.secure_cookies)
+            .await
+    {
+        append_set_cookie(resp.headers_mut(), refreshed_cookie);
     }
 
     resp
@@ -678,20 +699,11 @@ async fn auth_session_events_handler(
 async fn auth_change_password_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    headers: HeaderMap,
-    payload_res: Result<Json<ChangePasswordRequestBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ChangePasswordRequestBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": {
-                    "code": "BAD_REQUEST",
-                    "message": "Invalid password change request"
-                }
-            })),
-        )
-            .into_response();
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
     if body.current_password.is_empty() || body.new_password.chars().count() < 8 {
         return (
@@ -711,8 +723,11 @@ async fn auth_change_password_handler(
     };
 
     let stored = match get_user_by_username(db, &auth.user.username).await {
-        Ok(Some(u)) => u,
-        _ => return ServerError::Unauthorized(String::from("Authentication required")).into_response(),
+        Ok(Some(u)) if u.id == auth.user.id => u,
+        _ => {
+            return ServerError::Unauthorized(String::from("Authentication required"))
+                .into_response();
+        }
     };
 
     let valid = verify_password(&body.current_password, &stored.password_hash)
@@ -735,48 +750,60 @@ async fn auth_change_password_handler(
         return ServerError::Internal(String::from("Could not hash password")).into_response();
     };
 
-    let current_sid = if auth.session_id.is_empty() {
-        extract_session_cookie(&headers)
-    } else {
-        Some(auth.session_id)
-    };
-
-    let Ok(mut tx) = db.inner().begin().await else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
-    };
-
-    let now_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    if sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?;")
-        .bind(&new_hash)
-        .bind(&now_iso)
-        .bind(&auth.user.id)
-        .execute(&mut *tx)
-        .await
-        .is_err()
+    match commit_password_change(
+        db,
+        &auth.user.id,
+        &auth.session_id,
+        &stored.password_hash,
+        &new_hash,
+    )
+    .await
     {
-        let _ = tx.rollback().await;
-        return ServerError::Internal(String::from("Could not update password")).into_response();
-    }
-
-    if revoke_user_sessions_tx(&mut tx, &auth.user.id, current_sid.as_deref())
-        .await
-        .is_err()
-    {
-        let _ = tx.rollback().await;
-        return ServerError::Internal(String::from("Could not revoke sessions")).into_response();
-    }
-
-    if tx.commit().await.is_err() {
-        return ServerError::Internal(String::from("Could not commit password update"))
-            .into_response();
+        Ok(true) => {}
+        Ok(false) => {
+            return ServerError::Unauthorized("Authentication changed. Sign in again.".into())
+                .into_response();
+        }
+        Err(_) => return ServerError::Internal("Could not update password".into()).into_response(),
     }
 
     if let Some(sessions) = state.session_store() {
         sessions
-            .notify_user_sessions_revoked(&auth.user.id, current_sid.as_deref())
+            .notify_user_sessions_revoked(&auth.user.id, Some(&auth.session_id))
             .await;
         sessions.events().notify_changes();
     }
 
     Json(json!({ "ok": true })).into_response()
+}
+
+async fn commit_password_change(
+    db: &DbPool,
+    user_id: &str,
+    session_id: &str,
+    verified_hash: &str,
+    new_hash: &str,
+) -> Result<bool, UserError> {
+    let mut tx = db.inner().begin().await?;
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? AND password_hash = ? AND disabled = 0
+           AND EXISTS (
+               SELECT 1 FROM sessions WHERE id = ? AND user_id = users.id
+                 AND julianday(expires_at) > julianday('now')
+           );",
+    )
+    .bind(new_hash)
+    .bind(user_id)
+    .bind(verified_hash)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    revoke_user_sessions_tx(&mut tx, user_id, Some(session_id)).await?;
+    tx.commit().await?;
+    Ok(true)
 }

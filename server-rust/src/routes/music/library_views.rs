@@ -1,0 +1,421 @@
+use std::collections::HashMap;
+
+use crate::error::ApiJson;
+use axum::Json;
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{build_catalog_and_resolver, require_db};
+use crate::AppState;
+use crate::auth::AuthenticatedUser;
+use crate::catalog::merge::{strong_recording_ids, title_key};
+use crate::catalog::snapshot::catalog_revision;
+use crate::catalog::{
+    Available, CatalogEntityType, UnifiedCatalogItem, normalize_music_text, recordings_match,
+};
+use crate::db::{DbError, DbPool};
+use crate::error::ServerError;
+use crate::profile::LibraryFilter;
+use crate::providers::{IdentityHints, Track, TrackArtistCredit};
+
+#[derive(Debug, Deserialize)]
+pub(super) struct FilterTracksBody {
+    #[serde(default)]
+    filters: Vec<LibraryFilter>,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+fn filter_matches(filter: &LibraryFilter, value: &Value) -> bool {
+    let expected = &filter.value;
+    match filter.op.as_deref() {
+        None | Some("eq") => filter_text(value) == filter_text(expected),
+        Some("contains") => filter_text(value)
+            .to_lowercase()
+            .contains(&filter_text(expected).to_lowercase()),
+        Some("boolean") => filter_bool(value) == filter_bool(expected),
+        Some("gte") => filter_number(value)
+            .zip(filter_number(expected))
+            .is_some_and(|(actual, expected)| actual >= expected),
+        Some("lte") => filter_number(value)
+            .zip(filter_number(expected))
+            .is_some_and(|(actual, expected)| actual <= expected),
+        _ => false,
+    }
+}
+
+fn filter_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items.iter().map(filter_text).collect::<Vec<_>>().join(","),
+        _ => value.to_string(),
+    }
+}
+
+fn filter_bool(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => number.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(text) => !text.is_empty(),
+        _ => true,
+    }
+}
+
+fn filter_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Bool(value) => Some(f64::from(u8::from(*value))),
+        Value::String(text) if text.trim().is_empty() => Some(0.0),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => value.as_f64(),
+    }
+}
+
+type TrackActivity = (bool, i64, Option<String>);
+
+async fn user_track_activity(
+    db: &DbPool,
+    user_id: &str,
+) -> Result<HashMap<String, TrackActivity>, DbError> {
+    let rows = sqlx::query_as::<_, (String, bool, i64, Option<String>)>(
+        r"
+        WITH starred(track_id) AS (
+            SELECT track_id FROM favorites WHERE user_id = ?1
+            UNION
+            SELECT item_id FROM media_favorites WHERE user_id = ?1 AND item_type = 'track'
+        ), plays AS (
+            SELECT track_id, COUNT(*) AS play_count, MAX(played_at) AS last_played_at
+            FROM recently_played WHERE user_id = ?1 GROUP BY track_id
+        ), activity(track_id) AS (
+            SELECT track_id FROM starred UNION SELECT track_id FROM plays
+        )
+        SELECT activity.track_id, starred.track_id IS NOT NULL, COALESCE(plays.play_count, 0),
+               plays.last_played_at
+        FROM activity LEFT JOIN starred USING (track_id) LEFT JOIN plays USING (track_id)
+        ",
+    )
+    .bind(user_id)
+    .fetch_all(db.inner())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, favorite, count, last)| (id, (favorite, count, last)))
+        .collect())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnotatedTrack<'a> {
+    #[serde(flatten)]
+    track: &'a Available<Track>,
+    favorite: bool,
+    played: bool,
+    play_count: i64,
+    last_played_at: Option<&'a str>,
+    library_state: &'static str,
+    external_state: &'static str,
+}
+
+impl AnnotatedTrack<'_> {
+    fn matches(&self, filters: &[LibraryFilter]) -> Result<bool, serde_json::Error> {
+        let mut metadata: Option<Value> = None;
+        for filter in filters {
+            let annotation = match filter.field.as_str() {
+                "favorite" => json!(self.favorite),
+                "played" => json!(self.played),
+                "playCount" => json!(self.play_count),
+                "lastPlayedAt" => json!(self.last_played_at),
+                "libraryState" => json!(self.library_state),
+                "externalState" => json!(self.external_state),
+                field => {
+                    let metadata = match &metadata {
+                        Some(metadata) => metadata,
+                        None => metadata.insert(serde_json::to_value(self.track)?),
+                    };
+                    if !filter_matches(filter, &metadata[field]) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+            };
+            if !filter_matches(filter, &annotation) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub(super) async fn post_filter_tracks_handler(
+    State(state): State<AppState>,
+    auth: AuthenticatedUser,
+    body: Result<ApiJson<FilterTracksBody>, crate::error::ApiJsonRejection>,
+) -> Result<Response, ServerError> {
+    let ApiJson(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
+    let limit = body.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit)
+        || body.filters.iter().any(|filter| {
+            filter.field.is_empty()
+                || !matches!(
+                    filter.op.as_deref(),
+                    None | Some("eq" | "contains" | "boolean" | "gte" | "lte")
+                )
+        })
+    {
+        return Err(ServerError::BadRequest("Invalid library filter".into()));
+    }
+
+    let catalog = match build_catalog_and_resolver(&state) {
+        Ok((catalog, _, _)) => catalog,
+        Err(response) => return Ok(response),
+    };
+    let snapshot = state.catalog_snapshots().tracks(&catalog).await;
+    let activity = user_track_activity(require_db(&state)?, &auth.user.id).await?;
+    let mut ids = Vec::new();
+    let mut page = Vec::with_capacity(limit);
+
+    for track in &snapshot.items {
+        let (favorite, play_count, last_played_at) = activity
+            .get(&track.item.id)
+            .map_or((false, 0, None), |(favorite, count, last)| {
+                (*favorite, *count, last.as_deref())
+            });
+        let annotated = AnnotatedTrack {
+            track,
+            favorite,
+            played: play_count > 0,
+            play_count,
+            last_played_at,
+            library_state: "owned",
+            external_state: if track
+                .sources
+                .iter()
+                .flatten()
+                .any(|source| source.id.starts_with("external"))
+            {
+                "external"
+            } else {
+                "none"
+            },
+        };
+        if annotated
+            .matches(&body.filters)
+            .map_err(|error| ServerError::Internal(error.to_string()))?
+        {
+            if ids.len() >= body.offset && page.len() < limit {
+                page.push(
+                    serde_json::to_value(&annotated)
+                        .map_err(|error| ServerError::Internal(error.to_string()))?,
+                );
+            }
+            ids.push(track.item.id.as_str());
+        }
+    }
+
+    Ok(Json(json!({
+        "tracks": page,
+        "total": ids.len(),
+        "revision": catalog_revision(ids, snapshot.degraded),
+        "degraded": snapshot.degraded,
+    }))
+    .into_response())
+}
+
+const MAX_MATCH_ITEMS: usize = 100;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct LibraryMatchesBody {
+    items: Vec<LibraryMatchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryMatchItem {
+    id: String,
+    #[serde(rename = "type")]
+    kind: MatchKind,
+    title: String,
+    artist: String,
+    isrc: Option<String>,
+    music_brainz_id: Option<String>,
+    duration_seconds: Option<u32>,
+    artist_credits: Option<Vec<TrackArtistCredit>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MatchKind {
+    Track,
+    Album,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryMatch<'a> {
+    id: &'a str,
+    in_library: bool,
+    local_track_id: Option<&'a str>,
+    local_album_id: Option<&'a str>,
+}
+
+fn album_key(title: &str, artist: &str) -> Option<(String, String)> {
+    let artist = normalize_music_text(Some(artist));
+    if artist.is_empty() || normalize_music_text(Some(title)).is_empty() {
+        return None;
+    }
+    Some((title_key(title), artist))
+}
+
+fn local_recording(track: &Track) -> UnifiedCatalogItem {
+    UnifiedCatalogItem {
+        id: track.id.clone(),
+        item_type: CatalogEntityType::Track,
+        provider: "library".into(),
+        title: track.title.clone(),
+        artist: Some(track.artist_name.clone()),
+        artist_credits: track.artist_credits.clone(),
+        album: None,
+        duration_seconds: track.duration_seconds,
+        artwork: None,
+        identity_hints: track.identity_hints.clone(),
+        identity: None,
+    }
+}
+
+pub(super) async fn post_library_matches_handler(
+    State(state): State<AppState>,
+    _auth: AuthenticatedUser,
+    body: Result<ApiJson<LibraryMatchesBody>, crate::error::ApiJsonRejection>,
+) -> Result<Response, ServerError> {
+    let ApiJson(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
+    if body.items.len() > MAX_MATCH_ITEMS
+        || body.items.iter().any(|item| {
+            item.id.is_empty()
+                || item.id.chars().count() > 200
+                || item.title.chars().count() > 300
+                || item.artist.chars().count() > 300
+                || item
+                    .isrc
+                    .as_ref()
+                    .is_some_and(|code| code.chars().count() > 32)
+        })
+    {
+        return Err(ServerError::BadRequest(
+            "Invalid library match request".into(),
+        ));
+    }
+    if body.items.is_empty() {
+        return Ok(Json(json!({ "matches": [] })).into_response());
+    }
+
+    let catalog = match build_catalog_and_resolver(&state) {
+        Ok((catalog, _, _)) => catalog,
+        Err(response) => return Ok(response),
+    };
+    let tracks = async {
+        if body.items.iter().any(|item| item.kind == MatchKind::Track) {
+            Some(state.catalog_snapshots().tracks(&catalog).await)
+        } else {
+            None
+        }
+    };
+    let albums = async {
+        if body.items.iter().any(|item| item.kind == MatchKind::Album) {
+            state.catalog_snapshots().albums(&catalog).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let (tracks, albums) = tokio::join!(tracks, albums);
+    let albums = albums.map_err(|err| ServerError::BadGateway(err.to_string()))?;
+
+    let recordings: Vec<_> = tracks
+        .iter()
+        .flat_map(|snapshot| snapshot.items.iter())
+        .map(|track| local_recording(&track.item))
+        .collect();
+    let mut by_strong_id = HashMap::new();
+    let mut by_title: HashMap<_, Vec<_>> = HashMap::new();
+    for (index, recording) in recordings.iter().enumerate() {
+        for id in strong_recording_ids(recording) {
+            by_strong_id.entry(id).or_insert(index);
+        }
+        by_title
+            .entry(title_key(&recording.title))
+            .or_default()
+            .push(recording);
+    }
+    let mut by_album = HashMap::new();
+    for album in albums.iter().flat_map(|snapshot| snapshot.items.iter()) {
+        if let Some(key) = album_key(&album.item.name, &album.item.artist_name) {
+            by_album.entry(key).or_insert(album.item.id.as_str());
+        }
+    }
+
+    let matches: Vec<_> = body
+        .items
+        .iter()
+        .map(|item| {
+            let (local_track_id, local_album_id) = match item.kind {
+                MatchKind::Track => {
+                    let candidate = UnifiedCatalogItem {
+                        id: item.id.clone(),
+                        item_type: CatalogEntityType::Track,
+                        provider: "external".into(),
+                        title: item.title.clone(),
+                        artist: Some(item.artist.clone()),
+                        artist_credits: item.artist_credits.clone(),
+                        album: None,
+                        duration_seconds: item.duration_seconds,
+                        artwork: None,
+                        identity_hints: Some(IdentityHints {
+                            isrc: item.isrc.clone(),
+                            music_brainz_id: item.music_brainz_id.clone(),
+                            upc: None,
+                        }),
+                        identity: None,
+                    };
+                    let matched = strong_recording_ids(&candidate)
+                        .iter()
+                        .filter_map(|id| by_strong_id.get(id))
+                        .min()
+                        .map(|&index| &recordings[index])
+                        .or_else(|| {
+                            if normalize_music_text(Some(&candidate.title)).is_empty() {
+                                return None;
+                            }
+                            by_title
+                                .get(&title_key(&candidate.title))?
+                                .iter()
+                                .copied()
+                                .find(|track| recordings_match(track, &candidate))
+                        });
+                    (matched.map(|track| track.id.as_str()), None)
+                }
+                MatchKind::Album => {
+                    let matched = album_key(&item.title, &item.artist)
+                        .and_then(|key| by_album.get(&key).copied());
+                    (None, matched)
+                }
+            };
+            LibraryMatch {
+                id: &item.id,
+                in_library: local_track_id.is_some() || local_album_id.is_some(),
+                local_track_id,
+                local_album_id,
+            }
+        })
+        .collect();
+
+    Ok(Json(json!({ "matches": matches })).into_response())
+}

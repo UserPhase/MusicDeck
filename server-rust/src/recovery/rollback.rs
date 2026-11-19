@@ -37,26 +37,35 @@ fn remove_file(path: &Path) -> Result<(), RecoveryError> {
     Ok(())
 }
 
-fn restore_file(old: &Path, live: &Path, originally_present: bool) -> Result<(), RecoveryError> {
-    if let Some(info) = metadata(old)? {
-        if !info.is_file() {
-            return Err(RecoveryError::new(
-                "Rollback copy is not a regular file; recovery files were retained.",
-                500,
-            ));
-        }
-        remove_file(live)?;
-        std::fs::rename(old, live)
-            .map_err(|error| failure("Could not restore original file", error))?;
-    } else if !originally_present {
-        remove_file(live)?;
-    } else if !metadata(live)?.is_some_and(|info| info.is_file()) {
+fn stage_snapshot(stage: &Path, name: &str) -> Result<PathBuf, RecoveryError> {
+    let original = stage.join(name);
+    if !metadata(&original)?.is_some_and(|info| info.is_file()) {
         return Err(RecoveryError::new(
-            "Both original and rollback files are missing; recovery files were retained.",
+            format!(
+                "Original snapshot {name} is missing or invalid; recovery files were retained."
+            ),
             500,
         ));
     }
-    Ok(())
+    // Keep the source snapshot until the rollback journal is durable. Another
+    // interruption can retry from the same bytes without trusting the live file.
+    let replacement = stage.join(format!("rollback-{name}"));
+    remove_file(&replacement)?;
+    std::fs::copy(original, &replacement)
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)?
+                .sync_all()
+        })
+        .map_err(|error| failure("Could not stage the original file", error))?;
+    Ok(replacement)
+}
+
+fn install_snapshot(replacement: &Path, live: &Path) -> Result<(), RecoveryError> {
+    remove_file(live)?;
+    std::fs::rename(replacement, live)
+        .map_err(|error| failure("Could not restore original file", error))
 }
 
 fn remove_artwork(path: &Path) -> Result<(), RecoveryError> {
@@ -133,20 +142,22 @@ fn recover_inner(
     }
     if journal.phase == "installing" {
         // At startup there are no open SQLite handles. Live rollback uses SQL instead.
-        if restore_database_file && metadata(&stage.join("old-database.sqlite"))?.is_some() {
+        if restore_database_file {
+            let replacement = stage_snapshot(&stage, "old-database.sqlite")?;
             for suffix in ["-wal", "-shm", "-journal"] {
                 remove_file(&PathBuf::from(format!(
                     "{}{suffix}",
                     paths.database.display()
                 )))?;
             }
-            restore_file(&stage.join("old-database.sqlite"), &paths.database, true)?;
+            install_snapshot(&replacement, &paths.database)?;
         }
-        restore_file(
-            &stage.join("old-config.json"),
-            &paths.configuration,
-            journal.had_config,
-        )?;
+        if journal.had_config {
+            let replacement = stage_snapshot(&stage, "old-config.json")?;
+            install_snapshot(&replacement, &paths.configuration)?;
+        } else {
+            remove_file(&paths.configuration)?;
+        }
         if journal.replace_artwork {
             let old_artwork = stage.join("old-artwork");
             if let Some(info) = metadata(&old_artwork)? {

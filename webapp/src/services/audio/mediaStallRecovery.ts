@@ -1,4 +1,5 @@
 import type { MediaDeck } from "./outputs";
+import { replacementPlaybackUrl } from "../../utils/streamRecovery";
 
 export interface StallRecoveryOptions {
   stallTimeoutMs: number;
@@ -16,6 +17,7 @@ export interface StallRecoveryHost {
     position: number;
     attempts: number;
     restartedFromBeginning: boolean;
+    streamUrl?: string;
   }): void;
   onFailed(info: { key: string; position: number; attempts: number }): void;
 }
@@ -27,6 +29,7 @@ interface RecoveryRun {
   failed: boolean;
   timer: ReturnType<typeof setTimeout> | null;
   detach: (() => void) | null;
+  replacementUrl: string | null;
 }
 
 const MEDIA_ERR_NETWORK = 2;
@@ -45,10 +48,8 @@ function hasProgressed(element: HTMLMediaElement, since: number): boolean {
  * Watches the active HTMLMediaElement for mid-stream stalls and reconnects it
  * without touching queue state.
  *
- * Browsers do not let scripts add headers to media element requests. Reloading
- * the same URL and seeking to the saved timestamp makes the browser issue the
- * `Range: bytes=<offset>-` request itself, using its demuxer index to map the
- * timestamp to the correct byte offset (which scripts cannot do for VBR/containers).
+ * The first reload uses the pinned URL. Later attempts can obtain a fresh
+ * representation, with the browser resolving the seek using its new metadata.
  */
 export class MediaStallRecovery {
   private deck: MediaDeck | null = null;
@@ -159,6 +160,7 @@ export class MediaStallRecovery {
       failed: false,
       timer: null,
       detach: null,
+      replacementUrl: null,
     };
     this.run = run;
     this.scheduleAttempt(run);
@@ -209,34 +211,46 @@ export class MediaStallRecovery {
     const deck = this.deck;
     if (this.run !== run || !deck || deck.key !== run.key) return;
     const element = deck.element;
+    const replacement = source === null && run.attempt > 1 ? replacementPlaybackUrl(deck.src) : null;
+    if (replacement) run.replacementUrl = replacement;
     let restoring = false;
+    let seekTargetRequested = 0;
 
     const detach = () => {
       element.removeEventListener("loadedmetadata", onReady);
       element.removeEventListener("progress", onReady);
       element.removeEventListener("canplay", onReady);
       element.removeEventListener("error", onError);
+      element.removeEventListener("seeked", onSeeked);
       if (run.timer !== null) clearTimeout(run.timer);
       run.timer = null;
       run.detach = null;
     };
     const onError = () => this.scheduleAttempt(run);
-    const onReady = (event: Event) => {
-      if (restoring || run.detach !== detach || element.readyState < 1) return;
-      const seekable = deck.isSeekable();
+    const onSeeked = () => {
+      if (element.seeking || run.detach !== detach) return;
+      const target = seekTarget();
+      if (target !== seekTargetRequested && deck.isSeekable()) {
+        seekTargetRequested = target;
+        deck.seek(target);
+        if (element.seeking) return;
+      }
+      element.removeEventListener("seeked", onSeeked);
+      restorePlayback();
+    };
+    const seekTarget = () => {
       const duration = deck.duration();
-      // A finite stream can expose metadata before its first seekable range.
-      if (run.position > 0 && !seekable && Number.isFinite(element.duration) && event.type !== "canplay") return;
-      restoring = true;
-      const target = seekable && Number.isFinite(duration)
-        ? Math.min(run.position, Math.max(0, duration - END_GUARD_SECONDS))
-        : 0;
-      if (target > 0) deck.seek(target);
-      const restarted = !seekable && run.position > 0;
+      return deck.isSeekable() && Number.isFinite(duration)
+        ? Math.min(run.position, Math.max(0, duration - END_GUARD_SECONDS)) : 0;
+    };
+    const restorePlayback = () => {
       const finish = () => {
         if (run.detach !== detach) return;
+        if (!this.host.wantsPlayback() && deck.isPlaying()) deck.pause();
+        const settledPosition = seekTarget();
+        if (deck.isSeekable() && settledPosition !== seekTargetRequested) deck.seek(settledPosition);
         detach();
-        this.succeed(run, restarted, target);
+        this.succeed(run, !deck.isSeekable() && run.position > 0, settledPosition);
       };
       if (!this.host.wantsPlayback()) {
         finish();
@@ -251,6 +265,20 @@ export class MediaStallRecovery {
         }
       );
     };
+    const onReady = (event: Event) => {
+      if (restoring || run.detach !== detach || element.readyState < 1) return;
+      const seekable = deck.isSeekable();
+      // A finite stream can expose metadata before its first seekable range.
+      if (run.position > 0 && !seekable && Number.isFinite(element.duration) && event.type !== "canplay") return;
+      restoring = true;
+      seekTargetRequested = seekTarget();
+      if (seekTargetRequested > 0) deck.seek(seekTargetRequested);
+      if (replacement && element.seeking) {
+        element.addEventListener("seeked", onSeeked);
+        return;
+      }
+      restorePlayback();
+    };
 
     element.addEventListener("loadedmetadata", onReady);
     element.addEventListener("progress", onReady);
@@ -261,7 +289,7 @@ export class MediaStallRecovery {
       detach();
       this.scheduleAttempt(run);
     }, this.options.loadTimeoutMs);
-    deck.reloadSource(source ?? undefined);
+    deck.reloadSource(source ?? replacement ?? undefined);
   }
 
   private succeed(run: RecoveryRun, restartedFromBeginning: boolean, position: number): void {
@@ -273,6 +301,7 @@ export class MediaStallRecovery {
       position,
       attempts: run.attempt,
       restartedFromBeginning,
+      ...(run.replacementUrl && this.deck?.src === run.replacementUrl ? { streamUrl: run.replacementUrl } : {}),
     });
   }
 

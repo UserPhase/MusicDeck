@@ -17,6 +17,7 @@ import {
   startSilenceScan,
   getTrackLyrics,
   login,
+  request,
   matchLibraryItems,
   recordRecentlyPlayed,
   reportPlaybackSession,
@@ -50,8 +51,44 @@ test("listening checkpoints use authenticated cancellable requests and keepalive
   await saveMediaCheckpoint(input, controller.signal);
   expect(global.fetch).toHaveBeenLastCalledWith("/api/v1/user/media-sessions", expect.objectContaining({
     method: "POST", body: JSON.stringify(input), keepalive: true, signal: controller.signal,
-    credentials: "include", headers: { "Content-Type": "application/json" },
+    credentials: "include", headers: expect.any(Headers),
   }));
+});
+
+test("request merges caller headers with JSON defaults and omits the default for empty bodies", async () => {
+  global.fetch.mockResolvedValue({ ok: true, status: 204 });
+  const custom = new Headers({ "X-Fixture": "forwarded" });
+  await request("/api/fixture", { method: "POST", headers: custom, body: "{}" });
+  let headers = global.fetch.mock.calls.at(-1)[1].headers;
+  expect(headers.get("x-fixture")).toBe("forwarded");
+  expect(headers.get("content-type")).toBe("application/json");
+  expect(custom.has("content-type")).toBe(false);
+
+  await request("/api/fixture", {
+    method: "POST", body: "text", headers: [["cOnTeNt-TyPe", "text/plain"]],
+  });
+  headers = global.fetch.mock.calls.at(-1)[1].headers;
+  expect(headers.get("content-type")).toBe("text/plain");
+
+  await request("/api/fixture", { method: "POST" });
+  expect(global.fetch.mock.calls.at(-1)[1].headers.has("content-type")).toBe(false);
+});
+
+test.each([
+  ["application/json", '{"error":{"message":"Invalid ID","code":"INVALID_JSON_DATA","requestId":"from-body"}}',
+    { message: "Invalid ID", code: "INVALID_JSON_DATA", requestId: "from-body" }],
+  ["text/plain", " Gateway unavailable\nPlease retry. ",
+    { message: "Gateway unavailable Please retry.", requestId: "from-header" }],
+  ["text/html", "<html>gateway error</html>", { message: "MusicDeck returned 502" }],
+  ["text/plain", "x".repeat(257), { message: "MusicDeck returned 502" }],
+  ["application/json", "null", { message: "MusicDeck returned 502" }],
+])("request handles %s error responses safely", async (contentType, text, expected) => {
+  global.fetch.mockResolvedValue({
+    ok: false, status: 502,
+    headers: new Headers({ "content-type": contentType, "x-request-id": "from-header" }),
+    text: async () => text,
+  });
+  await expect(request("/api/fixture")).rejects.toMatchObject({ status: 502, ...expected });
 });
 
 test("export estimates use authenticated API requests and native downloads use safe URLs without a Blob", async () => {
@@ -520,16 +557,22 @@ test("search adapts provider-neutral groups while retaining legacy arrays", asyn
 });
 
 
-test("library match requests are bounded and preserve all batch responses", async () => {
+test("library match batching preserves input order and explicit misses", async () => {
+  const match = (item) => {
+    const inLibrary = item.id !== "album-99";
+    return {
+      id: item.id, inLibrary, localTrackId: null, localAlbumId: inLibrary ? `md_${item.id}` : null,
+    };
+  };
   global.fetch.mockImplementation(async (_path, options) => ({
     ok: true,
     status: 200,
-    json: async () => ({ matches: JSON.parse(options.body).items.map((item) => ({ id: item.id, inLibrary: true })) }),
+    json: async () => ({ matches: JSON.parse(options.body).items.map(match) }),
   }));
   const items = Array.from({ length: 101 }, (_, index) => ({
     id: `album-${index}`, type: "album", title: "Album", artist: "Artist",
   }));
-  expect(await matchLibraryItems(items)).toHaveLength(101);
+  expect(await matchLibraryItems(items)).toEqual(items.map(match));
   expect(global.fetch).toHaveBeenCalledTimes(2);
   expect(JSON.parse(global.fetch.mock.calls[0][1].body).items).toHaveLength(100);
   expect(JSON.parse(global.fetch.mock.calls[1][1].body).items).toHaveLength(1);

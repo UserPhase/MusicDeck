@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -52,6 +53,9 @@ use crate::services::listening_activity::{
 use crate::services::recently_played::{add_recently_played, list_recently_played_entries};
 use crate::state::AppState;
 use crate::streaming::{proxy_upstream_stream, send_error_response};
+
+mod library_views;
+use library_views::{post_filter_tracks_handler, post_library_matches_handler};
 
 #[cfg(test)]
 mod tests;
@@ -140,11 +144,7 @@ fn require_db(state: &AppState) -> Result<&DbPool, ServerError> {
 
 fn build_catalog_and_resolver(state: &AppState) -> Result<(CatalogService, SourceResolver, LibraryService), Response> {
     let Some(db) = state.db().cloned() else {
-        return Err(send_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Database pool is not initialized",
-            "BACKEND_ERROR",
-        ));
+        return Err(stream_database_unavailable());
     };
     let library = LibraryService::new(db, Some(state.config().music_root.clone()));
     let registry = state.providers().clone();
@@ -170,30 +170,38 @@ async fn list_albums_handler(
         .get("limit")
         .and_then(|s| s.parse::<u32>().ok())
         .map(|l| l.clamp(1, 500));
-    let offset = params
-        .get("offset")
-        .and_then(|s| s.parse::<usize>().ok());
+    let offset = params.get("offset").and_then(|s| s.parse::<usize>().ok());
 
-    match catalog.list_albums(if offset.is_some() { Some(500) } else { limit }).await {
-        Ok(res) => {
-            let total = res.items.len();
-            let albums: Vec<_> = match (offset, limit) {
-                (Some(off), Some(lim)) => res
+    if let Some(offset) = offset {
+        return match state.catalog_snapshots().albums(&catalog).await {
+            Ok(snapshot) => {
+                let albums: Vec<_> = snapshot
                     .items
-                    .into_iter()
-                    .skip(off)
-                    .take(lim as usize)
-                    .collect(),
-                (Some(off), None) => res.items.into_iter().skip(off).take(200).collect(),
-                _ => res.items,
-            };
-            Json(json!({
-                "albums": albums,
-                "total": total,
-                "degraded": res.degraded,
-            }))
-            .into_response()
-        }
+                    .iter()
+                    .skip(offset)
+                    .take(limit.unwrap_or(200) as usize)
+                    .collect();
+                Json(json!({
+                    "albums": albums,
+                    "total": snapshot.items.len(),
+                    "revision": snapshot.revision,
+                    "degraded": snapshot.degraded,
+                }))
+                .into_response()
+            }
+            Err(err) => {
+                send_error_response(StatusCode::BAD_GATEWAY, err.to_string(), "BACKEND_ERROR")
+            }
+        };
+    }
+
+    match catalog.list_albums(limit.or(Some(500))).await {
+        Ok(res) => Json(json!({
+            "albums": res.items,
+            "total": res.items.len(),
+            "degraded": res.degraded,
+        }))
+        .into_response(),
         Err(err) => send_error_response(StatusCode::BAD_GATEWAY, err.to_string(), "BACKEND_ERROR"),
     }
 }
@@ -998,27 +1006,52 @@ async fn get_track_handler(
     _auth: AuthenticatedUser,
     Path(track_id): Path<String>,
 ) -> Response {
-    let (catalog, resolver, _) = match build_catalog_and_resolver(&state) {
+    let (catalog, resolver, library) = match build_catalog_and_resolver(&state) {
         Ok(t) => t,
         Err(res) => return res,
     };
 
-    let candidates = resolver.candidate_sources(&track_id, None).await;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        library.track_content_revision(&track_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return send_error_response(StatusCode::NOT_FOUND, "Track not found", "NOT_FOUND");
+        }
+        _ => return stream_database_unavailable(),
+    }
+    let candidates = match resolver.try_candidate_sources(&track_id, None).await {
+        Ok(candidates) if !candidates.is_empty() => candidates,
+        _ => return stream_database_unavailable(),
+    };
+    let mut unavailable = false;
     for candidate in candidates {
-        if let Ok(Some(track)) = candidate
+        match candidate
             .provider
             .provider
             .get_track(&candidate.source.provider_item_id)
             .await
-            && let Ok(stamped) = catalog
+        {
+            Ok(Some(track)) => match catalog
                 .stamp_track(track, &candidate.source.connection_id)
                 .await
-        {
-            return Json(json!({ "track": stamped })).into_response();
+            {
+                Ok(track) => return Json(json!({ "track": track })).into_response(),
+                Err(_) => unavailable = true,
+            },
+            Ok(None) | Err(crate::providers::ProviderError::NotFound { .. }) => {}
+            Err(_) => unavailable = true,
         }
     }
 
-    send_error_response(StatusCode::NOT_FOUND, "Track not found", "NOT_FOUND")
+    if unavailable {
+        stream_database_unavailable()
+    } else {
+        send_error_response(StatusCode::NOT_FOUND, "Track not found", "NOT_FOUND")
+    }
 }
 
 async fn search_catalog_handler(
@@ -1170,6 +1203,7 @@ async fn stream_track_handler(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let deadline = tokio::time::Instant::now() + crate::providers::MEDIA_HEADER_BUDGET;
     let (_, resolver, library) = match build_catalog_and_resolver(&state) {
         Ok(t) => t,
         Err(res) => return res,
@@ -1179,15 +1213,58 @@ async fn stream_track_handler(
         .get(RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let if_range = headers.get(axum::http::header::IF_RANGE).and_then(|value| value.to_str().ok());
+    let if_range = headers
+        .get(axum::http::header::IF_RANGE)
+        .and_then(|value| value.to_str().ok());
 
+    let inspection_id = params
+        .get("inspectionId")
+        .map(String::as_str)
+        .filter(|id| !id.is_empty());
+    let previous_session = params.get("retryFrom").map(String::as_str);
+    let valid_session_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 160
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    };
+    if inspection_id.is_some_and(|id| !valid_session_id(id))
+        || previous_session.is_some_and(|id| {
+            !valid_session_id(id) || inspection_id.is_none() || inspection_id == Some(id)
+        })
+    {
+        return send_error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid playback session identifier",
+            "BAD_REQUEST",
+        );
+    }
+    let max_bit_rate = params
+        .get("maxBitRate")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|kbps| matches!(kbps, 128 | 192 | 256 | 320));
+    let inspection_context = || {
+        inspection_id.map(|id| {
+            (
+                state.inspector().clone(),
+                auth.user.id.clone(),
+                track_id.clone(),
+                id.to_owned(),
+                range_header.clone(),
+            )
+        })
+    };
     let playable_source = params
         .get("playableSource")
         .map(String::as_str)
         .filter(|s| !s.is_empty());
     // Older web and desktop clients send a selected connection as playableSource.
     let library_connection = playable_source.filter(|id| {
-        state.providers().get_by_connection_id(id).is_some_and(|provider| provider.enabled)
+        state
+            .providers()
+            .get_by_connection_id(id)
+            .is_some_and(|provider| provider.enabled)
     });
     if let Some(playable_source) = playable_source.filter(|_| library_connection.is_none()) {
         if state
@@ -1206,46 +1283,56 @@ async fn stream_track_handler(
         let external = state
             .source_providers()
             .is_external_source(&track_id, playable_source);
-        let fetch = state.source_providers().fetch_stream(
-            &track_id,
+        let permit = if external {
+            match state
+                .privacy()
+                .outbound_permit(crate::services::privacy::PrivacyCategory::External)
+            {
+                Ok(permit) => Some(permit),
+                Err(err) => return crate::routes::privacy::map_privacy_error(err),
+            }
+        } else {
+            None
+        };
+        let key = crate::catalog::resolver::PlaybackStreamKey {
+            scope: &auth.user.id,
+            session: inspection_id,
+            track: &track_id,
+            preferred_source: None,
+            max_bit_rate,
+        };
+        let fetch = state.source_providers().fetch_stream_for_session(
+            &key,
             playable_source,
             range_header.as_deref(),
             if_range,
+            previous_session,
+            deadline,
         );
-        let fetched = if external {
-            match state
-                .privacy()
-                .run_external(crate::services::privacy::PrivacyCategory::External, fetch)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => return crate::routes::privacy::map_privacy_error(err),
+        let fetched = if let Some(permit) = &permit {
+            tokio::select! {
+                biased;
+                () = permit.cancelled() => return send_error_response(StatusCode::FORBIDDEN, "External playback is disabled", "FORBIDDEN"),
+                result = fetch => result,
             }
         } else {
             fetch.await
         };
         return match fetched {
             Ok(crate::registry::source_providers::ResolvedPlayableStream::Library(stream)) => {
-                proxy_upstream_stream(stream, None)
+                proxy_upstream_stream(stream, inspection_context())
             }
-            Ok(crate::registry::source_providers::ResolvedPlayableStream::External(stream_result)) => {
-                let status = StatusCode::from_u16(stream_result.status).unwrap_or(StatusCode::OK);
-                let mut resp_headers = HeaderMap::new();
-                for (k, v) in stream_result.headers {
-                    if let (Ok(hn), Ok(hv)) = (
-                        axum::http::HeaderName::from_bytes(k.as_bytes()),
-                        axum::http::HeaderValue::from_str(&v),
-                    ) {
-                        resp_headers.insert(hn, hv);
-                    }
-                }
-                (
-                    status,
-                    resp_headers,
-                    axum::body::Body::from(stream_result.bytes),
-                )
-                    .into_response()
-            }
+            Ok(crate::registry::source_providers::ResolvedPlayableStream::External(
+                stream_result,
+            )) => match permit {
+                Some(permit) => stream_result.into_response(permit),
+                None => send_error_response(
+                    StatusCode::FORBIDDEN,
+                    "External playback is disabled",
+                    "FORBIDDEN",
+                ),
+            },
+            Err(error) if error.database_unavailable => stream_database_unavailable(),
             Err(_) => send_error_response(
                 StatusCode::BAD_GATEWAY,
                 "Playback unavailable",
@@ -1254,8 +1341,21 @@ async fn stream_track_handler(
         };
     }
 
-    if !library.exists(&track_id).await.unwrap_or(false) {
-        return send_error_response(StatusCode::NOT_FOUND, "Track not found", "NOT_FOUND");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        library.track_content_revision(&track_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return send_error_response(StatusCode::NOT_FOUND, "Track not found", "NOT_FOUND");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Could not check media identity");
+            return stream_database_unavailable();
+        }
+        Err(_) => return stream_database_unavailable(),
     }
 
     let preferred_source = params
@@ -1263,56 +1363,44 @@ async fn stream_track_handler(
         .map(String::as_str)
         .filter(|s| !s.is_empty())
         .or(library_connection);
-    let max_bit_rate = params
-        .get("maxBitRate")
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|kbps| matches!(kbps, 128 | 192 | 256 | 320));
-
-    let inspection_id = params
-        .get("inspectionId")
-        .cloned()
-        .filter(|s| !s.is_empty());
-    if let Some(ref insp_id) = inspection_id
-        && (insp_id.len() > 160
-            || !insp_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
-    {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid audio inspection identifier",
-            "BAD_REQUEST",
-        );
-    }
-
+    let key = crate::catalog::resolver::PlaybackStreamKey {
+        scope: &auth.user.id,
+        session: inspection_id,
+        track: &track_id,
+        preferred_source,
+        max_bit_rate,
+    };
     match resolver
-        .fetch_stream(
-            &track_id,
+        .fetch_recoverable_stream(
+            &key,
             range_header.as_deref(),
             if_range,
-            preferred_source,
-            max_bit_rate,
+            deadline,
+            previous_session,
         )
         .await
     {
-        Ok(stream_result) => {
-            let inspection_ctx = inspection_id.map(|insp_id| {
-                (
-                    state.inspector().clone(),
-                    auth.user.id,
-                    track_id,
-                    insp_id,
-                    range_header,
-                )
-            });
-            proxy_upstream_stream(stream_result, inspection_ctx)
-        }
+        Ok(stream_result) => proxy_upstream_stream(stream_result, inspection_context()),
+        Err(error) if error.database_unavailable => stream_database_unavailable(),
         Err(_) => send_error_response(
             StatusCode::BAD_GATEWAY,
             "Playback unavailable",
             "BACKEND_ERROR",
         ),
     }
+}
+
+pub(super) fn stream_database_unavailable() -> Response {
+    let mut response = send_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Playback database temporarily unavailable",
+        "BACKEND_ERROR",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 async fn inspect_stream_handler(
@@ -1334,17 +1422,19 @@ async fn inspect_stream_handler(
         Err(res) => return res,
     };
 
-    let source_meta = resolver
-        .audio_metadata(&track_id, None)
-        .await
-        .map_err(|_| ());
+    let inspector = state.inspector();
+    let source_meta =
+        if let Some(pipe) = inspector.source_descriptor(&auth.user.id, &track_id, inspection_id) {
+            inspector
+                .cached_source_metadata(&track_id, &pipe, async {
+                    resolver.stream_source_metadata(&pipe).await.map_err(|_| ())
+                })
+                .await
+        } else {
+            Ok(None)
+        };
 
-    let report = state.inspector().inspect_snapshot(
-        &auth.user.id,
-        &track_id,
-        inspection_id,
-        source_meta,
-    );
+    let report = inspector.inspect_snapshot(&auth.user.id, &track_id, inspection_id, source_meta);
     Json(report).into_response()
 }
 
@@ -1523,7 +1613,7 @@ async fn put_media_favorite_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path((item_type, item_id)): Path<(String, String)>,
-    payload_res: Result<Json<MediaFavoritePutBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<MediaFavoritePutBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     if !matches!(item_type.as_str(), "album" | "artist" | "track") || item_id.trim().is_empty() {
         return send_error_response(
@@ -1533,12 +1623,9 @@ async fn put_media_favorite_handler(
         );
     }
 
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid favorite payload",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {
@@ -1625,14 +1712,11 @@ async fn get_recently_played_handler(
 async fn post_recently_played_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<RecentlyPlayedPostBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<RecentlyPlayedPostBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid recently played request",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let track_id = body.track_id.trim();
@@ -1661,14 +1745,11 @@ async fn post_recently_played_handler(
 async fn post_listening_event_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<PlaybackEventInput>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PlaybackEventInput>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(event)) = payload_res else {
-        return send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playback event payload",
-            "VALIDATION_ERROR",
-        );
+    let ApiJson(event) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if event
@@ -1843,26 +1924,29 @@ async fn list_tracks_handler(
         Ok(t) => t,
         Err(res) => return res,
     };
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse::<usize>().ok());
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok());
     let offset = params
         .get("offset")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
 
-    let res = catalog.list_tracks().await;
-    let total = res.items.len();
-    let tracks: Vec<_> = match limit {
-        Some(lim) => res.items.into_iter().skip(offset).take(lim.clamp(1, 500)).collect(),
-        None => res.items,
-    };
+    let snapshot = state.catalog_snapshots().tracks(&catalog).await;
+    let limit =
+        limit
+            .map(|limit| limit.clamp(1, 500))
+            .unwrap_or(if params.contains_key("offset") {
+                200
+            } else {
+                snapshot.items.len()
+            });
+    let tracks: Vec<_> = snapshot.items.iter().skip(offset).take(limit).collect();
 
     Json(json!({
         "tracks": tracks,
-        "total": total,
+        "total": snapshot.items.len(),
         "offset": offset,
-        "degraded": res.degraded,
+        "revision": snapshot.revision,
+        "degraded": snapshot.degraded,
     }))
     .into_response()
 }
@@ -1942,35 +2026,4 @@ async fn get_random_tracks_handler(
         "degraded": res.degraded,
     }))
     .into_response()
-}
-
-async fn post_filter_tracks_handler(
-    State(state): State<AppState>,
-    _auth: AuthenticatedUser,
-    Json(body): Json<Value>,
-) -> Response {
-    let (catalog, _, _) = match build_catalog_and_resolver(&state) {
-        Ok(t) => t,
-        Err(res) => return res,
-    };
-    let limit = body
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(100)
-        .clamp(1, 500);
-    let mut res = catalog.list_tracks().await;
-    res.items.truncate(limit);
-    Json(json!({
-        "tracks": res.items,
-        "total": res.items.len(),
-        "degraded": res.degraded,
-    }))
-    .into_response()
-}
-
-async fn post_library_matches_handler(
-    _auth: AuthenticatedUser,
-) -> Response {
-    Json(json!({ "matches": {} })).into_response()
 }

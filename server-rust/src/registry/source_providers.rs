@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use url::Url;
 
-use crate::catalog::{LibraryService, SourceResolver, normalize_music_text};
+use crate::catalog::resolver::PlaybackStreamKey;
+use crate::catalog::{LibraryService, SourceResolver, SourceUnavailableError, normalize_music_text};
 use crate::db::DbPool;
 use crate::providers::{BackendRegistry, StreamResult, UpstreamStreamResponse};
 use crate::registry::playable_sources::{
@@ -89,11 +90,11 @@ impl SourceProvider for LibrarySourceProvider {
         };
 
         let lib = LibraryService::new(pool.clone(), None);
-        if !lib.exists(&result.id).await.unwrap_or(false) {
+        if !lib.exists(&result.id).await.map_err(|error| error.to_string())? {
             return Ok(Vec::new());
         }
 
-        let refs = lib.get_sources(&result.id).await.unwrap_or_default();
+        let refs = lib.get_sources(&result.id).await.map_err(|error| error.to_string())?;
         let mut sources = Vec::new();
         for source_ref in refs {
             let Some(backend) = self.backends.get_by_connection_id(&source_ref.connection_id) else {
@@ -327,29 +328,10 @@ impl SourceProvider for DeezerPreviewSourceProvider {
         source: &PlayableSource,
         range: Option<&str>,
     ) -> Result<UpstreamStreamResponse, String> {
-        let mut req = self.http.get(&source.id);
-        if let Some(r) = range {
-            req = req.header("Range", r);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|_| String::from("External preview is unavailable"))?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-            .collect();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|_| String::from("External preview is unavailable"))?;
-        Ok(UpstreamStreamResponse {
-            status,
-            headers,
-            bytes,
-        })
+        crate::streaming::http::fetch_external_media(
+            &source.id, range, None, crate::streaming::http::MAX_EXTERNAL_PREVIEW_BYTES,
+            crate::audio::is_allowed_preview,
+        ).await
     }
 }
 
@@ -547,29 +529,10 @@ impl SourceProvider for ItunesPreviewSourceProvider {
         source: &PlayableSource,
         range: Option<&str>,
     ) -> Result<UpstreamStreamResponse, String> {
-        let mut req = self.http.get(&source.id);
-        if let Some(r) = range {
-            req = req.header("Range", r);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|_| String::from("External preview is unavailable"))?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-            .collect();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|_| String::from("External preview is unavailable"))?;
-        Ok(UpstreamStreamResponse {
-            status,
-            headers,
-            bytes,
-        })
+        crate::streaming::http::fetch_external_media(
+            &source.id, range, None, crate::streaming::http::MAX_EXTERNAL_PREVIEW_BYTES,
+            crate::audio::is_allowed_preview,
+        ).await
     }
 }
 
@@ -1004,6 +967,21 @@ impl SourceProviderRegistry {
         })
     }
 
+    pub(crate) fn preparation_source(&self, track: &str, token: &str) -> Option<(PlayableSourceType, String)> {
+        let guard = self.source_cache.read().ok()?;
+        let source = guard.get(token)?;
+        if source.result_id != track || source.expires_at <= Instant::now() {
+            return None;
+        }
+        let kind = source.source.source_type;
+        let identity = if kind == PlayableSourceType::Library {
+            source.provider_source_id.clone()
+        } else {
+            serde_json::json!([source.provider_id, source.provider_source_id]).to_string()
+        };
+        Some((kind, identity))
+    }
+
     /// Streams audio for a previously minted `source_id` (`playable_<nanoid>`).
     pub async fn fetch_stream(
         &self,
@@ -1011,39 +989,71 @@ impl SourceProviderRegistry {
         source_id: &str,
         range: Option<&str>,
         if_range: Option<&str>,
-    ) -> Result<ResolvedPlayableStream, String> {
+    ) -> Result<ResolvedPlayableStream, SourceUnavailableError> {
+        self.fetch_stream_for_session(
+            &PlaybackStreamKey {
+                scope: "",
+                session: None,
+                track: result_id,
+                preferred_source: None,
+                max_bit_rate: None,
+            },
+            source_id,
+            range,
+            if_range,
+            None,
+            tokio::time::Instant::now() + crate::providers::MEDIA_HEADER_BUDGET,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_stream_for_session(
+        &self,
+        playback: &PlaybackStreamKey<'_>,
+        source_id: &str,
+        range: Option<&str>,
+        if_range: Option<&str>,
+        previous_session: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ResolvedPlayableStream, SourceUnavailableError> {
         let stored = {
             let mut guard = self
                 .source_cache
                 .write()
-                .map_err(|_| String::from("Playable source is unavailable"))?;
+                .map_err(|_| SourceUnavailableError::default())?;
             let Some(entry) = guard.get(source_id).cloned() else {
-                return Err(String::from("Playable source is unavailable"));
+                return Err(SourceUnavailableError::default());
             };
-            if entry.result_id != result_id || entry.expires_at < Instant::now() {
+            if entry.result_id != playback.track || entry.expires_at < Instant::now() {
                 guard.remove(source_id);
-                return Err(String::from("Playable source is unavailable"));
+                return Err(SourceUnavailableError::default());
             }
             entry
         };
 
         if stored.source.source_type == PlayableSourceType::Library {
             let Some(pool) = &self.db else {
-                return Err(String::from("Playable source is unavailable"));
+                return Err(SourceUnavailableError::database_unavailable());
             };
             let lib = LibraryService::new(pool.clone(), None);
             let resolver = SourceResolver::new(self.backends.clone(), lib);
+            let scope = format!("{}:{source_id}", playback.scope);
+            let key = PlaybackStreamKey {
+                scope: &scope,
+                session: playback.session.or(Some(source_id)),
+                preferred_source: Some(&stored.provider_source_id),
+                ..*playback
+            };
             return resolver
-                .fetch_stream(
-                    result_id,
+                .fetch_recoverable_stream(
+                    &key,
                     range,
                     if_range,
-                    Some(&stored.provider_source_id),
-                    None,
+                    deadline,
+                    previous_session,
                 )
                 .await
-                .map(ResolvedPlayableStream::Library)
-                .map_err(|e| e.to_string());
+                .map(ResolvedPlayableStream::Library);
         }
 
         let provider = self
@@ -1051,10 +1061,15 @@ impl SourceProviderRegistry {
             .read()
             .ok()
             .and_then(|g| g.iter().find(|p| p.id() == stored.provider_id).cloned())
-            .ok_or_else(|| String::from("Playable source is unavailable"))?;
+            .ok_or_else(|| SourceUnavailableError::default())?;
 
         let mut internal_source = stored.source;
         internal_source.id = stored.provider_source_id;
-        provider.fetch_stream(&internal_source, range).await.map(ResolvedPlayableStream::External)
+        tokio::time::timeout_at(deadline, provider.fetch_stream(&internal_source, range))
+            .await.map_err(|_| SourceUnavailableError::new("Media header deadline exceeded"))?
+            .map(ResolvedPlayableStream::External)
+            .map_err(SourceUnavailableError::new)
     }
+
+
 }

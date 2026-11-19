@@ -35,7 +35,7 @@ use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Row};
+use sqlx::Row;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
@@ -324,8 +324,24 @@ impl QueueSyncService {
 
         let compressed_len = i64::try_from(compressed.len()).unwrap_or(i64::MAX);
 
-        let mut conn = self.db.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE queue_contents SET content_id = content_id WHERE 0",
+        )
+        .await?;
+
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM queue_contents WHERE user_id = ? AND content_id = ?;",
+        )
+        .bind(user_id)
+        .bind(&content_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if exists {
+            tx.commit().await?;
+            return Ok((content_id, track_count));
+        }
 
         let budget_row = sqlx::query(
             "SELECT COALESCE(SUM(length(compressed)), 0) AS used FROM queue_contents WHERE user_id = ?;",
@@ -413,8 +429,11 @@ impl QueueSyncService {
         sequence: u64,
         now_ms: i64,
     ) -> Result<(bool, u64), QueueSyncError> {
-        let mut conn = self.db.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE queue_sessions SET sequence = sequence WHERE 0",
+        )
+        .await?;
 
         self.validate_checkpoint_on_conn(&mut tx, user_id, content_id, checkpoint, now_ms)
             .await?;
@@ -585,8 +604,11 @@ impl QueueSyncService {
         operation_id: &str,
         now_ms: i64,
     ) -> Result<String, QueueSyncError> {
-        let mut conn = self.db.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE named_queues SET revision = revision WHERE 0",
+        )
+        .await?;
 
         self.validate_checkpoint_on_conn(&mut tx, user_id, content_id, checkpoint, now_ms)
             .await?;
@@ -700,8 +722,11 @@ impl QueueSyncService {
             ));
         }
 
-        let mut conn = self.db.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE queue_playlist_saves SET operation_id = operation_id WHERE 0",
+        )
+        .await?;
 
         let prev_row = sqlx::query(
             "SELECT playlist_id, content_id, name FROM queue_playlist_saves WHERE user_id = ? AND operation_id = ?;",

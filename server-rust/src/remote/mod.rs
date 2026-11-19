@@ -58,6 +58,7 @@ pub const REGISTRATION_TIMEOUT_MS: u64 = 10_000;
 pub const COMMAND_TIMEOUT_MS: u64 = 8_000;
 const COMMAND_LIFETIME_MS: u64 = 10_000;
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(4);
+const PLAYBACK_LEASE_MS: u64 = 5_000;
 
 fn epoch_ms() -> u64 {
     SystemTime::now()
@@ -377,6 +378,26 @@ pub enum RemoteClientMessage {
         live_sync: bool,
         #[serde(default)]
         command_deadlines: bool,
+        /// Opt in to renewable playback ownership across transient disconnects.
+        #[serde(default)]
+        playback_lease: bool,
+        #[serde(default, rename = "playbackLeaseProtocol")]
+        playback_lease_protocol: Option<u8>,
+        #[serde(default, rename = "leaseGeneration")]
+        lease_generation: Option<Uuid>,
+    },
+    /// Request a lease acknowledgement for the active output.
+    RenewPlaybackLease {
+        /// Monotonic browser correlation counter.
+        sequence: u64,
+        device_id: String,
+        #[serde(rename = "leaseGeneration")]
+        lease_generation: Uuid,
+    },
+    ReleasePlaybackLease {
+        device_id: String,
+        #[serde(rename = "leaseGeneration")]
+        lease_generation: Uuid,
     },
     /// Report updated playback state and optionally select this player if no device is active.
     State {
@@ -489,7 +510,6 @@ pub enum TransferStage {
 struct ConnectedClient {
     conn_id: String,
     user_id: String,
-    #[allow(dead_code)]
     session_id: String,
     device_id: Option<String>,
     queue_device_id: Option<String>,
@@ -499,6 +519,9 @@ struct ConnectedClient {
     state: RemotePlaybackState,
     live_sync: bool,
     command_deadlines: bool,
+    playback_lease: bool,
+    lease: Option<PlayerLease>,
+    must_report_stopped: bool,
     queue: Option<Arc<TransferQueueState>>,
     tx: mpsc::Sender<Value>,
     disconnected: watch::Sender<bool>,
@@ -529,13 +552,41 @@ struct ActiveTransfer {
     stage: TransferStage,
     snapshot: Option<TransferSnapshot>,
     deadline: Instant,
+    target_playback_until: Option<Instant>,
     failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct DetachedPlayer {
+    session_id: String,
+    device_id: String,
+    lease: PlayerLease,
+    state: RemotePlaybackState,
+    queue: Option<Arc<TransferQueueState>>,
+}
+
+#[derive(Debug)]
+struct PlayerLease {
+    generation: Uuid,
+    expires: Instant,
+    last_sequence: u64,
+}
+
+impl PlayerLease {
+    fn new() -> Self {
+        Self {
+            generation: Uuid::new_v4(),
+            expires: Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS),
+            last_sequence: 0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct HubState {
     clients: HashMap<String, ConnectedClient>,
     active_player_by_user: HashMap<String, String>,
+    detached_players: HashMap<String, DetachedPlayer>,
     playback_by_user: HashMap<String, PlaybackState>,
     commands: HashMap<String, VecDeque<PendingCommand>>,
     transfers_by_user: HashMap<String, ActiveTransfer>,
@@ -594,6 +645,9 @@ impl RemoteControlHub {
                 state: RemotePlaybackState::default(),
                 live_sync: false,
                 command_deadlines: false,
+                playback_lease: false,
+                lease: None,
+                must_report_stopped: false,
                 queue: None,
                 tx,
                 disconnected: watch::channel(false).0,
@@ -670,13 +724,16 @@ impl RemoteControlHub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let Some(user_id) = guard.clients.get(conn_id)
+        let Some(user_id) = guard
+            .clients
+            .get(conn_id)
             .filter(|client| !*client.disconnected.borrow())
             .map(|client| client.user_id.clone())
         else {
             return;
         };
 
+        Self::expire_playback_lease_locked(&mut guard, &user_id);
         match message {
             RemoteClientMessage::Register {
                 device_id,
@@ -687,7 +744,12 @@ impl RemoteControlHub {
                 mut state,
                 live_sync,
                 command_deadlines,
+                playback_lease,
+                playback_lease_protocol,
+                lease_generation,
             } => {
+                // Sequence-only clients cannot prove ownership across sockets.
+                let playback_lease = playback_lease && playback_lease_protocol == Some(1);
                 let clean_name = device_name.trim().to_owned();
                 if device_id.is_empty()
                     || device_id.len() > 160
@@ -717,32 +779,87 @@ impl RemoteControlHub {
                     return;
                 }
 
-                let duplicate_conn_id = guard
-                    .clients
-                    .values()
-                    .find(|peer| {
-                        peer.conn_id != conn_id
-                            && peer.user_id == user_id
-                            && peer.device_id.as_deref() == Some(device_id.as_str())
-                    })
-                    .map(|p| p.conn_id.clone());
-
-                if let Some(dup_id) = duplicate_conn_id {
-                    Self::remove_client_locked(&mut guard, &dup_id);
+                let session_id = guard.clients[conn_id].session_id.clone();
+                if guard.detached_players.get(&user_id).is_some_and(|owner| {
+                    owner.device_id == device_id
+                        && (!playback_lease
+                            || owner.session_id != session_id
+                            || lease_generation != Some(owner.lease.generation))
+                }) {
+                    Self::send_frame_locked(&guard, conn_id, json!({ "type": "DEACTIVATE" }));
+                    return;
                 }
+                let duplicate = guard.clients.values().find(|peer| {
+                    peer.conn_id != conn_id
+                        && peer.user_id == user_id
+                        && peer.device_id.as_deref() == Some(device_id.as_str())
+                });
+                if duplicate.is_some_and(|peer| peer.session_id != session_id) {
+                    Self::send_error_locked(
+                        &guard,
+                        conn_id,
+                        "Device identity belongs to another session",
+                        None,
+                    );
+                    return;
+                }
+                if duplicate.is_some_and(|peer| {
+                    peer.lease.as_ref().is_some_and(|lease| {
+                        !playback_lease || lease_generation != Some(lease.generation)
+                    })
+                }) {
+                    Self::send_frame_locked(&guard, conn_id, json!({ "type": "DEACTIVATE" }));
+                    return;
+                }
+                let duplicate_id = duplicate.map(|peer| peer.conn_id.clone());
+                let (retained_queue, retained_lease) =
+                    if guard.detached_players.get(&user_id).is_some_and(|owner| {
+                        playback_lease
+                            && owner.device_id == device_id
+                            && owner.session_id == session_id
+                            && lease_generation == Some(owner.lease.generation)
+                    }) {
+                        let lease = guard.detached_players.remove(&user_id).unwrap();
+                        guard
+                            .active_player_by_user
+                            .insert(user_id.clone(), conn_id.to_owned());
+                        (lease.queue, Some(lease.lease))
+                    } else if let Some(old) = duplicate_id
+                        .as_ref()
+                        .filter(|old| guard.active_player_by_user.get(&user_id) == Some(*old))
+                    {
+                        guard
+                            .active_player_by_user
+                            .insert(user_id.clone(), conn_id.to_owned());
+                        let old = guard.clients.get_mut(old).unwrap();
+                        (old.queue.clone(), old.lease.take())
+                    } else {
+                        (None, None)
+                    };
 
-                let is_playing = state.playing && state.current_track.is_some();
+                let reported_stopped = !state.playing;
                 if state.playing
-                    && guard
+                    && (guard
                         .active_player_by_user
                         .get(&user_id)
                         .is_some_and(|active| active != conn_id)
+                        || (lease_generation.is_some()
+                            && retained_lease.is_none()
+                            && guard.clients[conn_id]
+                                .lease
+                                .as_ref()
+                                .map(|lease| lease.generation)
+                                != lease_generation)
+                        || guard.clients[conn_id].must_report_stopped
+                        || Self::handoff_blocks_playback(&guard, &user_id, conn_id))
                     && !Self::is_starting_transfer_target(&guard, &user_id, conn_id)
                 {
                     // A reconnecting player follows the device that still owns playback.
                     state.playing = false;
                     Self::send_frame_locked(&guard, conn_id, json!({ "type": "DEACTIVATE" }));
+                    guard.clients.get_mut(conn_id).unwrap().must_report_stopped = true;
                 }
+                let is_playing = state.playing && state.current_track.is_some();
                 let initialize = guard
                     .clients
                     .get(conn_id)
@@ -756,12 +873,27 @@ impl RemoteControlHub {
                     client.state = state;
                     client.live_sync = live_sync;
                     client.command_deadlines = command_deadlines;
+                    client.playback_lease = playback_lease;
+                    if reported_stopped {
+                        client.must_report_stopped = false;
+                    }
+                    if let Some(lease) = retained_lease {
+                        client.lease = Some(lease);
+                        client.deadline_changed.notify_one();
+                    }
+                    if retained_queue.is_some() {
+                        client.queue = retained_queue;
+                    }
+                }
+                if let Some(id) = duplicate_id {
+                    Self::remove_client_locked(&mut guard, &id, false);
                 }
 
-                if !guard.active_player_by_user.contains_key(&user_id) && is_playing {
-                    guard
-                        .active_player_by_user
-                        .insert(user_id.clone(), conn_id.to_owned());
+                if !guard.active_player_by_user.contains_key(&user_id)
+                    && !guard.transfers_by_user.contains_key(&user_id)
+                    && is_playing
+                {
+                    Self::select_player_locked(&mut guard, &user_id, conn_id);
                 }
 
                 Self::broadcast_devices_locked(&guard, &user_id);
@@ -779,6 +911,49 @@ impl RemoteControlHub {
 
                 match other {
                     RemoteClientMessage::Register { .. } => {}
+                    RemoteClientMessage::RenewPlaybackLease {
+                        sequence,
+                        device_id,
+                        lease_generation,
+                    } => {
+                        if let Some(lease) = Self::lease_for_client(
+                            &mut guard,
+                            &user_id,
+                            conn_id,
+                            &device_id,
+                            lease_generation,
+                        ) && sequence > lease.last_sequence
+                        {
+                            lease.last_sequence = sequence;
+                            lease.expires =
+                                Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS);
+                            guard.clients[conn_id].deadline_changed.notify_one();
+                            Self::send_frame_locked(
+                                &guard,
+                                conn_id,
+                                json!({
+                                    "type": "PLAYBACK_LEASE", "sequence": sequence, "leaseMs": PLAYBACK_LEASE_MS,
+                                    "device_id": device_id, "leaseGeneration": lease_generation,
+                                }),
+                            );
+                        }
+                    }
+                    RemoteClientMessage::ReleasePlaybackLease {
+                        device_id,
+                        lease_generation,
+                    } => {
+                        if Self::lease_for_client(
+                            &mut guard,
+                            &user_id,
+                            conn_id,
+                            &device_id,
+                            lease_generation,
+                        )
+                        .is_some()
+                        {
+                            Self::release_player_locked(&mut guard, &user_id, conn_id, false);
+                        }
+                    }
                     RemoteClientMessage::State {
                         state,
                         queue,
@@ -851,7 +1026,9 @@ impl RemoteControlHub {
                                 })
                                 .map(|c| c.conn_id.clone())
                         } else {
-                            active_conn.clone()
+                            active_conn
+                                .clone()
+                                .filter(|id| guard.clients.contains_key(id))
                         };
 
                         let Some(target_conn) = target_conn else {
@@ -1001,6 +1178,15 @@ impl RemoteControlHub {
                             return;
                         };
 
+                        if guard.detached_players.contains_key(&user_id) {
+                            Self::send_error_locked(
+                                &guard,
+                                conn_id,
+                                "The active player is reconnecting",
+                                Some(&request_id),
+                            );
+                            return;
+                        }
                         let source_conn = guard
                             .active_player_by_user
                             .get(&user_id)
@@ -1013,9 +1199,7 @@ impl RemoteControlHub {
                             })
                             .cloned();
                         let Some(source_conn) = source_conn else {
-                            guard
-                                .active_player_by_user
-                                .insert(user_id.clone(), target_conn);
+                            Self::select_player_locked(&mut guard, &user_id, &target_conn);
                             Self::broadcast_devices_locked(&guard, &user_id);
                             Self::sync_playback_locked(&mut guard, &user_id, None);
                             Self::send_frame_locked(
@@ -1042,6 +1226,7 @@ impl RemoteControlHub {
                                 failure: None,
                                 deadline: Instant::now()
                                     + Duration::from_millis(TRANSFER_TIMEOUT_MS),
+                                target_playback_until: None,
                             },
                         );
 
@@ -1074,7 +1259,186 @@ impl RemoteControlHub {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::remove_client_locked(&mut guard, conn_id);
+        let lease = Self::remove_client_locked(&mut guard, conn_id, true);
+        drop(guard);
+        if let Some((user_id, expires)) = lease {
+            self.schedule_detached_expiry(user_id, expires);
+        }
+    }
+
+    fn schedule_detached_expiry(&self, user_id: String, mut deadline: Instant) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let hub = self.clone();
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep_until(deadline).await;
+                let mut guard = hub
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::expire_playback_lease_locked(&mut guard, &user_id);
+                let Some(next) = Self::detached_deadline(&guard, &user_id) else {
+                    break;
+                };
+                deadline = next;
+            }
+        });
+    }
+
+    fn detached_deadline(guard: &HubState, user_id: &str) -> Option<Instant> {
+        guard
+            .detached_players
+            .get(user_id)
+            .map(|owner| owner.lease.expires)
+            .into_iter()
+            .chain(
+                guard
+                    .transfers_by_user
+                    .get(user_id)
+                    .filter(|transfer| {
+                        transfer.stage == TransferStage::Rollback
+                            && transfer.target_playback_until.is_some()
+                    })
+                    .map(|transfer| transfer.deadline),
+            )
+            .min()
+    }
+
+    pub(crate) fn revoke_sessions(&self, user_id: Option<&str>, matches: impl Fn(&str) -> bool) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connections: Vec<_> = guard
+            .clients
+            .values()
+            .filter(|client| {
+                user_id.is_none_or(|user| client.user_id == user) && matches(&client.session_id)
+            })
+            .map(|client| client.conn_id.clone())
+            .collect();
+        let deadlines: Vec<_> = connections
+            .into_iter()
+            .filter_map(|conn_id| Self::remove_client_locked(&mut guard, &conn_id, false))
+            .collect();
+        let detached: Vec<_> = guard
+            .detached_players
+            .iter()
+            .filter(|(user, owner)| {
+                user_id.is_none_or(|id| user.as_str() == id) && matches(&owner.session_id)
+            })
+            .map(|(user, _)| user.clone())
+            .collect();
+        for user in detached {
+            if let Some(conn_id) = guard.active_player_by_user.get(&user).cloned() {
+                Self::release_player_locked(&mut guard, &user, &conn_id, false);
+            }
+        }
+        drop(guard);
+        for (user, deadline) in deadlines {
+            self.schedule_detached_expiry(user, deadline);
+        }
+    }
+
+    fn expire_playback_lease_locked(guard: &mut HubState, user_id: &str) {
+        if let Some(transfer) = guard.transfers_by_user.get(user_id)
+            && transfer.stage == TransferStage::Rollback
+            && transfer.deadline <= Instant::now()
+        {
+            Self::abort_transfer_locked(guard, user_id, "Playback transfer timed out", true);
+        }
+        let Some(conn_id) = guard.active_player_by_user.get(user_id).cloned() else {
+            return;
+        };
+        let expires = guard
+            .detached_players
+            .get(user_id)
+            .map(|owner| owner.lease.expires)
+            .or_else(|| {
+                guard
+                    .clients
+                    .get(&conn_id)
+                    .and_then(|client| client.lease.as_ref())
+                    .map(|lease| lease.expires)
+            });
+        if expires.is_some_and(|expires| expires <= Instant::now()) {
+            Self::release_player_locked(guard, user_id, &conn_id, true);
+        }
+    }
+
+    fn lease_for_client<'a>(
+        guard: &'a mut HubState,
+        user_id: &str,
+        conn_id: &str,
+        device_id: &str,
+        generation: Uuid,
+    ) -> Option<&'a mut PlayerLease> {
+        if guard.active_player_by_user.get(user_id).map(String::as_str) != Some(conn_id) {
+            return None;
+        }
+        let client = guard.clients.get_mut(conn_id)?;
+        if client.device_id.as_deref() != Some(device_id) {
+            return None;
+        }
+        client
+            .lease
+            .as_mut()
+            .filter(|lease| lease.generation == generation)
+    }
+
+    fn select_player_locked(guard: &mut HubState, user_id: &str, conn_id: &str) {
+        if let Some(previous) = guard
+            .active_player_by_user
+            .insert(user_id.to_owned(), conn_id.to_owned())
+            && previous != conn_id
+            && let Some(client) = guard.clients.get_mut(&previous)
+        {
+            client.lease = None;
+        }
+        let client = guard.clients.get_mut(conn_id).unwrap();
+        if client.playback_lease && client.lease.is_none() {
+            client.lease = Some(PlayerLease::new());
+            client.deadline_changed.notify_one();
+        }
+    }
+
+    fn release_player_locked(guard: &mut HubState, user_id: &str, conn_id: &str, expired: bool) {
+        guard.active_player_by_user.remove(user_id);
+        guard.detached_players.remove(user_id);
+        if guard
+            .transfers_by_user
+            .get(user_id)
+            .is_some_and(|transfer| transfer.source_conn_id == conn_id)
+        {
+            Self::abort_transfer_locked(
+                guard,
+                user_id,
+                "The active player released ownership",
+                false,
+            );
+        }
+        if let Some(client) = guard.clients.get_mut(conn_id) {
+            let generation = client.lease.take().map(|lease| lease.generation);
+            client.state.playing = false;
+            client.must_report_stopped = true;
+            if expired {
+                Self::send_to_client(
+                    client,
+                    json!({ "type": "PLAYBACK_LEASE_EXPIRED", "leaseGeneration": generation }),
+                );
+            }
+        }
+        Self::broadcast_devices_locked(guard, user_id);
+        Self::sync_playback_locked(guard, user_id, None);
+        if !guard
+            .clients
+            .values()
+            .any(|client| client.user_id == user_id)
+        {
+            guard.playback_by_user.remove(user_id);
+        }
     }
 
     fn update_player_locked(
@@ -1089,19 +1453,26 @@ impl RemoteControlHub {
             Self::send_error_locked(guard, conn_id, "Invalid playback state", None);
             return;
         }
-        let is_playing = state.playing && state.current_track.is_some();
         // During handoff, the target starts before the server commits ownership.
+        let reported_stopped = !state.playing;
         if state.playing
-            && guard
+            && (guard
                 .active_player_by_user
                 .get(user_id)
                 .is_some_and(|active| active != conn_id)
+                || guard.clients[conn_id].must_report_stopped
+                || Self::handoff_blocks_playback(guard, user_id, conn_id))
             && !Self::is_starting_transfer_target(guard, user_id, conn_id)
         {
             state.playing = false;
             Self::send_frame_locked(guard, conn_id, json!({ "type": "DEACTIVATE" }));
         }
+        let is_playing = state.playing && state.current_track.is_some();
         if let Some(client) = guard.clients.get_mut(conn_id) {
+            if reported_stopped && client.must_report_stopped {
+                // Wait for a real stopped report, rather than a rejected playing report.
+                client.must_report_stopped = false;
+            }
             if let Some(queue) = queue.filter(Self::valid_live_queue) {
                 client.queue = Some(Arc::new(queue));
             } else if clear_queue {
@@ -1110,10 +1481,11 @@ impl RemoteControlHub {
             client.state = state;
         }
 
-        if !guard.active_player_by_user.contains_key(user_id) && is_playing {
-            guard
-                .active_player_by_user
-                .insert(user_id.to_owned(), conn_id.to_owned());
+        if !guard.active_player_by_user.contains_key(user_id)
+            && !guard.transfers_by_user.contains_key(user_id)
+            && is_playing
+        {
+            Self::select_player_locked(guard, user_id, conn_id);
         }
 
         Self::broadcast_devices_locked(guard, user_id);
@@ -1199,6 +1571,28 @@ impl RemoteControlHub {
             })
     }
 
+    fn handoff_blocks_playback(guard: &HubState, user_id: &str, conn_id: &str) -> bool {
+        guard
+            .transfers_by_user
+            .get(user_id)
+            .is_some_and(|transfer| {
+                transfer.stage == TransferStage::Rollback
+                    || (transfer.stage == TransferStage::Start
+                        && transfer.target_conn_id != conn_id)
+            })
+    }
+
+    fn source_can_resume(guard: &HubState, user_id: &str, source: &str) -> bool {
+        guard.active_player_by_user.get(user_id).map(String::as_str) == Some(source)
+            && guard.clients.get(source).is_some_and(|client| {
+                !*client.disconnected.borrow()
+                    && client
+                        .lease
+                        .as_ref()
+                        .is_none_or(|lease| lease.expires > Instant::now())
+            })
+    }
+
     pub(crate) fn operation_deadline(&self, conn_id: &str) -> Option<Instant> {
         let guard = self
             .state
@@ -1218,6 +1612,12 @@ impl RemoteControlHub {
                     .and_then(VecDeque::front)
                     .filter(|cmd| cmd.target_conn_id == conn_id)
                     .and_then(|cmd| cmd.deadline),
+            )
+            .chain(
+                guard.clients[conn_id]
+                    .lease
+                    .as_ref()
+                    .map(|lease| lease.expires),
             )
             .min()
     }
@@ -1242,6 +1642,7 @@ impl RemoteControlHub {
         else {
             return;
         };
+        Self::expire_playback_lease_locked(&mut guard, &user_id);
         if let Some(transfer) = guard.transfers_by_user.get(&user_id)
             && Self::transfer_deadline_owner(transfer) == conn_id
             && transfer.deadline <= now
@@ -1308,7 +1709,8 @@ impl RemoteControlHub {
                     .failure
                     .as_deref()
                     .unwrap_or("Playback transfer cancelled");
-                Self::finish_transfer_abort(guard, &transfer, detail, true);
+                let resume = Self::source_can_resume(guard, user_id, &transfer.source_conn_id);
+                Self::finish_transfer_abort(guard, &transfer, detail, resume);
             }
             return;
         }
@@ -1368,10 +1770,14 @@ impl RemoteControlHub {
                 }
             }
             RemoteClientMessage::Ready { .. } => {
+                let playback_until = guard.clients[conn_id]
+                    .playback_lease
+                    .then(|| Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS));
                 let source_conn_opt = {
                     let t = guard.transfers_by_user.get_mut(user_id).unwrap();
                     if conn_id == t.target_conn_id && t.stage == TransferStage::Prepare {
                         t.stage = TransferStage::Pause;
+                        t.target_playback_until = playback_until;
                         Some((t.source_conn_id.clone(), t.id.clone()))
                     } else {
                         None
@@ -1409,11 +1815,21 @@ impl RemoteControlHub {
                                     != serde_json::to_string(&snapshot.queue_state).ok()
                         });
                         t.snapshot = Some(snapshot.clone());
-                        if drifted {
+                        if drifted
+                            || t.target_playback_until
+                                .is_some_and(|until| until <= Instant::now())
+                        {
                             Some(Err(()))
                         } else {
                             t.stage = TransferStage::Start;
-                            Some(Ok((t.target_conn_id.clone(), t.id.clone())))
+                            if let Some(until) = t.target_playback_until {
+                                t.deadline = t.deadline.min(until);
+                            }
+                            Some(Ok((
+                                t.target_conn_id.clone(),
+                                t.id.clone(),
+                                t.target_playback_until.is_some(),
+                            )))
                         }
                     } else {
                         None
@@ -1421,7 +1837,13 @@ impl RemoteControlHub {
                 };
 
                 match step {
-                    Some(Ok((target_conn, tid))) => {
+                    Some(Ok((target_conn, tid, bounded))) => {
+                        if let Some(controller) = guard
+                            .clients
+                            .get(&guard.transfers_by_user[user_id].controller_conn_id)
+                        {
+                            controller.deadline_changed.notify_one();
+                        }
                         if let Some(source) = guard.clients.get_mut(conn_id) {
                             source.state.playing = false;
                         }
@@ -1434,6 +1856,7 @@ impl RemoteControlHub {
                                 "type": "START_TRANSFER",
                                 "transferId": tid,
                                 "snapshot": snapshot,
+                                "playbackLeaseMs": bounded.then_some(PLAYBACK_LEASE_MS),
                             }),
                         );
                     }
@@ -1474,9 +1897,7 @@ impl RemoteControlHub {
                 let transfer = guard.transfers_by_user.remove(user_id).unwrap();
                 let snapshot = transfer.snapshot.unwrap();
 
-                guard
-                    .active_player_by_user
-                    .insert(user_id.to_owned(), transfer.target_conn_id.clone());
+                Self::select_player_locked(guard, user_id, &transfer.target_conn_id);
 
                 let source = guard.clients.get(&transfer.source_conn_id);
                 let source_duration = source.map_or(0.0, |c| c.state.duration_ms);
@@ -1555,6 +1976,7 @@ impl RemoteControlHub {
         };
 
         let should_resume = resume_source && transfer.snapshot.as_ref().is_some_and(|s| s.playing);
+        let source_still_owns = Self::source_can_resume(guard, user_id, &transfer.source_conn_id);
 
         if transfer.stage != TransferStage::Rollback {
             Self::send_frame_locked(
@@ -1564,6 +1986,47 @@ impl RemoteControlHub {
                     "type": "ABORT_TRANSFER", "transferId": transfer.id,
                 }),
             );
+        }
+        if transfer.stage == TransferStage::Pause
+            && !guard.clients.contains_key(&transfer.target_conn_id)
+        {
+            Self::finish_transfer_abort(
+                guard,
+                &transfer,
+                message,
+                should_resume && source_still_owns,
+            );
+            return;
+        }
+        if matches!(
+            transfer.stage,
+            TransferStage::Start | TransferStage::Rollback
+        ) && let Some(until) = transfer.target_playback_until
+        {
+            if until > Instant::now() {
+                // A disconnected target may still be audible. Retain the fence
+                // even if neither participant has a socket to acknowledge rollback.
+                transfer.stage = TransferStage::Rollback;
+                transfer.deadline = until;
+                transfer.failure.get_or_insert_with(|| message.to_owned());
+                if let Some(source) = guard.clients.get(&transfer.source_conn_id) {
+                    source.deadline_changed.notify_one();
+                }
+                guard.transfers_by_user.insert(user_id.to_owned(), transfer);
+            } else {
+                let detail = transfer.failure.as_deref().unwrap_or(message);
+                Self::finish_transfer_abort(
+                    guard,
+                    &transfer,
+                    detail,
+                    transfer
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.playing)
+                        && source_still_owns,
+                );
+            }
+            return;
         }
         if should_resume
             && transfer.stage != TransferStage::Rollback
@@ -1618,10 +2081,12 @@ impl RemoteControlHub {
         );
     }
 
-    fn remove_client_locked(guard: &mut HubState, conn_id: &str) {
-        let Some(removed) = guard.clients.remove(conn_id) else {
-            return;
-        };
+    fn remove_client_locked(
+        guard: &mut HubState,
+        conn_id: &str,
+        keep_lease: bool,
+    ) -> Option<(String, Instant)> {
+        let removed = guard.clients.remove(conn_id)?;
         let user_id = removed.user_id;
         removed.disconnected.send_replace(true);
 
@@ -1669,21 +2134,40 @@ impl RemoteControlHub {
         if guard
             .active_player_by_user
             .get(&user_id)
-            .map(String::as_str)
-            == Some(conn_id)
+            .is_some_and(|id| id == conn_id)
         {
-            guard.active_player_by_user.remove(&user_id);
+            if keep_lease
+                && let Some(device_id) = removed.device_id
+                && let Some(lease) = removed.lease.filter(|lease| lease.expires > Instant::now())
+            {
+                guard.detached_players.insert(
+                    user_id.clone(),
+                    DetachedPlayer {
+                        session_id: removed.session_id,
+                        device_id,
+                        lease,
+                        state: removed.state,
+                        queue: removed.queue,
+                    },
+                );
+            } else {
+                guard.active_player_by_user.remove(&user_id);
+            }
         }
 
         Self::broadcast_devices_locked(guard, &user_id);
         Self::sync_playback_locked(guard, &user_id, None);
-        if !guard
-            .clients
-            .values()
-            .any(|client| client.user_id == user_id)
+        let deadline =
+            Self::detached_deadline(guard, &user_id).map(|until| (user_id.clone(), until));
+        if deadline.is_none()
+            && !guard
+                .clients
+                .values()
+                .any(|client| client.user_id == user_id)
         {
             guard.playback_by_user.remove(&user_id);
         }
+        deadline
     }
 
     /// Notifies other queue-aware devices that a committed account snapshot changed.
@@ -1734,12 +2218,16 @@ impl RemoteControlHub {
             .active_player_by_user
             .get(user_id)
             .and_then(|id| guard.clients.get(id));
-        let state = player.map(|client| &client.state);
+        let detached = guard.detached_players.get(user_id);
+        let state = player
+            .map(|client| &client.state)
+            .or_else(|| detached.map(|lease| &lease.state));
         let current_id = state
             .and_then(|state| state.current_track.as_ref())
             .map(|track| track.id.as_str());
         let queue = player
             .and_then(|client| client.queue.clone())
+            .or_else(|| detached.and_then(|lease| lease.queue.clone()))
             .filter(|queue| {
                 queue
                     .entries
@@ -1757,7 +2245,9 @@ impl RemoteControlHub {
             (None, None) => false,
             _ => true,
         });
-        let device_id = player.and_then(|client| client.device_id.clone());
+        let device_id = player
+            .and_then(|client| client.device_id.clone())
+            .or_else(|| detached.map(|lease| lease.device_id.clone()));
         let track = state.and_then(|state| state.current_track.clone());
         let position_ms = state.map_or(0.0, |state| state.position_ms);
         let duration_ms = state.map_or(0.0, |state| state.duration_ms);
@@ -1790,6 +2280,16 @@ impl RemoteControlHub {
             );
         }
         let playback = &guard.playback_by_user[user_id];
+        let owner = guard
+            .active_player_by_user
+            .get(user_id)
+            .and_then(|id| guard.clients.get(id));
+        let generation = |conn_id: &str| {
+            owner
+                .filter(|owner| owner.conn_id == conn_id)
+                .and_then(|owner| owner.lease.as_ref())
+                .map(|lease| lease.generation)
+        };
         if let Some(conn_id) = initialize {
             let supports_watchdog = guard
                 .clients
@@ -1802,6 +2302,11 @@ impl RemoteControlHub {
                     "type": "INITIAL_STATE", "state": playback, "server_time": now,
                     "queue": playback.queue.as_deref(),
                     "controlTimeoutMs": supports_watchdog.then_some(25_000),
+                    "playbackLeaseMs": guard.clients.get(conn_id).is_some_and(|client| client.playback_lease)
+                        .then_some(PLAYBACK_LEASE_MS),
+                    "playbackLeaseProtocol": guard.clients.get(conn_id).is_some_and(|client| client.playback_lease)
+                        .then_some(1),
+                    "leaseGeneration": generation(conn_id),
                 }),
             );
         }
@@ -1814,7 +2319,11 @@ impl RemoteControlHub {
             for client in guard.clients.values().filter(|c| {
                 c.user_id == user_id && c.live_sync && Some(c.conn_id.as_str()) != initialize
             }) {
-                Self::send_to_client(client, payload.clone());
+                let mut frame = payload.clone();
+                if let Some(generation) = generation(&client.conn_id) {
+                    frame["leaseGeneration"] = json!(generation);
+                }
+                Self::send_to_client(client, frame);
             }
         }
     }
@@ -2004,6 +2513,7 @@ mod tests {
         while target_rx.try_recv().is_ok() {}
         {
             let mut state = hub.state.lock().unwrap();
+            state.active_player_by_user.insert("alice".into(), source.clone());
             state.transfers_by_user.insert("alice".into(), ActiveTransfer {
                 id: "transfer".into(),
                 request_id: "switch".into(),
@@ -2012,6 +2522,7 @@ mod tests {
                 target_conn_id: target.clone(),
                 stage: TransferStage::Start,
                 deadline: Instant::now() + Duration::from_secs(10),
+                target_playback_until: None,
                 failure: None,
                 snapshot: Some(serde_json::from_value(json!({
                     "trackId": "track", "exactPositionMs": 1000, "volume": 1.0, "playing": true,
@@ -2037,6 +2548,70 @@ mod tests {
         );
         assert_eq!(source_rx.try_recv().unwrap()["resume"], true);
         assert_eq!(source_rx.try_recv().unwrap()["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn disconnected_handoff_target_blocks_resume_until_its_provisional_lease_expires() {
+        let hub = RemoteControlHub::new();
+        let (source, mut source_rx) = hub.connect_client("alice", "source-session", 0).unwrap();
+        let (target, _target_rx) = hub.connect_client("alice", "target-session", 0).unwrap();
+        let safe_after = Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS);
+        {
+            let mut state = hub.state.lock().unwrap();
+            state.active_player_by_user.insert("alice".into(), source.clone());
+            state.transfers_by_user.insert("alice".into(), ActiveTransfer {
+                id: "transfer".into(), request_id: "switch".into(), controller_conn_id: source.clone(),
+                source_conn_id: source.clone(), target_conn_id: target.clone(), stage: TransferStage::Start,
+                deadline: safe_after, target_playback_until: Some(safe_after), failure: None,
+                snapshot: Some(serde_json::from_value(json!({
+                    "trackId": "track", "exactPositionMs": 1000, "volume": 1.0, "playing": true,
+                    "queueState": { "entries": [], "index": 0, "repeatOne": false, "shuffle": false,
+                        "shuffleMode": "standard", "shuffleSeed": null, "albumAware": false, "context": null },
+                })).unwrap()),
+            });
+        }
+        hub.disconnect_client(&target);
+        assert!(source_rx.try_recv().is_err());
+        hub.handle_message(&target, serde_json::from_value(json!({
+            "type": "STARTED", "transferId": "transfer",
+        })).unwrap());
+        {
+            let mut state = hub.state.lock().unwrap();
+            let handoff = state.transfers_by_user.get_mut("alice").unwrap();
+            assert_eq!(handoff.stage, TransferStage::Rollback);
+            assert_eq!(handoff.deadline, safe_after);
+            handoff.deadline = Instant::now();
+            handoff.target_playback_until = Some(handoff.deadline);
+        }
+        hub.expire_operations(&source, Instant::now());
+        assert_eq!(source_rx.try_recv().unwrap()["resume"], true);
+        assert_eq!(source_rx.try_recv().unwrap()["ok"], false);
+        assert!(hub.state.lock().unwrap().transfers_by_user.is_empty());
+    }
+
+    #[test]
+    fn explicit_session_revocation_clears_detached_ownership_immediately() {
+        let hub = RemoteControlHub::new();
+        let (owner, _owner_rx) = hub.connect_client("alice", "revoked", 0).unwrap();
+        let register = |conn: &str, device: &str| {
+            hub.handle_message(conn, serde_json::from_value(json!({
+                "type": "REGISTER", "device_id": device, "device_name": device,
+                "device_type": "computer", "can_receive": true, "playback_lease": true, "playbackLeaseProtocol": 1, "live_sync": true,
+                "state": { "current_track": { "id": "track", "title": "Track" },
+                    "position_ms": 0, "duration_ms": 10000, "playing": true, "volume": 1 },
+            })).unwrap());
+        };
+        register(&owner, "desk");
+        hub.disconnect_client(&owner);
+        assert!(hub.state.lock().unwrap().detached_players.contains_key("alice"));
+        crate::auth::SessionEventBus::default()
+            .with_remote_hub(hub.clone())
+            .publish(crate::auth::SessionEvent::SessionRevoked {
+                session_id: "revoked".into(),
+            });
+        let (second, _second_rx) = hub.connect_client("alice", "valid", 0).unwrap();
+        register(&second, "phone");
+        assert_eq!(hub.state.lock().unwrap().active_player_by_user["alice"], second);
     }
 
     #[test]
@@ -2184,6 +2759,108 @@ mod tests {
         assert_eq!(remaining["is_active_player"], true);
         assert_eq!(remaining["playing"], true);
         assert_eq!(remaining["current_track"]["id"], "next desktop song");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_owner_can_reclaim_its_lease_but_cannot_take_over_after_expiry() {
+        let hub = RemoteControlHub::new();
+        let send = |conn: &str, payload| {
+            hub.handle_message(conn, serde_json::from_value(payload).unwrap());
+        };
+        let playing = json!({
+            "current_track": { "id": "track", "title": "Track" },
+            "position_ms": 0, "duration_ms": 10000, "playing": true, "volume": 1,
+        });
+        let register = |session, device, generation: Option<&str>| {
+            let (conn, rx) = hub.connect_client("alice", session, 0).unwrap();
+            send(
+                &conn,
+                json!({
+                    "type": "REGISTER", "device_id": device, "device_name": device,
+                    "device_type": "computer", "can_receive": true, "live_sync": true,
+                    "playback_lease": true, "playbackLeaseProtocol": 1, "leaseGeneration": generation, "state": playing,
+                }),
+            );
+            (conn, rx)
+        };
+        let active = || {
+            hub.state
+                .lock()
+                .unwrap()
+                .active_player_by_user
+                .get("alice")
+                .cloned()
+        };
+        let receive = |rx: &mut mpsc::Receiver<Value>, kind: &str| loop {
+            let frame = rx.try_recv().unwrap();
+            if frame["type"] == kind {
+                break frame;
+            }
+        };
+
+        let (original, mut original_rx) = register("session", "desk", None);
+        let initial = receive(&mut original_rx, "INITIAL_STATE");
+        let generation = initial["leaseGeneration"].as_str().unwrap();
+        let original_deadline = hub.state.lock().unwrap().clients[&original].lease.as_ref().unwrap().expires;
+        hub.disconnect_client(&original);
+        assert_eq!(active(), Some(original));
+        assert_eq!(hub.state.lock().unwrap().detached_players["alice"].lease.expires, original_deadline);
+
+        let (competitor, mut competitor_rx) = register("other-session", "phone", None);
+        receive(&mut competitor_rx, "DEACTIVATE");
+        let (_, mut impostor_rx) = register("foreign-session", "desk", Some(generation));
+        receive(&mut impostor_rx, "DEACTIVATE");
+        let wrong_generation = Uuid::new_v4().to_string();
+        let (stale, mut stale_rx) = register("session", "desk", Some(&wrong_generation));
+        receive(&mut stale_rx, "DEACTIVATE");
+        hub.disconnect_client(&stale);
+        send(
+            &competitor,
+            json!({ "type": "TRANSFER_PLAYBACK", "requestId": "early", "targetId": "phone" }),
+        );
+        assert_eq!(receive(&mut competitor_rx, "ERROR")["requestId"], "early");
+
+        let (reattached, mut desk_rx) = register("session", "desk", Some(generation));
+        assert_eq!(
+            receive(&mut desk_rx, "INITIAL_STATE")["state"]["device_id"],
+            "desk"
+        );
+        assert_eq!(active(), Some(reattached.clone()));
+        for (device, token) in [("phone", generation), ("desk", wrong_generation.as_str())] {
+            send(&reattached, json!({ "type": "RENEW_PLAYBACK_LEASE", "sequence": 1,
+                "device_id": device, "leaseGeneration": token }));
+        }
+        assert!(desk_rx.try_recv().is_err());
+        assert_eq!(hub.state.lock().unwrap().clients[&reattached].lease.as_ref().unwrap().expires, original_deadline);
+        send(
+            &reattached,
+            json!({ "type": "RENEW_PLAYBACK_LEASE", "sequence": 1,
+                "device_id": "desk", "leaseGeneration": generation }),
+        );
+        let grant = receive(&mut desk_rx, "PLAYBACK_LEASE");
+        assert_eq!(grant["leaseMs"], PLAYBACK_LEASE_MS);
+        assert_eq!(grant["leaseGeneration"], generation);
+        send(&reattached, json!({ "type": "RENEW_PLAYBACK_LEASE", "sequence": 1,
+            "device_id": "desk", "leaseGeneration": generation }));
+        assert!(desk_rx.try_recv().is_err());
+
+        hub.disconnect_client(&reattached);
+        hub.state
+            .lock()
+            .unwrap()
+            .detached_players
+            .get_mut("alice")
+            .unwrap()
+            .lease
+            .expires = Instant::now();
+        send(&competitor, json!({ "type": "STATE", "state": RemotePlaybackState::default() }));
+        send(&competitor, json!({ "type": "STATE", "state": playing }));
+        assert_eq!(active(), Some(competitor));
+        let (_, mut stale_rx) = register("session", "desk", Some(generation));
+        receive(&mut stale_rx, "DEACTIVATE");
+        let initial = receive(&mut stale_rx, "INITIAL_STATE");
+        assert_eq!(initial["state"]["device_id"], "phone");
+        assert_eq!(initial["state"]["is_playing"], true);
     }
 
     #[test]

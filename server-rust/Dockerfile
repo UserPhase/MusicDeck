@@ -94,7 +94,7 @@ VOLUME ["/app/data", "/app/config", "/app/cache"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD if [ -n "${MUSICDECK_BIND_ADDR:-}" ]; then bind="${MUSICDECK_BIND_ADDR}"; \
-      else host="${MUSICDECK_HOST:-${HOST:-127.0.0.1}}"; \
+      else host="${MUSICDECK_HOST:-${HOST:-0.0.0.0}}"; \
         case "$host" in *:*) host="[$host]";; esac; \
         bind="$host:${MUSICDECK_PORT:-${PORT:-4534}}"; fi; \
       case "$bind" in 0.0.0.0:*) bind="127.0.0.1:${bind##*:}";; "[::]:"*) bind="[::1]:${bind##*:}";; esac; \

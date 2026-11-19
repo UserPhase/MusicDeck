@@ -182,6 +182,11 @@ impl SessionStore {
         &self.events
     }
 
+    pub(crate) fn with_remote_hub(mut self, hub: crate::remote::RemoteControlHub) -> Self {
+        self.events = self.events.with_remote_hub(hub);
+        self
+    }
+
     /// Returns a reference to the underlying [`DbPool`].
     #[must_use]
     pub const fn db(&self) -> &DbPool {
@@ -307,39 +312,33 @@ impl SessionStore {
             return Ok(None);
         }
 
-        let row = sqlx::query("SELECT created_at, expires_at FROM sessions WHERE id = ?;")
-            .bind(trimmed)
-            .fetch_optional(self.db.inner())
-            .await?;
+        let mut tx = self.db.inner().begin().await?;
+        let expires: Option<String> = sqlx::query_scalar(
+            "UPDATE sessions
+             SET expires_at = CASE
+               WHEN julianday(expires_at) > julianday('now', ?1) THEN expires_at
+               ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+             END
+             WHERE id = ?2
+               AND julianday(expires_at) > julianday('now')
+               AND julianday(expires_at) > julianday(created_at, ?3)
+               AND EXISTS (SELECT 1 FROM users WHERE users.id = sessions.user_id AND disabled = 0)
+             RETURNING expires_at;",
+        )
+        .bind(format!("+{SESSION_DAYS} days"))
+        .bind(trimmed)
+        .bind(format!("+{} seconds", EPHEMERAL_SESSION_HOURS * 3600 + 60))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
-        let Some(row) = row else {
+        let Some(next_expires_at) = expires
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|date| date.with_timezone(&Utc))
+        else {
             return Ok(None);
         };
-
-        let created_str: String = row.try_get("created_at")?;
-        let expires_str: String = row.try_get("expires_at")?;
-        let Ok(created_dt) = DateTime::parse_from_rfc3339(&created_str) else {
-            return Ok(None);
-        };
-        let Ok(expires_dt) = DateTime::parse_from_rfc3339(&expires_str) else {
-            return Ok(None);
-        };
-
-        let ephemeral_threshold =
-            Duration::hours(EPHEMERAL_SESSION_HOURS) + Duration::seconds(60);
-        if (expires_dt - created_dt) <= ephemeral_threshold {
-            return Ok(None);
-        }
-
-        let next_expires_at = Utc::now() + Duration::days(SESSION_DAYS);
-        let next_expires_iso =
-            next_expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
-        sqlx::query("UPDATE sessions SET expires_at = ? WHERE id = ?;")
-            .bind(&next_expires_iso)
-            .bind(trimmed)
-            .execute(self.db.inner())
-            .await?;
 
         if let Some(entry) = self.cache.write().await.get_mut(trimmed) {
             entry.session.expires_at = next_expires_at;
@@ -416,13 +415,17 @@ pub async fn create_session_on_conn(
     let created_iso = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let expires_iso = expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    sqlx::query("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?);")
+    let inserted = sqlx::query("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?);")
         .bind(&id)
         .bind(user_id)
         .bind(&created_iso)
         .bind(&expires_iso)
         .execute(&mut *conn)
         .await?;
+
+    if inserted.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound.into());
+    }
 
     Ok(Session {
         id,

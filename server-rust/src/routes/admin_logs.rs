@@ -86,6 +86,7 @@ async fn list_admin_logs(
             StatusCode::BAD_REQUEST,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("VALIDATION_ERROR"),
                     message: String::from(
                         "level must be error, warn, info or debug and limit 1-1000",
@@ -185,6 +186,7 @@ async fn stream_admin_logs(
                 StatusCode::BAD_REQUEST,
                 Json(ApiErrorEnvelope {
                     error: ApiErrorBody {
+                        request_id: crate::error::current_request_id(),
                         code: String::from("VALIDATION_ERROR"),
                         message: String::from("after must be a log sequence number"),
                     },
@@ -212,6 +214,7 @@ async fn stream_admin_logs(
             StatusCode::TOO_MANY_REQUESTS,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("TOO_MANY_STREAMS"),
                     message: String::from("Too many open log streams"),
                 },

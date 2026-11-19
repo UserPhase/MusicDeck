@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::error::ApiJson;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -22,11 +23,12 @@ use axum::routing::{get, post};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::Sqlite;
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::{AuthenticatedUser, RequireAdmin};
+use crate::db::begin_sqlite_write;
 use crate::error::ServerError;
 use crate::mixes::{MixScope, SimilarMixError, SimilarMixInput};
 use crate::services::privacy::ExternalCategory;
@@ -162,7 +164,7 @@ async fn get_admin_sonic_handler(
 async fn put_admin_sonic_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    Json(body): Json<PutSonicSettingsBody>,
+    ApiJson(body): ApiJson<PutSonicSettingsBody>,
 ) -> Result<Response, ServerError> {
     state
         .sonic()
@@ -184,7 +186,7 @@ async fn put_admin_sonic_handler(
 async fn post_admin_sonic_action_handler(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    Json(body): Json<PostSonicActionBody>,
+    ApiJson(body): ApiJson<PostSonicActionBody>,
 ) -> Result<Response, ServerError> {
     if !matches!(body.action.as_str(), "start" | "pause" | "resume" | "cancel") {
         return Err(ServerError::BadRequest(String::from(
@@ -267,7 +269,7 @@ async fn get_similar_mix_seeds_handler(
 async fn post_similar_mix_seed_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<RegisterExternalSeedBody>,
+    ApiJson(body): ApiJson<RegisterExternalSeedBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -287,7 +289,7 @@ async fn post_similar_mix_seed_handler(
 async fn post_similar_mix_preview_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SimilarMixPreviewRequestBody>,
+    ApiJson(body): ApiJson<SimilarMixPreviewRequestBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -385,8 +387,8 @@ async fn post_similar_mix_preview_handler(
         .into_response())
 }
 
-async fn verify_preview_selection(
-    state: &AppState,
+async fn verify_preview_selection<'e>(
+    executor: impl sqlx::Executor<'e, Database = Sqlite>,
     user_id: &str,
     preview_id: &str,
     track_ids: &[String],
@@ -396,11 +398,7 @@ async fn verify_preview_selection(
         return Err(SimilarMixError::new("Invalid mix selection.", 400, None));
     }
 
-    let Some(pool) = state.db() else {
-        return Err(SimilarMixError::new("Database is unavailable.", 503, None));
-    };
-
-    let row = sqlx::query(
+    let row = sqlx::query_as::<_, (String, i64, Option<String>)>(
         r"
         SELECT candidate_ids_json, expires_at, playlist_id
         FROM similar_mix_previews
@@ -409,13 +407,12 @@ async fn verify_preview_selection(
     )
     .bind(preview_id)
     .bind(user_id)
-    .fetch_optional(pool.inner())
+    .fetch_optional(executor)
     .await
-    .ok()
-    .flatten();
+    .map_err(preview_storage_error)?;
 
     let now = Utc::now().timestamp_millis();
-    let Some(row) = row else {
+    let Some((candidates, expires_at, playlist_id)) = row else {
         return Err(SimilarMixError::new(
             "This mix preview expired. Refresh it before saving or queueing.",
             409,
@@ -423,7 +420,6 @@ async fn verify_preview_selection(
         ));
     };
 
-    let expires_at: i64 = row.try_get("expires_at").unwrap_or(0);
     if expires_at <= now {
         return Err(SimilarMixError::new(
             "This mix preview expired. Refresh it before saving or queueing.",
@@ -432,9 +428,8 @@ async fn verify_preview_selection(
         ));
     }
 
-    let cand_str: String = row.try_get("candidate_ids_json").unwrap_or_default();
-    let allowed: HashSet<String> = serde_json::from_str::<Vec<String>>(&cand_str)
-        .unwrap_or_default()
+    let allowed: HashSet<String> = serde_json::from_str::<Vec<String>>(&candidates)
+        .map_err(preview_storage_error)?
         .into_iter()
         .collect();
 
@@ -446,13 +441,18 @@ async fn verify_preview_selection(
         ));
     }
 
-    Ok(row.try_get("playlist_id").ok())
+    Ok(playlist_id)
+}
+
+fn preview_storage_error(error: impl std::fmt::Display) -> SimilarMixError {
+    tracing::error!(%error, "Failed to read Similar Mix preview");
+    SimilarMixError::new("The mix preview could not be read. Try again.", 503, None)
 }
 
 async fn post_similar_mix_selection_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SimilarMixSelectionBody>,
+    ApiJson(body): ApiJson<SimilarMixSelectionBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -460,8 +460,16 @@ async fn post_similar_mix_selection_handler(
         )));
     }
 
-    if let Err(err) =
-        verify_preview_selection(&state, &auth.user.id, &body.preview_id, &body.track_ids).await
+    let pool = state
+        .db()
+        .ok_or_else(|| ServerError::ServiceUnavailable("Database is unavailable".into()))?;
+    if let Err(err) = verify_preview_selection(
+        pool.inner(),
+        &auth.user.id,
+        &body.preview_id,
+        &body.track_ids,
+    )
+    .await
     {
         return Ok(mix_error_response(err));
     }
@@ -479,7 +487,7 @@ async fn post_similar_mix_selection_handler(
 async fn post_similar_mix_save_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    Json(body): Json<SimilarMixSelectionBody>,
+    ApiJson(body): ApiJson<SimilarMixSelectionBody>,
 ) -> Result<Response, ServerError> {
     if body.owner_id != auth.user.id {
         return Err(ServerError::Conflict(String::from(
@@ -490,15 +498,20 @@ async fn post_similar_mix_save_handler(
         .name
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() <= 200)
+        .filter(|s| !s.is_empty() && s.chars().count() <= 200)
     else {
         return Err(ServerError::BadRequest(String::from(
             "A mix name and valid preview are required.",
         )));
     };
 
+    let Some(pool) = state.db() else {
+        return Err(ServerError::ServiceUnavailable(String::from(
+            "Database is unavailable",
+        )));
+    };
     let existing_playlist_id = match verify_preview_selection(
-        &state,
+        pool.inner(),
         &auth.user.id,
         &body.preview_id,
         &body.track_ids,
@@ -509,54 +522,74 @@ async fn post_similar_mix_save_handler(
         Err(err) => return Ok(mix_error_response(err)),
     };
 
-    let Some(pool) = state.db() else {
-        return Err(ServerError::ServiceUnavailable(String::from(
-            "Database is unavailable",
-        )));
+    // Materialization reads the catalog and taste profile outside the writer lock.
+    let tracks = if existing_playlist_id.is_none() {
+        Some(
+            state
+                .similar_mixes()
+                .materialize(&auth.user.id, &body.track_ids)
+                .await,
+        )
+    } else {
+        None
     };
-
-    if let Some(pid) = existing_playlist_id {
-        let row = sqlx::query(
-            "SELECT id, name FROM playlists WHERE id = ? AND deleted_at IS NULL",
+    let mut tx = begin_sqlite_write(
+        pool.inner(),
+        "UPDATE similar_mix_previews SET playlist_id = playlist_id WHERE 0",
+    )
+    .await
+    .map_err(crate::db::DbError::from)?;
+    let claimed =
+        match verify_preview_selection(&mut *tx, &auth.user.id, &body.preview_id, &body.track_ids)
+            .await
+        {
+            Ok(pid) => pid,
+            Err(err) => return Ok(mix_error_response(err)),
+        };
+    if let Some(pid) = claimed {
+        let saved_name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM playlists WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL",
         )
         .bind(&pid)
-        .fetch_optional(pool.inner())
+        .bind(&auth.user.id)
+        .fetch_optional(&mut *tx)
         .await
-        .ok()
-        .flatten();
-        let Some(row) = row else {
+        .map_err(crate::db::DbError::from)?;
+        let Some(saved_name) = saved_name else {
             return Ok(mix_error_response(SimilarMixError::new(
                 "The saved playlist is in Trash. Restore it from your collection.",
                 409,
                 None,
             )));
         };
-        let p_name: String = row.try_get("name").unwrap_or_default();
+        tx.commit().await.map_err(crate::db::DbError::from)?;
         return Ok((
             StatusCode::OK,
             Json(json!({
-                "playlist": { "id": pid, "name": p_name },
+                "playlist": { "id": pid, "name": saved_name },
                 "alreadySaved": true,
             })),
         )
             .into_response());
     }
 
-    if let Err(err) = state
-        .similar_mixes()
-        .materialize(&auth.user.id, &body.track_ids)
-        .await
-    {
-        return Ok(mix_error_response(err));
-    }
+    let tracks = match tracks {
+        Some(Ok(tracks)) => tracks,
+        Some(Err(err)) => return Ok(mix_error_response(err)),
+        None => {
+            return Err(ServerError::Conflict(
+                "The saved playlist changed. Refresh the mix.".into(),
+            ));
+        }
+    };
 
-    let playlist_id = format!("pl_{}", Uuid::new_v4().simple());
+    let playlist_id = format!("mdpl_{}", Uuid::new_v4().simple());
     let now_iso = Utc::now().to_rfc3339();
 
-    let _ = sqlx::query(
+    let created = sqlx::query(
         r"
-        INSERT INTO playlists (id, name, description, owner_user_id, visibility, created_at, updated_at)
-        VALUES (?, ?, 'Similar song mix', ?, 'private', ?, ?)
+        INSERT INTO playlists (id, name, description, owner_user_id, sharing_mode, created_at, updated_at)
+        VALUES (?, ?, 'Similar song mix', ?, 'PRIVATE', ?, ?)
         ",
     )
     .bind(&playlist_id)
@@ -564,30 +597,83 @@ async fn post_similar_mix_save_handler(
     .bind(&auth.user.id)
     .bind(&now_iso)
     .bind(&now_iso)
-    .execute(pool.inner())
-    .await;
-
-    for (idx, tid) in body.track_ids.iter().enumerate() {
-        let _ = sqlx::query(
-            r"
-            INSERT INTO playlist_tracks (id, playlist_id, track_id, position, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(format!("pt_{}", Uuid::new_v4().simple()))
-        .bind(&playlist_id)
-        .bind(tid)
-        .bind(idx as i64)
-        .bind(&now_iso)
-        .execute(pool.inner())
-        .await;
+    .execute(&mut *tx)
+    .await.map_err(crate::db::DbError::from)?;
+    if created.rows_affected() != 1 {
+        return Err(ServerError::Internal(
+            "Similar Mix playlist was not inserted".into(),
+        ));
     }
 
-    let _ = sqlx::query("UPDATE similar_mix_previews SET playlist_id = ? WHERE id = ?")
+    for (position, track) in tracks.iter().enumerate() {
+        let (connection_id, library_track_id, external_json) = if track.stream_url.is_empty() {
+            let mut external = serde_json::to_value(track)
+                .map_err(|err| ServerError::Internal(err.to_string()))?;
+            external["external"] = json!(true);
+            (String::new(), None, Some(external.to_string()))
+        } else {
+            let source = sqlx::query_scalar::<_, String>(
+                r"
+                SELECT connection_id FROM library_item_sources
+                WHERE library_item_id = ? AND provider_item_id = ?
+                ORDER BY created_at, connection_id LIMIT 1
+                ",
+            )
+            .bind(&track.id)
+            .bind(&track.provider_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(crate::db::DbError::from)?;
+            let Some(connection_id) = source else {
+                return Ok(mix_error_response(SimilarMixError::new(
+                    "A selected library song is unavailable. Refresh the mix.",
+                    409,
+                    None,
+                )));
+            };
+            (connection_id, Some(track.id.as_str()), None)
+        };
+        let inserted = sqlx::query(
+            r"
+            INSERT INTO playlist_items
+                (id, playlist_id, position, connection_id, provider_track_id, library_track_id,
+                 created_at, external_track_json, added_by_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(format!("mdpli_{}", Uuid::new_v4().simple()))
+        .bind(&playlist_id)
+        .bind(position as i64)
+        .bind(connection_id)
+        .bind(&track.provider_id)
+        .bind(library_track_id)
+        .bind(&now_iso)
+        .bind(external_json)
+        .bind(&auth.user.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::db::DbError::from)?;
+        if inserted.rows_affected() != 1 {
+            return Err(ServerError::Internal(
+                "Similar Mix item was not inserted".into(),
+            ));
+        }
+    }
+
+    let claim = sqlx::query(
+        "UPDATE similar_mix_previews SET playlist_id = ? WHERE id = ? AND user_id = ? AND playlist_id IS NULL",
+    )
         .bind(&playlist_id)
         .bind(&body.preview_id)
-        .execute(pool.inner())
-        .await;
+        .bind(&auth.user.id)
+        .execute(&mut *tx)
+        .await.map_err(crate::db::DbError::from)?;
+    if claim.rows_affected() != 1 {
+        return Err(ServerError::Conflict(
+            "The mix preview changed. Refresh the mix.".into(),
+        ));
+    }
+    tx.commit().await.map_err(crate::db::DbError::from)?;
 
     Ok((
         StatusCode::CREATED,

@@ -32,7 +32,7 @@ use crate::auth::UserRecord;
 use crate::catalog::library::{LibraryItemType, LibraryService, SourceRef};
 use crate::config::AppConfig;
 use crate::db::DbPool;
-use crate::providers::BackendRegistry;
+use crate::providers::{BackendRegistry, MusicBackend};
 use crate::tasks::{TaskError, TaskManager, TaskProgressPatch, TaskRunContext, TaskType};
 
 /// Per-track entry status inside a Spotify playlist import manifest (`ImportEntryStatus`).
@@ -148,6 +148,18 @@ pub struct StoredImportJob {
     pub user: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreadable_manifest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) playlist_intent: Option<PlaylistCreationIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PlaylistCreationIntent {
+    marker: String,
+    connection_id: String,
+    tracks: Vec<(String, String)>,
+    attempted: bool,
+    upstream_id: Option<String>,
 }
 
 /// SQLite repository persisting [`StoredImportJob`] checkpoints in `import_jobs`.
@@ -231,6 +243,36 @@ impl SqliteImportJobRepository {
         Ok(())
     }
 
+    async fn claim_playlist_creation(
+        &self,
+        record: &mut StoredImportJob,
+        task_id: &str,
+    ) -> Result<(), TaskError> {
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE import_jobs SET status=status WHERE 0",
+        )
+        .await
+        .map_err(import_db_error)?;
+        let claimed = sqlx::query(
+            "UPDATE import_jobs SET manifest_json=json_set(manifest_json,'$.playlistIntent.attempted',json('true'))
+             WHERE id=? AND json_extract(manifest_json,'$.playlistIntent.attempted')=0
+               AND EXISTS (SELECT 1 FROM background_tasks WHERE id=? AND state IN ('PROCESSING','PAUSED'))",
+        ).bind(&record.job.id).bind(task_id).execute(&mut *tx).await.map_err(import_db_error)?.rows_affected();
+        if claimed == 0 {
+            return Err(TaskError::ExecutionFailed(
+                "Playlist creation is already claimed or the task was cancelled".into(),
+            ));
+        }
+        tx.commit().await.map_err(import_db_error)?;
+        record
+            .playlist_intent
+            .as_mut()
+            .expect("claimed playlist intent")
+            .attempted = true;
+        Ok(())
+    }
+
     async fn finish_playlist(
         &self,
         record: &StoredImportJob,
@@ -242,7 +284,12 @@ impl SqliteImportJobRepository {
     ) -> Result<(), TaskError> {
         let job = &record.job;
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.db.inner().begin().await.map_err(import_db_error)?;
+        let mut tx = crate::db::begin_sqlite_write(
+            self.db.inner(),
+            "UPDATE import_jobs SET status=status WHERE 0",
+        )
+        .await
+        .map_err(import_db_error)?;
         let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM background_tasks WHERE id=? AND state IN ('PROCESSING','PAUSED'))")
             .bind(task_id).fetch_one(&mut *tx).await.map_err(import_db_error)?;
         if !active {
@@ -324,8 +371,11 @@ impl SqliteImportJobRepository {
                 manifest: None,
             },
             unreadable_manifest: Some(manifest_json),
+            playlist_intent: None,
         };
-        let _ = self.save(&fallback).await;
+        if let Err(error) = self.save(&fallback).await {
+            tracing::warn!(job_id = %fallback.job.id, %error, "Could not quarantine an invalid playlist import checkpoint");
+        }
         fallback
     }
 
@@ -478,6 +528,48 @@ impl SpotifyPlaylistImportService {
             ));
         };
 
+        if let (Some(pool), Some(manager)) = (&self.db, tasks) {
+            let mut tx = crate::db::begin_sqlite_write(
+                pool.inner(),
+                "UPDATE import_jobs SET status=status WHERE 0",
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            let manifest: Option<String> = sqlx::query_scalar(
+                "SELECT manifest_json FROM import_jobs
+                 WHERE user_id=? AND status IN ('PENDING','PROCESSING','FAILED')
+                   AND json_extract(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.playlistUrl')=?
+                   AND json_type(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.playlistIntent')='object'
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            ).bind(&user.id).bind(&canonical_url).fetch_optional(&mut *tx).await.map_err(|err| err.to_string())?;
+            if let Some(manifest) = manifest {
+                let mut existing: StoredImportJob =
+                    serde_json::from_str(&manifest).map_err(|err| err.to_string())?;
+                let payload = json!({ "kind": "playlist", "jobId": existing.job.id });
+                let already_running: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM background_tasks WHERE type='SPOTDL_IMPORT'
+                      AND payload_json=? AND state IN ('QUEUED','PROCESSING','PAUSED'))",
+                )
+                .bind(payload.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|err| err.to_string())?;
+                if already_running {
+                    return Ok(existing.job);
+                }
+                existing.job.status = "queued".into();
+                existing.job.error = None;
+                SqliteImportJobRepository::save_on(&existing, &mut *tx).await?;
+                let task = manager
+                    .enqueue_on(&mut tx, TaskType::SpotdlImport, payload, &user.id, None)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                tx.commit().await.map_err(|err| err.to_string())?;
+                manager.notify_committed(&task);
+                return Ok(existing.job);
+            }
+        }
+
         let id = format!("spimp_{}", nanoid!(16));
         let job = ImportJob {
             id: id.clone(),
@@ -510,6 +602,7 @@ impl SpotifyPlaylistImportService {
                 "externalPlaybackEnabled": user.external_playback_enabled,
             }),
             unreadable_manifest: None,
+            playlist_intent: None,
         };
         if let Some(pool) = &self.db {
             let mut tx = pool.inner().begin().await.map_err(|err| err.to_string())?;
@@ -552,6 +645,35 @@ impl SpotifyPlaylistImportService {
         };
         let repo = SqliteImportJobRepository::new(pool.clone());
         for mut record in repo.read_unfinished().await.map_err(|e| e.to_string())? {
+            if record.playlist_intent.is_some() {
+                let mut tx = crate::db::begin_sqlite_write(
+                    pool.inner(),
+                    "UPDATE import_jobs SET status=status WHERE 0",
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+                let now = Utc::now().to_rfc3339();
+                let resumed = sqlx::query(
+                    "UPDATE background_tasks SET state='QUEUED', error=NULL, started_at=NULL,
+                        finished_at=NULL, updated_at=?
+                     WHERE type='SPOTDL_IMPORT'
+                       AND payload_json=?
+                       AND (state IN ('QUEUED', 'PROCESSING', 'PAUSED') OR
+                            (state='FAILED' AND error='Task was interrupted by a server restart'))",
+                )
+                .bind(&now)
+                .bind(json!({ "kind": "playlist", "jobId": record.job.id }).to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| err.to_string())?
+                .rows_affected();
+                if resumed > 0 {
+                    record.job.status = "queued".into();
+                    SqliteImportJobRepository::save_on(&record, &mut *tx).await?;
+                    tx.commit().await.map_err(|err| err.to_string())?;
+                    continue;
+                }
+            }
             let queued = record.job.status == "queued"
                 && sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM background_tasks WHERE type='SPOTDL_IMPORT'
@@ -567,7 +689,9 @@ impl SpotifyPlaylistImportService {
                 record.job.error = Some("Playlist import was interrupted by server restart. Start a new import to try again.".into());
                 record.job.current_track = None;
                 record.job.current_track_name = None;
-                repo.save(&record).await?;
+                if let Err(error) = repo.save(&record).await {
+                    tracing::warn!(job_id = %record.job.id, %error, "Could not mark interrupted playlist import as failed");
+                }
             }
         }
         Ok(())
@@ -671,6 +795,18 @@ impl SpotifyPlaylistImportService {
             )
             .await;
         if let Err(err) = &result {
+            let keep_intent = record.playlist_intent.is_some();
+            if keep_intent {
+                // Reload the durable checkpoint so a failed commit cannot discard
+                // the upstream ID or an earlier create attempt.
+                let Some(checkpoint) = repo.get_by_id(job_id).await else {
+                    return result.map(|()| record.job);
+                };
+                if checkpoint.job.playlist_id.is_some() {
+                    return Ok(checkpoint.job);
+                }
+                record = checkpoint;
+            }
             record.job.status = "failed".into();
             record.job.stage = "completed".into();
             record.job.error = Some(err.to_string());
@@ -679,26 +815,27 @@ impl SpotifyPlaylistImportService {
             record.job.current_track_name = None;
             record.job.imported_count = Some(0);
             record.job.completed_count = Some(0);
-            for entry in record.job.manifest.iter_mut().flatten() {
-                if matches!(
-                    entry.status,
-                    ImportEntryStatus::Ready | ImportEntryStatus::Completed
-                ) {
-                    entry.status = ImportEntryStatus::FailedLinking;
-                    entry.error = record.job.error.clone();
+            if !keep_intent {
+                for entry in record.job.manifest.iter_mut().flatten() {
+                    if matches!(
+                        entry.status,
+                        ImportEntryStatus::Ready | ImportEntryStatus::Completed
+                    ) {
+                        entry.status = ImportEntryStatus::FailedLinking;
+                        entry.error = record.job.error.clone();
+                    }
                 }
             }
-            if let Some(expected) = record.job.expected_count {
-                record.job.failed_count = Some(expected);
-            }
+            record.job.failed_count = record.job.expected_count;
             repo.save(&record)
                 .await
                 .map_err(TaskError::ExecutionFailed)?;
             tracing::warn!(job_id, error = %err, "Spotify playlist import failed");
             // Keep any unpublished audio available for recovery.
-            if scan_downloaded_audio_files(&staging_dir)
-                .await
-                .is_ok_and(|files| files.is_empty())
+            if !keep_intent
+                && scan_downloaded_audio_files(&staging_dir)
+                    .await
+                    .is_ok_and(|files| files.is_empty())
             {
                 cleanup_staging(&staging_dir).await;
             }
@@ -723,6 +860,23 @@ impl SpotifyPlaylistImportService {
                 "Import owner is disabled".into(),
             ));
         }
+        if let Some(intent) = &record.playlist_intent {
+            let backend = self
+                .library
+                .as_ref()
+                .and_then(|library| {
+                    library
+                        .providers
+                        .get_by_connection_id(&intent.connection_id)
+                })
+                .ok_or_else(|| {
+                    TaskError::ExecutionFailed("The Navidrome import backend is unavailable".into())
+                })?;
+            return self
+                .complete_playlist_intent(repo, record, context, backend.provider.as_ref())
+                .await;
+        }
+
         let (spotify_id, url) =
             parse_spotify_playlist_url(&record.playlist_url).ok_or_else(|| {
                 TaskError::Validation("Stored Spotify playlist URL is invalid".into())
@@ -957,60 +1111,20 @@ impl SpotifyPlaylistImportService {
             )));
         }
         context.checkpoint().await?;
-        let track_ids: Vec<String> = tracks
-            .iter()
-            .map(|(provider_id, _)| provider_id.clone())
-            .collect();
-        let upstream_id = provider
-            .create_imported_playlist(
-                job.playlist_name.as_deref().expect("import playlist name"),
-                job.playlist_description.as_deref().unwrap_or_default(),
-                &track_ids,
-            )
-            .await
-            .map_err(|err| {
-                TaskError::ExecutionFailed(format!(
-                    "Navidrome could not create the playlist: {err}"
-                ))
-            })?;
-        let local_id = format!("mdpl_{}", job.id);
-        for entry in job.manifest.as_mut().expect("indexed import manifest") {
-            if entry.status == ImportEntryStatus::Ready {
-                entry.status = ImportEntryStatus::Completed;
-            }
-        }
-        let completed = tracks.len();
-        let failed = expected - completed;
-        job.playlist_id = Some(local_id.clone());
-        job.imported_count = Some(completed);
-        job.completed_count = Some(completed);
-        job.failed_count = Some(failed);
-        job.current_track = None;
-        job.current_track_name = None;
-        job.status = if failed > 0 { "partial" } else { "completed" }.into();
-        job.stage = "completed".into();
-        job.error = (failed > 0).then(|| {
-            format!(
-                "Imported {completed} of {expected} tracks. {}",
-                first_import_error(job, "Some Spotify tracks were unavailable.")
-            )
+        record.playlist_intent = Some(PlaylistCreationIntent {
+            marker: format!("MusicDeck import {}", job.id),
+            connection_id: connection,
+            tracks,
+            attempted: false,
+            upstream_id: None,
         });
-        if let Err(err) = repo
-            .finish_playlist(
-                record,
-                &local_id,
-                &connection,
-                &upstream_id,
-                &tracks,
-                context.task_id(),
-            )
+        repo.save(record)
             .await
-        {
-            if let Err(cleanup) = provider.delete_playlist(&upstream_id).await {
-                tracing::warn!(playlist_id = upstream_id, error = %cleanup, "Could not remove unlinked Navidrome import playlist");
-            }
-            return Err(err);
-        }
+            .map_err(TaskError::ExecutionFailed)?;
+        self.complete_playlist_intent(repo, record, context, provider.as_ref())
+            .await?;
+        let completed = record.job.completed_count.unwrap_or_default();
+        let failed = record.job.failed_count.unwrap_or_default();
         if failed == 0
             && scan_downloaded_audio_files(&stage)
                 .await
@@ -1029,6 +1143,122 @@ impl SpotifyPlaylistImportService {
             .await;
         Ok(())
     }
+
+    async fn complete_playlist_intent(
+        &self,
+        repo: &SqliteImportJobRepository,
+        record: &mut StoredImportJob,
+        context: &TaskRunContext,
+        provider: &dyn MusicBackend,
+    ) -> Result<(), TaskError> {
+        let intent = record
+            .playlist_intent
+            .as_ref()
+            .expect("persisted playlist intent")
+            .clone();
+        let track_ids: Vec<String> = intent.tracks.iter().map(|(id, _)| id.clone()).collect();
+        let upstream_id = if let Some(id) = intent.upstream_id {
+            id
+        } else {
+            let playlists = provider
+                .list_playlists()
+                .await
+                .map_err(import_provider_error)?;
+            let mut matches = playlists
+                .into_iter()
+                .filter(|playlist| playlist.name == intent.marker);
+            let id = if let Some(existing) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(TaskError::ExecutionFailed(
+                        "Multiple Navidrome playlists match the import checkpoint".into(),
+                    ));
+                }
+                existing.provider_id
+            } else {
+                if intent.attempted {
+                    return Err(TaskError::ExecutionFailed(
+                        "Navidrome has not exposed the earlier playlist creation attempt".into(),
+                    ));
+                }
+                context.checkpoint().await?;
+                repo.claim_playlist_creation(record, context.task_id())
+                    .await?;
+                provider
+                    .create_imported_playlist(&intent.marker, &track_ids)
+                    .await
+                    .map_err(import_provider_error)?
+            };
+            record.playlist_intent.as_mut().unwrap().upstream_id = Some(id.clone());
+            repo.save(record)
+                .await
+                .map_err(TaskError::ExecutionFailed)?;
+            id
+        };
+        let job = &mut record.job;
+        let name = job
+            .playlist_name
+            .as_deref()
+            .ok_or_else(|| TaskError::Validation("Missing import playlist name".into()))?;
+        context.checkpoint().await?;
+        let playlist = provider
+            .finalize_imported_playlist(
+                &upstream_id,
+                name,
+                job.playlist_description.as_deref().unwrap_or_default(),
+            )
+            .await
+            .map_err(import_provider_error)?;
+        if !playlist
+            .and_then(|playlist| playlist.tracks)
+            .is_some_and(|tracks| {
+                tracks
+                    .iter()
+                    .map(|track| &track.provider_id)
+                    .eq(track_ids.iter())
+            })
+        {
+            return Err(TaskError::ExecutionFailed(
+                "Navidrome did not attach all requested tracks in order".into(),
+            ));
+        }
+
+        let local_id = format!("mdpl_{}", job.id);
+        for entry in job.manifest.iter_mut().flatten() {
+            if entry.status == ImportEntryStatus::Ready {
+                entry.status = ImportEntryStatus::Completed;
+            }
+        }
+        let completed = intent.tracks.len();
+        let expected = job.expected_count.unwrap_or(completed);
+        let failed = expected.saturating_sub(completed);
+        job.playlist_id = Some(local_id.clone());
+        job.imported_count = Some(completed);
+        job.completed_count = Some(completed);
+        job.failed_count = Some(failed);
+        job.current_track = None;
+        job.current_track_name = None;
+        job.status = if failed > 0 { "partial" } else { "completed" }.into();
+        job.stage = "completed".into();
+        job.error = (failed > 0).then(|| {
+            format!(
+                "Imported {completed} of {expected} tracks. {}",
+                first_import_error(job, "Some Spotify tracks were unavailable.")
+            )
+        });
+        repo.finish_playlist(
+            record,
+            &local_id,
+            &intent.connection_id,
+            &upstream_id,
+            &intent.tracks,
+            context.task_id(),
+        )
+        .await
+    }
+}
+
+fn import_provider_error(error: crate::providers::ProviderError) -> TaskError {
+    TaskError::ExecutionFailed(format!("Navidrome playlist import failed: {error}"))
 }
 
 #[derive(Default, Deserialize)]
@@ -1346,4 +1576,127 @@ fn first_import_error(job: &ImportJob, fallback: &str) -> String {
 
 fn import_db_error(err: impl std::fmt::Display) -> TaskError {
     TaskError::ExecutionFailed(format!("Could not save Spotify import to MusicDeck: {err}"))
+}
+
+#[cfg(test)]
+mod playlist_intent_tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use crate::providers::{Playlist, Track, media_fixture};
+    use crate::tasks::{TaskDefinition, TaskStatus};
+    use std::time::Duration;
+
+    struct ResumeImport(SpotifyPlaylistImportService);
+
+    #[async_trait::async_trait]
+    impl TaskDefinition for ResumeImport {
+        fn validate(&self, payload: &Value) -> bool {
+            payload.is_object()
+        }
+        async fn run(&self, payload: Value, context: TaskRunContext) -> Result<(), TaskError> {
+            self.0
+                .run_managed_job(
+                    payload["jobId"].as_str().unwrap(),
+                    &context,
+                    &SpotDLDownloaderAdapter::new(),
+                    None,
+                )
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_a_playlist_created_before_its_remote_id_was_saved() {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        sqlx::raw_sql("INSERT INTO roles VALUES ('user','Listener');
+            INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+            VALUES ('alice','alice','hash','Alice','user','2026-01-01','2026-01-01');")
+            .execute(db.inner()).await.unwrap();
+        let manager = TaskManager::new_with_dispatch(Some(db.clone()), false);
+        manager.initialize_tables().await;
+        let provider_track: Track = serde_json::from_value(json!({
+            "id": "track", "providerId": "track", "title": "Fixture",
+            "artistName": "Artist", "albumName": "Album", "streamUrl": ""
+        }))
+        .unwrap();
+        let store = SpotifyPlaylistImportService::new(Some(db.clone())).with_library(
+            Arc::new(RwLock::new(Arc::new(AppConfig::default()))),
+            BackendRegistry::new(vec![media_fixture::playlist_provider(
+                "fixture",
+                Playlist {
+                    id: "remote".into(),
+                    provider_id: "remote".into(),
+                    name: "MusicDeck import spimp_crash".into(),
+                    description: None,
+                    artwork_id: None,
+                    artwork_url: None,
+                    song_count: 2,
+                    tracks: Some(vec![provider_track.clone(), provider_track]),
+                },
+            )]),
+        );
+        manager.register(
+            TaskType::SpotdlImport,
+            Arc::new(ResumeImport(store.clone())),
+        );
+        let library_id = LibraryService::new(db.clone(), None)
+            .ensure_id(
+                LibraryItemType::Track,
+                &SourceRef {
+                    connection_id: "fixture".into(),
+                    provider_item_id: "track".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let repo = SqliteImportJobRepository::new(db.clone());
+        let record = serde_json::from_value::<StoredImportJob>(json!({
+            "job": {
+                "id": "spimp_crash", "userId": "alice", "status": "running", "stage": "importing",
+                "playlistName": "Desired name", "expectedCount": 2
+            },
+            "playlistUrl": "https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
+            "user": {"id": "alice", "disabled": false},
+            "playlistIntent": {"marker": "MusicDeck import spimp_crash", "connectionId": "fixture", "tracks": [["track", library_id], ["track", library_id]],
+                "attempted": true, "upstreamId": null}
+        })).unwrap();
+        repo.save(&record).await.unwrap();
+        let task = manager
+            .enqueue(
+                TaskType::SpotdlImport,
+                json!({"kind":"playlist", "jobId":"spimp_crash"}),
+                "alice",
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE background_tasks SET state='PROCESSING' WHERE id=?")
+            .bind(&task.id)
+            .execute(db.inner())
+            .await
+            .unwrap();
+
+        manager.recover_interrupted_tasks().await;
+        store.recover_interrupted_jobs().await.unwrap();
+        manager.enable_dispatch();
+        let task = manager
+            .wait_for_settlement(&task.id, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(task.state, TaskStatus::Finished, "{:?}", task.error);
+        let saved = repo.get_by_id("spimp_crash").await.unwrap();
+        assert_eq!(saved.job.playlist_id.as_deref(), Some("mdpl_spimp_crash"));
+        assert_eq!(
+            saved.playlist_intent.unwrap().upstream_id.as_deref(),
+            Some("remote")
+        );
+        let tracks: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT position, provider_track_id FROM playlist_items WHERE playlist_id='mdpl_spimp_crash' ORDER BY position",
+        ).fetch_all(db.inner()).await.unwrap();
+        assert_eq!(tracks, vec![(0, "track".into()), (1, "track".into())]);
+        manager.close();
+    }
 }

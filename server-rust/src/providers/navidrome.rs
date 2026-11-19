@@ -68,16 +68,11 @@ impl NavidromeClient {
                 ProviderError::Configuration(format!("HTTP client init failed: {err}"))
             })?;
 
-        let stream_http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(45))
-            // Range requests use a fresh HTTP/1 connection. Navidrome or an
-            // intervening proxy may close idle sockets on its own schedule.
-            .http1_only()
-            .pool_max_idle_per_host(0)
-            .build()
-            .map_err(|err| ProviderError::Configuration(format!("HTTP stream client init failed: {err}")))?;
-        Ok(Self { stream_http, ..Self::with_client(config, http) })
+        let stream_http = super::media_http_client()?;
+        Ok(Self {
+            stream_http,
+            ..Self::with_client(config, http)
+        })
     }
 
     /// Constructs a [`NavidromeClient`] using an existing pooled [`reqwest::Client`].
@@ -117,7 +112,8 @@ impl NavidromeClient {
         extra_params: &[(&str, String)],
     ) -> Result<Url, ProviderError> {
         let raw = format!("{}/rest/{endpoint}.view", self.base_url);
-        let mut url = Url::parse(&raw).map_err(|err| ProviderError::Configuration(err.to_string()))?;
+        let mut url =
+            Url::parse(&raw).map_err(|err| ProviderError::Configuration(err.to_string()))?;
         let (token, salt) = self.compute_subsonic_auth();
 
         let has_custom_client = extra_params.iter().any(|(k, _)| *k == "c");
@@ -414,7 +410,8 @@ impl MusicBackend for NavidromeClient {
                     })
                 })
         });
-        if include_artist_info && artist.image_url.is_none()
+        if include_artist_info
+            && artist.image_url.is_none()
             && (artist.artwork_id.is_none() || artwork_is_album_cover)
         {
             let info_opt = self
@@ -810,7 +807,9 @@ impl MusicBackend for NavidromeClient {
                         let status = &res["scanStatus"];
                         match status["scanning"].as_bool() {
                             Some(false) => {
-                                if let Some(error) = status["error"].as_str().filter(|err| !err.is_empty()) {
+                                if let Some(error) =
+                                    status["error"].as_str().filter(|err| !err.is_empty())
+                                {
                                     return Err(ProviderError::Upstream {
                                         provider: "Navidrome",
                                         message: format!("Navidrome scanner failed: {error}"),
@@ -917,10 +916,9 @@ impl MusicBackend for NavidromeClient {
     async fn create_imported_playlist(
         &self,
         name: &str,
-        description: &str,
         track_ids: &[String],
     ) -> Result<String, ProviderError> {
-        let mut form = vec![("name", name)];
+        let mut form = vec![("name", name), ("public", "false")];
         form.extend(track_ids.iter().map(|id| ("songId", id.as_str())));
         let url = self.build_url("createPlaylist", &[])?;
         let result = self
@@ -929,46 +927,34 @@ impl MusicBackend for NavidromeClient {
                 NAVIDROME_REQUEST_TIMEOUT_MS,
             )
             .await?;
-        let playlist = &result["playlist"];
-        let id = playlist["id"]
+        result["playlist"]["id"]
             .as_str()
             .filter(|id| !id.is_empty())
+            .map(str::to_owned)
             .ok_or_else(|| ProviderError::Upstream {
                 provider: "Navidrome",
                 message: "Navidrome did not return the created playlist ID".into(),
-            })?;
-        let verify_and_update = async {
-            if !playlist["entry"].as_array().is_some_and(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry["id"].as_str())
-                    .eq(track_ids.iter().map(|id| Some(id.as_str())))
-            }) {
-                return Err(ProviderError::Upstream {
-                    provider: "Navidrome",
-                    message: "Navidrome did not attach all requested tracks in order".into(),
-                });
-            }
-            self.request_json(
-                "updatePlaylist",
-                &[
-                    ("playlistId", id.to_owned()),
-                    ("comment", description.to_owned()),
-                    ("public", "false".into()),
-                ],
-                NAVIDROME_REQUEST_TIMEOUT_MS,
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-        if let Err(err) = verify_and_update {
-            if let Err(cleanup) = self.delete_playlist(id).await {
-                tracing::warn!(playlist_id = id, error = %cleanup, "Could not remove incomplete Navidrome import playlist");
-            }
-            return Err(err);
-        }
-        Ok(id.to_owned())
+            })
+    }
+
+    async fn finalize_imported_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<Option<Playlist>, ProviderError> {
+        self.request_json(
+            "updatePlaylist",
+            &[
+                ("playlistId", playlist_id.into()),
+                ("name", name.into()),
+                ("comment", description.into()),
+                ("public", "false".into()),
+            ],
+            NAVIDROME_REQUEST_TIMEOUT_MS,
+        )
+        .await?;
+        self.get_playlist(playlist_id).await
     }
 
     async fn fetch_stream(
@@ -987,41 +973,17 @@ impl MusicBackend for NavidromeClient {
         }
 
         let url = self.build_url("stream", &params)?;
-        let request = || {
-            let mut req = self.stream_http.get(url.clone()).header(ACCEPT_ENCODING, "identity");
-            if let Some(value) = range {
-                req = req.header(RANGE, value);
-                if let Some(validator) = if_range {
-                    req = req.header(IF_RANGE, validator);
-                }
+        let mut req = self
+            .stream_http
+            .get(url)
+            .header(ACCEPT_ENCODING, "identity");
+        if let Some(value) = range {
+            req = req.header(RANGE, value);
+            if let Some(validator) = if_range {
+                req = req.header(IF_RANGE, validator);
             }
-            req
-        };
-        let response = tokio::time::timeout(Duration::from_secs(12), async {
-            let first = request().send().await;
-            let retry = match &first {
-                Ok(response) => matches!(response.status().as_u16(), 502..=504),
-                Err(error) => error.is_request() && !error.is_timeout(),
-            };
-            if !retry {
-                return first;
-            }
-            tracing::debug!(
-                range_requested = range.is_some(),
-                status = first.as_ref().ok().map(|response| response.status().as_u16()),
-                transport = ?first.as_ref().err().and_then(|error| std::error::Error::source(error)),
-                "Retrying Navidrome media request before forwarding headers"
-            );
-            drop(first);
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            request().send().await
-        })
-        .await
-        .map_err(|_| ProviderError::Timeout { provider: "Navidrome stream headers" })?
-        .map_err(|err| ProviderError::Upstream {
-            provider: "Navidrome",
-            message: format!("{:?}", err.without_url()),
-        })?;
+        }
+        let response = super::send_media_request(req, "Navidrome").await?;
 
         Ok(StreamResult {
             status: response.status(),
@@ -1031,6 +993,7 @@ impl MusicBackend for NavidromeClient {
                 direct: max_bit_rate.is_none(),
                 requested_bitrate_kbps: max_bit_rate,
                 source_connection_id: None,
+                source_item_id: None,
             }),
         })
     }
@@ -1141,7 +1104,9 @@ impl MusicBackend for NavidromeClient {
                 NAVIDROME_REQUEST_TIMEOUT_MS,
             )
             .await?;
-        Ok(res.get("playlist").map(|pl| map_subsonic_playlist(pl, true)))
+        Ok(res
+            .get("playlist")
+            .map(|pl| map_subsonic_playlist(pl, true)))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<Option<Playlist>, ProviderError> {
@@ -1153,7 +1118,9 @@ impl MusicBackend for NavidromeClient {
             )
             .await
         {
-            Ok(res) => Ok(res.get("playlist").map(|pl| map_subsonic_playlist(pl, true))),
+            Ok(res) => Ok(res
+                .get("playlist")
+                .map(|pl| map_subsonic_playlist(pl, true))),
             Err(ProviderError::NotFound { .. }) => Ok(None),
             Err(err) => Err(err),
         }
@@ -1298,10 +1265,7 @@ fn is_track_credited_to(track: &Track, artist_id: &str) -> bool {
 /// Maps a raw Subsonic `song` JSON value into a MusicDeck [`Track`].
 #[must_use]
 pub fn map_subsonic_track(song: &Value) -> Track {
-    let track_id = song
-        .get("id")
-        .and_then(value_to_string)
-        .unwrap_or_default();
+    let track_id = song.get("id").and_then(value_to_string).unwrap_or_default();
 
     let artist_credits: Vec<TrackArtistCredit> = song
         .get("artists")
@@ -1565,10 +1529,14 @@ fn artist_image_url(value: &Value) -> Option<String> {
         return None;
     }
     let path = url.path().to_ascii_lowercase();
-    if path.contains("/rest/getcoverart") || path.contains("/api/artwork/") ||
-        path.contains("/cover/") || path.contains("/album/") ||
-        path.contains("2a96cbd8b46e442fc41c2b86b821562f") || path.contains("placeholder") ||
-        path.contains("/default-") || path.contains("/default_")
+    if path.contains("/rest/getcoverart")
+        || path.contains("/api/artwork/")
+        || path.contains("/cover/")
+        || path.contains("/album/")
+        || path.contains("2a96cbd8b46e442fc41c2b86b821562f")
+        || path.contains("placeholder")
+        || path.contains("/default-")
+        || path.contains("/default_")
     {
         return None;
     }
@@ -1582,7 +1550,9 @@ pub fn map_subsonic_artist(artist: &Value) -> Artist {
         .get("id")
         .and_then(value_to_string)
         .unwrap_or_default();
-    let artwork_id = artist.get("coverArt").and_then(value_to_string)
+    let artwork_id = artist
+        .get("coverArt")
+        .and_then(value_to_string)
         .filter(|id| !id.trim().is_empty() && !matches!(id.as_str(), "ar-0" | "al-0"));
     let artwork_url = format_artwork_url(artwork_id.as_deref());
 

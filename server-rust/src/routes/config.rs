@@ -10,6 +10,7 @@
 //!   validating that `appName` is a non-empty string of `1..=40` characters after trimming
 //!   and contains no ASCII control characters (`0x00..=0x1F` or `0x7F`).
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -45,13 +46,14 @@ async fn get_public_config(State(state): State<AppState>) -> Json<PublicAppConfi
 async fn patch_admin_config(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    payload_res: Result<Json<PublicAppConfig>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PublicAppConfig>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let validation_err = || {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("VALIDATION_ERROR"),
                     message: format!(
                         "Application name must be 1-{APP_NAME_MAX_LENGTH} characters without control characters"
@@ -62,8 +64,9 @@ async fn patch_admin_config(
             .into_response()
     };
 
-    let Ok(Json(payload)) = payload_res else {
-        return validation_err();
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Some(db) = state.db() else {
@@ -77,6 +80,7 @@ async fn patch_admin_config(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("INTERNAL_SERVER_ERROR"),
                     message: String::from("Failed to persist application configuration"),
                 },

@@ -11,6 +11,7 @@
 //!   via [`classify_integration_request`] and rejects disallowed external integrations
 //!   with `HTTP 403 Forbidden` (`LOCAL_ONLY_MODE_ACTIVE` or `EXTERNAL_INTEGRATION_DISABLED`).
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -48,19 +49,11 @@ async fn get_privacy_policy(State(state): State<AppState>, _user: AuthenticatedU
 async fn patch_privacy_policy(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    payload_res: Result<Json<PrivacySettings>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PrivacySettings>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(settings)) = payload_res else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiErrorEnvelope {
-                error: ApiErrorBody {
-                    code: String::from("VALIDATION_ERROR"),
-                    message: String::from("Invalid privacy policy"),
-                },
-            }),
-        )
-            .into_response();
+    let ApiJson(settings) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let updated = tokio::spawn(async move {
@@ -197,6 +190,7 @@ pub async fn privacy_guard_middleware(
             StatusCode::BAD_REQUEST,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("VALIDATION_ERROR"),
                     message: String::from("Malformed request path"),
                 },
@@ -231,6 +225,7 @@ pub(crate) fn map_privacy_error(err: PrivacyError) -> Response {
             StatusCode::FORBIDDEN,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from(code.as_str()),
                     message: String::from(code.message()),
                 },

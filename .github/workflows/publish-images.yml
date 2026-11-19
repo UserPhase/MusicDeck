@@ -80,31 +80,63 @@ jobs:
           cache-from: type=gha,scope=musicdeck-server
           cache-to: type=gha,scope=musicdeck-server,mode=max
 
-      - name: Verify Rust runtime startup
+      - name: Build production web gateway image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./webapp
+          file: ./webapp/Dockerfile
+          target: production
+          load: true
+          tags: musicdeck-web:gateway-test
+          cache-from: type=gha,scope=musicdeck-web
+          cache-to: type=gha,scope=musicdeck-web,mode=max
+
+      - name: Verify playback through the production gateway
         run: |
-          container="musicdeck-rust-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          network="musicdeck-smoke-$suffix"
+          server="musicdeck-server-$suffix"
+          gateway="musicdeck-gateway-$suffix"
+          provider="musicdeck-provider-$suffix"
+          database="/app/data/musicdeck-smoke.sqlite"
+          origin="http://127.0.0.1:14534"
           cleanup() {
-            docker logs "$container" || true
-            docker rm --force --volumes "$container" >/dev/null 2>&1 || true
+            for container in "$gateway" "$server" "$provider"; do
+              docker logs "$container" || true
+              docker rm --force --volumes "$container" >/dev/null 2>&1 || true
+            done
+            docker network rm "$network" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
-          docker run --detach --name "$container" \
-            -e MUSICDECK_HOST=0.0.0.0 \
-            -e MUSICDECK_PORT=4534 \
+          docker network create "$network"
+          docker run --detach --name "$provider" --network "$network" \
+            --network-alias provider \
+            --mount "type=bind,src=$PWD/scripts/test-docker-gateway.py,dst=/smoke.py,readonly" \
+            python:3.13-alpine python -u /smoke.py provider
+          docker run --detach --name "$server" --network "$network" \
+            --network-alias musicdeck-server --tmpfs /music:ro \
             -e MUSICDECK_ENV=production \
-            -e MUSICDECK_PUBLIC_URL=http://localhost:4534 \
+            -e "MUSICDECK_DB_PATH=$database" \
+            -e "MUSICDECK_PUBLIC_URL=$origin" \
             -e MUSICDECK_SECURE_COOKIES=false \
             -e MUSICDECK_SESSION_SECRET=ci-only-session-secret \
             -e MUSICDECK_ADMIN_PASSWORD=ci-only-admin-password \
+            -e MUSIC_BACKEND=navidrome \
+            -e NAVIDROME_URL=http://provider:8090 \
+            -e NAVIDROME_USERNAME=smoke -e NAVIDROME_PASSWORD=smoke \
             musicdeck-server:music-root-test
+          docker run --detach --name "$gateway" --network "$network" \
+            --publish 127.0.0.1:14534:80 musicdeck-web:gateway-test
           for attempt in $(seq 1 60); do
-            if docker exec "$container" gosu musicdeck curl --fail --silent \
-              http://127.0.0.1:4534/api/health >/dev/null; then
+            if curl --noproxy '*' --fail --silent --max-time 4 "$origin/api/health" > /tmp/musicdeck-health.json; then
+              jq -e '.ok and .database.connected and (.degradedCapabilities | index("musicStorage") != null)' /tmp/musicdeck-health.json
+              docker exec -i "$server" gosu musicdeck python3 - seed "$database" < scripts/test-docker-gateway.py
+              python3 scripts/test-docker-gateway.py verify "$origin"
               exit 0
             fi
             sleep 2
           done
-          echo "Rust server did not become healthy within 120 seconds." >&2
+          echo "MusicDeck gateway did not become healthy within 120 seconds." >&2
           exit 1
 
       - name: Test music-root permissions

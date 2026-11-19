@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -220,12 +221,20 @@ async fn drive_remote_websocket(
 
     loop {
         let pong_deadline = heartbeat.deadline;
-        if *disconnected.borrow() || pong_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        let revoked = *disconnected.borrow();
+        if revoked || pong_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            let (code, reason) = if revoked {
+                (4002, "Device playback control revoked")
+            } else {
+                hub.disconnect_client(conn_id);
+                (1011, "Device control heartbeat timed out")
+            };
             send_remote_frame(
                 &mut socket,
                 WsMessage::Close(Some(CloseFrame {
-                    code: 4002,
-                    reason: "Device playback control revoked".into(),
+                    code,
+                    reason: reason.into(),
                 })),
             )
             .await;
@@ -270,6 +279,11 @@ async fn drive_remote_websocket(
                     _ => Some((1011, "Session storage temporarily unavailable")),
                 };
                 if let Some((code, reason)) = close {
+                    if code == 4001 {
+                        hub.revoke_sessions(Some(&user_id), |session| session == session_id);
+                    } else {
+                        hub.disconnect_client(conn_id);
+                    }
                     send_remote_frame(&mut socket, WsMessage::Close(Some(CloseFrame {
                         code,
                         reason: reason.into(),
@@ -459,6 +473,7 @@ fn map_cast_error(err: CastError, include_cast_cors: bool) -> Response {
         status,
         Json(ApiErrorEnvelope {
             error: ApiErrorBody {
+                request_id: crate::error::current_request_id(),
                 code: String::from(code),
                 message: msg,
             },
@@ -476,7 +491,7 @@ fn map_cast_error(err: CastError, include_cast_cors: bool) -> Response {
 async fn create_cast_ticket_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<CastTicketRequest>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CastTicketRequest>, crate::error::ApiJsonRejection>,
 ) -> Response {
     if let Err(PrivacyError::Blocked(code)) =
         state.privacy().assert_external_allowed(PrivacyCategory::External)
@@ -484,11 +499,9 @@ async fn create_cast_ticket_handler(
         return send_error_response(StatusCode::FORBIDDEN, code.message(), code.as_str());
     }
 
-    let Ok(Json(req_body)) = payload_res else {
-        return map_cast_error(
-            CastError::Validation(String::from("Invalid Cast track request")),
-            false,
-        );
+    let ApiJson(req_body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Some(db) = state.db().cloned() else {
@@ -541,13 +554,11 @@ async fn create_cast_ticket_handler(
 async fn delete_cast_ticket_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<CastTokenQueryOrBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CastTokenQueryOrBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return map_cast_error(
-            CastError::Validation(String::from("Invalid Cast ticket")),
-            false,
-        );
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     match state
@@ -630,11 +641,20 @@ async fn cast_stream_handler(
     let resolver = SourceResolver::new(state.providers().clone(), library);
     let range_hdr = headers.get(RANGE).and_then(|v| v.to_str().ok());
 
+    let stream_key = crate::catalog::resolver::PlaybackStreamKey {
+        scope: &lease.user_id,
+        session: Some(token),
+        track: &lease.track_id,
+        preferred_source: None,
+        max_bit_rate: lease.max_bit_rate,
+    };
     match resolver
-        .fetch_stream(
-            &lease.track_id, range_hdr,
-            headers.get(axum::http::header::IF_RANGE).and_then(|value| value.to_str().ok()),
-            None, lease.max_bit_rate,
+        .fetch_pinned_stream(
+            &stream_key,
+            range_hdr,
+            headers
+                .get(axum::http::header::IF_RANGE)
+                .and_then(|value| value.to_str().ok()),
         )
         .await
     {

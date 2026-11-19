@@ -153,7 +153,10 @@ async fn startup_rejects_corrupt_stored_policy() {
     let error = AppState::with_database(AppConfig::default(), db)
         .await
         .expect_err("reject corrupt policy");
-    assert!(matches!(error, PrivacyError::CorruptStoredPolicy(_)));
+    assert!(matches!(
+        error,
+        crate::state::AppStateInitError::Privacy(PrivacyError::CorruptStoredPolicy(_))
+    ));
 }
 
 #[tokio::test]
@@ -239,7 +242,7 @@ async fn database_failure_returns_http_500_and_preserves_policy_and_notification
 }
 
 #[tokio::test]
-async fn invalid_policy_returns_http_400_without_changing_state() {
+async fn invalid_policy_returns_http_422_without_changing_state() {
     let (db, state, session_id) = memory_state().await;
     let before = state.privacy().snapshot();
     let (status, error) = privacy_request(
@@ -249,8 +252,9 @@ async fn invalid_policy_returns_http_400_without_changing_state() {
         Some(json!({ "localOnly": "true" })),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"]["code"], "VALIDATION_ERROR");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error["error"]["code"], "INVALID_JSON_DATA");
+    assert!(error["error"]["requestId"].as_str().is_some());
     assert_eq!(state.privacy().snapshot(), before);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM server_settings WHERE key = ?")
         .bind(PRIVACY_POLICY_SETTING_KEY)

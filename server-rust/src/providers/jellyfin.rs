@@ -46,6 +46,7 @@ pub struct JellyfinClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
+    stream_http: reqwest::Client,
 }
 
 /// Alias matching the legacy TypeScript class name `JellyfinBackend`.
@@ -60,7 +61,11 @@ impl JellyfinClient {
             .build()
             .map_err(|err| ProviderError::Configuration(format!("HTTP client init failed: {err}")))?;
 
-        Ok(Self::with_client(config, http))
+        let stream_http = super::media_http_client()?;
+        Ok(Self {
+            stream_http,
+            ..Self::with_client(config, http)
+        })
     }
 
     /// Constructs a [`JellyfinClient`] using an existing pooled [`reqwest::Client`].
@@ -69,6 +74,7 @@ impl JellyfinClient {
         Self {
             base_url: config.url.trim_end_matches('/').to_owned(),
             api_key: config.api_key,
+            stream_http: http.clone(),
             http,
         }
     }
@@ -672,7 +678,7 @@ impl MusicBackend for JellyfinClient {
 
         let url = self.build_url(&path, &params)?;
         let mut req = self
-            .http
+            .stream_http
             .get(url)
             .header(http::header::ACCEPT_ENCODING, "identity")
             .header(AUTHORIZATION, jellyfin_authorization(&self.api_key));
@@ -683,10 +689,7 @@ impl MusicBackend for JellyfinClient {
             }
         }
 
-        let response = req.send().await.map_err(|err| ProviderError::Upstream {
-            provider: "Jellyfin",
-            message: err.to_string(),
-        })?;
+        let response = super::send_media_request(req, "Jellyfin").await?;
 
         Ok(StreamResult {
             status: response.status(),
@@ -696,6 +699,7 @@ impl MusicBackend for JellyfinClient {
                 direct: max_bit_rate.is_none(),
                 requested_bitrate_kbps: max_bit_rate,
                 source_connection_id: None,
+                source_item_id: None,
             }),
         })
     }

@@ -22,7 +22,7 @@ use crate::catalog::identity::{
     version_signature,
 };
 
-fn title_key(title: &str) -> String {
+pub(crate) fn title_key(title: &str) -> String {
     format!(
         "{}|{}",
         normalize_music_text(Some(title)),
@@ -30,7 +30,7 @@ fn title_key(title: &str) -> String {
     )
 }
 
-fn strong_recording_ids(track: &UnifiedCatalogItem) -> HashSet<String> {
+pub(crate) fn strong_recording_ids(track: &UnifiedCatalogItem) -> HashSet<String> {
     let mut ids = HashSet::new();
     if let Some(ref hints) = track.identity_hints {
         if let Some(ref mbid) = hints.music_brainz_id {

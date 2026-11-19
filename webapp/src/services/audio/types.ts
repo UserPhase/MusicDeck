@@ -58,6 +58,7 @@ export interface PlaybackEngineEventMap {
     position: number;
     attempts: number;
     restartedFromBeginning: boolean;
+    streamUrl?: string;
   };
   recoveryFailed: { key: string; position: number; attempts: number };
   transitionStart: { kind: TransitionKind; fromKey: string; toKey: string };

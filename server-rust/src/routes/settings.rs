@@ -12,6 +12,7 @@
 //! - `PATCH /api/admin/settings/server`: Admin-only update of global server settings (including
 //!   5-field cron schedule validation for `library.scanSchedule` and `listening.thresholdSeconds`).
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
@@ -85,6 +86,7 @@ fn map_settings_error(err: SettingsError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("VALIDATION_ERROR"),
                     message,
                 },
@@ -95,6 +97,7 @@ fn map_settings_error(err: SettingsError) -> Response {
             StatusCode::NOT_FOUND,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("NOT_FOUND"),
                     message,
                 },
@@ -126,12 +129,11 @@ async fn get_own_user_settings(
 async fn patch_own_user_settings(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<SettingsPatchEnvelope>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SettingsPatchEnvelope>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(payload)) = payload_res else {
-        return map_settings_error(SettingsError::Validation(String::from(
-            "Invalid user settings request",
-        )));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if let Err(err) = validate_user_settings_patch(&payload.settings) {
@@ -175,7 +177,7 @@ async fn admin_patch_user_settings(
     State(state): State<AppState>,
     _admin: RequireAdmin,
     Path(user_id): Path<String>,
-    payload_res: Result<Json<SettingsPatchEnvelope>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SettingsPatchEnvelope>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let Ok(db) = require_db(&state) else {
         return ServerError::Internal(String::from("Database unavailable")).into_response();
@@ -187,10 +189,9 @@ async fn admin_patch_user_settings(
         Err(err) => return ServerError::Internal(err.to_string()).into_response(),
     }
 
-    let Ok(Json(payload)) = payload_res else {
-        return map_settings_error(SettingsError::Validation(String::from(
-            "Invalid user preferences request",
-        )));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if let Err(err) = validate_admin_user_settings_patch(&payload.settings) {
@@ -222,12 +223,11 @@ async fn admin_get_server_settings(
 async fn admin_patch_server_settings(
     State(state): State<AppState>,
     _admin: RequireAdmin,
-    payload_res: Result<Json<SettingsPatchEnvelope>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<SettingsPatchEnvelope>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(payload)) = payload_res else {
-        return map_settings_error(SettingsError::Validation(String::from(
-            "Invalid server settings request",
-        )));
+    let ApiJson(payload) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     let Ok(db) = require_db(&state) else {

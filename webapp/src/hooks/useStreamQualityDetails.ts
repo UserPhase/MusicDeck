@@ -4,6 +4,7 @@ import { inspectAudioStream } from "../api/musicdeck";
 import type { PlaybackEngine } from "../services/audio/PlaybackEngine";
 
 const INSPECTION_INTERVAL_MS = 2000;
+const INSPECTION_TIMEOUT_MS = 10_000;
 const MAX_INSPECTION_RETRY_MS = 30_000;
 
 export interface AudioProperties {
@@ -39,14 +40,17 @@ export function useStreamQualityDetails({
     setState({ key, source: null, output: null, delivery: null, loading: Boolean(inspectionId && trackId && userId), error: "", pipeline });
     if (!trackId || !userId || !inspectionId) return;
     let controller: AbortController | null = null;
+    let timeout: number | undefined;
     let cancelled = false;
     let retryDelay = INSPECTION_INTERVAL_MS;
     let retryAt = 0;
     const update = async () => {
-      if (controller || cancelled || Date.now() < retryAt) return;
+      if (controller || cancelled || performance.now() < retryAt) return;
       const pipeline = engine?.getAudioDiagnostics() ?? null;
-      controller = new AbortController();
-      const signal = controller.signal;
+      const attempt = new AbortController();
+      controller = attempt;
+      const signal = attempt.signal;
+      timeout = window.setTimeout(() => attempt.abort(), INSPECTION_TIMEOUT_MS);
       try {
         const data: Pick<StreamQualityDetails, "source" | "output" | "delivery" | "sourceError"> =
           await inspectAudioStream(trackId, inspectionId, signal);
@@ -56,21 +60,26 @@ export function useStreamQualityDetails({
           setState({ key, ...data, loading: false, error: "", pipeline });
         }
       } catch (error) {
-        if (!signal.aborted && !cancelled) {
+        if (!cancelled) {
           retryDelay = Math.min(retryDelay * 2, MAX_INSPECTION_RETRY_MS);
-          retryAt = Date.now() + retryDelay;
+          retryAt = performance.now() + retryDelay;
           const requestId = (error as { requestId?: unknown } | null)?.requestId;
-          const message = error instanceof Error ? error.message : "Audio inspection failed.";
+          const message = signal.aborted ? "Audio inspection timed out."
+            : error instanceof Error ? error.message : "Audio inspection failed.";
           setState((previous) => ({ ...previous, key, loading: false, pipeline,
             error: typeof requestId === "string" ? `${message} Request ID: ${requestId}.` : message }));
         }
-      } finally { controller = null; }
+      } finally {
+        window.clearTimeout(timeout);
+        controller = null;
+      }
     };
     const stopPolling = startVisualPolling(update, INSPECTION_INTERVAL_MS);
-    return () => { cancelled = true; controller?.abort(); stopPolling(); };
+    return () => { cancelled = true; window.clearTimeout(timeout); controller?.abort(); stopPolling(); };
   }, [engine, key, userId, trackId, inspectionId]);
   const current = state.key === key ? state : { source: null, output: null, delivery: null, pipeline: null, loading: Boolean(inspectionId), error: "" };
   return { ...current, serverNormalized, preview,
+    pipeline: inspectionId ? current.pipeline : engine?.getAudioDiagnostics() ?? null,
     note: preview ? "Provider preview: full-file source and output properties cannot be verified."
       : serverNormalized ? "Server-normalized asset: the library stream observer does not inspect this separate processed file."
         : !inspectionId ? "No observable library stream is active." : "Delivery rate measures server-to-MusicDeck transfer speed, not encoded audio bitrate. Unknown properties are not inferred from settings." };

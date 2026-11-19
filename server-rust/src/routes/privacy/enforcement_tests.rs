@@ -269,7 +269,7 @@ async fn waiting_policy_mutation_rechecks_session_after_restore_revocation() {
                     patch_privacy_policy(
                         State(state),
                         admin,
-                        Ok(Json(PrivacySettings {
+                        Ok(crate::error::ApiJson(PrivacySettings {
                             local_only: true,
                             ..Default::default()
                         })),

@@ -66,6 +66,7 @@ pub struct RegisteredProvider {
 #[derive(Debug, Clone, Default)]
 pub struct BackendRegistry {
     providers: Arc<RwLock<Vec<RegisteredProvider>>>,
+    pub(crate) playback_pins: Arc<crate::catalog::resolver::PlaybackPins>,
 }
 
 /// Alias matching the legacy TypeScript class name `ProviderRegistry`.
@@ -77,6 +78,7 @@ impl BackendRegistry {
     pub fn new(providers: Vec<RegisteredProvider>) -> Self {
         Self {
             providers: Arc::new(RwLock::new(providers)),
+            playback_pins: Arc::default(),
         }
     }
 

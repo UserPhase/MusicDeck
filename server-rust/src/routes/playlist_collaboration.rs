@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -246,6 +247,7 @@ fn map_org_error(err: OrganizationError) -> Response {
             status,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from(code),
                     message: err.to_string(),
                 },
@@ -262,6 +264,7 @@ fn map_collab_error(err: CollaborationError) -> Response {
             status,
             Json(ApiErrorEnvelope {
                 error: ApiErrorBody {
+                    request_id: crate::error::current_request_id(),
                     code: String::from("PLAYLIST_ACCESS_ERROR"),
                     message: err.to_string(),
                 },
@@ -293,14 +296,11 @@ async fn get_organization_tree_handler(
 async fn post_organization_operation_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<OrganizeRequestBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<OrganizeRequestBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid folder or playlist placement.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -370,14 +370,11 @@ async fn execute_playlist_command_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<ExecuteCommandBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ExecuteCommandBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist command.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -417,7 +414,7 @@ async fn reverse_playlist_command_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path((command_id, direction_str)): Path<(String, String)>,
-    payload_res: Result<Json<ReverseCommandBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ReverseCommandBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let direction = match direction_str.as_str() {
         "undo" => CommandDirection::Undo,
@@ -431,12 +428,9 @@ async fn reverse_playlist_command_handler(
         }
     };
 
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid undo or redo request.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -590,14 +584,11 @@ async fn put_playlist_sharing_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<UpdateSharingBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<UpdateSharingBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid sharing settings.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -632,14 +623,11 @@ async fn create_share_link_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<CreateLinkBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<CreateLinkBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Choose a valid link recipient.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -672,14 +660,11 @@ async fn revoke_share_link_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path((playlist_id, link_id)): Path<(String, String)>,
-    payload_res: Result<Json<ActorOnlyBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ActorOnlyBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Account identity is required.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -704,14 +689,11 @@ async fn revoke_share_link_handler(
 async fn resolve_share_link_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    payload_res: Result<Json<ResolveShareTokenBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ResolveShareTokenBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid playlist invitation.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.token.len() != 64
@@ -744,7 +726,7 @@ async fn collaborative_edit_tracks_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<ExecuteCommandBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<ExecuteCommandBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
     let (org, collab, playlists) = match build_services(&state) {
         Ok(s) => s,
@@ -758,12 +740,9 @@ async fn collaborative_edit_tracks_handler(
         return map_collab_error(err);
     }
 
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid collaborative track edit.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if body.owner_id != auth.user.id {
@@ -837,14 +816,11 @@ async fn start_party_session_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<StartPartyBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<StartPartyBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid party player identity.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if Uuid::parse_str(&body.device_id).is_err() {
@@ -887,14 +863,11 @@ async fn post_party_track_request_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<PartyTrackRequestBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PartyTrackRequestBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid party track request.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if Uuid::parse_str(&body.idempotency_key).is_err() || body.track_id.trim().is_empty() {
@@ -946,14 +919,11 @@ async fn post_party_control_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(playlist_id): Path<String>,
-    payload_res: Result<Json<PartyControlBody>, axum::extract::rejection::JsonRejection>,
+    payload_res: Result<ApiJson<PartyControlBody>, crate::error::ApiJsonRejection>,
 ) -> Response {
-    let Ok(Json(body)) = payload_res else {
-        return with_no_store(send_error_response(
-            StatusCode::BAD_REQUEST,
-            "Invalid party action.",
-            "BAD_REQUEST",
-        ));
+    let ApiJson(body) = match payload_res {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
 
     if Uuid::parse_str(&body.device_id).is_err() {

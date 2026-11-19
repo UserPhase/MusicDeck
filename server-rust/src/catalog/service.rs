@@ -358,7 +358,7 @@ impl CatalogService {
         limit: Option<u32>,
     ) -> Result<CatalogListResult<Album>, ProviderError> {
         let providers = self.registry.list();
-        if providers.is_empty() {
+        if providers.is_empty() && limit.is_some() {
             return Err(ProviderError::Configuration(String::from(
                 "All catalog providers are unavailable",
             )));
@@ -372,7 +372,11 @@ impl CatalogService {
             if !entry.enabled {
                 continue;
             }
-            match entry.provider.list_albums(limit).await {
+            let result = match limit {
+                Some(limit) => entry.provider.list_albums(Some(limit)).await,
+                None => entry.provider.list_all_albums().await,
+            };
+            match result {
                 Ok(albums) => {
                     successes += 1;
                     for album in albums {
@@ -392,7 +396,7 @@ impl CatalogService {
             }
         }
 
-        if successes == 0 && failures > 0 {
+        if limit.is_some() && successes == 0 && failures > 0 {
             return Err(ProviderError::Upstream {
                 provider: "CatalogService",
                 message: String::from("All catalog providers are unavailable"),
@@ -566,8 +570,9 @@ impl CatalogService {
             match entry.provider.list_tracks().await {
                 Ok(tracks) => {
                     for track in tracks {
-                        if let Ok(stamped) = self.stamp_track(track, &entry.connection_id).await {
-                            items.push(stamped);
+                        match self.stamp_track(track, &entry.connection_id).await {
+                            Ok(stamped) => items.push(stamped),
+                            Err(_) => failures += 1,
                         }
                     }
                 }
@@ -611,7 +616,9 @@ impl CatalogService {
     pub async fn get_album(&self, album_id: &str) -> Option<Available<Album>> {
         let sources = self.library.get_sources(album_id).await.ok()?;
         for src in sources {
-            let entry = self.registry.get_by_connection_id(&src.connection_id)?;
+            let Some(entry) = self.registry.get_by_connection_id(&src.connection_id) else {
+                continue;
+            };
             if !entry.enabled {
                 continue;
             }

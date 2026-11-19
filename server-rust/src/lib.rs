@@ -65,6 +65,108 @@ pub mod error {
         pub code: String,
         /// Safe, redacted description of the failure suitable for client display.
         pub message: String,
+        /// Server-generated request correlation ID.
+        #[serde(rename = "requestId", default)]
+        pub request_id: String,
+    }
+
+    tokio::task_local! {
+        static REQUEST_ID: String;
+    }
+
+    pub(crate) fn current_request_id() -> String {
+        REQUEST_ID
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) async fn request_id_middleware(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut response = REQUEST_ID
+            .scope(request_id.clone(), next.run(request))
+            .await;
+        response.headers_mut().insert(
+            "x-request-id",
+            http::HeaderValue::from_str(&request_id).expect("UUID is a valid header value"),
+        );
+        response
+    }
+
+    /// Axum JSON extractor with MusicDeck's error contract.
+    pub struct ApiJson<T>(pub T);
+
+    /// Safe JSON rejection with the status reported by Axum.
+    pub struct ApiJsonRejection {
+        status: StatusCode,
+        request_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
+    where
+        S: Send + Sync,
+        T: serde::de::DeserializeOwned,
+    {
+        type Rejection = ApiJsonRejection;
+
+        async fn from_request(
+            request: axum::extract::Request,
+            state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            Json::from_request(request, state)
+                .await
+                .map(|Json(value)| Self(value))
+                .map_err(|error| ApiJsonRejection {
+                    status: error.status(),
+                    request_id: current_request_id(),
+                })
+        }
+    }
+
+    impl IntoResponse for ApiJsonRejection {
+        fn into_response(self) -> Response {
+            let (code, message) = match self.status {
+                StatusCode::BAD_REQUEST => ("INVALID_JSON", "The request body is not valid JSON."),
+                StatusCode::UNPROCESSABLE_ENTITY => (
+                    "INVALID_JSON_DATA",
+                    "The JSON body does not match the expected fields or value types.",
+                ),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+                    "UNSUPPORTED_MEDIA_TYPE",
+                    "Send the request body with an application/json content type.",
+                ),
+                StatusCode::PAYLOAD_TOO_LARGE => (
+                    "PAYLOAD_TOO_LARGE",
+                    "The request body exceeds the size limit.",
+                ),
+                _ => (
+                    "INVALID_REQUEST_BODY",
+                    "The request body could not be read.",
+                ),
+            };
+            let header = http::HeaderValue::from_str(&self.request_id)
+                .expect("UUID is a valid header value");
+            let mut response = (
+                self.status,
+                Json(ApiErrorEnvelope {
+                    error: ApiErrorBody {
+                        code: code.into(),
+                        message: message.into(),
+                        request_id: self.request_id,
+                    },
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert("x-request-id", header);
+            response.headers_mut().insert(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
     }
 
     /// Unified server error enumeration covering startup, routing, and domain failures.
@@ -143,9 +245,7 @@ pub mod error {
                 | Self::Database(_)
                 | Self::Bind { .. }
                 | Self::Io(_)
-                | Self::Internal(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR")
-                }
+                | Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR"),
             }
         }
     }
@@ -169,6 +269,7 @@ pub mod error {
                 error: ApiErrorBody {
                     code: String::from(code),
                     message,
+                    request_id: current_request_id(),
                 },
             };
 
@@ -198,7 +299,7 @@ pub mod state {
     use crate::logger::{LogBuffer, register_log_secret, server_logs};
     use crate::mixes::SimilarMixEngine;
     use crate::playlists::PartyBroadcastHub;
-    use crate::plugins::{ExtensionManager, PluginRegistry};
+    use crate::plugins::{ExtensionManager, PluginRegistry, PluginRegistryError};
     use crate::providers::BackendRegistry;
     use crate::recommendations::RecommendationService;
     use crate::registry::{SearchProviderRegistry, SourcePipelineRegistry, SourceProviderRegistry};
@@ -234,10 +335,12 @@ pub mod state {
         restore_state: crate::recovery::RestoreState,
         /// Optional SQLite database connection pool.
         pub db: Option<DbPool>,
+        prepared_audio: Option<Arc<crate::audio::prepared::PreparedAudio>>,
         /// Optional session store backed by SQLite and an in-memory `RwLock` cache.
         pub sessions: Option<SessionStore>,
         /// Dynamic registry of enabled upstream media providers (`Navidrome`, `Jellyfin`).
         pub providers: BackendRegistry,
+        catalog_snapshots: crate::catalog::snapshot::CatalogSnapshots,
         /// Zero-copy binary stream header and throughput inspector.
         pub inspector: AudioMetadataInspector,
         /// Real-time WebSocket broadcast hub for live collaborative playlist party sessions.
@@ -321,6 +424,14 @@ pub mod state {
         }
     }
 
+    #[derive(Debug, thiserror::Error)]
+    pub enum AppStateInitError {
+        #[error("Could not load persisted privacy policy: {0}")]
+        Privacy(#[from] PrivacyError),
+        #[error("Could not load persisted plugins: {0}")]
+        Plugins(#[from] PluginRegistryError),
+    }
+
     impl AppState {
         /// Constructs a new [`AppState`] from the provided [`AppConfig`], registering
         /// deployment secrets with the log redactor.
@@ -329,13 +440,22 @@ pub mod state {
             Self::from_arc_config(Arc::new(config))
         }
 
-        /// Loads persisted privacy policy before constructing database-backed services.
-        pub async fn with_database(config: AppConfig, db: DbPool) -> Result<Self, PrivacyError> {
+        /// Loads persisted privacy policy and plugins before constructing database-backed services.
+        pub async fn with_database(
+            config: AppConfig,
+            db: DbPool,
+        ) -> Result<Self, AppStateInitError> {
             Self::with_database_dispatch(config, db, true).await
         }
 
-        pub async fn with_database_dispatch(config: AppConfig, db: DbPool, dispatch: bool) -> Result<Self, PrivacyError> {
+        pub async fn with_database_dispatch(
+            config: AppConfig,
+            db: DbPool,
+            dispatch: bool,
+        ) -> Result<Self, AppStateInitError> {
             let privacy = PrivacyManager::from_database(db.clone(), &config).await?;
+            let plugins = PluginRegistry::new(Some(db.clone()));
+            plugins.reload_installed().await?;
             let arc_cfg = Arc::new(config);
             let sessions = SessionStore::new(db.clone(), arc_cfg.auth.session_secret.clone());
             let mut state = Self::with_log_buffer(arc_cfg, server_logs());
@@ -385,25 +505,30 @@ pub mod state {
                     .with_library(inner.runtime_config.clone(), inner.providers.clone());
                 let spotify_imports = SpotifyPlaylistImportService::new(Some(db.clone()))
                     .with_library(inner.runtime_config.clone(), inner.providers.clone());
-                let spotdl_runner: Arc<dyn crate::tasks::TaskDefinition> =
-                    Arc::new(SpotdlRunner::with_services(
+                let spotdl_runner: Arc<dyn crate::tasks::TaskDefinition> = Arc::new(
+                    SpotdlRunner::with_services(
                         Some(db.clone()),
                         acquisitions.clone(),
                         spotify_imports.clone(),
-                    ).with_privacy(inner.privacy.clone()));
+                    )
+                    .with_privacy(inner.privacy.clone()),
+                );
                 tasks.register(TaskType::SpotdlImport, Arc::clone(&spotdl_runner));
                 tasks.register(TaskType::SpotdlDownload, spotdl_runner);
                 inner.tasks = tasks;
                 inner.scanner_scheduler = ScannerScheduler::new(Some(db.clone()));
                 inner.acquisitions = acquisitions;
                 inner.spotify_imports = spotify_imports;
-                inner.plugins = PluginRegistry::new(Some(db.clone()));
+                inner.plugins = plugins;
                 inner.extensions =
                     ExtensionManager::new(Some(db.clone()), &inner.config.extensions_dir);
                 inner.library_health_scan =
                     LibraryHealthScanService::new(Some(db.clone()), inner.providers.clone());
+                inner.prepared_audio = Some(Arc::new(crate::audio::prepared::PreparedAudio::new(
+                    db.clone(),
+                )));
                 inner.db = Some(db);
-                inner.sessions = Some(sessions);
+                inner.sessions = Some(sessions.with_remote_hub(inner.remote_hub.clone()));
             }
             Ok(state)
         }
@@ -484,8 +609,10 @@ pub mod state {
                     runtime_ready: AtomicBool::new(true),
                     restore_state: crate::recovery::RestoreState::default(),
                     db: None,
+                    prepared_audio: None,
                     sessions: None,
                     providers,
+                    catalog_snapshots: Default::default(),
                     inspector: AudioMetadataInspector::new(),
                     party_hub: PartyBroadcastHub::new(),
                     remote_hub: RemoteControlHub::new(),
@@ -619,6 +746,10 @@ pub mod state {
             let providers = crate::providers::create_provider_registry(db, &config)
                 .await
                 .map_err(|err| crate::error::ServerError::Internal(err.to_string()))?;
+            self.plugins()
+                .reload_installed()
+                .await
+                .map_err(|err| crate::error::ServerError::Internal(err.to_string()))?;
             if !self.privacy().configured_snapshot().effective.external {
                 self.scrobble_queue()
                     .cancel_privacy_pending()
@@ -626,6 +757,7 @@ pub mod state {
                     .map_err(|err| crate::error::ServerError::Internal(err.to_string()))?;
             }
             self.providers().replace_all(providers.list());
+            self.catalog_snapshots().invalidate().await;
             self.update_config(config);
             Ok(())
         }
@@ -645,6 +777,10 @@ pub mod state {
             self.inner.db.as_ref()
         }
 
+        pub(crate) fn prepared_audio(&self) -> Option<&Arc<crate::audio::prepared::PreparedAudio>> {
+            self.inner.prepared_audio.as_ref()
+        }
+
         /// Returns a reference to the attached [`SessionStore`], if initialized.
         #[must_use]
         pub fn session_store(&self) -> Option<&SessionStore> {
@@ -655,6 +791,10 @@ pub mod state {
         #[must_use]
         pub fn providers(&self) -> &BackendRegistry {
             &self.inner.providers
+        }
+
+        pub(crate) fn catalog_snapshots(&self) -> &crate::catalog::snapshot::CatalogSnapshots {
+            &self.inner.catalog_snapshots
         }
 
         /// Returns a reference to the [`AudioMetadataInspector`].
@@ -953,8 +1093,7 @@ pub use inspector::{
 pub use users::{
     CreateUserPayload, StoredUserCredentials, UpdateOwnProfilePayload, User, UserError,
     UserPermissionFlags, UserUpdatePayload, check_delete_guard, check_update_guard, create_user,
-    delete_user, get_user_by_id, get_user_by_username, list_users, update_own_profile,
-    update_user,
+    delete_user, get_user_by_id, get_user_by_username, list_users, update_own_profile, update_user,
 };
 
 pub use config::{
@@ -984,13 +1123,12 @@ pub use media::{
 pub use middleware::{SecurityHeadersPolicy, security_headers_middleware};
 pub use playlists::{
     COLLAGE_SIZE, COLLAGE_TILE_COUNT, CustomPlaylistArtwork, MAX_ARTWORK_REQUEST_BYTES,
-    MAX_CACHED_COLLAGES, MAX_CUSTOM_ARTWORK_BYTES, PLAYLIST_ARTWORK_PREFIX,
-    PLAYLIST_ARTWORK_SIZES, PlaylistArtworkDescriptor, PlaylistArtworkMode,
-    PlaylistArtworkService, PlaylistBatchEdit, PlaylistError, PlaylistPermissions, PlaylistRecord,
-    PlaylistService, PlaylistTrack, PlaylistUpdatePayload, PlaylistVisibility, RenderedArtwork,
-    TrackAddedByUser, build_playlist_artwork_id, compose_raster_2x2_collage,
-    compose_svg_2x2_collage, parse_image_data_url, parse_playlist_artwork_id,
-    resolve_artwork_size,
+    MAX_CACHED_COLLAGES, MAX_CUSTOM_ARTWORK_BYTES, PLAYLIST_ARTWORK_PREFIX, PLAYLIST_ARTWORK_SIZES,
+    PlaylistArtworkDescriptor, PlaylistArtworkMode, PlaylistArtworkService, PlaylistBatchEdit,
+    PlaylistError, PlaylistPermissions, PlaylistRecord, PlaylistService, PlaylistTrack,
+    PlaylistUpdatePayload, PlaylistVisibility, RenderedArtwork, TrackAddedByUser,
+    build_playlist_artwork_id, compose_raster_2x2_collage, compose_svg_2x2_collage,
+    parse_image_data_url, parse_playlist_artwork_id, resolve_artwork_size,
 };
 pub use providers::{
     Album, Artist, AudioMetadataSummary, AudioStreamInfo, BackendRegistry, IdentityHints,
@@ -1095,6 +1233,7 @@ pub fn create_router(state: AppState) -> Router {
             sensitive_headers,
         ))
         .layer(CatchPanicLayer::new())
+        .layer(from_fn(error::request_id_middleware))
         .with_state(state)
 }
 
@@ -1126,6 +1265,7 @@ fn build_cors_layer(origin: &str) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(allow_origin)
         .allow_credentials(true)
+        .expose_headers([http::header::HeaderName::from_static("x-request-id")])
         .allow_methods([
             http::Method::GET,
             http::Method::POST,
