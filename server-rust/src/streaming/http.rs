@@ -497,6 +497,53 @@ fn media_storage_unavailable() -> Response {
     response
 }
 
+struct ObservedDelivery {
+    inspector: AudioMetadataInspector,
+    key: (String, String, String),
+    generation: u64,
+    last_sample: Option<Instant>,
+    pending_bytes: u64,
+    prefix: Vec<u8>,
+    prefix_bytes: usize,
+    finished: bool,
+}
+
+impl ObservedDelivery {
+    fn record(&mut self, bytes: &[u8]) {
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes.len() as u64);
+        let take = bytes.len().min(MAX_HEADER_INSPECTION_BYTES - self.prefix_bytes);
+        self.prefix.extend_from_slice(&bytes[..take]);
+        self.prefix_bytes += take;
+        let now = Instant::now();
+        if self.last_sample.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(100)) {
+            self.flush();
+            self.last_sample = Some(now);
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending_bytes > 0 {
+            self.inspector.record_sample(&self.key, Some(self.generation), self.pending_bytes, &self.prefix);
+            self.pending_bytes = 0;
+            self.prefix.clear();
+        }
+    }
+
+    fn finish(&mut self, state: DeliveryState) {
+        self.flush();
+        self.inspector.finish_generation(&self.key, Some(self.generation), state);
+        self.finished = true;
+    }
+}
+
+impl Drop for ObservedDelivery {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(DeliveryState::Cancelled);
+        }
+    }
+}
+
 /// Converts an upstream [`StreamResult`] into an Axum [`Response`], forwarding allowed
 /// byte-range and caching headers and optionally observing chunks in [`AudioMetadataInspector`].
 pub fn proxy_upstream_stream(
@@ -519,44 +566,14 @@ pub fn proxy_upstream_stream(
                 .map(|range| range.length())
         })
         .flatten();
+    let completion_length = expected.or_else(|| {
+        (status == StatusCode::OK && !upstream_headers.contains_key(CONTENT_ENCODING))
+            .then(|| upstream.response.content_length())
+            .flatten()
+    });
     let source = Box::pin(upstream.response.bytes_stream());
     let audio = upstream.audio_stream.is_some();
-    let byte_stream = futures_util::stream::unfold(
-        Some((source, 0_u64, connection_id)),
-        move |state| async move {
-            let (mut source, delivered, connection_id) = state?;
-            let next = if audio {
-                tokio::time::timeout(crate::providers::MEDIA_BODY_IDLE_TIMEOUT, source.next()).await
-            } else {
-                Ok(source.next().await)
-            };
-            let result = match next {
-                Ok(Some(Ok(bytes))) => {
-                    let received = delivered.saturating_add(bytes.len() as u64);
-                    if expected.is_none_or(|size| received <= size) {
-                        return Some((Ok(bytes), Some((source, received, connection_id))));
-                    }
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Upstream partial response exceeded its range",
-                    )
-                }
-                Ok(Some(Err(error))) => std::io::Error::other(error.without_url()),
-                Ok(None) if expected.is_none_or(|size| size == delivered) => return None,
-                Ok(None) => std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Upstream partial response ended early",
-                ),
-                Err(_) => {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Upstream audio body stalled")
-                }
-            };
-            tracing::warn!(?connection_id, %status, delivered, error = ?result, "Upstream media response failed after headers");
-            Some((Err(result), None))
-        },
-    );
-
-    let body = if let Some((inspector, user_id, track_id, inspection_id, range_hdr)) = inspection {
+    let observer = inspection.and_then(|(inspector, user_id, track_id, inspection_id, range_hdr)| {
         let generation = inspector.begin_observation(
             &user_id,
             &track_id,
@@ -566,45 +583,69 @@ pub fn proxy_upstream_stream(
             content_range_str.as_deref(),
             upstream.audio_stream,
         );
-
-        let key = (user_id, track_id, inspection_id);
-        let mut last_sample: Option<Instant> = None;
-        let mut byte_count = 0;
-        let mut prefix = Vec::new();
-        let mut prefix_bytes = 0;
-        let observed_stream = byte_stream.map(move |chunk_res| match chunk_res {
-            Ok(bytes) => {
-                byte_count += bytes.len() as u64;
-                let take = bytes.len().min(MAX_HEADER_INSPECTION_BYTES - prefix_bytes);
-                prefix.extend_from_slice(&bytes[..take]);
-                prefix_bytes += take;
-                let now = Instant::now();
-                if last_sample
-                    .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(100))
-                {
-                    inspector.record_sample(&key, Some(generation), byte_count, &prefix);
-                    last_sample = Some(now);
-                    byte_count = 0;
-                    prefix.clear();
+        (generation != 0).then(|| ObservedDelivery {
+            inspector,
+            key: (user_id, track_id, inspection_id),
+            generation,
+            last_sample: None,
+            pending_bytes: 0,
+            prefix: Vec::new(),
+            prefix_bytes: 0,
+            finished: false,
+        })
+    });
+    let byte_stream = futures_util::stream::unfold(
+        Some((source, 0_u64, connection_id, observer)),
+        move |state| async move {
+            let (mut source, delivered, connection_id, mut observer) = state?;
+            let next = if audio {
+                tokio::time::timeout(crate::providers::MEDIA_BODY_IDLE_TIMEOUT, source.next()).await
+            } else {
+                Ok(source.next().await)
+            };
+            let result = match next {
+                Ok(Some(Ok(bytes))) => {
+                    let received = delivered.saturating_add(bytes.len() as u64);
+                    if expected.is_none_or(|size| received <= size) {
+                        if let Some(observer) = &mut observer {
+                            observer.record(&bytes);
+                            // HTTP may stop polling the body once it writes Content-Length bytes.
+                            if completion_length == Some(received) {
+                                observer.finish(DeliveryState::Finished);
+                            }
+                        }
+                        return Some((Ok(bytes), Some((source, received, connection_id, observer))));
+                    }
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Upstream partial response exceeded its range",
+                    )
                 }
-                Ok(bytes)
+                Ok(Some(Err(error))) => std::io::Error::other(error.without_url()),
+                Ok(None) if expected.is_none_or(|size| size == delivered) => {
+                    if let Some(observer) = &mut observer {
+                        observer.finish(DeliveryState::Finished);
+                    }
+                    return None;
+                }
+                Ok(None) => std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Upstream partial response ended early",
+                ),
+                Err(_) => {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Upstream audio body stalled")
+                }
+            };
+            tracing::warn!(?connection_id, %status, delivered, error = ?result, "Upstream media response failed after headers");
+            if let Some(observer) = &mut observer {
+                observer.finish(DeliveryState::Error);
             }
-            Err(err) => {
-                inspector.record_sample(&key, Some(generation), byte_count, &prefix);
-                inspector.finish_generation(&key, Some(generation), DeliveryState::Error);
-                Err(err)
-            }
-        });
-        Body::from_stream(observed_stream)
-    } else {
-        Body::from_stream(byte_stream)
-    };
+            Some((Err(result), None))
+        },
+    );
 
-    let mut response = Response::builder()
-        .status(status)
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-
+    let mut response = Response::new(Body::from_stream(byte_stream));
+    *response.status_mut() = status;
     let out_headers = response.headers_mut();
     for header_name in ALLOWED_PROXY_HEADERS {
         if let Some(value) = upstream_headers.get(&header_name) {
@@ -636,6 +677,49 @@ pub fn send_error_response(status: StatusCode, message: impl Into<String>, code:
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn inspection_flushes_stream_eof_cancellation_and_error() {
+        use crate::providers::media_fixture::response;
+        let inspector = AudioMetadataInspector::new();
+        let key = |id: &str| Some((inspector.clone(), "user".into(), "track".into(), id.into(), None));
+        let report = |id| inspector.inspect_snapshot("user", "track", id, None);
+        let header = bytes::Bytes::from_static(b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0\x80\xbb\0\0\0\xee\x02\0\x04\0\x10\0data\x04\0\0\0");
+        let original = [header.slice(..12), header.slice(12..)];
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+            original.clone().into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        let stream = proxy_upstream_stream(response(StatusCode::OK, [], body), key("eof"));
+        assert_eq!(stream.into_body().collect().await.unwrap().to_bytes(), header);
+        let finished = report("eof");
+        assert_eq!(finished.delivery.state, DeliveryState::Finished);
+        assert_eq!(finished.delivery.bytes, header.len() as u64);
+        assert_eq!(finished.output.properties.sample_rate_hz, Some(48_000));
+
+        let pending = futures_util::stream::iter([Ok::<_, std::io::Error>(original[0].clone())])
+            .chain(futures_util::stream::pending());
+        let upstream = response(StatusCode::OK, [], reqwest::Body::wrap_stream(pending));
+        let mut body = proxy_upstream_stream(upstream, key("cancel")).into_body();
+        assert!(body.frame().await.unwrap().is_ok());
+        drop(body);
+        let cancelled = report("cancel");
+        assert_eq!(cancelled.delivery.state, DeliveryState::Cancelled);
+        assert_eq!(cancelled.delivery.bytes, 12);
+        assert_eq!(cancelled.output.properties.codec, None);
+
+        let chunks = futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"corrupt")),
+            Err(std::io::Error::other("fixture unavailable")),
+        ]);
+        let upstream = response(StatusCode::OK, [], reqwest::Body::wrap_stream(chunks));
+        let mut body = proxy_upstream_stream(upstream, key("error")).into_body();
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(body.frame().await.unwrap().is_err());
+        let error = report("error");
+        assert_eq!(error.delivery.state, DeliveryState::Error);
+        assert_eq!(error.delivery.bytes, 7);
+        assert_eq!(error.output.properties.codec, None);
+    }
 
     #[tokio::test]
     async fn external_media_stream_enforces_byte_cap_idle_deadline_and_revocation() {

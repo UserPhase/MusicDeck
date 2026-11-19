@@ -1,6 +1,22 @@
 // The server scrobbles to the provider when a report first reaches this point:
 // 50% of the track or 20 seconds of actual listening, whichever comes first.
 export const SCROBBLE_MAX_SECONDS = 20;
+const MAX_LISTENING_SECONDS = 86_400;
+
+function reportDuration(value) {
+  const seconds = Number(value);
+  return seconds > 0 && seconds <= MAX_LISTENING_SECONDS ? seconds : null;
+}
+
+function snapshotText(value, limit = 500) {
+  return typeof value === "string" ? value.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "") : "";
+}
+
+function snapshotId(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return snapshotText(value) || null;
+}
+
 export function scrobblePointSeconds(durationSeconds) {
   return Number(durationSeconds) > 0 ? Math.min(SCROBBLE_MAX_SECONDS, Number(durationSeconds) / 2) : SCROBBLE_MAX_SECONDS;
 }
@@ -16,6 +32,8 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
   const inFlight = new Set();
   let lastReport = 0;
   let lastRetry = now();
+  let retryAfter = 0;
+  let consecutiveFailures = 0;
   let timer = null;
   let suspended = false;
   try {
@@ -32,9 +50,12 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
   }
 
   function transmit(payload) {
+    if (now() < retryAfter) return;
     const id = payload.playbackSessionId;
     inFlight.add(id);
     Promise.resolve().then(() => report({ ...payload, ownerUserId: userId })).then((result) => {
+      consecutiveFailures = 0;
+      retryAfter = 0;
       if (result?.tasteExcluded) {
         const isActive = active?.payload.playbackSessionId === id;
         if (isActive) { active.payload.excludeFromTaste = true; persist(); }
@@ -50,7 +71,18 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
         active.announced = true;
         onCounted?.(active.song, payload.startedAt);
       }
-    }).catch((error) => console.error("Could not record listening activity; next report will retry:", error))
+    }).catch((error) => {
+      if (error?.status === 400 || error?.status === 422) {
+        // A rejected report cannot be retried as-is. Keep any newer snapshot.
+        if (pending.get(id) === payload) {
+          pending.delete(id);
+          persistPending();
+        }
+        return;
+      }
+      consecutiveFailures = Math.min(consecutiveFailures + 1, 4);
+      retryAfter = now() + Math.min(60_000, 10_000 * 2 ** (consecutiveFailures - 1));
+    })
       .finally(() => { inFlight.delete(id); syncTimer(); });
   }
 
@@ -70,6 +102,8 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
     active.payload.excludeFromTaste = Boolean(active.payload.excludeFromTaste || taste.excludeFromTaste);
     active.payload.reportedAt = new Date(now()).toISOString();
     active.payload.finished = finished;
+    active.payload.listenedSeconds = Math.min(active.payload.listenedSeconds, MAX_LISTENING_SECONDS);
+    active.payload.durationSeconds = reportDuration(active.payload.durationSeconds);
     active.lastSentSeconds = active.payload.listenedSeconds;
     const payload = { ...active.payload, track: { ...active.payload.track } };
     lastReport = now();
@@ -103,7 +137,7 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
     if (wrapped) active.payload.listenedSeconds += tailSeconds;
     active.lastTime = time;
     active.lastPosition = position;
-    if (Number.isFinite(audio.duration) && audio.duration > 0) active.payload.durationSeconds = audio.duration;
+    if (Number.isFinite(duration) && duration > 0) active.payload.durationSeconds = reportDuration(duration);
     if (wrapped) {
       const song = active.song;
       closeActive();
@@ -163,10 +197,10 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
           `listen_${now()}_${Math.random().toString(36).slice(2)}`,
         trackId: String(song.id), startedAt: new Date(startedAt).toISOString(), listenedSeconds: initialSeconds,
         clientName: "MusicDeck Web",
-        durationSeconds: Number(song.duration) > 0 ? Number(song.duration) : null, finished: false,
-        track: { title: song.title || "", artist: song.artist || "", album: song.album || "",
-          artistId: song.artistId || null, albumId: song.albumId || null,
-          coverArt: song.coverArt || null, coverUrl: song.coverUrl || null },
+        durationSeconds: reportDuration(song.duration), finished: false,
+        track: { title: snapshotText(song.title), artist: snapshotText(song.artist), album: snapshotText(song.album),
+          artistId: snapshotId(song.artistId), albumId: snapshotId(song.albumId),
+          coverArt: snapshotId(song.coverArt), coverUrl: snapshotText(song.coverUrl, 2000) || null },
       },
     };
     active.payload.playlistId = active.payload.playlistId ?? taste.playlistId ?? null;
@@ -190,6 +224,7 @@ export function createListeningTracker({ report, onCounted, onTasteExcluded, now
   }
 
   function retry() {
+    if (now() < retryAfter) return;
     const retryable = [...pending.values()].filter((payload) => !inFlight.has(payload.playbackSessionId));
     retryable.slice(0, 5).forEach(transmit);
     lastRetry = now();

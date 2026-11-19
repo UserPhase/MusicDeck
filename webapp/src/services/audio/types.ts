@@ -2,6 +2,12 @@ export type TransitionMode = "off" | "gapless" | "crossfade";
 export type TransitionKind = "gapless" | "crossfade";
 export type CrossfadeCurve = "linear" | "equal-power";
 
+export interface SilenceTrim {
+  readonly leading: number;
+  readonly trailing: number;
+  readonly analyzedDuration?: number;
+}
+
 /**
  * Per-track output processing. Values that resolve after a track starts
  * (loudness analysis, silence detection) are applied with
@@ -14,11 +20,15 @@ export interface TrackAudioSettings {
   readonly trimStart?: number;
   /** Where audible content ends, in seconds; `null` plays to the end of the file. */
   readonly trimEnd?: number | null;
+  /** Detected silence, applied only against the actual finite media duration. */
+  readonly silenceTrim?: SilenceTrim | null;
 }
 
 export interface PlayableTrack extends TrackAudioSettings {
   readonly offlineTrackId?: string;
   readonly offlineOnly?: boolean;
+  /** Original audio and its level when a prepared normalization artifact fails. */
+  readonly normalizedFallback?: () => { src: string; gain: number };
   readonly cast?: {
     trackId: string; title: string; artist: string; album: string;
     maxBitRate?: number;
@@ -49,6 +59,8 @@ export type EngineState =
 export interface PlaybackEngineEventMap {
   stateChange: { key: string | null; state: EngineState };
   timeUpdate: { key: string; position: number; duration: number };
+  /** Automatic movement past a silent intro, outside the listening clock. */
+  silenceSkipped: { key: string };
   /** The track finished and no transition took over; the queue decides what plays next. */
   trackEnd: { key: string };
   sleepStop: { key: string | null };

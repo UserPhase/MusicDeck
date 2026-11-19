@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { request } from "../api/musicdeck";
+import { playbackFeatureEnabled } from "./playbackFeatures";
 import { readLocalQueue, markQueueSynced, QUEUE_LOCAL_CHANGED, decodeQueueContent, validateCheckpoint, sameQueueCheckpoint,
   type QueueCheckpoint, type QueueHead, type LocalQueue, type QueueContent } from "./storage/QueueDatabase";
 export interface QueueSessionSummary { deviceId: string; deviceName: string; contentId: string; checkpoint: QueueCheckpoint; sequence: number; updatedAt: number; trackCount: number }
@@ -24,20 +25,22 @@ export class QueueSyncClient {
   private refreshFlight: Promise<void> | null = null;
   private refreshAgain = false;
   private syncAgain = false;
-  private timer: ReturnType<typeof setTimeout> | null = null; private retry = 0;
+  private timer: ReturnType<typeof setTimeout> | null = null; private retry = 0; private retryAt = 0;
+  private syncEnabled = false;
   private flushLocal: (() => Promise<QueueHead | null>) | null = null;
   private canPublish = () => true;
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private publish(patch: Partial<Snapshot>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
-  activate(owner: string | null) {
-    if (this.state.owner === owner) return;
-    this.epoch++; this.controllers.forEach(c => c.abort()); this.controllers.clear(); this.syncFlight = null; this.latestSynced = null; this.retry = 0; this.syncAgain = false;
+  activate(owner: string | null, syncEnabled = playbackFeatureEnabled("queueCloudSync")) {
+    if (this.state.owner === owner && this.syncEnabled === syncEnabled) return;
+    this.syncEnabled = syncEnabled;
+    this.epoch++; this.controllers.forEach(c => c.abort()); this.controllers.clear(); this.syncFlight = null; this.latestSynced = null; this.retry = 0; this.retryAt = 0; this.syncAgain = false;
     this.refreshFlight = null; this.refreshAgain = false;
     if (this.timer) clearTimeout(this.timer); this.timer = null;
     window.removeEventListener(QUEUE_LOCAL_CHANGED, this.changed); window.removeEventListener("online", this.online);
     this.publish({ owner, sessions: [], named: [], error: "", syncing: false });
-    if (owner) { window.addEventListener(QUEUE_LOCAL_CHANGED, this.changed); window.addEventListener("online", this.online); void this.refresh(); }
+    if (owner && syncEnabled) { window.addEventListener(QUEUE_LOCAL_CHANGED, this.changed); window.addEventListener("online", this.online); void this.refresh(); }
   }
   bind(flush: (() => Promise<QueueHead | null>) | null, canPublish = () => true) {
     this.flushLocal = flush;
@@ -45,8 +48,13 @@ export class QueueSyncClient {
   }
   checkpointChanged() { if (this.state.owner && this.canPublish()) this.scheduleSync(); }
   private changed = (event: Event) => { const detail = (event as CustomEvent<{ owner: string }>).detail; if (detail?.owner === this.state.owner) this.scheduleSync(); };
-  private online = () => { this.retry = 0; this.scheduleSync(); void this.refresh(); };
-  private scheduleSync() { if (this.syncFlight) { this.syncAgain = true; return; } if (this.timer) clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = null; void this.sync({ ifChanged: true }).catch(() => undefined); }, Math.min(60_000, 400 * 2 ** this.retry)); }
+  private online = () => { this.retry = 0; this.retryAt = 0; this.scheduleSync(); void this.refresh(); };
+  private scheduleSync() {
+    if (!this.syncEnabled) return;
+    if (this.syncFlight) { this.syncAgain = true; return; }
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => { this.timer = null; void this.sync({ ifChanged: true }).catch(() => undefined); }, Math.max(400, this.retryAt - Date.now()));
+  }
   private async call<T>(path: string, options: RequestInit = {}): Promise<T> {
     const owner = this.state.owner, version = this.epoch;
     if (!owner) throw new Error("Sign in to manage saved queues.");
@@ -59,6 +67,7 @@ export class QueueSyncClient {
     } finally { clearTimeout(timer); this.controllers.delete(controller); options.signal?.removeEventListener("abort", abort); }
   }
   invalidate() {
+    if (!this.syncEnabled) return;
     if (this.refreshFlight) this.refreshAgain = true;
     else void this.refresh();
   }
@@ -97,26 +106,39 @@ export class QueueSyncClient {
   async sync({ ifChanged = false } = {}): Promise<void> {
     if (this.syncFlight) return this.syncFlight;
     const owner = this.state.owner, version = this.epoch;
-    if (!owner || !this.canPublish()) return;
+    if (!this.syncEnabled || !owner || !this.canPublish() || (ifChanged && Date.now() < this.retryAt)) return;
     const operation = (async () => {
       this.publish({ syncing: true });
       try {
         await this.flushLocal?.(); const local = await readLocalQueue(owner); if (!local || version !== this.epoch || !this.canPublish()) return;
         const contentId = await this.upload(local); if (version !== this.epoch || !this.canPublish()) return;
         if (ifChanged && this.latestSynced?.serverContentId === contentId && sameQueueCheckpoint(this.latestSynced.checkpoint, local.head.checkpoint)) return;
-        const sequence = Math.max(local.head.sequence, (this.state.sessions.find(row => row.deviceId === queueDeviceId())?.sequence ?? 0) + 1, (this.latestSynced?.sequence ?? 0) + 1);
-        const result = await this.referencing(local, () => this.call<{ saved: boolean; sequence: number }>("", { method: "PUT", body: JSON.stringify({ ownerId: owner, deviceId: queueDeviceId(), deviceName: queueDeviceName(), contentId,
-          checkpoint: local.head.checkpoint, sequence }) }));
+        const deviceId = queueDeviceId(), deviceName = queueDeviceName();
+        const remoteSequence = this.state.sessions.find(row => row.deviceId === deviceId)?.sequence ?? 0;
+        const sequence = Math.max(local.head.sequence, remoteSequence + 1, (this.latestSynced?.sequence ?? 0) + 1);
+        const save = (sequence: number) => this.referencing(local, () => this.call<{ saved: boolean; sequence: number }>("", {
+          method: "PUT", body: JSON.stringify({ ownerId: owner, deviceId, deviceName, contentId, checkpoint: local.head.checkpoint, sequence }),
+        }));
+        let result = await save(sequence);
+        // Another tab or a page-exit checkpoint may have advanced the server sequence.
+        // Keep the captured time so the server can still reject an older checkpoint.
+        if (!result.saved && result.sequence >= sequence && Number.isSafeInteger(result.sequence + 1) &&
+            version === this.epoch && this.canPublish()) {
+          result = await save(result.sequence + 1);
+        }
         if (!result.saved) {
           await this.refresh();
           throw Object.assign(new Error("A newer checkpoint exists for this browser. Retry sync to send the current queue."), { status: 409 });
         }
-        this.latestSynced = { ...local.head, sequence, serverContentId: contentId }; this.retry = 0; this.publish({ error: "" });
+        this.latestSynced = { ...local.head, sequence: result.sequence, serverContentId: contentId }; this.retry = 0; this.retryAt = 0; this.publish({ error: "" });
       } catch (error) {
         if (version === this.epoch) {
           this.retry = Math.min(this.retry + 1, 8); this.publish({ error: error instanceof Error ? error.message : "Queue sync failed. Your local queue remains available." });
           const status = (error as { status?: number })?.status;
-          if (!status || status >= 500 || status === 429) this.scheduleSync();
+          if (!status || status >= 500 || status === 429) {
+            this.retryAt = Date.now() + Math.min(60_000, 400 * 2 ** this.retry);
+            this.scheduleSync();
+          }
         }
         throw error;
       } finally { if (version === this.epoch) this.publish({ syncing: false }); }
@@ -128,7 +150,7 @@ export class QueueSyncClient {
   /** Exit requests contain only an already-uploaded content reference and a small checkpoint. */
   exitCheckpoint(checkpoint: QueueCheckpoint, currentHead: QueueHead | null) {
     const synced = this.latestSynced, owner = this.state.owner;
-    if (!this.canPublish() || !owner || !synced?.serverContentId || !currentHead || synced.contentKey !== currentHead.contentKey || synced.owner !== owner) return;
+    if (!this.syncEnabled || Date.now() < this.retryAt || !this.canPublish() || !owner || !synced?.serverContentId || !currentHead || synced.contentKey !== currentHead.contentKey || synced.owner !== owner) return;
     if (sameQueueCheckpoint(synced.checkpoint, checkpoint)) return;
     void fetch(BASE, { method: "PUT", credentials: "include", keepalive: true, headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ownerId: owner, deviceId: queueDeviceId(), deviceName: queueDeviceName(), contentId: synced.serverContentId, checkpoint,

@@ -4,14 +4,16 @@
 //! boundary trim analysis (`silence`), embedded container tag inspection/repair (`tagger`),
 //! and provenance-verified FLAC-to-MP3 library shrinkage (`shrink`).
 
+mod ffmpeg;
 pub mod loudness;
 pub(crate) mod prepared;
 pub mod shrink;
 pub mod silence;
+pub(crate) mod analysis_scan;
 pub mod tagger;
 
 pub use loudness::{
-    LOUDNESS_CACHE_TTL_MS, LOUDNESS_TARGET, LibraryAnalysisScanService, LibraryScanStatus,
+    LOUDNESS_CACHE_TTL_MS, LOUDNESS_TARGET, LibraryScanStatus,
     LoudnessMeasurement, LoudnessMetadata, LoudnessService, MAX_LOUDNESS_INPUT_BYTES,
     ScanParametersConflict, TRUE_PEAK_LIMIT, is_allowed_preview, loudness_measurement_key,
     loudness_stream_cache_key, measured_playback_gain, parse_loudness, playback_identity,

@@ -426,6 +426,47 @@ impl TasteProfileManager {
         title: Option<&str>,
         artist: Option<&str>,
     ) -> TasteExclusionDecision {
+        let decision = self
+            .assess_exclusion(
+                user_id,
+                track_id,
+                started_at,
+                reported_at,
+                private_listening_flag,
+                exclude_from_taste_flag,
+                playlist_id,
+                title,
+                artist,
+            )
+            .await;
+        if decision.excluded {
+            let _ = sqlx::query("INSERT OR IGNORE INTO taste_settings (user_id) VALUES (?)")
+                .bind(user_id)
+                .execute(self.db.inner())
+                .await;
+            let _ = sqlx::query(
+                "UPDATE taste_settings SET provider_history_disabled = 1 WHERE user_id = ? AND provider_history_disabled = 0",
+            )
+            .bind(user_id)
+            .execute(self.db.inner())
+            .await;
+        }
+        decision
+    }
+
+    /// Checks exclusion rules without recording provider-history preferences.
+    pub(crate) async fn assess_exclusion(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        started_at: &str,
+        reported_at: Option<&str>,
+        private_listening_flag: bool,
+        exclude_from_taste_flag: bool,
+        playlist_id: Option<&str>,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> TasteExclusionDecision {
         let state = self.state(user_id).await;
         let now_iso = Utc::now().to_rfc3339();
         let at = reported_at.unwrap_or(&now_iso);
@@ -499,19 +540,6 @@ impl TasteProfileManager {
             || playlist_excluded
             || track_excluded
             || before_reset;
-
-        if excluded {
-            let _ = sqlx::query("INSERT OR IGNORE INTO taste_settings (user_id) VALUES (?)")
-                .bind(user_id)
-                .execute(self.db.inner())
-                .await;
-            let _ = sqlx::query(
-                "UPDATE taste_settings SET provider_history_disabled = 1 WHERE user_id = ? AND provider_history_disabled = 0",
-            )
-            .bind(user_id)
-            .execute(self.db.inner())
-            .await;
-        }
 
         TasteExclusionDecision {
             excluded,

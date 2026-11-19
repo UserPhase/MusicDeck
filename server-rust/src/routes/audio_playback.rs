@@ -25,9 +25,10 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::AppState;
+use crate::audio::silence::silence_unavailable;
 use crate::audio::prepared::{Preparation, PreparationError, PreparedAccess};
 use crate::audio::{
-    LOUDNESS_TARGET, LibraryAnalysisScanService, LoudnessService, SilenceAnalysisService,
+    LOUDNESS_TARGET, LoudnessService,
     SilenceParameters, is_allowed_preview, measured_playback_gain, playback_identity,
 };
 use crate::auth::AuthenticatedUser;
@@ -67,6 +68,8 @@ struct SilenceScanRequestBody {
     pub threshold_db: Option<f64>,
     #[serde(default)]
     pub min_silence_seconds: Option<f64>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Builds the router for `/api/playback/*` and `/api/tracks/:track_id/silence*`.
@@ -106,12 +109,11 @@ pub fn audio_playback_routes() -> Router<AppState> {
 async fn get_loudness_scan_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-) -> Response {
-    let scan_service = LibraryAnalysisScanService::new(state.db().cloned(), "loudness");
-    let status = scan_service
-        .status(&auth.user.id, auth.user.is_admin())
-        .await;
-    (StatusCode::OK, Json(json!({ "scan": status }))).into_response()
+) -> Result<Response, ServerError> {
+    let scan = state.loudness_scan()
+        .ok_or_else(|| ServerError::ServiceUnavailable("Library loudness analysis is unavailable".into()))?
+        .status(&auth.user.id, auth.user.is_admin()).await?;
+    Ok(Json(json!({ "scan": scan })).into_response())
 }
 
 async fn post_loudness_scan_handler(
@@ -120,22 +122,11 @@ async fn post_loudness_scan_handler(
     ApiJson(body): ApiJson<Value>,
 ) -> Result<Response, ServerError> {
     if !body.as_object().is_some_and(serde_json::Map::is_empty) {
-        return Err(ServerError::BadRequest(String::from(
-            "Invalid scan request",
-        )));
+        return Err(ServerError::BadRequest("Invalid scan request".into()));
     }
-    if state.db().is_none() {
-        return Err(ServerError::ServiceUnavailable(String::from(
-            "Library analysis is unavailable",
-        )));
-    }
-
-    let scan_service = LibraryAnalysisScanService::new(state.db().cloned(), "loudness");
-    let scan = scan_service
-        .start(&auth.user.id, auth.user.is_admin(), HashMap::new())
-        .await
-        .map_err(|e| ServerError::Conflict(e.to_string()))?;
-
+    let scan = state.loudness_scan()
+        .ok_or_else(|| ServerError::ServiceUnavailable("Library loudness analysis is unavailable".into()))?
+        .start(&auth.user.id, auth.user.is_admin(), None).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "scan": scan }))).into_response())
 }
 
@@ -299,7 +290,7 @@ fn ready_payload(
 ) -> Value {
     json!({ "status": "ready", "streamUrl": format!("/api/playback/normalized/{key}"),
         "integratedLufs": artifact.integrated_lufs, "truePeakDb": artifact.true_peak_db,
-        "gainDb": gain.map_or(0.0, |gain| gain.gain_db) })
+        "gainDb": gain.map_or(0.0, |gain| gain.gain_db), "loudness": gain })
 }
 
 async fn post_playback_normalize_handler(
@@ -481,6 +472,8 @@ async fn post_playback_normalize_handler(
         )
         .await
         && let Some(inline) = track.loudness
+        && inline.integrated_lufs.is_finite()
+        && inline.true_peak_db.is_finite()
     {
         return Ok(Json(measured_payload(
             "measured",
@@ -542,12 +535,10 @@ async fn post_playback_normalize_handler(
 async fn get_silence_scan_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-) -> Response {
-    let scan_service = LibraryAnalysisScanService::new(state.db().cloned(), "silence");
-    let status = scan_service
-        .status(&auth.user.id, auth.user.is_admin())
-        .await;
-    (StatusCode::OK, Json(json!({ "scan": status }))).into_response()
+) -> Result<Response, ServerError> {
+    let scan = state.silence_scan().ok_or_else(silence_unavailable)?
+        .status(&auth.user.id, auth.user.is_admin()).await?;
+    Ok(Json(json!({ "scan": scan })).into_response())
 }
 
 async fn post_silence_scan_handler(
@@ -557,25 +548,8 @@ async fn post_silence_scan_handler(
 ) -> Result<Response, ServerError> {
     let params = SilenceParameters::validate(body.threshold_db, body.min_silence_seconds)
         .map_err(ServerError::BadRequest)?;
-    if state.db().is_none() {
-        return Err(ServerError::ServiceUnavailable(String::from(
-            "Library silence analysis is unavailable",
-        )));
-    }
-
-    let mut map = HashMap::new();
-    map.insert(String::from("thresholdDb"), params.threshold_db);
-    map.insert(
-        String::from("minSilenceSeconds"),
-        params.min_silence_seconds,
-    );
-
-    let scan_service = LibraryAnalysisScanService::new(state.db().cloned(), "silence");
-    let scan = scan_service
-        .start(&auth.user.id, auth.user.is_admin(), map)
-        .await
-        .map_err(|e| ServerError::Conflict(e.to_string()))?;
-
+    let scan = state.silence_scan().ok_or_else(silence_unavailable)?
+        .start(&auth.user.id, auth.user.is_admin(), Some(params)).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "scan": scan }))).into_response())
 }
 
@@ -583,10 +557,17 @@ async fn get_track_silence_handler(
     State(state): State<AppState>,
     _auth: AuthenticatedUser,
     Path(track_id): Path<String>,
-) -> Response {
-    let service = SilenceAnalysisService::new(state.db().cloned());
-    let analysis = service.get_analysis(&track_id, None).await;
-    (StatusCode::OK, Json(json!({ "analysis": analysis }))).into_response()
+    Query(query): Query<SilenceScanRequestBody>,
+) -> Result<Response, ServerError> {
+    let params = if query.threshold_db.is_some() || query.min_silence_seconds.is_some() {
+        Some(SilenceParameters::validate(query.threshold_db, query.min_silence_seconds)
+            .map_err(ServerError::BadRequest)?)
+    } else {
+        None
+    };
+    let scan = state.silence_scan().ok_or_else(silence_unavailable)?;
+    let analysis = scan.silence().ok_or_else(silence_unavailable)?.get_analysis(&track_id, params).await?;
+    Ok(Json(json!({ "analysis": analysis })).into_response())
 }
 
 async fn post_track_silence_analyze_handler(
@@ -597,9 +578,12 @@ async fn post_track_silence_analyze_handler(
 ) -> Result<Response, ServerError> {
     let params = SilenceParameters::validate(body.threshold_db, body.min_silence_seconds)
         .map_err(ServerError::BadRequest)?;
-    let service = SilenceAnalysisService::new(state.db().cloned());
-    let existing = service.get_analysis(&track_id, Some(params)).await;
-    Ok((StatusCode::OK, Json(json!({ "analysis": existing }))).into_response())
+    let scan = state.silence_scan().ok_or_else(silence_unavailable)?;
+    let wait = Duration::from_secs(if body.force { 30 } else { 2 });
+    let (analysis, _) = scan.silence().ok_or_else(silence_unavailable)?.analyze_track(
+        &scan.resolver(), &track_id, params, body.force, wait,
+    ).await?;
+    Ok(Json(json!({ "analysis": analysis })).into_response())
 }
 
 async fn get_playback_normalized_handler(
@@ -631,10 +615,9 @@ async fn get_playback_normalized_handler(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
-    response.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&etag).expect("hex cache key"),
-    );
+    if let Ok(etag) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, etag);
+    }
     if let Some(permit) = permit {
         let (parts, body) = response.into_parts();
         let guarded = bounded_media_body(

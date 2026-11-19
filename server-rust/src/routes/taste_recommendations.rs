@@ -11,15 +11,17 @@
 //! - `POST /api/v1/taste-profile/reset`
 //! - `GET /api/recommendations`
 //! - `POST /api/recommendations/feedback`
+//! - `POST /api/recommendations/autoplay`
 //! - `GET /api/radio`
 //! - `GET /api/library/health`
 //! - `GET /api/library/insights/statistics`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::error::ApiJson;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -31,12 +33,20 @@ use crate::AppState;
 use crate::auth::AuthenticatedUser;
 use crate::catalog::CatalogService;
 use crate::error::ServerError;
+use crate::external::DeezerAdapter;
 use crate::profile::{
     LibraryInsightsService, TasteProfileError, TasteProfileManager, TasteTarget,
 };
 use crate::recommendations::{
     FeedbackAction, RecommendationContext, RecommendationKind, RecommendationSeed,
 };
+use crate::recommendations::service::{
+    PlaylistRecommendationSeeds, recommend_external_for_playlist, recommend_for_playlist,
+};
+use crate::services::privacy::ExternalCategory;
+
+use super::external_discovery::find_external_artist_by_name;
+use super::playlists::{build_playlist_service, map_playlist_error};
 
 fn taste_error_response(err: TasteProfileError) -> Response {
     let status = StatusCode::from_u16(err.status_code).unwrap_or(StatusCode::BAD_REQUEST);
@@ -120,6 +130,18 @@ struct RecommendationFeedbackBody {
     pub album: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayBody {
+    seed_id: String,
+    limit: Option<usize>,
+    #[serde(default)]
+    exclude_ids: Vec<String>,
+    playlist_id: Option<String>,
+    #[serde(default)]
+    exclude_from_taste: bool,
+}
+
 /// Builds the router for `/api/v1/taste-profile/*`, `/api/recommendations/*`, `/api/radio`, and `/api/library/*`.
 pub fn taste_and_recommendation_routes() -> Router<AppState> {
     Router::new()
@@ -160,7 +182,7 @@ pub fn taste_and_recommendation_routes() -> Router<AppState> {
         )
         .route("/api/radio", get(get_radio_handler))
         .route("/api/recommendations/radio", post(post_radio_handler))
-        .route("/api/recommendations/autoplay", post(post_radio_handler))
+        .route("/api/recommendations/autoplay", post(post_autoplay_handler))
         .route("/api/library/health", get(get_library_health_handler))
         .route(
             "/api/library/insights/statistics",
@@ -602,38 +624,235 @@ async fn get_library_insights_statistics_handler(
 async fn get_playlist_recommendations_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
-    axum::extract::Path(_playlist_id): axum::extract::Path<String>,
+    Path(playlist_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, ServerError> {
+    let external = match params.get("source").map(String::as_str) {
+        None | Some("library") => false,
+        Some("external") => true,
+        _ => {
+            return Err(ServerError::BadRequest(
+                "Invalid recommendation source".into(),
+            ));
+        }
+    };
     let Some(pool) = state.db() else {
         return Err(ServerError::ServiceUnavailable(String::from(
             "Database is unavailable",
         )));
     };
-    let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+    let service = match build_playlist_service(&state) {
+        Ok(service) => service,
+        Err(response) => return Ok(response),
+    };
+    let playlist = match service.get(&playlist_id, &auth.user).await {
+        Ok(Some(playlist)) => playlist,
+        Ok(None) => return Err(ServerError::NotFound("Playlist not found".into())),
+        Err(err) => return Ok(map_playlist_error(err)),
+    };
+    let can_modify = playlist
+        .permissions
+        .is_some_and(|permissions| permissions.can_edit_tracks);
+    let response = |items, message: Option<&str>| {
+        (
+            no_store_headers(),
+            Json(json!({ "items": items, "message": message, "canModify": can_modify })),
+        )
+            .into_response()
+    };
+    let external_allowed = || {
+        (auth.user.is_admin() || auth.user.external_search_enabled)
+            && state
+                .privacy()
+                .is_external_allowed(ExternalCategory::Metadata)
+    };
+    if external && !external_allowed() {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions are disabled."),
+        ));
+    }
+    let seeds = PlaylistRecommendationSeeds::new(playlist.tracks.as_deref().unwrap_or_default());
+    if seeds.is_empty() {
+        return Ok(response(Vec::new(), None));
+    }
+
     let limit = params
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(10)
+        .unwrap_or(30)
         .clamp(1, 30);
-    let items = state
-        .recommendations()
-        .recommend(
-            &catalog,
-            &RecommendationContext {
-                user_id: auth.user.id,
-                kind: RecommendationKind::Discover,
+    let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+    let inventory = state.catalog_snapshots().tracks(&catalog).await;
+    if !external {
+        let items =
+            recommend_for_playlist(pool, &auth.user.id, &seeds, &inventory.items, limit).await;
+        return Ok(response(
+            items,
+            inventory
+                .degraded
+                .then_some("Some library sources are unavailable."),
+        ));
+    }
+    if inventory.degraded {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions will return when all library sources can be checked."),
+        ));
+    }
+    if !external_allowed() {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions are disabled."),
+        ));
+    }
+
+    let artists = seeds.external_artist_names();
+    let lookups = futures_util::future::join_all(
+        artists
+            .iter()
+            .map(|name| find_external_artist_by_name(&state, name)),
+    )
+    .await;
+    if !external_allowed() {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions are disabled."),
+        ));
+    }
+    let no_artist_matches = !lookups.is_empty()
+        && lookups
+            .iter()
+            .all(|(deezer, itunes)| deezer.is_none() && itunes.is_none());
+    let deezer = DeezerAdapter::new(state.artwork_tokens().clone(), 8);
+    let deezer_seeds: Vec<_> = artists
+        .iter()
+        .copied()
+        .zip(&lookups)
+        .filter_map(|(name, (detail, _))| Some((name, detail.as_ref()?.get("id")?.as_str()?)))
+        .collect();
+    let mut seen_ids: HashSet<_> = deezer_seeds
+        .iter()
+        .map(|(_, id)| (*id).to_owned())
+        .collect();
+    let matches = futures_util::future::join_all(
+        deezer_seeds
+            .iter()
+            .map(|(_, id)| deezer.related_artists(id)),
+    )
+    .await;
+    if !external_allowed() {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions are disabled."),
+        ));
+    }
+    let related_artists: Vec<_> = matches
+        .into_iter()
+        .zip(deezer_seeds)
+        .flat_map(|(matches, (seed, _))| {
+            matches.into_iter().map(move |(id, name)| (id, name, seed))
+        })
+        .filter(|(id, _, _)| seen_ids.insert(id.clone()))
+        .take(6)
+        .collect();
+    let related_tracks = futures_util::future::join_all(
+        related_artists
+            .iter()
+            .map(|(id, name, _)| deezer.top_tracks(id, name)),
+    )
+    .await;
+    if !external_allowed() {
+        return Ok(response(
+            Vec::new(),
+            Some("External suggestions are disabled."),
+        ));
+    }
+    let related =
+        related_tracks
+            .into_iter()
+            .zip(related_artists)
+            .flat_map(|(tracks, (_, _, seed))| {
+                tracks.into_iter().map(move |track| (track, Some(seed)))
+            });
+    let candidates = lookups
+        .into_iter()
+        .flat_map(|(deezer, itunes)| [deezer, itunes].into_iter().flatten())
+        .flat_map(|mut artist| {
+            artist
+                .get_mut("tracks")
+                .map(serde_json::Value::take)
+                .and_then(|tracks| match tracks {
+                    serde_json::Value::Array(tracks) => Some(tracks),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        })
+        .map(|track| (track, None))
+        .chain(related);
+    let items = recommend_external_for_playlist(
+        pool,
+        &auth.user.id,
+        &seeds,
+        &inventory.items,
+        candidates,
+        limit,
+    )
+    .await;
+    Ok(response(
+        items,
+        no_artist_matches.then_some("External catalogs returned no matching artists."),
+    ))
+}
+
+async fn post_autoplay_handler(
+    State(state): State<AppState>,
+    auth: AuthenticatedUser,
+    ApiJson(body): ApiJson<AutoplayBody>,
+) -> Result<Response, ServerError> {
+    let limit = body.limit.unwrap_or(10);
+    let invalid_id = |id: &str, max| id.trim().is_empty() || id.chars().count() > max;
+    if invalid_id(&body.seed_id, 256)
+        || !(1..=50).contains(&limit)
+        || body.exclude_ids.len() > 500
+        || body.exclude_ids.iter().any(|id| invalid_id(id, 256))
+        || body
+            .playlist_id
+            .as_deref()
+            .is_some_and(|id| invalid_id(id, 300))
+    {
+        return Err(ServerError::BadRequest("Invalid autoplay request".into()));
+    }
+    let Some(pool) = state.db() else {
+        return Err(ServerError::ServiceUnavailable(
+            "Database is unavailable".into(),
+        ));
+    };
+    let (tracks, degraded) = if body.exclude_from_taste {
+        (Vec::new(), false)
+    } else {
+        let catalog = CatalogService::from_pool(pool.clone(), state.providers().clone());
+        // Return before the player's request deadline so it can start its library fallback.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.recommendations().playback_autoplay(
+                &catalog,
+                state.catalog_snapshots(),
+                &auth.user.id,
+                &body.seed_id,
                 limit,
-                seed: None,
-            },
+                &body.exclude_ids,
+                body.playlist_id.as_deref(),
+            ),
         )
         .await;
+        let degraded = result.is_err();
+        (result.unwrap_or_default(), degraded)
+    };
+
     Ok((
-        StatusCode::OK,
-        Json(json!({
-            "tracks": items,
-            "degraded": false,
-        })),
+        no_store_headers(),
+        Json(json!({ "tracks": tracks, "items": tracks, "degraded": degraded })),
     )
         .into_response())
 }

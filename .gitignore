@@ -6,21 +6,37 @@ node_modules/
 .env
 .env.*
 !.env.example
+*.env
+.envrc
+*.key
+*.pem
+*.p12
+*.pfx
+id_ed25519
+id_rsa
 
 # === Build output ===
 build/
 dist/
 **/build/
 **/dist/
-/server-rust/target/
+target/
 
 # === Local runtime data (SQLite DB, downloaded music, temp acquisitions) ===
 data/
 **/data/
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
-*.sqlite-journal
+*.db
+*.db-*
+*.sqlite*
+*.flac
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.ogg
+*.opus
+*.mp4
+*.mkv
 /music/*
 !/music/.gitkeep
 /server/music/

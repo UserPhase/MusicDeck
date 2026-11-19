@@ -4,6 +4,7 @@ import {
   updatePlaylist,
   startSpotifyPlaylistImport,
   getSpotifyPlaylistImport,
+  getPlaylistRecommendations,
 } from "./playlists";
 
 import {
@@ -26,6 +27,27 @@ jest.mock("./musicdeck", () => ({
 
 beforeEach(() => {
   jest.clearAllMocks();
+});
+
+test("playlist recommendations request fresh data and allow a valid empty result", async () => {
+  const result = { items: [], canModify: true, message: null };
+  global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => result });
+  const { signal } = new AbortController();
+  await expect(getPlaylistRecommendations("mix/id", "external", signal)).resolves.toEqual(result);
+  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/mix%2Fid/recommendations?source=external",
+    expect.objectContaining({ cache: "no-store", signal }));
+});
+
+test.each([
+  [204, async () => undefined, "empty or unreadable"],
+  [200, async () => { throw new SyntaxError("Unexpected end of JSON input"); }, "empty or unreadable"],
+  [200, async () => ({ tracks: [] }), "older playlist recommendations API"],
+])("playlist recommendations report unexpected HTTP %s payloads as errors", async (status, json, message) => {
+  global.fetch = jest.fn().mockResolvedValue({ ok: true, status, json });
+  await expect(getPlaylistRecommendations("mix")).rejects.toMatchObject({
+    code: "INVALID_PLAYLIST_RECOMMENDATIONS",
+    message: expect.stringContaining(message),
+  });
 });
 
 

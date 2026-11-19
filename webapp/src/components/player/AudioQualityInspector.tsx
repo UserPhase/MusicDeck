@@ -108,7 +108,7 @@ export default function AudioQualityInspector({ onClose }: { onClose(): void }) 
         <Field label="Output channels">{details?.pipeline?.outputChannels}</Field>
         <Field label="Client track gain">{details?.pipeline?.gainDb != null ? `${details.pipeline.gainDb >= 0 ? "+" : ""}${details.pipeline.gainDb.toFixed(2)} dB${details.serverNormalized ? " (server processing separate)" : ""}` : "Muted / unknown"}</Field>
         <Field label="Delivery throughput">{bitrate(details?.delivery?.bitrateKbps)}</Field>
-        <Field label="Received bytes">{details?.delivery ? details.delivery.bytes.toLocaleString() : "Unknown"}</Field>
+        <Field label="Received bytes">{details?.delivery?.bytes?.toLocaleString() ?? "Unknown"}</Field>
         <Field label="Transfer state">{details?.delivery?.state}</Field>
       </dl></section>
       <section className="quality-controls"><h3>Stream preference</h3>

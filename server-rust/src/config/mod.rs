@@ -586,7 +586,8 @@ impl AppConfig {
 
         let (host, port) = parse_listener_addr(env)?;
         let public_url = read_env(env, "MUSICDECK_PUBLIC_URL", "http://localhost:4534");
-        let cors_origin = read_env(env, "MUSICDECK_CORS_ORIGIN", "http://localhost:3000");
+        let default_cors_origin = if is_production { &public_url } else { "http://localhost:3000" };
+        let cors_origin = read_env(env, "MUSICDECK_CORS_ORIGIN", default_cors_origin);
         let trusted_proxies =
             parse_trusted_proxies(&read_env(env, "MUSICDECK_TRUSTED_PROXIES", ""))?;
 

@@ -34,10 +34,13 @@ import {
   starSong,
   unstarSong,
   getAutoplayTracks,
+  getPlaylist,
+  getRandomSongs,
   RECOMMENDATION_FEEDBACK_CHANGED_EVENT,
   getUserSettings,
   updateUserSettings,
   getSilenceAnalysis,
+  SILENCE_ANALYZED_EVENT,
   analyzeSilence,
   USER_SETTINGS_CHANGED_EVENT,
   saveMediaCheckpoint,
@@ -50,8 +53,9 @@ import { useAuth } from "./AuthContext";
 import { tasteProfileStore, TASTE_CHANGED } from "../services/TasteProfileStore";
 import { DEFAULT_ACCENT_COLOR, normalizeAccentColor } from "../utils/accentColors";
 import { trustedPreviewUrl } from "../utils/previewPlayback";
-import { createPlaybackSessionId } from "../utils/streamRecovery";
+import { initialPlaybackUrl } from "../utils/streamRecovery";
 import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
+import { playbackFeatureEnabled } from "../services/playbackFeatures";
 import type { AccountQueueSource } from "../services/QueueSyncClient";
 import { newestPeerQueue, useAccountQueue } from "../hooks/useAccountQueue";
 import type { QueueCheckpoint, QueueContent } from "../services/storage/QueueDatabase";
@@ -70,8 +74,8 @@ import {
 } from "../utils/loudness";
 import { usePlaybackEngine } from "../hooks/usePlaybackEngine";
 import { useBrowserMediaSession } from "../hooks/useBrowserMediaSession";
-import { currentEntryOf, shuffleUpcoming, upcomingEntryOf, useQueueStore, usePersistentQueue } from "../hooks/useQueueStore";
-import type { PlaybackStatus, QueueEntry, QueueState, QueueStore } from "../hooks/useQueueStore";
+import { currentEntryOf, QUEUE_PREVIEW_SIZE, repeatModeOf, shuffleUpcoming, upcomingEntryOf, useQueueStore, usePersistentQueue } from "../hooks/useQueueStore";
+import type { PlaybackStatus, QueueEntry, QueueState, QueueStore, RepeatMode, SetQueueOptions } from "../hooks/useQueueStore";
 import { PLAYBACK_BLOCKED_MESSAGE } from "../services/audio/PlaybackEngine";
 import type { PlaybackEngine } from "../services/audio/PlaybackEngine";
 import { replayGainLevel } from "../services/audio/outputs";
@@ -81,7 +85,7 @@ import {
   CROSSFADE_MIN_SECONDS,
   DEFAULT_CROSSFADE_SECONDS,
 } from "../services/audio/crossfadeTransition";
-import type { EngineState, PlayableTrack, TransitionMode as EngineTransitionMode } from "../services/audio/types";
+import type { EngineState, PlayableTrack, SilenceTrim, TransitionMode as EngineTransitionMode } from "../services/audio/types";
 
 /*
  * PlayerProvider binds the app to the playback engine.
@@ -132,7 +136,7 @@ export interface PlayerContextValue {
   activeSidebar: Sidebar;
   setActiveSidebar: (next: Sidebar | ((current: Sidebar) => Sidebar)) => void;
   autoOpenSidebar: boolean;
-  isAutoplayEnabled: boolean;
+  isEndlessPlaybackEnabled: boolean;
   autoDownloadLiked: boolean;
   isPlaying: boolean;
   isRemotePlayback: boolean;
@@ -159,6 +163,7 @@ export interface PlayerContextValue {
   isAlbumAware: boolean;
   changeAlbumAware: (enabled: boolean) => void;
   isLooping: boolean;
+  repeatMode: RepeatMode;
   previewDurationSeconds: number | null;
   playbackUnavailable: boolean;
   playbackMessage: string;
@@ -206,7 +211,7 @@ export interface PlayerContextValue {
   changeLayoutDensity: (value: string) => void;
   changeAccentColor: (value: string) => void;
   changeAutoOpenSidebar: (value: boolean) => void;
-  changeAutoplayEnabled: (value: boolean) => void;
+  changeEndlessPlaybackEnabled: (value: boolean) => void;
   changeAutoDownloadLiked: (value: boolean) => void;
   resetPlayer: () => void;
   audioEngine?: PlaybackEngine | null;
@@ -248,6 +253,7 @@ interface ResolvedAudio {
   url: string;
   normalized: boolean;
   loudness?: unknown;
+  originalLoudness?: unknown;
   gainDb?: number;
 }
 
@@ -260,31 +266,36 @@ interface NormalizationBinding {
   measurement: unknown;
 }
 
-interface TrimBounds {
-  leading: number;
-  trailing: number;
-  /** Absolute end of audible content; known once a duration is. */
-  end: number | null;
-}
-
 interface SilenceTrimSettings {
   enabled: boolean;
   thresholdDb: number;
   minSilenceSeconds: number;
 }
 
+interface SilenceAnalysis {
+  status?: string;
+  leadingSilenceSeconds?: number;
+  trailingSilenceSeconds?: number;
+  durationSeconds?: number | null;
+  thresholdDb?: number;
+  minSilenceSeconds?: number;
+}
+
+function matchesSilenceProfile(analysis: SilenceAnalysis | null, params: Pick<SilenceTrimSettings, "thresholdDb" | "minSilenceSeconds">): analysis is SilenceAnalysis {
+  return analysis?.status === "completed" &&
+    (analysis.thresholdDb === undefined || analysis.thresholdDb === params.thresholdDb) &&
+    (analysis.minSilenceSeconds === undefined || analysis.minSilenceSeconds === params.minSilenceSeconds);
+}
+
 interface RestoreRequest {
   trackId: string;
   attempted: boolean;
   blocked: boolean;
-  resumeWhenReady?: () => void;
-  registryTimeout?: number;
 }
 
 // ---------------------------------------------------------------- constants
 
 const RECONNECTING_MESSAGE = "Connection interrupted. Reconnecting…";
-const CHECKPOINT_SYNC_MESSAGE = "Listening progress couldn’t sync. MusicDeck will try again when it saves your next position.";
 const RESTARTED_MESSAGE = "Reconnected. This stream can't resume mid-track, so it restarted.";
 const PREVIEW_UNAVAILABLE_MESSAGE = "Preview unavailable for this track";
 const PREVIEW_DURATION_SECONDS = 30;
@@ -293,8 +304,7 @@ const MAX_RECENTLY_PLAYED = 50;
 const RESTART_THRESHOLD_SECONDS = 3;
 /** Auto-refill starts once this many (or fewer) tracks remain after the current one. */
 export const REFILL_TRIGGER_UPCOMING = 2;
-const REFILL_TARGET_UPCOMING = 10;
-const QUEUE_END_AUTOPLAY_COUNT = 10;
+const ENDLESS_LOOKUP_TIMEOUT_MS = 2500;
 const NORMALIZED_STREAM = /^\/api\/playback\/normalized\/[a-f0-9]{64}$/;
 const NORMALIZATION_POLL_MS = 1500;
 const NORMALIZATION_DEADLINE_MS = 195_000;
@@ -416,9 +426,68 @@ function randomValues(count: number): number[] {
 function sameSongId(a: Song | null | undefined, b: Song | null | undefined): boolean {
   return a?.id != null && b?.id != null && String(a.id) === String(b.id);
 }
-function autoplayTracksFor(song: Song, limit: number, excludeIds: Array<string | number>) {
-  return song.tastePlaylistId ? getAutoplayTracks(song.id, limit, excludeIds, { playlistId: String(song.tastePlaylistId), excludeFromTaste: Boolean(song.excludeFromTaste) })
-    : getAutoplayTracks(song.id, limit, excludeIds);
+function playlistIdFor(context: PlaybackContextInfo | null, track?: Song): string | null {
+  if (context?.type === "playlist") return context.id ? String(context.id) : null;
+  if (context?.type === "collection" && context.id && context.playlistLoopId === String(context.id)) return String(context.id);
+  // A filtered playlist's queue checkpoint retains its collection ID and track attribution.
+  return context?.type === "collection" && track?.tastePlaylistId === context.id ? context.id : null;
+}
+
+function serializePlaybackContext(context: PlaybackContextInfo | null): QueueCheckpoint["context"] {
+  if (!context) return null;
+  const id = String(context.id ?? "").slice(0, 1024);
+  return { type: String(context.type ?? "").slice(0, 80), id, name: String(context.name ?? "").slice(0, 500),
+    coverArt: typeof context.coverArt === "string" ? context.coverArt.slice(0, 2048) : null,
+    ...(context.type === "collection" && id && context.playlistLoopId === String(context.id) ? { playlistLoopId: id } : {}) };
+}
+
+function playlistTracksIn(state: QueueState<Song>, playlistId: string): Song[] {
+  return state.entries.map(({ track }) => track).filter((track) => track.tastePlaylistId === playlistId ||
+    (isMediaResumeContext(track.mediaResume) && track.mediaResume.type === "playlist" && track.mediaResume.mediaId === playlistId));
+}
+
+function mediaTracks(tracks: Song[], context: PlaybackContextInfo | null): Song[] {
+  const playlistId = playlistIdFor(context);
+  return tracks.map((track, trackIndex) => ({
+    ...track,
+    ...(playlistId ? { tastePlaylistId: playlistId } : {}),
+    mediaResume: context?.id && (context.type === "album" || context.type === "playlist") && isLibraryPlayable(track) ? {
+      type: context.type, mediaId: String(context.id), title: context.name,
+      trackIndex, trackCount: tracks.length, occurrenceId: typeof track.playlistItemId === "string" ? track.playlistItemId : null,
+    } : undefined,
+  }));
+}
+
+async function lookupEndlessTracks<T>(load: (signal: AbortSignal) => Promise<T>): Promise<T | undefined> {
+  const controller = new AbortController();
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => load(controller.signal)).catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        timer = window.setTimeout(() => {
+          controller.abort();
+          resolve(undefined);
+        }, ENDLESS_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function asEndlessTrack(track: Song): Song {
+  return { ...track, autoplayGenerated: true, albumPlaybackId: undefined, albumTrackIndex: undefined, mediaResume: undefined };
+}
+
+function reshuffledPlaylistOrder(tracks: Song[], previous: Song[]): number[] {
+  const shuffled = shuffleUpcoming(tracks.map((_, index) => index), -1, randomValues(tracks.length - 1));
+  const occurrence = (track: Song) => track.playlistItemId ?? track.mediaResume?.occurrenceId ?? track.id;
+  if (shuffled.length > 1 && previous.length === shuffled.length &&
+      shuffled.every((trackIndex, index) => occurrence(tracks[trackIndex]) === occurrence(previous[index]))) {
+    return [...shuffled.slice(1), shuffled[0]];
+  }
+  return shuffled;
 }
 
 /**
@@ -456,6 +525,17 @@ const PlayerContext = createContext<PlayerContextValue | null>(null);
 const InactivePlayerContext = createContext<PlayerContextValue | null>(null);
 
 export function PlayerProvider({ children }: { children?: ReactNode }) {
+  const [features] = useState(() => ({
+    remoteControl: playbackFeatureEnabled("remoteControl"),
+    streamInspection: playbackFeatureEnabled("streamInspection"),
+    serverNormalization: playbackFeatureEnabled("serverNormalization"),
+    queueCloudSync: playbackFeatureEnabled("queueCloudSync"),
+    mediaSessions: playbackFeatureEnabled("mediaSessions"),
+    listeningEvents: playbackFeatureEnabled("listeningEvents"),
+    silenceTrimming: playbackFeatureEnabled("silenceTrimming"),
+    autoplayRecommendations: playbackFeatureEnabled("autoplayRecommendations"),
+    audioEffects: playbackFeatureEnabled("audioEffects"),
+  }));
   const { isAuthenticated, isLoading: authIsLoading, session } = useAuth() as unknown as AuthState;
   const sessionId = session?.id ?? null;
   // The remembered collection permits local reads without granting server access.
@@ -491,6 +571,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const [isReplayGainEnabled, setIsReplayGainEnabled] = useState(
     () => readStored("playerNormalizationEnabled", "ReplayGain preference") !== "false"
   );
+  const replayGainActive = (features.audioEffects || features.serverNormalization) && isReplayGainEnabled;
   const [normalizationTarget, setNormalizationTarget] = useState<number>(DEFAULT_LOUDNESS_TARGET);
 
   const [layoutDensity, setLayoutDensity] = useState<LayoutDensity>(() =>
@@ -502,10 +583,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const [autoOpenSidebar, setAutoOpenSidebar] = useState(
     () => readStored("playerAutoOpenSidebar", "auto-open sidebar preference") === "true"
   );
-  const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(() => {
-    const saved = readStored("playerAutoplayEnabled", "autoplay preference");
-    return saved === null ? true : saved === "true";
-  });
+  const [isEndlessPlaybackEnabled, setIsEndlessPlaybackEnabled] = useState(
+    () => readStored("playerAutoplayEnabled", "endless playback preference") === "true"
+  );
+  const endlessRef = useRef(isEndlessPlaybackEnabled);
+  const endlessVersionRef = useRef(0);
   const [autoDownloadLiked, setAutoDownloadLiked] = useState(
     () => readStored("playerAutoDownloadLiked", "auto-download preference") === "true"
   );
@@ -519,10 +601,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const transitionModeRef = useRef(transitionMode);
   const crossfadeDurationRef = useRef(crossfadeDuration);
   const streamQualityRef = useRef(streamQuality);
-  const replayGainEnabledRef = useRef(isReplayGainEnabled);
+  const replayGainEnabledRef = useRef(replayGainActive);
   const normalizationTargetRef = useRef<number>(DEFAULT_LOUDNESS_TARGET);
-  const autoplayRef = useRef(isAutoplayEnabled);
-  autoplayRef.current = isAutoplayEnabled;
 
   // ------------------------------------------------------------ UI state
 
@@ -612,7 +692,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     return () => { shuffleHistoryRef.current = { userId: null, plays: [], entryId: null }; };
   }, [sessionId]);
 
+  const transferTransaction = useRef<{ signal: AbortSignal; rollback: () => void } | null>(null);
+  const [stagingTransfer, setStagingTransfer] = useState(false);
+  const mediaTrackerRef = useRef<ReturnType<typeof createMediaSessionTracker> | null>(null);
   const recordShufflePlay = useCallback((entry: QueueEntry<Song>) => {
+    if (transferTransaction.current) return;
     const history = shuffleHistoryRef.current;
     if (!history.userId || history.entryId === entry.entryId) return;
     const now = Date.now();
@@ -648,12 +732,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }, []);
 
   const engine = usePlaybackEngine({
-    transitionMode: engineTransitionMode(transitionMode),
-    albumAware: isAlbumAware,
+    transitionMode: features.audioEffects ? engineTransitionMode(transitionMode) : "off",
+    albumAware: features.audioEffects && isAlbumAware,
     crossfadeSeconds: crossfadeDuration,
     volume: perceptualVolumeToGain(volume),
     createAudioElement,
-    ...(desktop ? { audioContext: null } : {}),
+    ...(desktop || !features.audioEffects ? { audioContext: null } : {}),
   });
   const engineRef = useRef<PlaybackEngine | null>(engine);
   engineRef.current = engine;
@@ -664,7 +748,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const sourceCacheRef = useRef(new Map<string, ResolvedAudio>());
   /** Latest linear level per entry; reloads (repeat, normalization toggle) reuse it. */
   const gainByEntryRef = useRef(new Map<string, number>());
-  const trimByEntryRef = useRef(new Map<string, TrimBounds>());
+  const trimByEntryRef = useRef(new Map<string, SilenceTrim>());
   const bindingsRef = useRef(new Map<string, NormalizationBinding>());
   const normalizationRequestsRef = useRef(new Map<string, NormalizationRequest>());
   const normalizationControllersRef = useRef(new Set<AbortController>());
@@ -697,22 +781,26 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   function normalizationInfo(song: Song, source: unknown, previewUrl: string | null): Omit<ResolvedAudio, "url"> & {
     streamUrl?: string;
   } {
+    if (!features.serverNormalization) return { normalized: false };
     if (offlineDownloadEngine.getSnapshot().tracks.some((track) => track.track_id === String(song.id) && track.status === "verified")) return { normalized: false };
     if (!replayGainEnabledRef.current || albumPlayback(song) || streamQualityRef.current === "direct") return { normalized: false };
     const result = cachedNormalization(normalizationKey(song, source, previewUrl));
     if (result?.status === "ready" && typeof result.streamUrl === "string" && NORMALIZED_STREAM.test(result.streamUrl)) {
-      return { normalized: true, loudness: validLoudness(result), streamUrl: result.streamUrl };
+      return { normalized: true, loudness: validLoudness(result), originalLoudness: validLoudness(result.loudness),
+        gainDb: result.gainDb, streamUrl: result.streamUrl };
     }
     return { normalized: false, gainDb: result?.gainDb };
   }
 
+  function originalPlaybackUrl(song: Song, source: unknown, previewUrl: string | null): string {
+    return previewUrl
+      ? `/api/playback/preview?url=${encodeURIComponent(previewUrl)}`
+      : initialPlaybackUrl(String(getStreamUrl(song.id, source, streamQualityRef.current)), features.streamInspection);
+  }
+
   function resolvePlaybackAudio(song: Song, source: unknown, previewUrl: string | null): ResolvedAudio {
     const { streamUrl, ...info } = normalizationInfo(song, source, previewUrl);
-    if (streamUrl) return { ...info, url: streamUrl };
-    const original = previewUrl
-      ? `/api/playback/preview?url=${encodeURIComponent(previewUrl)}`
-      : String(getStreamUrl(song.id, source, streamQualityRef.current));
-    return { ...info, url: original };
+    return { ...info, url: streamUrl ?? originalPlaybackUrl(song, source, previewUrl) };
   }
 
   /**
@@ -724,11 +812,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (resolved) return resolved;
     const { source, previewUrl } = songSource(entry.track);
     resolved = resolvePlaybackAudio(entry.track, source, previewUrl);
-    if (resolved.url.startsWith("/api/tracks/")) {
-      const url = new URL(resolved.url, window.location.origin);
-      url.searchParams.set("inspectionId", createPlaybackSessionId());
-      resolved.url = url.pathname + url.search;
-    }
     sourceCacheRef.current.set(entry.entryId, resolved);
     const binding = bindingsRef.current.get(entry.entryId);
     if (resolved.normalized) {
@@ -763,6 +846,26 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       : replayGainLevel(replayGainMetadata(entry.track));
   }
 
+  function recoverOriginal(entry: QueueEntry<Song>, prepared: ResolvedAudio): { src: string; gain: number } {
+    const { source, previewUrl } = songSource(entry.track);
+    const key = normalizationKey(entry.track, source, previewUrl);
+    if (cachedNormalization(key)?.streamUrl === prepared.url) normalizationCacheRef.current.delete(key);
+    const original = {
+      url: originalPlaybackUrl(entry.track, source, previewUrl),
+      normalized: false,
+      gainDb: loudnessGainDb(prepared.originalLoudness, normalizationTargetRef.current) ?? prepared.gainDb,
+    };
+    const binding = bindingsRef.current.get(entry.entryId);
+    if (binding) {
+      binding.normalized = false;
+      binding.measurement = prepared.originalLoudness;
+    }
+    const gain = initialLevel(entry, original);
+    sourceCacheRef.current.set(entry.entryId, original);
+    gainByEntryRef.current.set(entry.entryId, gain);
+    return { src: resolveDesktopApiUrl(original.url), gain };
+  }
+
   const toPlayable = (entry: QueueEntry<Song>): PlayableTrack => {
     const resolved = resolvedFor(entry);
     const gain = gainByEntryRef.current.get(entry.entryId) ?? initialLevel(entry, resolved);
@@ -780,10 +883,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       albumPlaybackId: albumPlayback(entry.track) ? entry.track.albumPlaybackId : undefined,
       albumTrackIndex: albumPlayback(entry.track) ? entry.track.albumTrackIndex : undefined,
       src: resolveDesktopApiUrl(resolved.url),
+      ...(resolved.normalized ? { normalizedFallback: () => recoverOriginal(entry, resolved) } : {}),
       gain,
-      trimStart: albumPlayback(entry.track) ? 0 : trim?.leading ?? 0,
       // A preview is only a fragment of the recording: the engine ends it here.
-      trimEnd: preview ? PREVIEW_DURATION_SECONDS : albumPlayback(entry.track) ? null : trim?.end ?? null,
+      trimEnd: preview ? PREVIEW_DURATION_SECONDS : null,
+      silenceTrim: preview || albumPlayback(entry.track) ? null : trim ?? null,
       durationHint: songDurationHint(entry.track),
     };
   };
@@ -829,6 +933,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     engine, trackId: currentSong ? String(currentSong.id) : null,
     streamUrl: resolvedCurrentAudio?.url ?? null, userId: isAuthenticated ? sessionId : null,
     preview: isPreview, serverNormalized: resolvedCurrentAudio?.normalized ?? false,
+    enabled: features.streamInspection,
   });
 
   /** Engine position when it is playing this entry; otherwise the last known UI position. */
@@ -847,35 +952,33 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const checkpointOwnerRef = useRef(sessionId);
   checkpointOwnerRef.current = isAuthenticated ? sessionId : null;
   useEffect(() => {
-    if (!engine || !isAuthenticated || !sessionId) return;
+    if (!features.mediaSessions || !engine || !isAuthenticated || !sessionId) return;
     const controllers = new Set<AbortController>();
     const tracker = createMediaSessionTracker({
       engine,
-      getTrack: (key) => stateRef.current.entries.find((entry) => entry.entryId === key)?.track,
+      getTrack: (key) => transferTransaction.current ? undefined
+        : stateRef.current.entries.find((entry) => entry.entryId === key)?.track,
       save: async (input: MediaCheckpointInput) => {
         if (checkpointOwnerRef.current !== sessionId) return;
         const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 15_000);
         controllers.add(controller);
         try {
           const result: { checkpoint: MediaCheckpoint | null } = await saveMediaCheckpoint(input, controller.signal);
           if (checkpointOwnerRef.current === sessionId && !controller.signal.aborted) {
-            setPlaybackMessage((message) => message === CHECKPOINT_SYNC_MESSAGE ? "" : message);
             window.dispatchEvent(new CustomEvent(MEDIA_CHECKPOINT_CHANGED, { detail: { userId: sessionId, checkpoint: result.checkpoint, input } }));
           }
-        } finally { controllers.delete(controller); }
-      },
-      onError: (error) => {
-        if (checkpointOwnerRef.current !== sessionId) return;
-        console.error("Could not sync listening checkpoint:", error);
-        setPlaybackMessage(CHECKPOINT_SYNC_MESSAGE);
+        } finally { window.clearTimeout(timeout); controllers.delete(controller); }
       },
     });
+    mediaTrackerRef.current = tracker;
     return () => {
+      if (mediaTrackerRef.current === tracker) mediaTrackerRef.current = null;
       const sameAccount = checkpointOwnerRef.current === sessionId;
       if (!sameAccount) controllers.forEach((controller) => controller.abort());
       tracker.destroy({ flushPending: sameAccount });
     };
-  }, [engine, isAuthenticated, sessionId]);
+  }, [engine, features.mediaSessions, isAuthenticated, sessionId]);
 
   // ------------------------------------------------------------ listening tracker
 
@@ -919,10 +1022,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }
 
   useEffect(() => {
-    if (!isAuthenticated || !sessionId) return undefined;
+    if (!features.listeningEvents || !isAuthenticated || !sessionId) return undefined;
+    let storage: Storage | undefined;
+    try { storage = window.sessionStorage; } catch { /* Reporting can use its in-memory outbox. */ }
     const tracker = createListeningTracker({
       userId: sessionId,
-      storage: window.sessionStorage,
+      storage,
       report: reportPlaybackSession,
       onCounted: undefined,
       onTasteExcluded: (payload: { trackId: string; startedAt: string; reportedAt?: string }, isActive: boolean) => {
@@ -936,9 +1041,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         excludeFromTaste: tasteProfileStore.excludes(song), playlistId: typeof song.tastePlaylistId === "string" ? song.tastePlaylistId : null }),
     }) as ListeningTracker;
     listeningSessionRef.current = tracker;
-    Promise.resolve(getListeningConfig())
+    Promise.resolve().then(() => getListeningConfig())
       .then((config: { thresholdSeconds: number }) => tracker.setThreshold(config.thresholdSeconds))
-      .catch((error: unknown) => console.error("Could not load listening threshold; using 30 seconds:", error));
+      .catch(() => undefined);
     const flush = () => tracker.flush();
     window.addEventListener("pagehide", flush);
     return () => {
@@ -947,7 +1052,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       window.removeEventListener("pagehide", flush);
       if (listeningSessionRef.current === tracker) listeningSessionRef.current = null;
     };
-  }, [isAuthenticated, sessionId]);
+  }, [features.listeningEvents, isAuthenticated, sessionId]);
 
   // A new load or a new entry closes the previous listening session; playing a
   // library track (never a preview) opens one. The tracker reports the moment
@@ -961,10 +1066,10 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       if (tracked.entryId !== null) tracker?.finish();
       trackedLoadRef.current = { entryId: currentEntryId, sequence };
     }
-    if (!tracker || !isPlaying || !currentEntry || isPreview || !isLibraryPlayable(currentEntry.track)) return;
+    if (!tracker || stagingTransfer || transferTransaction.current || !isPlaying || !currentEntry || isPreview || !isLibraryPlayable(currentEntry.track)) return;
     tracker.begin(currentEntry.track, clockFor(currentEntry.entryId));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, currentEntryId, loadSequence, isPreview, isAuthenticated, sessionId]);
+  }, [isPlaying, currentEntryId, loadSequence, isPreview, isAuthenticated, sessionId, stagingTransfer]);
 
   // ------------------------------------------------------------ restore helpers
 
@@ -978,7 +1083,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     automaticallyResuming.current = false;
     resumeListenerCleanupRef.current?.();
     resumeListenerCleanupRef.current = null;
-    window.clearTimeout(restoreRef.current?.registryTimeout);
     restoreRef.current = null;
     setRestorePending(false);
   }, []);
@@ -986,7 +1090,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const attemptRestoredPlaybackRef = useRef<(restore: RestoreRequest) => void>(() => undefined);
   const restoredCheckpointTime = useRef(0);
   const remotePlayingElsewhere = useRef(false);
-  const remoteRegistryReady = useRef(false);
   const suppressedRestoreRevision = useRef<number | null>(null);
   const followingAccountQueue = useRef(false);
   attemptRestoredPlaybackRef.current = (restore: RestoreRequest) => {
@@ -1022,7 +1125,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   useEffect(() => () => {
     resumeListenerCleanupRef.current?.();
     resumeListenerCleanupRef.current = null;
-    window.clearTimeout(restoreRef.current?.registryTimeout);
     restoreRef.current = null;
   }, []);
 
@@ -1043,37 +1145,20 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           ? previous
           : { entryId: entry.entryId, audioDuration: snapshot.duration }
       );
-      clockFor(entry.entryId).duration = snapshot.duration;
-      applyTrailingTrim(entry.entryId, snapshot.duration);
+      if (features.listeningEvents) clockFor(entry.entryId).duration = snapshot.duration;
     }
     setCurrentTime(snapshot.position);
     const restore = restoreRef.current;
     if (restore && !restore.attempted && String(entry.track.id) === restore.trackId) {
       restore.attempted = true;
-      const owner = queueSyncClient.getSnapshot().owner;
-      let queueChecked = false;
-      const resume = (timedOut = false) => {
-        if (!restore.resumeWhenReady || !mountedRef.current || restoreRef.current !== restore) return;
-        if (!timedOut && (!queueChecked || !remoteRegistryReady.current)) return;
-        restore.resumeWhenReady = undefined;
-        window.clearTimeout(restore.registryTimeout);
-        const account = queueSyncClient.getSnapshot();
-        const peer = account.owner === owner && owner ? newestPeerQueue(account.sessions, queueDeviceId()) : undefined;
-        if (remotePlayingElsewhere.current || (peer && peer.checkpoint.capturedAt > restoredCheckpointTime.current)) {
-          suppressedRestoreRevision.current = stateRef.current.revision;
-          followingAccountQueue.current = true;
-          cancelRestoreResume();
-        } else attemptRestoredPlaybackRef.current(restore);
-      };
-      restore.resumeWhenReady = resume;
-      if (!owner || navigator.onLine === false) resume(true);
-      else {
-        restore.registryTimeout = window.setTimeout(() => resume(true), 2000);
-        void queueSyncClient.refresh().then(() => {
-          queueChecked = true;
-          resume();
-        });
-      }
+      const account = queueSyncClient.getSnapshot();
+      const peer = features.queueCloudSync && account.owner === checkpointOwnerRef.current
+        ? newestPeerQueue(account.sessions, queueDeviceId()) : undefined;
+      if (remotePlayingElsewhere.current || (peer && peer.checkpoint.capturedAt > restoredCheckpointTime.current)) {
+        suppressedRestoreRevision.current = stateRef.current.revision;
+        followingAccountQueue.current = true;
+        cancelRestoreResume();
+      } else attemptRestoredPlaybackRef.current(restore);
     }
   };
 
@@ -1126,8 +1211,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (loadRequest) cuedPositionRef.current = null;
   }, [loadRequest]);
 
-  const queueEndPendingRef = useRef(false);
+  const queueEndPendingRef = useRef<{ generation: number; loadSequence: number } | null>(null);
   const feedbackVersionRef = useRef(0);
+  const playlistPassRef = useRef<{ context: PlaybackContextInfo; tracks: Song[] | null; pending?: Promise<Song[]> } | null>(null);
+  const refillAttemptRef = useRef<{
+    generation: number; entryId: string; version: number; claimedAtEnd: boolean; pending: Promise<Song[]>;
+  } | null>(null);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -1142,63 +1231,158 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     engineRef.current?.pause();
     storeRef.current.stop();
     cuedPositionRef.current = null;
+    playlistPassRef.current = null;
     setPlaybackContext(null);
     setPlaybackUnavailable(false);
   }, [cancelRestoreResume]);
 
-  const continueAfterQueueEnd = useCallback(async (signal?: AbortSignal) => {
-    if (queueEndPendingRef.current || signal?.aborted) return;
-    const context = playbackContextRef.current;
-    const playlistId = context?.type === "playlist" ? String(context.id) : context?.playlistLoopId;
-    if (playlistId && loopPlaylistRef.current === playlistId) {
-      const index = stateRef.current.entries.findIndex(entry => entry.track.tastePlaylistId === playlistId);
-      if (index >= 0) {
-        storeRef.current.jumpToIndex(index);
-        return;
+  const preparePlaylistPass = useCallback((context: PlaybackContextInfo, playlistId: string) => {
+    const previous = playlistPassRef.current;
+    if (previous?.context === context) return previous;
+    const pass: NonNullable<typeof playlistPassRef.current> = { context, tracks: null };
+    pass.pending = lookupEndlessTracks(async (signal) => {
+      const playlist = await getPlaylist(playlistId, signal);
+      return mediaTracks(playlist?.entry ?? [], { ...context, type: "playlist", id: playlistId });
+    }).then((tracks) => {
+      pass.tracks = tracks ?? [];
+      return pass.tracks;
+    });
+    playlistPassRef.current = pass;
+    return pass;
+  }, []);
+
+  const prepareEndlessRefill = useCallback((state: QueueState<Song>, entry: QueueEntry<Song>) => {
+    const version = endlessVersionRef.current;
+    const previous = refillAttemptRef.current;
+    if (previous?.generation === state.generation && previous.entryId === entry.entryId && previous.version === version) return previous;
+    const isCurrent = () => mountedRef.current && endlessRef.current && endlessVersionRef.current === version &&
+      stateRef.current.generation === state.generation && currentEntryOf(stateRef.current)?.entryId === entry.entryId;
+    const refillCapacity = (current: QueueState<Song>, scheduled: readonly Song[] = []) => {
+      const queued = new Set(current.entries.map(({ track }) => String(track.id)));
+      // The recommendation append may still be waiting for a React render.
+      const pendingCount = scheduled.filter((track) => !queued.has(String(track.id))).length;
+      for (const track of scheduled) queued.add(String(track.id));
+      const upcoming = current.entries.length - current.currentIndex - 1;
+      return { queued, needed: Math.max(0, QUEUE_PREVIEW_SIZE - upcoming - pendingCount) };
+    };
+    const select = (results: unknown, libraryOnly: boolean, scheduled: readonly Song[] = []) => {
+      if (!Array.isArray(results)) return [];
+      const { queued, needed } = refillCapacity(stateRef.current, scheduled);
+      const candidates = results.filter((song: Song) => {
+        if (song?.id == null || queued.has(String(song.id)) ||
+            (libraryOnly ? !isLibraryPlayable(song) : unplayableReasonFor(song))) return false;
+        queued.add(String(song.id));
+        return true;
+      });
+      const ordered = shuffleEnabledRef.current && shuffleModeRef.current === "smart"
+        ? smartShuffle(candidates, { ...smartShuffleOptionsRef.current(), currentTrack: entry.track }).tracks : candidates;
+      const available = libraryOnly && !ordered.length ? candidates : ordered;
+      return available.slice(0, needed).map(asEndlessTrack);
+    };
+    const canRecommend = () => features.autoplayRecommendations && isLibraryPlayable(entry.track) &&
+      !tasteExcludedEntriesRef.current.has(entry.entryId) && !tasteProfileStore.getSnapshot().privateListening &&
+      !tasteProfileStore.excludes(entry.track);
+    const attempt = { generation: state.generation, entryId: entry.entryId, version,
+      claimedAtEnd: false, pending: Promise.resolve<Song[]>([]) };
+    refillAttemptRef.current = attempt;
+    attempt.pending = (async () => {
+      let recommendations: Song[] = [];
+      if (canRecommend()) {
+        const limit = refillCapacity(state).needed + 5;
+        const feedbackVersion = feedbackVersionRef.current;
+        const excludeIds = state.entries.map(({ track }) => track.id);
+        const taste = entry.track.tastePlaylistId ? { playlistId: String(entry.track.tastePlaylistId) } : {};
+        const results = await lookupEndlessTracks((signal) => getAutoplayTracks(entry.track.id, limit, excludeIds, taste, signal));
+        if (!isCurrent() || feedbackVersionRef.current !== feedbackVersion) return [];
+        recommendations = canRecommend() ? select(results, false) : [];
+        if (recommendations.length) {
+          if (attempt.claimedAtEnd || stateRef.current.repeatOne) return recommendations;
+          storeRef.current.append(recommendations, { dedupe: true, generation: attempt.generation });
+        }
       }
-    }
-    if (!autoplayRef.current || tasteExcludedEntriesRef.current.has(currentEntryOf(stateRef.current)?.entryId ?? "") || (tasteProfileStore.getSnapshot().owner === trackingUserRef.current && tasteProfileStore.getSnapshot().privateListening) || tasteProfileStore.excludes(currentEntryOf(stateRef.current)?.track)) {
-      stopAtQueueEnd();
+      if (!isCurrent()) return [];
+      const { queued, needed } = refillCapacity(stateRef.current, recommendations);
+      if (!needed) return [];
+      // Ask for extra candidates so queued tracks don't consume the remaining slots.
+      const limit = Math.min(100, needed + Math.max(5, queued.size));
+      const library = await lookupEndlessTracks((signal) => getRandomSongs(limit, signal));
+      return isCurrent() ? select(library, true, recommendations) : [];
+    })().catch(() => []);
+    return attempt;
+  }, [features.autoplayRecommendations]);
+
+  const continueAfterQueueEnd = useCallback(async (signal?: AbortSignal, manual = false) => {
+    const state = stateRef.current;
+    const pending = queueEndPendingRef.current;
+    if (signal?.aborted || (pending?.generation === state.generation && pending.loadSequence === state.loadSequence)) return;
+    const entry = currentEntryOf(state);
+    const context = playbackContextRef.current;
+    const playlistId = playlistIdFor(context, entry?.track);
+    const finishNormally = () => {
+      if (stateRef.current.repeatAll) storeRef.current.jumpToIndex(0);
+      else stopAtQueueEnd();
+    };
+    const playlistLoopActive = () => Boolean(playlistId && playlistId === loopPlaylistRef.current);
+    if ((!endlessRef.current && !playlistLoopActive()) || !entry || (state.repeatAll && !playlistId)) {
+      finishNormally();
       return;
     }
-    queueEndPendingRef.current = true;
-    const queueGeneration = stateRef.current.generation;
-    const feedbackVersion = feedbackVersionRef.current;
+
+    const continuation = { generation: state.generation, loadSequence: state.loadSequence };
+    queueEndPendingRef.current = continuation;
+    const version = endlessVersionRef.current;
+    const stillAtEnd = () => !signal?.aborted && mountedRef.current && stateRef.current.generation === state.generation &&
+      currentEntryOf(stateRef.current)?.entryId === entry.entryId && stateRef.current.loadSequence === state.loadSequence;
+    const advance = (action: () => void) => signal ? flushSync(action) : action();
     try {
-      const state = stateRef.current;
-      const seed = currentEntryOf(state)?.track ?? state.entries[state.entries.length - 1]?.track;
-      if (!seed) { stopAtQueueEnd(); return; }
-      const nextSongs = await autoplayTracksFor(seed, QUEUE_END_AUTOPLAY_COUNT, state.entries.map((entry) => entry.track.id));
-      if (signal?.aborted || !mountedRef.current || stateRef.current.generation !== queueGeneration) return;
-      if (!autoplayRef.current || feedbackVersionRef.current !== feedbackVersion || tasteProfileStore.excludes(seed) || tasteProfileStore.getSnapshot().privateListening) { stopAtQueueEnd(); return; }
-      if (!Array.isArray(nextSongs) || nextSongs.length === 0) {
-        stopAtQueueEnd();
-        return;
+      let tracks: Song[];
+      let shuffleOrder: number[] | undefined;
+      if (context && playlistId) {
+        const pass = preparePlaylistPass(context, playlistId);
+        const fullPlaylist = pass.tracks ?? await pass.pending ?? [];
+        if (!stillAtEnd()) return;
+        const previous = playlistTracksIn(stateRef.current, playlistId);
+        if (!fullPlaylist.length) playlistPassRef.current = null;
+        const canonical = fullPlaylist.length ? fullPlaylist : [...previous].sort((a, b) =>
+          (a.mediaResume?.trackIndex ?? 0) - (b.mediaResume?.trackIndex ?? 0));
+        tracks = canonical.filter((track) => !unplayableReasonFor(track));
+        if (shuffleEnabledRef.current) shuffleOrder = reshuffledPlaylistOrder(tracks, previous);
+      } else {
+        const local = state.entries.find(({ track }) => !sameSongId(track, entry.track) && isLibraryPlayable(track))?.track
+          ?? (isLibraryPlayable(entry.track) ? entry.track : null);
+        let attempt = refillAttemptRef.current;
+        if (attempt?.entryId !== entry.entryId || attempt.generation !== state.generation) attempt = null;
+        if (!local) attempt = prepareEndlessRefill(state, entry);
+        if (attempt) attempt.claimedAtEnd = true;
+        // Reuse a library track immediately if the network refill is still waiting.
+        tracks = local ? [asEndlessTrack(local)] : await attempt?.pending ?? [];
       }
-      const generated = shuffleEnabledRef.current && shuffleModeRef.current === "smart"
-        ? smartShuffle(nextSongs as Song[], smartShuffleOptionsRef.current()).tracks : nextSongs as Song[];
-      if (!generated.length) {
-        setPlaybackMessage("Smart Shuffle found no tracks outside the two-hour listening window.");
-        stopAtQueueEnd();
-        return;
-      }
-      if (signal) flushSync(() => storeRef.current.setQueue(generated, 0));
-      else storeRef.current.setQueue(generated, 0);
-    } catch (error) {
-      console.error("Could not generate local autoplay:", error);
-      if (!signal?.aborted && mountedRef.current && stateRef.current.generation === queueGeneration) {
-        setPlaybackMessage("Autoplay is unavailable. Please try again.");
-        stopAtQueueEnd();
-      }
+
+      if (!stillAtEnd()) return;
+      if (!manual && stateRef.current.repeatOne) { advance(() => storeRef.current.loadCurrent()); return; }
+      if (stateRef.current.repeatAll && !playlistId) { advance(finishNormally); return; }
+      if (!playlistLoopActive() && (!endlessRef.current || version !== endlessVersionRef.current)) { advance(finishNormally); return; }
+      if (upcomingEntryOf(stateRef.current)) { advance(() => storeRef.current.playNext()); return; }
+      if (!tracks.length) { advance(finishNormally); return; }
+      advance(() => {
+        if (playlistId) storeRef.current.setQueue(tracks, 0, { shuffleOrder });
+        else {
+          storeRef.current.append(tracks, { generation: state.generation });
+          storeRef.current.playNext();
+        }
+      });
+    } catch {
+      if (stillAtEnd()) advance(finishNormally);
     } finally {
-      queueEndPendingRef.current = false;
+      if (queueEndPendingRef.current === continuation) queueEndPendingRef.current = null;
     }
-  }, [stopAtQueueEnd]);
+  }, [prepareEndlessRefill, preparePlaylistPass, stopAtQueueEnd]);
 
   useEffect(() => {
     if (!engine) return undefined;
     const currentKey = () => currentEntryOf(stateRef.current)?.entryId ?? null;
     const unsubscribers = [
+      engine.on("silenceSkipped", ({ key }) => clocksRef.current.get(key)?.emit("seeked")),
       engine.on("timeUpdate", ({ key, position, duration: total }) => {
         const clock = clocksRef.current.get(key);
         if (clock) {
@@ -1221,12 +1405,13 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         const entry = state === "playing" ? stateRef.current.entries.find((candidate) => candidate.entryId === key) : null;
         if (entry) recordShufflePlay(entry);
       }),
-      engine.on("transitionCommit", ({ toKey }) => {
+      engine.on("transitionCommit", ({ fromKey, toKey }) => {
+        if (trackedLoadRef.current.entryId === fromKey) listeningSessionRef.current?.finish();
         const entry = stateRef.current.entries.find((candidate) => candidate.entryId === toKey);
         if (entry) recordShufflePlay(entry);
       }),
       engine.on("trackEnd", ({ key }) => {
-        listeningSessionRef.current?.finish();
+        if (trackedLoadRef.current.entryId === key) listeningSessionRef.current?.finish();
         const state = stateRef.current;
         const entry = currentEntryOf(state);
         if (!entry || entry.entryId !== key || state.repeatOne) return;
@@ -1313,7 +1498,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     previewUrl: string | null,
     listener?: (result: NormalizationResult) => void
   ): Promise<NormalizationResult | undefined> {
-    if (streamQualityRef.current === "direct") return Promise.resolve(undefined);
+    if (!features.serverNormalization || streamQualityRef.current === "direct") return Promise.resolve(undefined);
     const key = normalizationKey(song, source, previewUrl);
     const target = normalizationTargetRef.current;
     const cached = cachedNormalization(key);
@@ -1392,6 +1577,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         streamQualityRef.current === "direct" ||
         albumPlayback(binding.song) ||
         target !== normalizationTargetRef.current ||
+        sourceCacheRef.current.get(entryId)?.normalized ||
         typeof result.gainDb !== "number" ||
         !Number.isFinite(result.gainDb)
       ) {
@@ -1407,7 +1593,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           gainByEntryRef.current.set(entryId, 1);
           return;
         }
-        if (upgradeUpcomingStream(entryId, binding, result.streamUrl)) return;
+        if (upgradeUpcomingStream(entryId, binding, result, result.streamUrl)) return;
       }
       applyLevel(entryId, decibelsToLevel(result.gainDb));
     });
@@ -1419,15 +1605,18 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
    * prepared; once a transition into the entry has begun, the measured gain is
    * applied to the original stream instead.
    */
-  function upgradeUpcomingStream(entryId: string, binding: NormalizationBinding, streamUrl: string): boolean {
+  function upgradeUpcomingStream(entryId: string, binding: NormalizationBinding, result: NormalizationResult, streamUrl: string): boolean {
     const activeEngine = engineRef.current;
     const upcoming = upcomingEntryOf(stateRef.current);
     if (!activeEngine || upcoming?.entryId !== entryId) return false;
     const snapshot = activeEngine.getSnapshot();
     if (snapshot.key === entryId || snapshot.transition !== null) return false;
-    sourceCacheRef.current.set(entryId, { url: streamUrl, normalized: true, loudness: binding.measurement });
+    const loudness = validLoudness(result);
+    sourceCacheRef.current.set(entryId, { url: streamUrl, normalized: true, loudness,
+      originalLoudness: validLoudness(result.loudness), gainDb: result.gainDb });
     gainByEntryRef.current.set(entryId, 1);
     binding.normalized = true;
+    binding.measurement = loudness;
     activeEngine.setUpcoming(toPlayable(upcoming));
     return true;
   }
@@ -1479,14 +1668,14 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   useEffect(() => () => abortNormalization(), [abortNormalization]);
 
   // Source and gain policy change together, preserving the live position and pause state.
-  const previousProcessingRef = useRef({ normalization: isReplayGainEnabled, album: isAlbumAware, shuffle: isShuffleEnabled });
+  const previousProcessingRef = useRef({ normalization: replayGainActive, album: isAlbumAware, shuffle: isShuffleEnabled });
   useEffect(() => {
-    replayGainEnabledRef.current = isReplayGainEnabled;
+    replayGainEnabledRef.current = replayGainActive;
     const previous = previousProcessingRef.current;
-    previousProcessingRef.current = { normalization: isReplayGainEnabled, album: isAlbumAware, shuffle: isShuffleEnabled };
-    const normalizationChanged = previous.normalization !== isReplayGainEnabled;
-    const albumChanged = previous.album !== isAlbumAware ||
-      ((previous.album || isAlbumAware) && previous.shuffle !== isShuffleEnabled);
+    previousProcessingRef.current = { normalization: replayGainActive, album: isAlbumAware, shuffle: isShuffleEnabled };
+    const normalizationChanged = previous.normalization !== replayGainActive;
+    const albumChanged = (features.audioEffects || features.serverNormalization) && (previous.album !== isAlbumAware ||
+      ((previous.album || isAlbumAware) && previous.shuffle !== isShuffleEnabled));
     if (!normalizationChanged && !albumChanged) return;
     if (!normalizationChanged &&
       !stateRef.current.entries.some((entry) => typeof entry.track.albumPlaybackId === "string")) return;
@@ -1501,16 +1690,16 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       engineRef.current?.setUpcoming(upcoming ? toPlayable(upcoming) : null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isReplayGainEnabled, isAlbumAware, isShuffleEnabled, abortNormalization]);
+  }, [replayGainActive, isAlbumAware, isShuffleEnabled, abortNormalization]);
 
   useEffect(() => {
     for (const entry of [currentEntry, upcomingEntry]) if (entry) bindNormalization(entry);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentEntry, upcomingEntry, isReplayGainEnabled, isAlbumAware, isShuffleEnabled, streamQuality]);
+  }, [currentEntry, upcomingEntry, replayGainActive, isAlbumAware, isShuffleEnabled, streamQuality]);
 
   // Warm the next tracks while playing so their loudness is ready in time.
   useEffect(() => {
-    if (!isAuthenticated || !isPlaying || !isReplayGainEnabled || currentIndex < 0) return undefined;
+    if (!features.serverNormalization || !isAuthenticated || !isPlaying || !isReplayGainEnabled || currentIndex < 0) return undefined;
     let cancelled = false;
     (async () => {
       for (const song of queue.slice(currentIndex + 1, currentIndex + 1 + NORMALIZATION_PREWARM_COUNT)) {
@@ -1532,7 +1721,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
 
   const silenceAnalysisRequestsRef = useRef(new Map<string, Promise<unknown>>());
   /** entryId → analysis parameters it was requested with. */
-  const trimRequestsRef = useRef(new Map<string, string>());
+  const trimRequestsRef = useRef(new Map<string, { parametersKey: string }>());
 
   function getOrAnalyzeSilence(song: Song, parameters: { thresholdDb: number; minSilenceSeconds: number }) {
     const trackId = String(song.id);
@@ -1541,7 +1730,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (pending) return pending;
     const request = (async () => {
       const saved = await getSilenceAnalysis(trackId, parameters);
-      if (saved?.status === "completed") return saved;
+      if (matchesSilenceProfile(saved, parameters)) return saved;
       return analyzeSilence(trackId, parameters);
     })();
     silenceAnalysisRequestsRef.current.set(key, request);
@@ -1549,26 +1738,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       .finally(() => {
         if (silenceAnalysisRequestsRef.current.get(key) === request) silenceAnalysisRequestsRef.current.delete(key);
       })
-      .catch(() => {
-        // The caller logs analysis failures.
-      });
+      .catch(() => undefined);
     return request;
-  }
-
-  /** Trailing silence is stored as a length; it becomes an end point once the duration is known. */
-  function applyTrailingTrim(entryId: string, knownDuration: number): void {
-    const bounds = trimByEntryRef.current.get(entryId);
-    if (!bounds || bounds.trailing <= 0 || bounds.end !== null || !(knownDuration > bounds.trailing)) return;
-    const end = knownDuration - bounds.trailing;
-    trimByEntryRef.current.set(entryId, { ...bounds, end });
-    engineRef.current?.updateTrack(entryId, { trimEnd: end });
   }
 
   useEffect(() => {
     const activeEngine = engineRef.current;
-    if (!silenceTrimSettings.enabled) {
+    if (!isAuthenticated || !features.silenceTrimming || !silenceTrimSettings.enabled) {
       for (const entryId of Array.from(trimByEntryRef.current.keys())) {
-        activeEngine?.updateTrack(entryId, { trimStart: 0, trimEnd: null });
+        activeEngine?.updateTrack(entryId, { silenceTrim: null });
       }
       trimByEntryRef.current.clear();
       trimRequestsRef.current.clear();
@@ -1579,86 +1757,90 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       minSilenceSeconds: silenceTrimSettings.minSilenceSeconds,
     };
     const parametersKey = JSON.stringify(parameters);
+    function applyTrim(entryId: string, result: SilenceAnalysis) {
+      const leading = result.leadingSilenceSeconds ?? 0;
+      const trailing = result.trailingSilenceSeconds ?? 0;
+      if (!Number.isFinite(leading) || !Number.isFinite(trailing) || leading < 0 || trailing < 0) return;
+      const duration = Number(result.durationSeconds);
+      const silenceTrim = leading === 0 && trailing === 0 ? null : {
+        leading, trailing, analyzedDuration: Number.isFinite(duration) && duration > 0 ? duration : undefined,
+      };
+      if (silenceTrim) trimByEntryRef.current.set(entryId, silenceTrim);
+      else trimByEntryRef.current.delete(entryId);
+      engineRef.current?.updateTrack(entryId, { silenceTrim });
+    }
+    const eligibleEntries: Array<NonNullable<typeof currentEntry>> = [];
     for (const entry of [currentEntry, upcomingEntry]) {
       if (entry && albumPlayback(entry.track)) {
-        trimByEntryRef.current.delete(entry.entryId);
+        if (trimByEntryRef.current.delete(entry.entryId)) {
+          activeEngine?.updateTrack(entry.entryId, { silenceTrim: null });
+        }
         trimRequestsRef.current.delete(entry.entryId);
-        activeEngine?.updateTrack(entry.entryId, { trimStart: 0, trimEnd: null });
         continue;
       }
-      if (!entry || trimRequestsRef.current.get(entry.entryId) === parametersKey) continue;
+      if (!entry) continue;
       const { library, previewUrl } = songSource(entry.track);
       if (!library || previewUrl) continue;
-      trimRequestsRef.current.set(entry.entryId, parametersKey);
+      eligibleEntries.push(entry);
+      if (trimRequestsRef.current.get(entry.entryId)?.parametersKey === parametersKey) continue;
+      if (trimByEntryRef.current.delete(entry.entryId)) {
+        activeEngine?.updateTrack(entry.entryId, { silenceTrim: null });
+      }
       const { entryId } = entry;
+      const request = { parametersKey };
+      trimRequestsRef.current.set(entryId, request);
       getOrAnalyzeSilence(entry.track, parameters)
         .then((analysis) => {
-          const result = analysis as {
-            status?: string;
-            leadingSilenceSeconds?: number;
-            trailingSilenceSeconds?: number;
-            durationSeconds?: number | null;
-          } | null;
-          if (!mountedRef.current || trimRequestsRef.current.get(entryId) !== parametersKey) return;
-          if (!result || result.status !== "completed") return;
-          const leading = Math.max(0, Number(result.leadingSilenceSeconds) || 0);
-          const trailing = Math.max(0, Number(result.trailingSilenceSeconds) || 0);
-          trimByEntryRef.current.set(entryId, { leading, trailing, end: null });
-          // Arriving after playback started skips the leading silence immediately.
-          engineRef.current?.updateTrack(entryId, { trimStart: leading });
-          const snapshot = engineRef.current?.getSnapshot();
-          const knownDuration =
-            Number(result.durationSeconds) > 0
-              ? Number(result.durationSeconds)
-              : snapshot?.key === entryId && snapshot.duration > 0
-                ? snapshot.duration
-                : 0;
-          if (knownDuration > 0) applyTrailingTrim(entryId, knownDuration);
+          if (!mountedRef.current || trimRequestsRef.current.get(entryId) !== request) return;
+          const result = analysis as SilenceAnalysis | null;
+          if (matchesSilenceProfile(result, parameters)) applyTrim(entryId, result);
         })
-        .catch((error: unknown) => {
-          console.warn("Could not analyze silence for track:", entry.track.id, error);
-        });
+        .catch(() => undefined);
     }
+
+    function handleSilenceAnalyzed(event: Event) {
+      const detail = (event as CustomEvent<{ trackId: string; analysis: SilenceAnalysis }>).detail;
+      if (!detail || !matchesSilenceProfile(detail.analysis, parameters)) return;
+      for (const entry of eligibleEntries) {
+        if (String(entry.track.id) !== String(detail.trackId)) continue;
+        trimRequestsRef.current.set(entry.entryId, { parametersKey });
+        applyTrim(entry.entryId, detail.analysis);
+      }
+    }
+    window.addEventListener(SILENCE_ANALYZED_EVENT, handleSilenceAnalyzed);
+    return () => window.removeEventListener(SILENCE_ANALYZED_EVENT, handleSilenceAnalyzed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [silenceTrimSettings, currentEntry, upcomingEntry, isAlbumAware, isShuffleEnabled]);
+  }, [isAuthenticated, features.silenceTrimming, silenceTrimSettings, currentEntry, upcomingEntry, isAlbumAware, isShuffleEnabled]);
 
   // ------------------------------------------------------------ auto-refill
 
-  // Once two or fewer tracks remain after the current one, append related
-  // tracks in the background. One attempt per queue generation and position,
-  // and appends are dropped if the queue was replaced meanwhile.
+  // Prepare the next tracks before the active deck finishes.
   const upcomingCount = currentIndex < 0 ? 0 : entries.length - currentIndex - 1;
-  const refillAttemptRef = useRef("");
   useEffect(() => {
-    if (!isAuthenticated || !isAutoplayEnabled || !isPlaying || currentIndex < 0) return;
-    if (tasteExcludedEntriesRef.current.has(currentEntryOf(stateRef.current)?.entryId ?? "") || tasteProfileStore.getSnapshot().privateListening || tasteProfileStore.excludes(currentEntryOf(stateRef.current)?.track)) return;
-    if (upcomingCount > REFILL_TRIGGER_UPCOMING) return;
-    const attempt = `${generation}:${currentIndex}`;
-    if (refillAttemptRef.current === attempt) return;
-    refillAttemptRef.current = attempt;
-    const needed = REFILL_TARGET_UPCOMING - upcomingCount;
-    const feedbackVersion = feedbackVersionRef.current;
-    const snapshot = stateRef.current;
-    const seed = currentEntryOf(snapshot)?.track;
-    if (!seed) return;
-    Promise.resolve(autoplayTracksFor(seed, needed + 5, snapshot.entries.map((entry) => entry.track.id)))
-      .then((nextSongs: unknown) => {
-        const latest = stateRef.current;
-        if (!mountedRef.current || !autoplayRef.current || latest.generation !== generation || feedbackVersionRef.current !== feedbackVersion || tasteProfileStore.getSnapshot().privateListening || tasteProfileStore.excludes(seed) || !Array.isArray(nextSongs)) return;
-        const existing = new Set(latest.entries.map((entry) => String(entry.track.id)));
-        const candidates = (nextSongs as Song[]).filter((song) => song?.id != null && !existing.has(String(song.id)));
-        const additions = (shuffleEnabledRef.current && shuffleModeRef.current === "smart"
-          ? smartShuffle(candidates, { ...smartShuffleOptionsRef.current(), currentTrack: currentEntryOf(latest)?.track }).tracks
-          : candidates).slice(0, needed);
-        if (additions.length) storeRef.current.append(additions, { dedupe: true, generation });
-      })
-      .catch((error: unknown) => {
-        console.error("Could not refill queue:", error);
-        if (mountedRef.current && stateRef.current.generation === generation) {
-          setPlaybackMessage("Autoplay is unavailable. Your existing queue will keep playing.");
-        }
-      });
-  }, [isAuthenticated, isAutoplayEnabled, isPlaying, currentIndex, upcomingCount, generation]);
+    if (!loopPlaylistId || playlistIdFor(playbackContext, currentEntry?.track) !== loopPlaylistId) return;
+    const generated = entries.slice(currentIndex + 1).filter(({ track }) => track.autoplayGenerated).map(({ entryId }) => entryId);
+    if (generated.length) storeRef.current.removeEntries(generated);
+  }, [loopPlaylistId, playbackContext, currentEntry, entries, currentIndex]);
+  useEffect(() => {
+    if (!isAuthenticated || !isPlaying || !currentEntry || queueState.repeatOne) return;
+    const playlistId = playlistIdFor(playbackContext, currentEntry.track);
+    if (playlistId && playbackContext) {
+      if (isEndlessPlaybackEnabled || loopPlaylistId === playlistId) preparePlaylistPass(playbackContext, playlistId);
+      return;
+    }
+    if (!isEndlessPlaybackEnabled || queueState.repeatAll || upcomingCount > REFILL_TRIGGER_UPCOMING) return;
+    const previous = refillAttemptRef.current;
+    const attempt = prepareEndlessRefill(stateRef.current, currentEntry);
+    if (attempt === previous) return;
+    void attempt.pending.then((tracks) => {
+      if (mountedRef.current && !attempt.claimedAtEnd && endlessRef.current && endlessVersionRef.current === attempt.version &&
+          refillAttemptRef.current === attempt && !stateRef.current.repeatOne && !stateRef.current.repeatAll &&
+          currentEntryOf(stateRef.current)?.entryId === attempt.entryId && tracks.length) {
+        storeRef.current.append(tracks, { dedupe: true, generation: attempt.generation });
+      }
+    });
+  }, [isAuthenticated, isEndlessPlaybackEnabled, isPlaying, currentEntry, upcomingCount, generation,
+    queueState.repeatOne, queueState.repeatAll, loopPlaylistId, playbackContext, prepareEndlessRefill, preparePlaylistPass]);
 
   useEffect(() => {
     const handleFeedback = (event: Event) => {
@@ -1686,6 +1868,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const detail = (event as CustomEvent<{ trackIds?: unknown[] }>).detail;
       const ids = new Set((detail?.trackIds || []).map(String));
       const state = stateRef.current;
+      const pass = playlistPassRef.current;
+      if (ids.size && pass?.tracks) pass.tracks = pass.tracks.filter((track) => !ids.has(String(track.id)));
       if (!ids.size || !state.entries.some((entry) => ids.has(String(entry.track.id)))) return;
       const current = currentEntryOf(state);
       if (current && ids.has(String(current.track.id))) {
@@ -1705,19 +1889,21 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const queueCheckpoint = (): QueueCheckpoint => ({ index: stateRef.current.currentIndex, position: Math.max(0,
     cuedPositionRef.current?.trackId === String(currentEntryOf(stateRef.current)?.track.id) ? cuedPositionRef.current.seconds : positionOf(currentEntryOf(stateRef.current)?.entryId ?? null)),
     repeatOne: stateRef.current.repeatOne, shuffle: shuffleEnabledRef.current, shuffleSeed: stateRef.current.shuffleSeed,
+    ...(stateRef.current.repeatAll ? { repeatAll: true } : {}),
+    ...(loopPlaylistRef.current ? { loopPlaylistId: loopPlaylistRef.current } : {}),
     shuffleMode: shuffleModeRef.current, albumAware: isAlbumAware, volume, wasPlaying: isPlayingRef.current || restorePending,
-    context: playbackContext ? { type: playbackContext.type, id: playbackContext.id, name: playbackContext.name, coverArt: playbackContext.coverArt } : null, capturedAt: Date.now() });
+    context: serializePlaybackContext(playbackContext), capturedAt: Date.now() });
   const queueCheckpointRef = useRef(queueCheckpoint); queueCheckpointRef.current = queueCheckpoint;
   const applyQueuePreferences = (checkpoint: QueueCheckpoint) => {
     setIsShuffleEnabled(checkpoint.shuffle); shuffleEnabledRef.current = checkpoint.shuffle;
     shufflePreferenceVersionRef.current++; applyShuffleMode(checkpoint.shuffleMode);
-    changeAlbumAware(checkpoint.albumAware); storeRef.current.setRepeatOne(checkpoint.repeatOne);
+    changeAlbumAware(checkpoint.albumAware); storeRef.current.setRepeatMode(repeatModeOf(checkpoint));
+    loopPlaylistRef.current = checkpoint.loopPlaylistId ?? null; setLoopPlaylistId(loopPlaylistRef.current);
     changeVolume(checkpoint.volume); setPlaybackContext(checkpoint.context);
   };
-  const transferTransaction = useRef<{ signal: AbortSignal; rollback: () => void } | null>(null);
   const persistedQueue = usePersistentQueue(store, { ownerId: localQueueOwner,
     canPersist: () => !transferTransaction.current,
-    checkpointKey: `${Math.floor(currentTime)}:${volume}:${isShuffleEnabled}:${isAlbumAware}:${shuffleMode}:${restorePending}`,
+    checkpointKey: `${Math.floor(currentTime)}:${volume}:${isShuffleEnabled}:${isAlbumAware}:${shuffleMode}:${restorePending}:${loopPlaylistId ?? ""}`,
     getCheckpoint: () => queueCheckpointRef.current(), onError: setQueuePersistenceError, onReady: setHydratedQueueUserId,
     onRestore: saved => {
       const checkpoint = saved.head.checkpoint, song = saved.content.entries[checkpoint.index]?.track as Song | undefined;
@@ -1747,16 +1933,16 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   }, [desktop, engine, localQueueOwner, persistedQueue.ready]);
   useEffect(() => {
     const owner = isAuthenticated ? sessionId : null;
-    queueSyncClient.activate(owner);
+    queueSyncClient.activate(owner, features.queueCloudSync);
     queueSyncClient.bind(() => queuePersistenceRef.current.flush(), () => !followingAccountQueue.current && !transferTransaction.current);
     return () => { queueSyncClient.bind(null); queueSyncClient.activate(null); };
-  }, [isAuthenticated, sessionId]);
+  }, [features.queueCloudSync, isAuthenticated, sessionId]);
   useEffect(() => {
-    if (!isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
+    if (!features.queueCloudSync || !isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
     void queueSyncClient.sync({ ifChanged: true }).catch(() => undefined);
-  }, [isAuthenticated, sessionId, hydratedQueueUserId, isPlaying, restorePending, currentEntryId, isShuffleEnabled, queueState.repeatOne]);
+  }, [features.queueCloudSync, isAuthenticated, sessionId, hydratedQueueUserId, isPlaying, restorePending, currentEntryId, isShuffleEnabled, queueState.repeatOne, queueState.repeatAll, loopPlaylistId]);
   useEffect(() => {
-    if (!engine || !isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
+    if (!features.queueCloudSync || !engine || !isAuthenticated || !sessionId || hydratedQueueUserId !== sessionId || restorePending) return;
     let nextSync = performance.now() + 10_000;
     return engine.on("timeUpdate", ({ key }) => {
       if (!isPlayingRef.current || key !== currentEntryOf(stateRef.current)?.entryId) return;
@@ -1765,7 +1951,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       nextSync = now + 10_000;
       void queueSyncClient.sync({ ifChanged: true }).catch(() => undefined);
     });
-  }, [engine, isAuthenticated, sessionId, hydratedQueueUserId, restorePending]);
+  }, [engine, features.queueCloudSync, isAuthenticated, sessionId, hydratedQueueUserId, restorePending]);
   useEffect(() => {
     if (!localQueueOwner || hydratedQueueUserId !== localQueueOwner) return;
     const flush = () => {
@@ -1813,9 +1999,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     albumAwareRef.current = Boolean(enabled);
     albumPreferenceVersionRef.current++;
     setIsAlbumAware(Boolean(enabled));
-    engineRef.current?.setAlbumAware(Boolean(enabled));
+    if (features.audioEffects) engineRef.current?.setAlbumAware(Boolean(enabled));
     if (persist) writeStored("playerAlbumAware", String(Boolean(enabled)), "album-aware mode");
-  }, []);
+  }, [features.audioEffects]);
 
   const changeShuffleMode = useCallback((mode: ShuffleMode) => {
     if (!isShuffleMode(mode) || mode === shuffleModeRef.current) return;
@@ -1843,9 +2029,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     transitionModeRef.current = value;
     setTransitionMode(value);
     // Synchronous, so a transition planned on the next progress tick already uses it.
-    engineRef.current?.setTransitionMode(engineTransitionMode(value));
+    if (features.audioEffects) engineRef.current?.setTransitionMode(engineTransitionMode(value));
     writeStored("playerTransitionMode", value, "transition mode");
-  }, []);
+  }, [features.audioEffects]);
 
   const changeCrossfadeDuration = useCallback((value: number) => {
     const seconds = clampCrossfadeDuration(value);
@@ -1920,10 +2106,20 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     writeStored("playerAutoOpenSidebar", String(next), "auto-open sidebar preference");
   }
 
-  function changeAutoplayEnabled(value: boolean) {
+  function changeEndlessPlaybackEnabled(value: boolean) {
     const next = Boolean(value);
-    setIsAutoplayEnabled(next);
-    writeStored("playerAutoplayEnabled", String(next), "autoplay preference");
+    if (endlessRef.current !== next) {
+      endlessRef.current = next;
+      endlessVersionRef.current++;
+      setIsEndlessPlaybackEnabled(next);
+      if (!next) {
+        const state = stateRef.current;
+        const generated = state.entries.slice(state.currentIndex + 1)
+          .filter(({ track }) => track.autoplayGenerated).map(({ entryId }) => entryId);
+        if (generated.length) storeRef.current.removeEntries(generated);
+      }
+    }
+    writeStored("playerAutoplayEnabled", String(next), "endless playback preference");
   }
 
   function changeAutoDownloadLiked(value: boolean) {
@@ -1941,15 +2137,16 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (full || settings["playback.normalization.targetLufs"] !== undefined) {
       changeNormalizationTarget(Number(settings["playback.normalization.targetLufs"] ?? DEFAULT_LOUDNESS_TARGET));
     }
-    if (full) {
+    const trimEnabled = settings["playback.silenceTrim.enabled"];
+    const trimThreshold = settings["playback.silenceTrim.thresholdDb"];
+    const trimMinimum = settings["playback.silenceTrim.minSilenceSeconds"];
+    if (full || trimEnabled !== undefined || trimThreshold !== undefined || trimMinimum !== undefined) {
       setSilenceTrimSettings((current) => ({
-        enabled: Boolean(settings["playback.silenceTrim.enabled"]),
-        thresholdDb: typeof settings["playback.silenceTrim.thresholdDb"] === "number"
-          ? settings["playback.silenceTrim.thresholdDb"] as number
-          : current.thresholdDb,
-        minSilenceSeconds: typeof settings["playback.silenceTrim.minSilenceSeconds"] === "number"
-          ? settings["playback.silenceTrim.minSilenceSeconds"] as number
-          : current.minSilenceSeconds,
+        enabled: typeof trimEnabled === "boolean" ? trimEnabled : full ? false : current.enabled,
+        thresholdDb: typeof trimThreshold === "number" && Number.isFinite(trimThreshold)
+          ? Math.max(-100, Math.min(0, trimThreshold)) : full ? -35 : current.thresholdDb,
+        minSilenceSeconds: typeof trimMinimum === "number" && Number.isFinite(trimMinimum)
+          ? Math.max(0.1, Math.min(30, trimMinimum)) : full ? 0.5 : current.minSilenceSeconds,
       }));
     }
     const savedSeconds = settings["playback.crossfadeDuration"];
@@ -1970,15 +2167,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (typeof settings["playback.normalization.enabled"] === "boolean") {
       changeReplayGainEnabled(settings["playback.normalization.enabled"] as boolean);
     }
+    if (typeof settings["playback.autoplay.enabled"] === "boolean") {
+      changeEndlessPlaybackEnabled(settings["playback.autoplay.enabled"] as boolean);
+    }
     if (!full) return;
     if (settings["ui.layoutDensity"] === "comfortable" || settings["ui.layoutDensity"] === "compact") {
       changeLayoutDensity(settings["ui.layoutDensity"] as string);
     }
     if (typeof settings["ui.autoOpenSidebar"] === "boolean") {
       changeAutoOpenSidebar(settings["ui.autoOpenSidebar"] as boolean);
-    }
-    if (typeof settings["playback.autoplay.enabled"] === "boolean") {
-      changeAutoplayEnabled(settings["playback.autoplay.enabled"] as boolean);
     }
     if (typeof settings["acquisition.autoDownloadLiked"] === "boolean") {
       changeAutoDownloadLiked(settings["acquisition.autoDownloadLiked"] as boolean);
@@ -1990,6 +2187,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     let cancelled = false;
     const shuffleVersion = shufflePreferenceVersionRef.current;
     const albumVersion = albumPreferenceVersionRef.current;
+    const endlessVersion = endlessVersionRef.current;
     Promise.resolve(getUserSettings())
       .then((settings: unknown) => {
         if (cancelled || !Array.isArray(settings)) return;
@@ -2003,6 +2201,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         }
         if (shuffleVersion !== shufflePreferenceVersionRef.current) delete map["playback.shuffleMode"];
         if (albumVersion !== albumPreferenceVersionRef.current) delete map["playback.albumAware"];
+        if (endlessVersion !== endlessVersionRef.current) delete map["playback.autoplay.enabled"];
         applySettingsRef.current(map, true);
       })
       .catch(() => {
@@ -2036,11 +2235,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     trimRequestsRef.current.clear();
     bindingsRef.current.clear();
     cuedPositionRef.current = null;
+    playlistPassRef.current = null;
     setHydratedQueueUserId(null);
     listeningSessionRef.current?.finish();
     engineRef.current?.pause();
     storeRef.current.stop();
-    storeRef.current.setRepeatOne(false);
+    storeRef.current.setRepeatMode("off");
     loopPlaylistRef.current = null;
     setLoopPlaylistId(null);
     setActiveSidebar("none");
@@ -2089,12 +2289,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           shuffleDataOwnerRef.current.recent = sessionId;
           setRecentlyPlayed(normalizeRecentlyPlayed(recent));
         }
-      } catch (error) {
-        console.error("Could not load recently played:", error);
-      }
+      } catch { /* The player can run without account listening history. */ }
     }
 
     void loadLikedSongs();
+    if (!features.listeningEvents) return () => { cancelled = true; };
     const refreshRecent = () => {
       if (getVisualActivity()) void loadRecentlyPlayed();
     };
@@ -2105,7 +2304,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       window.removeEventListener(LISTENING_ACTIVITY_CHANGED_EVENT, refreshRecent);
       stopPolling();
     };
-  }, [isAuthenticated, authIsLoading, sessionId, localQueueOwner, resetPlayer]);
+  }, [features.listeningEvents, isAuthenticated, authIsLoading, sessionId, localQueueOwner, resetPlayer]);
 
   async function setTrackFavorite(song: Song, liked: boolean) {
     const songId = String(song.id);
@@ -2129,20 +2328,10 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
 
   // ------------------------------------------------------------ playback actions
 
-  function mediaTracks(tracks: Song[], context: PlaybackContextInfo | null): Song[] {
-    return tracks.map((track, trackIndex) => ({
-      ...track,
-      ...(context?.type === "playlist" && context.id ? { tastePlaylistId: String(context.id) } : {}),
-      mediaResume: context?.id && (context.type === "album" || context.type === "playlist") && isLibraryPlayable(track) ? {
-        type: context.type, mediaId: String(context.id), title: context.name,
-        trackIndex, trackCount: tracks.length, occurrenceId: typeof track.playlistItemId === "string" ? track.playlistItemId : null,
-      } : undefined,
-    }));
-  }
-
-  function startQueue(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, smart = false, startAt = 0) {
+  function startQueue(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, options?: SetQueueOptions) {
     cancelRestoreResume();
     cuedPositionRef.current = null;
+    if (playlistPassRef.current?.context !== context) playlistPassRef.current = null;
     setPlaybackContext(context);
     const albumPlaybackId = context?.type === "album" && !shuffleEnabledRef.current
       ? String(context.id || context.name || "album") : undefined;
@@ -2150,23 +2339,24 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       ...track, albumPlaybackId,
       albumTrackIndex: albumPlaybackId ? (isMediaResumeContext(track.mediaResume) ? track.mediaResume.trackIndex : albumTrackIndex) : undefined,
     }));
-    storeRef.current.setQueue(items, startIndex, smart ? { smartShuffle: smartShuffleOptionsRef.current(), startAt } : { startAt });
+    storeRef.current.setQueue(items, startIndex, options);
   }
 
   function startSelection(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, fromHere: boolean) {
     const allTracks = mediaTracks(tracks, context);
+    playlistPassRef.current = context?.type === "playlist" ? { context, tracks: allTracks } : null;
     const selected = fromHere ? allTracks.slice(startIndex) : allTracks;
     const index = fromHere ? 0 : startIndex;
-    const ordered = isShuffleEnabled && shuffleModeRef.current === "standard"
-      ? shuffleUpcoming(selected, index, randomValues(selected.length - index - 2))
-      : selected;
-    startQueue(ordered, index, context, isShuffleEnabled && shuffleModeRef.current === "smart");
+    const options = shuffleEnabledRef.current ? shuffleModeRef.current === "smart"
+      ? { smartShuffle: smartShuffleOptionsRef.current() }
+      : { shuffleOrder: shuffleUpcoming(selected.map((_, position) => position), index, randomValues(selected.length - index - 2)) }
+      : undefined;
+    startQueue(selected, index, context, options);
   }
 
   function playOnActiveDevice(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, fromHere = false) {
-    if (!remotePlayer && (!orderedLocalControls || tracks.length > 1000)) return null;
+    if (!remotePlayer) return null;
     if (tracks.some(track => track.offlineOnly || songSource(track).source)) {
-      if (!remotePlayer) return null;
       setPlaybackMessage("Choose this device in Devices to play a device-only track or source.");
       return Promise.resolve();
     }
@@ -2182,12 +2372,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       }),
       start_index: startIndex,
       from_here: fromHere,
-      context: context ? {
-        type: String(context.type ?? "").slice(0, 80),
-        id: String(context.id ?? "").slice(0, 1024),
-        name: String(context.name ?? "").slice(0, 500),
-        coverArt: typeof context.coverArt === "string" ? context.coverArt.slice(0, 2048) : null,
-      } : null,
+      context: serializePlaybackContext(context),
     });
   }
 
@@ -2215,7 +2400,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       return;
     }
     if (!remotePlayingElsewhere.current && !pausedAccountQueue && sameSongId(song, currentSong)) {
-      if (orderedLocalControls) return toggleSelectedPlayback();
       togglePlay();
       return;
     }
@@ -2282,7 +2466,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     // Resume is an explicit ordered-collection action, not a shuffled restart.
     shuffleEnabledRef.current = false;
     setIsShuffleEnabled(false);
-    startQueue(mediaTracks(songs, context), index, context, false, positionSeconds);
+    const tracks = mediaTracks(songs, context);
+    playlistPassRef.current = context.type === "playlist" ? { context, tracks } : null;
+    startQueue(tracks, index, context, { startAt: positionSeconds });
   }
 
   async function playQueueSong(index: number) {
@@ -2306,15 +2492,18 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       storeRef.current.playNext();
       return;
     }
-    if (signal && queueEndPendingRef.current) throw new Error("The player is already finding the next track.");
+    const pending = queueEndPendingRef.current;
+    if (signal && pending?.generation === state.generation && pending.loadSequence === state.loadSequence) {
+      throw new Error("The player is already finding the next track.");
+    }
     listeningSessionRef.current?.finish();
-    await continueAfterQueueEnd(signal);
+    await continueAfterQueueEnd(signal, true);
   }
 
   /** Restarts the current entry; a restart is a new listening session. */
   function restartCurrent(entry: QueueEntry<Song>) {
     listeningSessionRef.current?.finish();
-    const start = trimByEntryRef.current.get(entry.entryId)?.leading ?? 0;
+    const start = engineHasLoaded(entry.entryId) ? engineRef.current?.getTrimmedStart() ?? 0 : 0;
     if (engineHasLoaded(entry.entryId)) {
       const clock = clockFor(entry.entryId);
       clock.seeking = true;
@@ -2326,7 +2515,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       cuedPositionRef.current = { ...cuedPositionRef.current, seconds: start };
     }
     setCurrentTime(start);
-    if (isPlayingRef.current && !isPreviewRef.current && isLibraryPlayable(entry.track)) {
+    if (!transferTransaction.current && isPlayingRef.current && !isPreviewRef.current && isLibraryPlayable(entry.track)) {
       listeningSessionRef.current?.begin(entry.track, clockFor(entry.entryId), false);
     }
   }
@@ -2347,7 +2536,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     const enable = !shuffleEnabledRef.current;
     shuffleEnabledRef.current = enable;
     setIsShuffleEnabled(enable);
-    if (!enable) return;
+    if (!enable) { storeRef.current.unshuffleUpcoming(); return; }
     if (shuffleModeRef.current === "smart") storeRef.current.smartShuffleUpcoming(smartShuffleOptionsRef.current());
     else storeRef.current.shuffleUpcoming(randomValues(entryCount - index - 2));
   }
@@ -2357,21 +2546,26 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     toggleShuffleForQueue(state.entries.length, state.currentIndex);
   }
 
-  function setRepeatOne(enabled: boolean) {
-    if (enabled) {
+  function cycleRepeatMode(currentMode: RepeatMode) {
+    const next = currentMode === "off" ? "all" : currentMode === "all" ? "one" : "off";
+    if (next !== "off") {
       loopPlaylistRef.current = null;
       setLoopPlaylistId(null);
     }
-    storeRef.current.setRepeatOne(enabled);
+    refillAttemptRef.current = null;
+    storeRef.current.setRepeatMode(next);
   }
 
-  function toggleLoop() {
-    setRepeatOne(!stateRef.current.repeatOne);
-  }
+  function toggleLoop() { cycleRepeatMode(repeatModeOf(stateRef.current)); }
 
-  function togglePlaylistLoop(playlistId: string) {
-    const next = loopPlaylistRef.current === playlistId ? null : playlistId;
-    if (next) storeRef.current.setRepeatOne(false);
+  function setPlaylistLoop(playlistId: string, enabled: boolean) {
+    const next = enabled ? playlistId : loopPlaylistRef.current === playlistId ? null : loopPlaylistRef.current;
+    if (next === loopPlaylistRef.current) return;
+    if (next) {
+      storeRef.current.setRepeatMode("off");
+      const entry = currentEntryOf(stateRef.current);
+      if (playlistIdFor(playbackContextRef.current, entry?.track) === next) refillAttemptRef.current = null;
+    }
     loopPlaylistRef.current = next;
     setLoopPlaylistId(next);
   }
@@ -2403,14 +2597,14 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   // ------------------------------------------------------------ render
 
   const liveQueue = useCallback((): RemotePlaybackSnapshot["queueState"] => {
-    const context = playbackContext ? { type: playbackContext.type, id: playbackContext.id,
-      name: playbackContext.name.slice(0, 500), coverArt: playbackContext.coverArt } : null;
+    const context = serializePlaybackContext(playbackContext);
     // Keep the current occurrence in the published window even for very large queues.
     const offset = Math.max(0, currentIndex - 4999);
     return {
       entries: entries.slice(offset, offset + 5000).map((item) => ({ occurrenceId: item.entryId, trackId: String(item.track.id),
           title: String(item.track.title || "").slice(0, 500), artist: String(item.track.artist || item.track.artistName || "").slice(0, 500), album: String(item.track.album || item.track.albumName || "").slice(0, 500),
           duration: songDurationHint(item.track) || 0,
+          ...(item.unshuffledIndex === undefined ? {} : { unshuffledIndex: item.unshuffledIndex }),
           ...(item.track.albumPlaybackId ? { albumPlaybackId: String(item.track.albumPlaybackId), albumTrackIndex: Number(item.track.albumTrackIndex) || 0 } : {}),
           ...(isMediaResumeContext(item.track.mediaResume) ? { resume: {
             type: item.track.mediaResume.type, mediaId: item.track.mediaResume.mediaId, title: item.track.mediaResume.title,
@@ -2418,9 +2612,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           } } : {}),
         })),
       index: Math.max(0, currentIndex - offset), repeatOne: queueState.repeatOne, shuffle: isShuffleEnabled,
+      ...(queueState.repeatAll ? { repeatAll: true } : {}),
+      ...(loopPlaylistId ? { loopPlaylistId } : {}),
       shuffleMode, shuffleSeed: queueState.shuffleSeed, albumAware: isAlbumAware, context,
     };
-  }, [entries, currentIndex, queueState.repeatOne, queueState.shuffleSeed, isShuffleEnabled, shuffleMode, isAlbumAware, playbackContext]);
+  }, [entries, currentIndex, queueState.repeatOne, queueState.repeatAll, queueState.shuffleSeed, loopPlaylistId, isShuffleEnabled, shuffleMode, isAlbumAware, playbackContext]);
 
   function captureRemotePlayback(): RemotePlaybackSnapshot {
     if (engineRef.current?.isRemoteOutput) throw new Error("Stop Google Cast before transferring playback to another device.");
@@ -2469,9 +2665,23 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         if (signal?.aborted) throw new Error("Playback command cancelled.");
       };
       checkCancellation();
+      if (command.type === "SET_PLAYLIST_LOOP") {
+        flushSync(() => setPlaylistLoop(command.playlist_id, command.enabled));
+        return;
+      }
+      if (command.type === "TOGGLE_SHUFFLE" || command.type === "TOGGLE_REPEAT") {
+        if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
+        flushSync(command.type === "TOGGLE_SHUFFLE" ? toggleShuffle : toggleLoop);
+        return;
+      }
       if (command.type === "SET_VOLUME") { flushSync(() => changeVolume(command.volume)); return; }
+      if (command.type === "PAUSE") {
+        flushSync(() => { storeRef.current.cancelPendingLoad(); activeEngine.pause(); });
+        return;
+      }
       const load = stateRef.current.loadRequest;
-      if (load) await storeRef.current.waitForLoad(load.sequence, signal).catch(() => {});
+      // A disconnected controller can cancel its wait, but it does not own this existing load.
+      if (load) await storeRef.current.waitForLoad(load.sequence, signal, false).catch(() => {});
       checkCancellation();
       const applyAndWait = async (apply: () => void | Promise<void>) => {
         const previousSequence = stateRef.current.loadSequence;
@@ -2479,9 +2689,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         if (result) {
           await result;
         }
-        checkCancellation();
         const next = stateRef.current.loadRequest;
         if (next && next.sequence > previousSequence) await storeRef.current.waitForLoad(next.sequence, signal);
+        checkCancellation();
       };
       if (command.type === "PLAY_SELECTION") {
         if (remote.isRemote) throw new Error("The active player changed. Try playing the selection again.");
@@ -2494,8 +2704,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         return;
       }
       if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
-      if (command.type === "TOGGLE_SHUFFLE") { flushSync(toggleShuffle); return; }
-      if (command.type === "TOGGLE_REPEAT") { flushSync(toggleLoop); return; }
       if (command.type === "ENQUEUE") {
         const tracks = command.tracks.map(sanitizeQueueTrack) as Song[];
         flushSync(() => {
@@ -2514,8 +2722,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         flushSync(() => moveQueueItem(index, target));
         return;
       }
-      if (command.type === "PAUSE") flushSync(() => activeEngine.pause());
-      else if (command.type === "PLAY") {
+      if (command.type === "PLAY") {
         const key = currentEntryOf(stateRef.current)?.entryId ?? null;
         if (!engineHasLoaded(key)) { await applyAndWait(togglePlay); return; }
         await activeEngine.play();
@@ -2543,8 +2750,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const activeEngine = engineRef.current;
       if (!activeEngine) throw new Error("The playback engine is not ready");
       if (activeEngine.isRemoteOutput) throw new Error("Stop Google Cast on the target before transferring playback.");
+      const originalQueue = stateRef.current;
       const selected = await getListeningTrack(snapshot.trackId, signal);
       if (signal.aborted) throw new Error("Transfer cancelled");
+      if (stateRef.current.generation !== originalQueue.generation ||
+          stateRef.current.entries !== originalQueue.entries ||
+          stateRef.current.currentIndex !== originalQueue.currentIndex || isPlayingRef.current ||
+          activeEngine.isRemoteOutput) {
+        throw new Error("Playback changed on the target. Try transferring again.");
+      }
       if (!selected?.id || String(selected.id) !== snapshot.trackId || !isLibraryPlayable({ ...selected, id: selected.id })) {
         throw new Error("The target cannot access this library track");
       }
@@ -2561,12 +2775,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       const previous = stateRef.current;
       const previousCheckpoint = queueCheckpointRef.current();
       const previousContext = playbackContextRef.current;
-      const previousLoop = loopPlaylistRef.current;
       const owner = trackingUserRef.current;
       let staged: QueueState<Song> | undefined;
       const rollback = () => {
         if (transferTransaction.current?.signal !== signal) return;
         transferTransaction.current = null;
+        if (mountedRef.current) setStagingTransfer(false);
         const current = stateRef.current;
         if (!mountedRef.current || !staged || trackingUserRef.current !== owner || current.generation !== staged.generation ||
             current.entries !== staged.entries || current.currentIndex !== staged.currentIndex) return;
@@ -2577,7 +2791,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
             deferLoad: !previous.loadRequest,
           });
           applyQueuePreferences(previousCheckpoint);
-          loopPlaylistRef.current = previousLoop; setLoopPlaylistId(previousLoop);
           setPlaybackContext(previousContext);
           const entry = previous.entries[previous.currentIndex];
           cuedPositionRef.current = entry ? { trackId: String(entry.track.id), seconds: previousCheckpoint.position } : null;
@@ -2589,12 +2802,15 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       activeEngine.pause();
       cancelRestoreResume();
       flushSync(() => {
+        setStagingTransfer(true);
         shuffleEnabledRef.current = queue.shuffle; setIsShuffleEnabled(queue.shuffle);
         shuffleModeRef.current = queue.shuffleMode; setShuffleMode(queue.shuffleMode);
         changeAlbumAware(queue.albumAware, false);
         setPlaybackContext(queue.context);
-        storeRef.current.setQueue(tracks, queue.index, { autoplay: false, startAt: snapshot.exactPositionMs / 1000, shuffleSeed: queue.shuffleSeed });
-        storeRef.current.setRepeatOne(queue.repeatOne);
+        storeRef.current.setQueue(tracks, queue.index, { autoplay: false, startAt: snapshot.exactPositionMs / 1000,
+          shuffleSeed: queue.shuffleSeed, unshuffledIndices: queue.entries.map(entry => entry.unshuffledIndex) });
+        storeRef.current.setRepeatMode(repeatModeOf(queue));
+        loopPlaylistRef.current = queue.loopPlaylistId ?? null; setLoopPlaylistId(loopPlaylistRef.current);
       });
       staged = stateRef.current;
       await new Promise<void>((resolve, reject) => {
@@ -2631,6 +2847,10 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       if (transaction?.signal !== signal) return;
       signal.removeEventListener("abort", transaction.rollback);
       transferTransaction.current = null;
+      setStagingTransfer(false);
+      mediaTrackerRef.current?.captureCurrent();
+      const current = currentEntryOf(stateRef.current);
+      if (current && isPlayingRef.current) recordShufflePlay(current);
       writeStored("playerAlbumAware", String(albumAwareRef.current), "album-aware mode");
       writeStored("playerVolume", String(volume), "volume");
       void persistedQueue.flush().catch(() => {});
@@ -2644,7 +2864,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
           stateRef.current.entries.length !== snapshot.queueState.entries.length ||
           stateRef.current.entries.some((item, index) => item.track.remoteOccurrenceId !== snapshot.queueState.entries[index].occurrenceId) ||
           stateRef.current.currentIndex !== snapshot.queueState.index ||
-          stateRef.current.repeatOne !== snapshot.queueState.repeatOne) throw new Error("The target queue changed during handoff");
+          repeatModeOf(stateRef.current) !== repeatModeOf(snapshot.queueState)) throw new Error("The target queue changed during handoff");
       activeEngine.seek(snapshot.exactPositionMs / 1000);
       flushSync(() => {
         changeVolume(snapshot.volume, false);
@@ -2657,18 +2877,13 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       }
     },
   };
-  const remote = useRemoteSession(isAuthenticated ? sessionId : null, remoteAdapter);
+  const remote = useRemoteSession(features.remoteControl && isAuthenticated ? sessionId : null, remoteAdapter);
   const controlRemote = async (command: Parameters<typeof remote.command>[0]): Promise<void> => {
     try { await remote.command(command); }
     catch (failure: unknown) {
-      console.error("Could not control the remote player:", failure);
       setPlaybackMessage(failure instanceof Error ? failure.message : "Remote playback command failed");
     }
   };
-  // The selected device also goes through the hub so its controls are ordered
-  // with commands from controllers. Offline and Cast playback stay local.
-  const orderedLocalControls = remote.ordersCommands && remote.status === "connected" &&
-    remote.activeDevice?.device_id === remote.deviceId && !engineRef.current?.isRemoteOutput && !cast.connected;
   const toggleSelectedPlayback = () => controlRemote({ type: (remotePlayer?.playing ?? isPlayingRef.current) ? "PAUSE" : "PLAY" });
   async function enqueueOnActiveDevice(tracks: Song[], next: boolean, dedupe: boolean) {
     if (!tracks.length) return;
@@ -2689,7 +2904,6 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const remoteTrack = remotePlayer?.current_track;
   const castRendering = cast.connected || Boolean(engine?.isRemoteOutput);
   remotePlayingElsewhere.current = Boolean(remote.isRemote);
-  remoteRegistryReady.current = remote.status === "connected";
   useEffect(() => {
     if (remote.activeDevice?.device_id === remote.deviceId) {
       if (!restoreRef.current) automaticallyResuming.current = false;
@@ -2700,13 +2914,12 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       cancelRestoreResume();
       engineRef.current?.pause();
     }
-    if (remote.status === "connected") restoreRef.current?.resumeWhenReady?.();
-  }, [cancelRestoreResume, remote.activeDevice?.device_id, remote.deviceId, remote.isRemote, remote.status]);
+  }, [cancelRestoreResume, remote.activeDevice?.device_id, remote.deviceId, remote.isRemote]);
 
   const localHead = persistedQueue.getHead();
   const suppressedRestore = suppressedRestoreRevision.current === queueState.revision;
   const accountQueue = useAccountQueue({
-    owner: isAuthenticated && hydratedQueueUserId === sessionId ? sessionId : null,
+    owner: features.queueCloudSync && isAuthenticated && hydratedQueueUserId === sessionId ? sessionId : null,
     localCapturedAt: suppressedRestore ? restoredCheckpointTime.current : localHead?.checkpoint.capturedAt ?? 0,
     followPaused: !isPlaying && !castRendering && !restorePending && !preferLocalQueue && (!entries.length || Boolean(localHead)),
     activeDevice: remotePlayer,
@@ -2716,16 +2929,20 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const accountTracks = useMemo(() => accountQueue?.content.entries.map(entry => entry.track as Song), [accountQueue?.content]);
   const accountIndex = accountQueue?.checkpoint.index ?? -1;
   const liveQueueState = liveRemote?.queue;
+  const displayedQueue = liveQueueState ?? accountQueue?.checkpoint ?? (remotePlayer ? null : queueState);
+  const repeatMode = displayedQueue ? repeatModeOf(displayedQueue) : "off";
   const liveTracks = useMemo(() => liveQueueState?.entries.map((entry): Song => ({
     id: entry.trackId, title: entry.title, artist: entry.artist, album: entry.album, duration: entry.duration,
     mediaResume: entry.resume,
   })), [liveQueueState]);
   const accountSong = accountTracks?.[accountIndex] ?? liveTracks?.[liveQueueState?.index ?? -1];
   const pausedAccountQueue = remotePlayer ? null : accountQueue;
+  const displayedLoopPlaylist = remotePlayer
+    ? (liveQueueState ? liveQueueState.loopPlaylistId : accountQueue?.checkpoint.loopPlaylistId) ?? null
+    : pausedAccountQueue ? pausedAccountQueue.checkpoint.loopPlaylistId ?? null : loopPlaylistId;
   const queueOccurrenceAt = (index: number) => liveQueueState
     ? liveQueueState.entries[index]?.occurrenceId
-    : remotePlayer ? accountQueue?.content.entries[index]?.entryId : stateRef.current.entries[index]?.entryId;
-  const orderedSeek = orderedLocalControls && engineHasLoaded(currentEntryId) && duration > 0;
+    : accountQueue?.content.entries[index]?.entryId;
   const seekSelectedPlayer = (seconds: number) => {
     if (!Number.isFinite(seconds)) return;
     const total = remotePlayer?.duration_ms ?? duration * 1000;
@@ -2738,6 +2955,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     cancelRestoreResume();
     engineRef.current?.pause();
     listeningSessionRef.current?.finish();
+    setPreferLocalQueue(true);
     applyQueuePreferences(checkpoint);
     cuedPositionRef.current = autoplay ? null : { trackId: content.entries[index].track.id, seconds: startAt };
     storeRef.current.hydrate(content.entries as QueueEntry<Song>[], index, {
@@ -2779,7 +2997,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     activeSidebar,
     setActiveSidebar,
     autoOpenSidebar,
-    isAutoplayEnabled,
+    isEndlessPlaybackEnabled,
     autoDownloadLiked,
     isPlaying: remotePlayer ? remotePlayer.playing : isPlaying,
     isRemotePlayback: Boolean(remotePlayer),
@@ -2805,7 +3023,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     isShuffleEnabled: liveQueueState?.shuffle ?? accountQueue?.checkpoint.shuffle ?? (!remotePlayer && isShuffleEnabled),
     shuffleMode: liveQueueState?.shuffleMode ?? accountQueue?.checkpoint.shuffleMode ?? shuffleMode,
     changeShuffleMode,
-    isLooping: liveQueueState?.repeatOne ?? accountQueue?.checkpoint.repeatOne ?? (!remotePlayer && queueState.repeatOne),
+    isLooping: repeatMode !== "off",
+    repeatMode,
     previewDurationSeconds: !remotePlayer && isPreview ? PREVIEW_DURATION_SECONDS : null,
     playbackUnavailable: !remotePlayer && playbackUnavailable,
     playbackMessage: remotePlayer ? remote.error || playbackMessage : playbackMessage,
@@ -2832,37 +3051,42 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     playContext,
     playQueue,
     resumeMedia,
-    playQueueSong: remotePlayer || orderedLocalControls ? async (index) => {
+    playQueueSong: remotePlayer ? async (index) => {
       const entry_id = queueOccurrenceAt(index);
       if (entry_id) await controlRemote({ type: "PLAY_QUEUE_ENTRY", entry_id });
     } : pausedAccountQueue ? async (index) => takeAccountQueue(index, true) : playQueueSong,
-    moveQueueItem: remotePlayer || orderedLocalControls ? (from, to) => {
+    moveQueueItem: remotePlayer ? (from, to) => {
       const entry_id = queueOccurrenceAt(from), target_id = queueOccurrenceAt(to);
       if (entry_id && target_id) void controlRemote({ type: "MOVE_QUEUE_ENTRY", entry_id, target_id });
     } : pausedAccountQueue ? (from, to) => { takeAccountQueue(); moveQueueItem(from, to); } : moveQueueItem,
-    nextSong: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "SKIP", direction: "next" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex + 1) : () => nextSong(),
-    previousSong: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "SKIP", direction: "previous" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex - 1) : previousSong,
-    toggleShuffle: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "TOGGLE_SHUFFLE" }) : pausedAccountQueue ? () => {
+    nextSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "next" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex + 1) : () => nextSong(),
+    previousSong: remotePlayer ? () => controlRemote({ type: "SKIP", direction: "previous" }) : pausedAccountQueue ? async () => takeAccountQueue(accountIndex - 1) : previousSong,
+    toggleShuffle: remotePlayer ? () => controlRemote({ type: "TOGGLE_SHUFFLE" }) : pausedAccountQueue ? () => {
       takeAccountQueue();
       toggleShuffleForQueue(pausedAccountQueue.content.entries.length, accountIndex);
     } : toggleShuffle,
-    toggleLoop: remotePlayer || orderedLocalControls ? () => controlRemote({ type: "TOGGLE_REPEAT" }) : pausedAccountQueue ? () => {
+    toggleLoop: remotePlayer ? () => controlRemote({ type: "TOGGLE_REPEAT" }) : pausedAccountQueue ? () => {
       takeAccountQueue();
-      setRepeatOne(!pausedAccountQueue.checkpoint.repeatOne);
+      cycleRepeatMode(repeatModeOf(pausedAccountQueue.checkpoint));
     } : toggleLoop,
-    loopPlaylistId,
-    togglePlaylistLoop,
-    togglePlay: remotePlayer || orderedLocalControls ? toggleSelectedPlayback
+    loopPlaylistId: displayedLoopPlaylist,
+    togglePlaylistLoop: (playlistId) => {
+      const enabled = displayedLoopPlaylist !== playlistId;
+      if (remotePlayer) { void controlRemote({ type: "SET_PLAYLIST_LOOP", playlist_id: playlistId, enabled }); return; }
+      if (pausedAccountQueue) takeAccountQueue();
+      setPlaylistLoop(playlistId, enabled);
+    },
+    togglePlay: remotePlayer ? toggleSelectedPlayback
       : pausedAccountQueue ? () => takeAccountQueue(accountIndex, true) : togglePlay,
     toggleLike: remoteTrack ? () => toggleLikeSong({ id: remoteTrack.id, title: remoteTrack.title }) : accountSong ? () => toggleLikeSong(accountSong) : toggleLike,
     toggleLikeSong,
     setTrackFavorite,
-    seek: remotePlayer || orderedSeek ? (percent) => seekSelectedPlayer(percent / 100 * (remotePlayer ? remotePlayer.duration_ms / 1000 : duration))
+    seek: remotePlayer ? (percent) => seekSelectedPlayer(percent / 100 * (remotePlayer.duration_ms / 1000))
       : pausedAccountQueue ? (percent) => takeAccountQueue(accountIndex, false, percent / 100 * (songDurationHint(accountSong) ?? 0)) : seek,
-    seekToSeconds: remotePlayer || orderedSeek ? seekSelectedPlayer : pausedAccountQueue ? (seconds) => {
+    seekToSeconds: remotePlayer ? seekSelectedPlayer : pausedAccountQueue ? (seconds) => {
       if (Number.isFinite(seconds)) takeAccountQueue(accountIndex, false, Math.max(0, seconds));
     } : seekToSeconds,
-    changeVolume: remotePlayer || orderedLocalControls ? (value) => {
+    changeVolume: remotePlayer ? (value) => {
       if (Number.isFinite(value)) void controlRemote({ type: "SET_VOLUME", volume: Math.max(0, Math.min(1, value)) });
     }
       : pausedAccountQueue ? (value) => { takeAccountQueue(); changeVolume(value); } : changeVolume,
@@ -2875,7 +3099,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     changeLayoutDensity,
     changeAccentColor,
     changeAutoOpenSidebar,
-    changeAutoplayEnabled,
+    changeEndlessPlaybackEnabled,
     changeAutoDownloadLiked,
     resetPlayer,
   };

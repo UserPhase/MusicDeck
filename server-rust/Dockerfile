@@ -46,6 +46,7 @@ ENV PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
 ENV HOME=/app/home
 ENV MUSICDECK_EXTENSIONS_DIR=/extensions
 ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
 
 COPY requirements.txt ./requirements.txt
 

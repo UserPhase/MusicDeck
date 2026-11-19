@@ -15,8 +15,21 @@ beforeEach(async () => {
   global.fetch = jest.fn(async () => ({ ok: true })) as unknown as typeof fetch;
   client = new QueueSyncClient();
 });
-afterEach(() => { client.bind(null); client.activate(null); });
+afterEach(() => { client.bind(null); client.activate(null); localStorage.clear(); });
 async function seed() { return writeLocalQueue("alice", { version: 2, entries: Array.from({ length: 10_000 }, (_, i) => ({ entryId: `q${i}`, track: { id: `song-${i % 2}` } })) }, checkpoint()); }
+test.each(["queueCloudSync", "queueSync"])("the %s opt-out leaves the local snapshot available without cloud reads or writes", async (flag) => {
+  localStorage.setItem(`musicdeck:playback:${flag}`, "false");
+  await seed();
+  client.activate("alice");
+  client.invalidate();
+  client.checkpointChanged();
+  await client.sync();
+  const local = (await readLocalQueue("alice"))!;
+  client.exitCheckpoint(checkpoint(), local.head);
+  expect(local.content.entries).toHaveLength(10_000);
+  expect(mocked).not.toHaveBeenCalled();
+  expect(global.fetch).not.toHaveBeenCalled();
+});
 test("bulk content uploads once; pause and exit send only a small checkpoint", async () => {
   await seed(); client.activate("alice"); await client.sync();
   const local = (await readLocalQueue("alice"))!;
@@ -52,6 +65,22 @@ test("a recreated local database advances beyond this browser's existing server 
   client.activate("alice"); await client.refresh(); await client.sync();
   const update = mocked.mock.calls.find(([, options]) => options?.method === "PUT")!;
   expect(JSON.parse(update[1].body).sequence).toBe(501);
+});
+test("retries once using the server sequence when a stale listing omitted the latest write", async () => {
+  await seed();
+  mocked.mockImplementation(async (url, options = {}) => {
+    if (url.includes("/content?")) return { contentId: hash };
+    if (options.method !== "PUT") return { sessions: [], namedQueues: [] };
+    const { sequence } = JSON.parse(options.body);
+    return sequence <= 500 ? { saved: false, sequence: 500 } : { saved: true, sequence };
+  });
+  client.activate("alice");
+  await client.sync();
+  const updates = mocked.mock.calls.filter(([, options]) => options?.method === "PUT")
+    .map(([, options]) => JSON.parse(options.body));
+  expect(updates.map(update => update.sequence)).toEqual([1, 501]);
+  expect(updates[1].checkpoint).toEqual(updates[0].checkpoint);
+  expect(client.getSnapshot().error).toBe("");
 });
 test("expired server contents are reuploaded from the complete local queue on retry", async () => {
   await seed(); client.activate("alice"); await client.sync();

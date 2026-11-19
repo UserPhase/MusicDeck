@@ -51,11 +51,17 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 8;
 
 pub(crate) fn temporary_sqlite_error(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
-        || error
-            .as_database_error()
-            .and_then(|err| err.code())
-            .and_then(|code| code.parse::<u32>().ok())
-            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+        || matches!(sqlite_primary_code(error), Some(5 | 6))
+}
+
+fn sqlite_primary_code(error: &sqlx::Error) -> Option<u32> {
+    error.as_database_error()?.code()?.parse::<u32>().ok().map(|code| code & 0xff)
+}
+
+pub(crate) fn playback_storage_unavailable(error: &sqlx::Error) -> bool {
+    temporary_sqlite_error(error)
+        // READONLY, IOERR, FULL and CANTOPEN can recover after storage is restored.
+        || matches!(sqlite_primary_code(error), Some(8 | 10 | 13 | 14))
 }
 
 /// Acquire SQLite's writer lock before taking a read snapshot. SQLx 0.8.3

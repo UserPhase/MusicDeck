@@ -507,7 +507,10 @@ impl DeezerAdapter {
         );
 
         let artist_payload: Value = artist_res.ok()?.json().await.ok()?;
-        let name = artist_payload.get("name").and_then(Value::as_str)?.to_owned();
+        let name = artist_payload
+            .get("name")
+            .and_then(Value::as_str)?
+            .to_owned();
         let pic_raw = artist_payload
             .get("picture_xl")
             .or_else(|| artist_payload.get("picture_big"))
@@ -557,68 +560,15 @@ impl DeezerAdapter {
             }
         }
 
-        let mut tracks = Vec::new();
-        if let Some(res) = top_res.ok() {
-            if let Ok(top_payload) = res.json::<Value>().await {
-                if let Some(arr) = top_payload.get("data").and_then(Value::as_array) {
-                    for item in arr {
-                        let Some(tid) = item.get("id").and_then(Value::as_i64) else {
-                            continue;
-                        };
-                        let tr_title = item
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Unknown title");
-                        let alb_title = item
-                            .get("album")
-                            .and_then(|a| a.get("title"))
-                            .and_then(Value::as_str);
-                        let alb_id = item
-                            .get("album")
-                            .and_then(|a| a.get("id"))
-                            .and_then(Value::as_i64)
-                            .map(|id| format!("external_deezer_album_{id}"));
-                        let cov = item
-                            .get("album")
-                            .and_then(|a| a.get("cover_xl").or_else(|| a.get("cover_big")))
-                            .and_then(Value::as_str);
-                        let tr_art = self.artwork_tokens.artwork_ref(cov, &["dzcdn.net"]);
-                        let duration = item.get("duration").and_then(Value::as_u64);
-                        let preview_url = item
-                            .get("preview")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty());
-
-                        tracks.push(json!({
-                            "type": "track",
-                            "id": format!("external_deezer_track_{tid}"),
-                            "title": tr_title,
-                            "subtitle": name,
-                            "artist": name,
-                            "artistName": name,
-                            "artistId": external_id,
-                            "album": alb_title,
-                            "albumName": alb_title,
-                            "albumId": alb_id,
-                            "artwork": tr_art,
-                            "artworkId": tr_art.as_ref().map(|a| &a.id),
-                            "artworkUrl": tr_art.as_ref().map(|a| &a.url),
-                            "previewUrl": preview_url,
-                            "durationSeconds": duration,
-                            "provider": "external",
-                            "source": { "kind": "external", "count": 0 },
-                            "availability": null,
-                            "metadata": {
-                                "durationSeconds": duration,
-                                "artistId": external_id,
-                                "albumId": alb_id,
-                                "deezerTrackId": tid,
-                            }
-                        }));
-                    }
-                }
-            }
-        }
+        let tracks = match top_res {
+            Ok(response) => response
+                .json::<Value>()
+                .await
+                .ok()
+                .map(|payload| self.artist_top_tracks(&payload, external_id, &name))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
 
         Some(json!({
             "id": external_id,
@@ -629,6 +579,116 @@ impl DeezerAdapter {
             "albums": albums,
             "tracks": tracks,
         }))
+    }
+
+    async fn artist_list(&self, external_id: &str, resource: &str, limit: usize) -> Option<Value> {
+        let id = external_id
+            .strip_prefix("external_deezer_artist_")?
+            .parse::<u64>()
+            .ok()?;
+        self.http
+            .get(format!(
+                "https://api.deezer.com/artist/{id}/{resource}?limit={limit}"
+            ))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    pub(crate) async fn related_artists(&self, external_id: &str) -> Vec<(String, String)> {
+        let Some(payload) = self.artist_list(external_id, "related", 2).await else {
+            return Vec::new();
+        };
+        payload
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|artist| {
+                let id = artist.get("id")?.as_u64()?;
+                let name = artist.get("name")?.as_str()?.trim();
+                (!name.is_empty())
+                    .then(|| (format!("external_deezer_artist_{id}"), name.to_owned()))
+            })
+            .take(2)
+            .collect()
+    }
+
+    pub(crate) async fn top_tracks(&self, artist_id: &str, name: &str) -> Vec<Value> {
+        let Some(payload) = self.artist_list(artist_id, "top", 12).await else {
+            return Vec::new();
+        };
+        self.artist_top_tracks(&payload, artist_id, name)
+    }
+
+    fn artist_top_tracks(&self, payload: &Value, external_id: &str, name: &str) -> Vec<Value> {
+        let mut tracks = Vec::new();
+        for item in payload
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(tid) = item.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            let tr_title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown title");
+            let alb_title = item
+                .get("album")
+                .and_then(|a| a.get("title"))
+                .and_then(Value::as_str);
+            let alb_id = item
+                .get("album")
+                .and_then(|a| a.get("id"))
+                .and_then(Value::as_i64)
+                .map(|id| format!("external_deezer_album_{id}"));
+            let cov = item
+                .get("album")
+                .and_then(|a| a.get("cover_xl").or_else(|| a.get("cover_big")))
+                .and_then(Value::as_str);
+            let tr_art = self.artwork_tokens.artwork_ref(cov, &["dzcdn.net"]);
+            let duration = item.get("duration").and_then(Value::as_u64);
+            let preview_url = item
+                .get("preview")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+
+            tracks.push(json!({
+                "type": "track",
+                "id": format!("external_deezer_track_{tid}"),
+                "title": tr_title,
+                "subtitle": name,
+                "artist": name,
+                "artistName": name,
+                "artistId": external_id,
+                "album": alb_title,
+                "albumName": alb_title,
+                "albumId": alb_id,
+                "artwork": tr_art,
+                "artworkId": tr_art.as_ref().map(|a| &a.id),
+                "artworkUrl": tr_art.as_ref().map(|a| &a.url),
+                "previewUrl": preview_url,
+                "durationSeconds": duration,
+                "provider": "external",
+                "source": { "kind": "external", "count": 0 },
+                "availability": null,
+                "metadata": {
+                    "durationSeconds": duration,
+                    "artistId": external_id,
+                    "albumId": alb_id,
+                    "deezerTrackId": tid,
+                }
+            }));
+        }
+        tracks
     }
 }
 

@@ -99,7 +99,8 @@ jobs:
           gateway="musicdeck-gateway-$suffix"
           provider="musicdeck-provider-$suffix"
           database="/app/data/musicdeck-smoke.sqlite"
-          origin="http://127.0.0.1:14534"
+          gateway_url="http://127.0.0.1:14534"
+          browser_origin="http://musicdeck.example.test:14534"
           cleanup() {
             for container in "$gateway" "$server" "$provider"; do
               docker logs "$container" || true
@@ -117,7 +118,7 @@ jobs:
             --network-alias musicdeck-server --tmpfs /music:ro \
             -e MUSICDECK_ENV=production \
             -e "MUSICDECK_DB_PATH=$database" \
-            -e "MUSICDECK_PUBLIC_URL=$origin" \
+            -e "MUSICDECK_PUBLIC_URL=$browser_origin" \
             -e MUSICDECK_SECURE_COOKIES=false \
             -e MUSICDECK_SESSION_SECRET=ci-only-session-secret \
             -e MUSICDECK_ADMIN_PASSWORD=ci-only-admin-password \
@@ -128,10 +129,13 @@ jobs:
           docker run --detach --name "$gateway" --network "$network" \
             --publish 127.0.0.1:14534:80 musicdeck-web:gateway-test
           for attempt in $(seq 1 60); do
-            if curl --noproxy '*' --fail --silent --max-time 4 "$origin/api/health" > /tmp/musicdeck-health.json; then
+            if curl --noproxy '*' --fail --silent --max-time 4 "$gateway_url/api/health" > /tmp/musicdeck-health.json; then
               jq -e '.ok and .database.connected and (.degradedCapabilities | index("musicStorage") != null)' /tmp/musicdeck-health.json
+              filters=$(docker exec "$server" gosu musicdeck ffmpeg -hide_banner -filters)
+              grep -Eq '[[:space:]]silencedetect[[:space:]]' <<< "$filters"
+              grep -Eq '[[:space:]]loudnorm[[:space:]]' <<< "$filters"
               docker exec -i "$server" gosu musicdeck python3 - seed "$database" < scripts/test-docker-gateway.py
-              python3 scripts/test-docker-gateway.py verify "$origin"
+              python3 scripts/test-docker-gateway.py verify "$gateway_url" "$browser_origin"
               exit 0
             fi
             sleep 2

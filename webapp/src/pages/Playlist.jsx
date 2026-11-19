@@ -172,7 +172,6 @@ function Playlist() {
     downloadQuality,
     isShuffleEnabled,
     toggleShuffle,
-    isRemotePlayback,
     loopPlaylistId,
     togglePlaylistLoop,
   } = usePlayer();
@@ -810,7 +809,6 @@ async function handleRemoveSong(
               aria-label="Toggle shuffle"
               aria-pressed={Boolean(isShuffleEnabled)}
               onClick={toggleShuffle}
-              disabled={isRemotePlayback}
             >
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M3 6h3c5 0 6 12 11 12h4m-4-4 4 4-4 4M3 18h3c2 0 3.5-2 4.8-4.5M14 8.7C15 7 16 6 17 6h4m-4-4 4 4-4 4" />
@@ -819,7 +817,7 @@ async function handleRemoveSong(
 
             <button type="button" className={`detail-secondary-action${loopPlaylistId === String(playlist.id) ? " is-active" : ""}`}
               aria-label="Loop playlist" aria-pressed={loopPlaylistId === String(playlist.id)}
-              disabled={!songs.length || isRemotePlayback} onClick={() => togglePlaylistLoop(String(playlist.id))}>
+              disabled={!playlist.entry?.length} onClick={() => togglePlaylistLoop(String(playlist.id))}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="m17 3 4 4-4 4M3 7h18M7 21l-4-4 4-4m14 4H3" />
               </svg>

@@ -298,21 +298,26 @@ impl ScrobbleQueueService {
     async fn plugin_config(&self, provider: ScrobbleProvider) -> Result<Value, ScrobbleError> {
         let pool = self.require_db()?;
         let mut connection = pool.inner().acquire().await.map_err(queue_database_error)?;
-        Self::plugin_config_on_conn(&mut connection, provider).await
+        let row = Self::plugin_config_row(&mut connection, provider).await.map_err(queue_database_error)?;
+        Self::parse_plugin_config(row, provider)
     }
 
-    async fn plugin_config_on_conn(
+    async fn plugin_config_row(
         connection: &mut sqlx::SqliteConnection,
         provider: ScrobbleProvider,
-    ) -> Result<Value, ScrobbleError> {
-        let row = sqlx::query(
+    ) -> Result<Option<sqlx::sqlite::SqliteRow>, sqlx::Error> {
+        sqlx::query(
             "SELECT enabled, config_json, permissions_json FROM plugin_configs WHERE plugin_id = ?",
         )
         .bind(provider.as_str())
         .fetch_optional(connection)
         .await
-        .map_err(queue_database_error)?;
+    }
 
+    fn parse_plugin_config(
+        row: Option<sqlx::sqlite::SqliteRow>,
+        provider: ScrobbleProvider,
+    ) -> Result<Value, ScrobbleError> {
         let Some(row) = row else {
             return Err(ScrobbleError::new(
                 "PLUGIN_DISABLED",
@@ -1005,8 +1010,10 @@ impl ScrobbleQueueService {
             return;
         };
         let result = async {
-            let mut transaction = pool.inner().begin().await.map_err(queue_database_error)?;
-            self.enqueue_playback_on_conn(
+            let mut transaction = crate::db::begin_sqlite_write(
+                pool.inner(), "UPDATE scrobble_queue SET state = state WHERE 0",
+            ).await?;
+            let enqueued = self.enqueue_playback_on_conn(
                 &mut transaction,
                 user_id,
                 event_id,
@@ -1018,14 +1025,15 @@ impl ScrobbleQueueService {
                 duration_seconds,
             )
             .await?;
-            transaction.commit().await.map_err(queue_database_error)
+            transaction.commit().await?;
+            Ok::<_, sqlx::Error>(enqueued)
         }
         .await;
-        if let Err(error) = result {
-            tracing::error!(error = %error, "Could not enqueue playback");
-            return;
+        match result {
+            Ok(true) => self.kick(),
+            Ok(false) => {},
+            Err(error) => tracing::error!(%error, "Could not enqueue playback"),
         }
-        self.kick();
     }
 
     /// Enqueues the canonical saved event inside its listening-event transaction.
@@ -1034,34 +1042,27 @@ impl ScrobbleQueueService {
         connection: &mut sqlx::SqliteConnection,
         user_id: &str,
         event_id: &str,
-    ) -> Result<(), ScrobbleError> {
+        listened_seconds: f64,
+        duration_seconds: Option<f64>,
+    ) -> Result<bool, sqlx::Error> {
+        if !ScrobbleProvider::ALL.into_iter().any(|provider|
+            qualifies_for_scrobble(provider, listened_seconds, duration_seconds)) {
+            return Ok(false);
+        }
         let row = sqlx::query(
-            "SELECT track_json, created_at, listened_seconds, duration_seconds
-             FROM listening_events WHERE id = ? AND user_id = ?",
+            "SELECT track_json, created_at FROM listening_events WHERE id = ? AND user_id = ?",
         )
         .bind(event_id)
         .bind(user_id)
         .fetch_one(&mut *connection)
-        .await
-        .map_err(queue_database_error)?;
-        let raw: String = row.try_get("track_json").map_err(queue_database_error)?;
-        let track: crate::services::listening_activity::PlaybackTrackSnapshot =
-            serde_json::from_str(&raw).map_err(|_| {
-                ScrobbleError::new(
-                    "INVALID_LISTEN",
-                    "Stored playback metadata is unreadable.",
-                    FailureKind::Configuration,
-                    None,
-                    0,
-                )
-            })?;
-        let started_at: String = row.try_get("created_at").map_err(queue_database_error)?;
-        let seconds: f64 = row
-            .try_get("listened_seconds")
-            .map_err(queue_database_error)?;
-        let duration: Option<f64> = row
-            .try_get("duration_seconds")
-            .map_err(queue_database_error)?;
+        .await?;
+        let raw: Option<String> = row.try_get("track_json")?;
+        let Some(track) = raw.as_deref().and_then(|raw|
+            serde_json::from_str::<crate::services::listening_activity::PlaybackTrackSnapshot>(raw).ok()) else {
+            tracing::warn!(event_id, "Skipping scrobble for unreadable playback metadata");
+            return Ok(false);
+        };
+        let started_at: String = row.try_get("created_at")?;
         self.enqueue_playback_on_conn(
             connection,
             user_id,
@@ -1070,8 +1071,8 @@ impl ScrobbleQueueService {
             &track.title,
             Some(&track.album),
             &started_at,
-            seconds,
-            duration,
+            listened_seconds,
+            duration_seconds,
         )
         .await
     }
@@ -1087,16 +1088,16 @@ impl ScrobbleQueueService {
         started_at_iso: &str,
         listened_seconds: f64,
         duration_seconds: Option<f64>,
-    ) -> Result<(), ScrobbleError> {
+    ) -> Result<bool, sqlx::Error> {
         if self.stopped.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         if !self.privacy.is_external_allowed(PrivacyCategory::External) {
-            return Ok(());
+            return Ok(false);
         }
 
         let Ok(started_dt) = DateTime::parse_from_rfc3339(started_at_iso) else {
-            return Ok(());
+            return Ok(false);
         };
         let started_ms = started_dt.timestamp_millis();
 
@@ -1104,13 +1105,12 @@ impl ScrobbleQueueService {
         if let Some(policy_row) =
             sqlx::query("SELECT updated_at FROM server_settings WHERE key = 'privacy.policy'")
                 .fetch_optional(&mut *connection)
-                .await
-                .map_err(queue_database_error)?
+                .await?
         {
             if let Ok(updated_str) = policy_row.try_get::<String, _>("updated_at") {
                 if let Ok(policy_dt) = DateTime::parse_from_rfc3339(&updated_str) {
                     if started_ms < policy_dt.timestamp_millis() {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
@@ -1124,7 +1124,7 @@ impl ScrobbleQueueService {
             || track_trimmed.eq_ignore_ascii_case("unknown title")
             || track_trimmed.eq_ignore_ascii_case("unknown track")
         {
-            return Ok(());
+            return Ok(false);
         }
 
         let listen = ScrobbleListen {
@@ -1141,7 +1141,7 @@ impl ScrobbleQueueService {
         };
 
         if validate_listen(&listen).is_err() {
-            return Ok(());
+            return Ok(false);
         }
 
         let dedupe_input =
@@ -1152,20 +1152,18 @@ impl ScrobbleQueueService {
         let dedupe_key = format!("{:x}", sha.finalize());
         let payload_json = serde_json::to_string(&listen).unwrap_or_default();
         let now = Self::now_ms();
+        let mut enqueued = false;
 
         for provider in ScrobbleProvider::ALL {
             if !qualifies_for_scrobble(provider, listened_seconds, duration_seconds) {
                 continue;
             }
-            if let Err(error) = Self::plugin_config_on_conn(connection, provider).await {
-                if error.kind == FailureKind::Transient {
-                    return Err(error);
-                }
+            let plugin = Self::plugin_config_row(connection, provider).await?;
+            if Self::parse_plugin_config(plugin, provider).is_err() {
                 continue;
             }
             let Some(conn) = Self::fetch_connection_on_conn(connection, user_id, provider)
-                .await
-                .map_err(queue_database_error)?
+                .await?
             else {
                 continue;
             };
@@ -1173,7 +1171,7 @@ impl ScrobbleQueueService {
                 continue;
             }
 
-            sqlx::query(
+            let inserted = sqlx::query(
                 r"
                 INSERT OR IGNORE INTO scrobble_queue (
                     id, user_id, provider, listening_event_id, dedupe_key,
@@ -1193,11 +1191,11 @@ impl ScrobbleQueueService {
             .bind(now)
             .bind(now)
             .execute(&mut *connection)
-            .await
-            .map_err(queue_database_error)?;
+            .await?;
+            enqueued |= inserted.rows_affected() > 0;
         }
 
-        Ok(())
+        Ok(enqueued)
     }
 
     /// Returns the connection and queue diagnostic status for both `lastfm` and `listenbrainz`.
@@ -1520,7 +1518,9 @@ impl ScrobbleQueueService {
         let Some(pool) = &self.db else {
             return;
         };
-        let Ok(mut tx) = pool.inner().begin().await else {
+        let Ok(mut tx) = crate::db::begin_sqlite_write(
+            pool.inner(), "UPDATE scrobble_queue SET state = state WHERE 0",
+        ).await else {
             return;
         };
 

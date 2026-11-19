@@ -20,6 +20,7 @@ const checkpoint: MediaCheckpoint = {
 const tracks = [{ id: "track-two", playlistItemId: "slot-two" }, { id: "track-two", playlistItemId: "slot-one" }];
 beforeEach(() => {
   jest.clearAllMocks();
+  localStorage.removeItem("musicdeck:playback:mediaSessions");
   mockUserId = "resume-user";
   jest.mocked(getMediaCheckpoints).mockResolvedValue({ items: [checkpoint] });
   jest.mocked(getPlaylist).mockResolvedValue({ entry: tracks } as Awaited<ReturnType<typeof getPlaylist>>);
@@ -73,4 +74,14 @@ test("sync events update rings immediately and completed collections leave the s
     detail: { userId: "resume-user", input: { ...checkpoint, capturedAt: 2500 }, checkpoint },
   })));
   expect(screen.queryByText("Late Night")).not.toBeInTheDocument();
+});
+
+test("an older save can return the newest checkpoint from another device", async () => {
+  render(<MemoryRouter><ContinueListeningRow /></MemoryRouter>);
+  await screen.findByText("Late Night");
+  act(() => window.dispatchEvent(new CustomEvent(MEDIA_CHECKPOINT_CHANGED, {
+    detail: { userId: "resume-user", input: { ...checkpoint, capturedAt: 900 },
+      checkpoint: { ...checkpoint, capturedAt: 2000, progress: .58 } },
+  })));
+  expect(screen.getByRole("img", { name: "58% complete" })).toBeInTheDocument();
 });

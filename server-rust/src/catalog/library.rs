@@ -107,21 +107,7 @@ impl LibraryService {
         ref_item: &SourceRef,
         content: Option<&TrackContentHint>,
     ) -> Result<String, DbError> {
-        let existing = sqlx::query(
-            r"
-            SELECT library_item_id AS id
-            FROM library_item_sources
-            WHERE connection_id = ? AND provider_item_id = ? AND item_type = ?;
-            ",
-        )
-        .bind(&ref_item.connection_id)
-        .bind(&ref_item.provider_item_id)
-        .bind(item_type.as_str())
-        .fetch_optional(self.db.inner())
-        .await?;
-
-        if let Some(row) = existing {
-            let id: String = row.try_get("id")?;
+        if let Some(id) = self.find_id(item_type, ref_item).await? {
             if item_type == LibraryItemType::Track
                 && let Some(hint) = content
             {
@@ -183,6 +169,25 @@ impl LibraryService {
         }
 
         Ok(id)
+    }
+
+    pub(crate) async fn find_id(
+        &self,
+        item_type: LibraryItemType,
+        ref_item: &SourceRef,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            r"
+            SELECT library_item_id AS id
+            FROM library_item_sources
+            WHERE connection_id = ? AND provider_item_id = ? AND item_type = ?;
+            ",
+        )
+        .bind(&ref_item.connection_id)
+        .bind(&ref_item.provider_item_id)
+        .bind(item_type.as_str())
+        .fetch_optional(self.db.inner())
+        .await?)
     }
 
     /// Convenience wrapper for `ensure_id(LibraryItemType::Artwork, ref_item, None)`.

@@ -25,6 +25,7 @@ function state(overrides = {}) {
     isShuffleEnabled: false,
     toggleLoop: jest.fn(),
     isLooping: true,
+    repeatMode: "one",
     volume: 0.5,
     changeVolume: jest.fn(),
     toggleLike: jest.fn(),
@@ -39,7 +40,7 @@ function state(overrides = {}) {
 }
 
 test("drives playback through the shared player context", () => {
-  const player = state();
+  const player = state({ isRemotePlayback: true });
   usePlayer.mockReturnValue(player);
   render(<AppleHeaderPlayer />);
 
@@ -59,7 +60,12 @@ test("drives playback through the shared player context", () => {
   expect(player.toggleLike).toHaveBeenCalled();
   expect(player.seek).toHaveBeenCalledWith(50);
   expect(player.changeVolume).toHaveBeenCalledWith(0.2);
-  expect(screen.getByRole("button", { name: "Turn off repeat" })).toHaveAttribute("aria-pressed", "true");
+  const repeat = screen.getByRole("button", { name: "Repeat one. Turn off repeat" });
+  expect(repeat).toHaveAttribute("aria-pressed", "true");
+  fireEvent.click(repeat);
+  fireEvent.click(screen.getByRole("button", { name: "Turn on shuffle" }));
+  expect(player.toggleLoop).toHaveBeenCalledTimes(1);
+  expect(player.toggleShuffle).toHaveBeenCalledTimes(1);
 });
 
 test("toggles the lyrics and queue panels", () => {

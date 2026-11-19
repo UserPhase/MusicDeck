@@ -4,13 +4,14 @@
 //! and `server/src/routes/cast.ts`.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::error::ApiJson;
-use axum::Json;
+use axum::{Extension, Json};
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, HOST, ORIGIN, RANGE, REFERRER_POLICY,
@@ -25,6 +26,7 @@ use url::Url;
 use crate::auth::{AuthenticatedUser, extract_session_cookie};
 use crate::cast::{CastError, CastTicketRequest};
 use crate::catalog::{LibraryItemType, LibraryService, SourceResolver};
+use crate::config::AppConfig;
 use crate::error::{ApiErrorBody, ApiErrorEnvelope, ServerError};
 use crate::remote::{
     REGISTRATION_TIMEOUT_MS, REMOTE_WS_PATH, RemoteClientMessage, RemoteControlHub,
@@ -73,6 +75,7 @@ impl Drop for RemoteConnection {
 async fn remote_ws_or_426_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     ws_opt: Option<WebSocketUpgrade>,
 ) -> Response {
     // Plain HTTP GET without WebSocket upgrade returns `426 Upgrade Required`
@@ -89,13 +92,16 @@ async fn remote_ws_or_426_handler(
         .get(ORIGIN)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    if !is_allowed_remote_origin(
-        origin,
-        headers.get(HOST).and_then(|value| value.to_str().ok()),
-        &state.config().network.public_url,
-        state.config().cors_origin(),
-    ) {
-        return StatusCode::FORBIDDEN.into_response();
+    let config = state.config();
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    if !is_allowed_remote_origin(origin, host, &config.network.public_url, config.cors_origin())
+        && !is_local_dev_proxy(origin, host, &config, peer.map(|Extension(ConnectInfo(addr))| addr))
+    {
+        return send_error_response(
+            StatusCode::FORBIDDEN,
+            "Remote WebSocket origin is not allowed",
+            "REMOTE_ORIGIN_FORBIDDEN",
+        );
     }
 
     let Some(session_id) = extract_session_cookie(&headers) else {
@@ -104,13 +110,14 @@ async fn remote_ws_or_426_handler(
     let Some(store) = state.session_store().cloned() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let user = match store.get_session_user_by_id(&session_id).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(error) => {
+    let user = match tokio::time::timeout(REMOTE_PONG_TIMEOUT, store.get_session_user_by_id(&session_id)).await {
+        Ok(Ok(Some(user))) => user,
+        Ok(Ok(None)) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(Err(error)) => {
             tracing::warn!(%error, "Remote session lookup failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let now_ms = current_epoch_ms();
@@ -164,6 +171,21 @@ fn is_allowed_remote_origin(
     })
 }
 
+fn is_local_dev_proxy(
+    origin: &str,
+    host: Option<&str>,
+    config: &AppConfig,
+    peer: Option<SocketAddr>,
+) -> bool {
+    // CRA's proxy target in webapp/package.json is 127.0.0.1:4534.
+    // On WebSocket upgrades it rewrites Host to the backend and preserves the browser's Origin.
+    !config.is_production
+        && config.network.host.is_loopback()
+        && peer.is_some_and(|addr| addr.ip().is_loopback())
+        && matches!(origin, "http://localhost:3000" | "http://127.0.0.1:3000")
+        && host.is_some_and(|host| host == format!("127.0.0.1:{}", config.network.port))
+}
+
 const REMOTE_PING_INTERVAL: Duration = Duration::from_secs(15);
 const REMOTE_PONG_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,7 +237,12 @@ async fn drive_remote_websocket(
     tokio::pin!(reg_deadline);
     let mut reg_checked = false;
 
-    let mut ping_ticker = tokio::time::interval(REMOTE_PING_INTERVAL);
+    // The upgrade already validated the session. Let the device register before
+    // the first periodic check can wait on session storage.
+    let mut ping_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + REMOTE_PING_INTERVAL,
+        REMOTE_PING_INTERVAL,
+    );
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat = RemoteHeartbeat::default();
 
@@ -344,9 +371,13 @@ async fn drive_remote_websocket(
                             continue;
                         };
 
+                        let request_id = raw_val.get("requestId").and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty() && id.len() <= 160).map(str::to_owned);
                         let Ok(parsed_msg) = serde_json::from_value::<RemoteClientMessage>(raw_val) else {
-                            let err_json = r#"{"type":"ERROR","message":"Invalid remote message"}"#;
-                            if !send_remote_frame(&mut socket, WsMessage::Text(err_json.into())).await { break; }
+                            let error = serde_json::json!({
+                                "type": "ERROR", "message": "Invalid remote message", "requestId": request_id,
+                            });
+                            if !send_remote_frame(&mut socket, WsMessage::Text(error.to_string().into())).await { break; }
                             continue;
                         };
 
@@ -405,6 +436,119 @@ mod tests {
                 "{origin}"
             );
         }
+    }
+
+    #[test]
+    fn restricts_the_cra_origin_to_native_development_on_loopback() {
+        let mut config = AppConfig::default();
+        config.network.public_url = "http://localhost:8080".into();
+        config.network.cors_origin = config.network.public_url.clone();
+        let host = Some("127.0.0.1:4534");
+        let peer = Some("127.0.0.1:52000".parse().unwrap());
+        let origin = "http://localhost:3000";
+        assert!(!is_allowed_remote_origin(origin, host, &config.network.public_url, config.cors_origin()));
+        assert!(is_local_dev_proxy(origin, host, &config, peer));
+        assert!(is_local_dev_proxy("http://127.0.0.1:3000", host, &config, peer));
+        for other in ["http://localhost:3001", "https://localhost:3000", "http://localhost.evil.test:3000", "null"] {
+            assert!(!is_local_dev_proxy(other, host, &config, peer), "{other}");
+        }
+        assert!(!is_local_dev_proxy(origin, Some("127.0.0.1:8080"), &config, peer));
+        assert!(!is_local_dev_proxy(origin, host, &config, None));
+        assert!(!is_local_dev_proxy(origin, host, &config, Some("192.168.1.3:52000".parse().unwrap())));
+        config.is_production = true;
+        assert!(!is_local_dev_proxy(origin, host, &config, peer));
+        config.is_production = false;
+        config.network.host = "0.0.0.0".parse().unwrap();
+        assert!(!is_local_dev_proxy(origin, host, &config, peer));
+    }
+
+    #[tokio::test]
+    async fn registers_authenticated_cra_websocket_and_rejects_other_origins() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = AppConfig::default();
+        config.network.port = addr.port();
+        config.network.public_url = "http://localhost:8080".into();
+        config.network.cors_origin = config.network.public_url.clone();
+        let db = crate::db::DbPool::connect_memory().await.unwrap();
+        crate::db::run_migrations(&db, None).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO roles (name, description) VALUES ('user','Listener');
+             INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+             VALUES ('listener','listener','unused','Listener','user','now','now');",
+        ).execute(db.inner()).await.unwrap();
+        let state = AppState::with_database(config, db).await.unwrap();
+        let session = state.session_store().unwrap().create_session("listener", true).await.unwrap();
+        let app = crate::create_router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        for (origin, signed_in, expected) in [
+            ("http://localhost:3000", true, "101"),
+            ("http://127.0.0.1:3000", true, "101"),
+            ("http://localhost:3000", false, "401"),
+            ("http://unrelated.test:3000", true, "403"),
+            ("http://localhost:3001", true, "403"),
+            ("http://localhost:8080", true, "101"),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let cookie = if signed_in { format!("Cookie: {}={}\r\n", crate::auth::SESSION_COOKIE, session.id) } else { String::new() };
+            let request = format!(
+                "GET {REMOTE_WS_PATH} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n{cookie}Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line.split_whitespace().nth(1), Some(expected), "{origin} signed_in={signed_in}: {line}");
+                if expected != "101" { return; }
+
+                loop {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" { break; }
+                }
+                let register = serde_json::json!({
+                    "type": "REGISTER", "device_id": "dev-tab", "device_name": "Local Browser",
+                    "device_type": "computer", "can_receive": false, "queue_device_id": "browser-tab",
+                    "live_sync": true, "command_deadlines": true, "playback_lease": true, "playbackLeaseProtocol": 1,
+                    "state": {"current_track": null, "position_ms": 0, "duration_ms": 0, "playing": false, "volume": 1},
+                }).to_string();
+                let mask = [1, 2, 3, 4];
+                let mut frame = vec![0x81, 0xfe]; // Masked text with a two-byte length.
+                frame.extend(u16::try_from(register.len()).unwrap().to_be_bytes());
+                frame.extend(mask);
+                frame.extend(register.bytes().enumerate().map(|(i, byte)| byte ^ mask[i % 4]));
+                stream.write_all(&frame).await.unwrap();
+
+                for message_type in ["DEVICES", "INITIAL_STATE"] {
+                    assert_eq!(stream.read_u8().await.unwrap(), 0x81, "expected {message_type} before any heartbeat");
+                    let len = match stream.read_u8().await.unwrap() {
+                        len @ 0..=125 => len as usize,
+                        126 => stream.read_u16().await.unwrap() as usize,
+                        len => panic!("unexpected WebSocket frame length marker: {len}"),
+                    };
+                    let mut payload = vec![0; len];
+                    stream.read_exact(&mut payload).await.unwrap();
+                    let message: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    assert_eq!(message["type"], message_type);
+                    if message_type == "DEVICES" {
+                        assert_eq!(message["live_state_protocol"], true);
+                        assert_eq!(message["devices"][0]["device_id"], "dev-tab");
+                    } else {
+                        assert!(message["state"]["revision"].as_u64().is_some_and(|rev| rev > 0));
+                        assert_eq!(message["state"]["track"], serde_json::Value::Null);
+                        assert_eq!(message["controlTimeoutMs"], 25_000);
+                    }
+                }
+            }).await.unwrap();
+        }
+        server.abort();
+        state.tasks().close();
     }
 
     #[test]

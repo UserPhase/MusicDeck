@@ -110,13 +110,15 @@ describe.each(["docker-compose.yml", "docker-compose.dev.yml"])("%s backend port
     expect(services["musicdeck-server"].expose).toContain("4534");
     expect(services["musicdeck-server"].healthcheck?.test.join(" ")).toContain("127.0.0.1:4534/api/health");
     const nginx = fs.readFileSync(path.join(root, "webapp/nginx.conf"), "utf8");
-    expect(nginx).toContain("proxy_pass http://$musicdeck_upstream:4534");
+    expect(nginx).toContain("proxy_pass http://musicdeck_backend");
+    expect(nginx).toMatch(/location = \/api\/v1\/remote \{[^}]*proxy_set_header Upgrade \$http_upgrade;[^}]*proxy_set_header Host \$http_host;/);
     expect(nginx).toContain("Content-Security-Policy");
     expect(nginx).toContain("frame-ancestors 'self'");
     expect(nginx).toContain("X-Content-Type-Options");
     expect(nginx).toContain("Referrer-Policy");
     expect(nginx).not.toContain("Strict-Transport-Security");
     if (file === "docker-compose.yml") {
+      expect(services["musicdeck-server"].environment?.MUSICDECK_ENV).toBe("production");
       expect(services["musicdeck-server"].environment?.MUSICDECK_SECURE_COOKIES).toBe("true");
       expect(services["musicdeck-web"].ports?.[0].host_ip).toBe("127.0.0.1");
     }

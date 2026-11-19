@@ -1217,21 +1217,17 @@ async fn stream_track_handler(
         .get(axum::http::header::IF_RANGE)
         .and_then(|value| value.to_str().ok());
 
-    let inspection_id = params
+    // The wire name predates stream recovery. Keep using it as the playback pin
+    // even for clients that opt out of collecting quality observations.
+    let playback_session = params
         .get("inspectionId")
         .map(String::as_str)
         .filter(|id| !id.is_empty());
+    let inspect = params.get("inspect").is_none_or(|value| value != "false");
     let previous_session = params.get("retryFrom").map(String::as_str);
-    let valid_session_id = |id: &str| {
-        !id.is_empty()
-            && id.len() <= 160
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    };
-    if inspection_id.is_some_and(|id| !valid_session_id(id))
+    if playback_session.is_some_and(|id| !valid_session_id(id))
         || previous_session.is_some_and(|id| {
-            !valid_session_id(id) || inspection_id.is_none() || inspection_id == Some(id)
+            !valid_session_id(id) || playback_session.is_none() || playback_session == Some(id)
         })
     {
         return send_error_response(
@@ -1245,7 +1241,7 @@ async fn stream_track_handler(
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|kbps| matches!(kbps, 128 | 192 | 256 | 320));
     let inspection_context = || {
-        inspection_id.map(|id| {
+        playback_session.filter(|_| inspect).map(|id| {
             (
                 state.inspector().clone(),
                 auth.user.id.clone(),
@@ -1296,7 +1292,7 @@ async fn stream_track_handler(
         };
         let key = crate::catalog::resolver::PlaybackStreamKey {
             scope: &auth.user.id,
-            session: inspection_id,
+            session: playback_session,
             track: &track_id,
             preferred_source: None,
             max_bit_rate,
@@ -1365,7 +1361,7 @@ async fn stream_track_handler(
         .or(library_connection);
     let key = crate::catalog::resolver::PlaybackStreamKey {
         scope: &auth.user.id,
-        session: inspection_id,
+        session: playback_session,
         track: &track_id,
         preferred_source,
         max_bit_rate,
@@ -1403,39 +1399,48 @@ pub(super) fn stream_database_unavailable() -> Response {
     response
 }
 
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 160
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 async fn inspect_stream_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
     Path(track_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(inspection_id) = params.get("inspectionId").filter(|s| !s.trim().is_empty()) else {
+    let Some(inspection_id) = params.get("inspectionId").filter(|id| valid_session_id(id)) else {
         return send_error_response(
             StatusCode::BAD_REQUEST,
-            "inspectionId query parameter is required",
+            "A valid inspectionId query parameter is required",
             "VALIDATION_ERROR",
         );
     };
 
-    let (_, resolver, _) = match build_catalog_and_resolver(&state) {
-        Ok(t) => t,
-        Err(res) => return res,
+    let inspector = state.inspector();
+    let pipe = inspector.source_descriptor(&auth.user.id, &track_id, inspection_id);
+    let source_meta = if let Some(pipe) = &pipe {
+        let result = inspector
+            .cached_source_metadata(&track_id, pipe, async {
+                SourceResolver::stream_source_metadata(state.providers(), pipe)
+                    .await
+                    .map_err(|_| ())
+            })
+            .await;
+        Some((pipe, result))
+    } else {
+        None
     };
 
-    let inspector = state.inspector();
-    let source_meta =
-        if let Some(pipe) = inspector.source_descriptor(&auth.user.id, &track_id, inspection_id) {
-            inspector
-                .cached_source_metadata(&track_id, &pipe, async {
-                    resolver.stream_source_metadata(&pipe).await.map_err(|_| ())
-                })
-                .await
-        } else {
-            Ok(None)
-        };
-
     let report = inspector.inspect_snapshot(&auth.user.id, &track_id, inspection_id, source_meta);
-    Json(report).into_response()
+    let mut response = Json(report).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 async fn fetch_artwork_handler(
@@ -1764,19 +1769,27 @@ async fn post_listening_event_handler(
         );
     }
 
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let result = match state.db() {
+        Some(db) => record_playback_with_scrobbles(db, &auth.user.id, &event, Some(state.scrobble_queue())).await,
+        None => Err(ListeningActivityError::StorageUnavailable),
     };
-
-    match record_playback_with_scrobbles(db, &auth.user.id, &event, Some(state.scrobble_queue()))
-        .await
-    {
+    let mut response = match result {
         Ok(outcome) => Json(outcome).into_response(),
         Err(ListeningActivityError::Validation(msg)) => {
             send_error_response(StatusCode::BAD_REQUEST, msg, "VALIDATION_ERROR")
         }
+        Err(ListeningActivityError::Sqlx(err) | ListeningActivityError::Db(crate::db::DbError::Sqlx(err))) => {
+            ServerError::playback_storage("save listening event", err).into_response()
+        }
+        Err(err @ ListeningActivityError::StorageUnavailable) => {
+            ServerError::ServiceUnavailable(err.to_string()).into_response()
+        }
         Err(err) => ServerError::Internal(err.to_string()).into_response(),
+    };
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
     }
+    response
 }
 
 async fn get_listening_activity_config_handler(
@@ -1966,13 +1979,14 @@ async fn list_recently_added_tracks_handler(
         .unwrap_or(20)
         .clamp(1, 100);
 
-    let mut res = catalog.list_tracks().await;
-    res.items.sort_by(|a, b| b.item.added_at.cmp(&a.item.added_at));
-    res.items.truncate(limit);
+    let snapshot = state.catalog_snapshots().tracks(&catalog).await;
+    let mut tracks: Vec<_> = snapshot.items.iter().collect();
+    tracks.sort_by(|a, b| b.item.added_at.cmp(&a.item.added_at));
+    tracks.truncate(limit);
 
     Json(json!({
-        "tracks": res.items,
-        "degraded": res.degraded,
+        "tracks": tracks,
+        "degraded": snapshot.degraded,
     }))
     .into_response()
 }
@@ -2019,11 +2033,11 @@ async fn get_random_tracks_handler(
         .unwrap_or(20)
         .clamp(1, 100);
 
-    let mut res = catalog.list_tracks().await;
-    res.items.truncate(limit);
+    let snapshot = state.catalog_snapshots().tracks(&catalog).await;
+    let tracks: Vec<_> = snapshot.items.iter().take(limit).collect();
     Json(json!({
-        "tracks": res.items,
-        "degraded": res.degraded,
+        "tracks": tracks,
+        "degraded": snapshot.degraded,
     }))
     .into_response()
 }

@@ -112,7 +112,10 @@ function PlayerSettings({
       <article className="settings-row settings-transition-row">
         <div className="settings-row-copy">
           <h3>Track Transitions</h3>
-          <p id={descriptionId} aria-live="polite">{selected.description}</p>
+          <p id={descriptionId} aria-live="polite">
+            {selected.description}
+            {isCrossfade && isAlbumAware && " Album-Aware Playback keeps consecutive tracks in an ordered album gapless."}
+          </p>
         </div>
         <fieldset className="settings-transition-control" aria-describedby={descriptionId}>
           <legend>Track transitions</legend>

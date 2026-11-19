@@ -90,14 +90,25 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
     const seenIsrc = new Set(songs.map((song) => song.identityHints?.isrc || song.metadata?.isrc).filter(Boolean));
     const owned = (local.data?.items || []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
     const discovered = (externalEnabled ? external.data?.items || [] : []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
-    const all = [];
+    const byArtist = new Map();
+    let count = 0;
     for (let index = 0; index < Math.max(owned.length, discovered.length); index++) {
       for (const item of [owned[index], discovered[index]]) {
         if (!item || existingIds.has(String(item.id)) || seen.has(recording(item))) continue;
         const isrc = item.identityHints?.isrc || item.metadata?.isrc;
         if (isrc && seenIsrc.has(isrc)) continue;
         seen.add(recording(item)); if (isrc) seenIsrc.add(isrc);
-        all.push(item);
+        const artist = normalize(item.artist || item.artistName);
+        if (!byArtist.has(artist)) byArtist.set(artist, []);
+        byArtist.get(artist).push(item);
+        count++;
+      }
+    }
+    const all = [];
+    // Give each matching artist a spot before showing another song by the same artist.
+    for (let round = 0; all.length < count; round++) {
+      for (const tracks of byArtist.values()) {
+        if (round < tracks.length) all.push(tracks[round]);
       }
     }
     return all;
@@ -135,6 +146,8 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
   const totalPages = Math.max(1, Math.ceil(items.length / 6));
   const visible = items.slice((page % totalPages) * 6, (page % totalPages) * 6 + 6);
   const loading = local.isFetching || (externalEnabled && external.isFetching);
+  const responseError = [local.error, externalEnabled && external.error]
+    .find((error) => error?.code === "INVALID_PLAYLIST_RECOMMENDATIONS");
   if (!songs.length) return null;
   return <section className="playlist-recommendations" aria-labelledby="playlist-recommendations-title">
     <div className="playlist-recommendations-heading"><div>
@@ -155,9 +168,9 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
           />)}
     </div></TrackActionScope>
     {loading && <p className="playlist-recommendations-status" role="status">{items.length ? "Finding more songs…" : "Finding songs for this playlist…"}</p>}
-    {!loading && !items.length && !local.isError && !(externalEnabled && external.isError) && <p className="playlist-recommendations-status">No more suggestions yet. Try again after adding a few different songs.</p>}
+    {!loading && !items.length && !local.isError && !(externalEnabled && external.isError) && <p className="playlist-recommendations-status">No matching songs found for this playlist.</p>}
     {(local.isError || (externalEnabled && external.isError)) && <p className="playlist-recommendations-status" role="status">
-      Some recommendations couldn't be loaded. <button type="button" onClick={() => {
+      {responseError?.message || "Some recommendations couldn't be loaded."} <button type="button" onClick={() => {
         if (local.isError) void local.refetch(); if (externalEnabled && external.isError) void external.refetch();
       }}>Retry recommendations</button>
     </p>}

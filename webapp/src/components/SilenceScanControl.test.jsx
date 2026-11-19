@@ -54,3 +54,14 @@ test("reports start failures and lets the user retry", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("Could not start the library scan");
   expect(screen.getByRole("button", { name: "Analyze all tracks" })).toBeEnabled();
 });
+
+test("keeps the backend rejection visible when the initial scan status request finishes", async () => {
+  let finishStatus;
+  getSilenceScan.mockReturnValueOnce(new Promise((resolve) => { finishStatus = resolve; }));
+  startSilenceScan.mockRejectedValueOnce(Object.assign(new Error("Silence analysis storage is unavailable"), { status: 503 }));
+  render(<SilenceScanControl {...parameters} />);
+  fireEvent.click(screen.getByRole("button", { name: "Analyze all tracks" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Silence analysis storage is unavailable");
+  await act(async () => finishStatus(null));
+  expect(screen.getByRole("alert")).toHaveTextContent("Silence analysis storage is unavailable");
+});

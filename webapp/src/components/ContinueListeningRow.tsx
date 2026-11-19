@@ -71,9 +71,10 @@ function ResumeAction({ checkpoint }: { checkpoint: MediaCheckpoint }) {
   </div>;
 }
 
-export default function ContinueListeningRow({ fallback }: { fallback?: ReactNode }) {
+export default function ContinueListeningRow({ fallback, title }: { fallback?: ReactNode; title?: string }) {
   const { items, loading, error, retry } = useMediaSessions();
-  return <>
+  if (title && !items.length && !loading && !error && !fallback) return null;
+  const content = <>
     {loading && !items.length && <p className="home-section-state" role="status">Loading listening progress...</p>}
     {error && <p className="resume-error" role="status">{error} <button type="button" onClick={retry}>Retry listening progress</button></p>}
     {items.length > 0 && <div className="continue-collection-grid">
@@ -81,4 +82,8 @@ export default function ContinueListeningRow({ fallback }: { fallback?: ReactNod
     </div>}
     {!items.length && fallback}
   </>;
+  return title ? <section className="home-section" aria-label={title}>
+    <div className="home-section-header"><h2>{title}</h2></div>
+    {content}
+  </section> : content;
 }

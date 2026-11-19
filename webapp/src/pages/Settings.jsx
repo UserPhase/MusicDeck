@@ -5,6 +5,7 @@ import {
   getUserSettings,
   updateUserSettings,
   USER_SETTINGS_CHANGED_EVENT,
+  SILENCE_ANALYZED_EVENT,
 } from "../api/musicdeck";
 import { DEFAULT_CROSSFADE_SECONDS, clampCrossfadeDuration, isTransitionMode, usePlayer } from "../context/PlayerContext";
 import LoudnessScanControl from "../components/LoudnessScanControl";
@@ -78,8 +79,8 @@ function Settings() {
     changeAccentColor,
     autoOpenSidebar: globalAutoOpenSidebar = false,
     changeAutoOpenSidebar,
-    isAutoplayEnabled: globalAutoplayEnabled = true,
-    changeAutoplayEnabled,
+    isEndlessPlaybackEnabled: globalEndlessPlaybackEnabled = false,
+    changeEndlessPlaybackEnabled,
   } = player;
   const [silenceTrimEnabled, setSilenceTrimEnabled] = useState(false);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState(-35);
@@ -109,7 +110,8 @@ function Settings() {
   const layoutPresetTouchedRef = useRef(false);
   const [accentColor, setAccentColor] = useState(globalAccentColor);
   const [autoOpenSidebar, setAutoOpenSidebar] = useState(globalAutoOpenSidebar);
-  const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(globalAutoplayEnabled);
+  const [isEndlessPlaybackEnabled, setIsEndlessPlaybackEnabled] = useState(globalEndlessPlaybackEnabled);
+  useEffect(() => setIsEndlessPlaybackEnabled(globalEndlessPlaybackEnabled), [globalEndlessPlaybackEnabled]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
@@ -142,8 +144,8 @@ function Settings() {
   const initialQueuePreferences = useRef({
     autoOpenSidebar: globalAutoOpenSidebar,
     changeAutoOpenSidebar,
-    autoplayEnabled: globalAutoplayEnabled,
-    changeAutoplayEnabled,
+    endlessPlaybackEnabled: globalEndlessPlaybackEnabled,
+    changeEndlessPlaybackEnabled,
   });
 
   useEffect(() => {
@@ -279,13 +281,13 @@ function Settings() {
           setAutoOpenSidebar(nextAutoOpenSidebar);
           initialQueuePreferences.current.changeAutoOpenSidebar?.(nextAutoOpenSidebar);
 
-          const nextAutoplayEnabled = Boolean(getSetting(
+          const nextEndlessPlaybackEnabled = getSetting(
             settings,
             "playback.autoplay.enabled",
-            initialQueuePreferences.current.autoplayEnabled,
-          ));
-          setIsAutoplayEnabled(nextAutoplayEnabled);
-          initialQueuePreferences.current.changeAutoplayEnabled?.(nextAutoplayEnabled);
+            initialQueuePreferences.current.endlessPlaybackEnabled,
+          ) === true;
+          setIsEndlessPlaybackEnabled(nextEndlessPlaybackEnabled);
+          initialQueuePreferences.current.changeEndlessPlaybackEnabled?.(nextEndlessPlaybackEnabled);
 
         }
       } catch (err) {
@@ -308,10 +310,13 @@ function Settings() {
       setSaving(true);
       setMessage("");
       setError(null);
-      await updateUserSettings({
+      const silenceSettings = {
         "playback.silenceTrim.enabled": silenceTrimEnabled,
         "playback.silenceTrim.thresholdDb": Number(silenceThresholdDb),
         "playback.silenceTrim.minSilenceSeconds": Number(silenceMinSeconds),
+      };
+      await updateUserSettings({
+        ...silenceSettings,
         "playback.crossfadeDuration": Number(crossfadeDuration),
         "playback.transitionMode": transitionMode,
         "playback.shuffleMode": shuffleMode,
@@ -323,8 +328,9 @@ function Settings() {
         "ui.layoutDensity": layoutDensity,
         "ui.accentColor": accentColor,
         "ui.autoOpenSidebar": autoOpenSidebar,
-        "playback.autoplay.enabled": isAutoplayEnabled,
+        "playback.autoplay.enabled": isEndlessPlaybackEnabled,
       });
+      window.dispatchEvent(new CustomEvent(USER_SETTINGS_CHANGED_EVENT, { detail: silenceSettings }));
       setMessage("Settings saved.");
     } catch (err) {
       setError(err.message || "Could not save settings.");
@@ -510,8 +516,16 @@ function Settings() {
       const analysis = await analyzeSilence(currentSong.id, {
         thresholdDb: Number(silenceThresholdDb),
         minSilenceSeconds: Number(silenceMinSeconds),
+        force: true,
       });
-      setReanalyzeMessage(analysis?.status === "completed" ? "Re-analysis complete for the current track." : "Could not analyze this track. Please try again.");
+      if (analysis?.status === "completed") {
+        window.dispatchEvent(new CustomEvent(SILENCE_ANALYZED_EVENT, {
+          detail: { trackId: currentSong.id, analysis },
+        }));
+        setReanalyzeMessage("Re-analysis complete for the current track.");
+      } else {
+        setReanalyzeMessage(analysis?.errorMessage || "Could not analyze this track. Please try again.");
+      }
     } catch (err) {
       setReanalyzeMessage(
         err.message || "Could not re-analyze the current track.",
@@ -540,6 +554,21 @@ function Settings() {
             <h2 id="audio-playback-title">Audio &amp; Playback</h2>
           </div>
 
+          <article className="settings-row">
+            <div className="settings-row-copy">
+              <h3>Endless Playback</h3>
+              <p>Keep the queue going with library tracks, or start another pass through the playlist.</p>
+            </div>
+            <label className="settings-switch" aria-label="Endless Playback">
+              <input
+                type="checkbox"
+                checked={isEndlessPlaybackEnabled}
+                onChange={(event) => handleQueuePreferenceChange(event, setIsEndlessPlaybackEnabled, changeEndlessPlaybackEnabled, "playerAutoplayEnabled")}
+              />
+              <span aria-hidden="true" />
+            </label>
+          </article>
+
           {player.audioEngine && <Suspense fallback={<p role="status">Loading equalizer…</p>}>
             <EqualizerSettings engine={player.audioEngine} local={!player.isCasting && !player.isRemotePlayback}
               playing={player.isPlaying && !player.isBuffering} />
@@ -549,8 +578,8 @@ function Settings() {
             <div className="settings-row-copy">
               <h3>Automatic Silence Trimming</h3>
               <p>
-                Automatically analyze new library tracks during playback, then
-                skip detected silence at the beginning and end.
+                Skip detected silence at the beginning and end of library tracks
+                when matching silence analysis is available.
               </p>
             </div>
             <label
@@ -865,21 +894,6 @@ function Settings() {
                 type="checkbox"
                 checked={autoOpenSidebar}
                 onChange={(event) => handleQueuePreferenceChange(event, setAutoOpenSidebar, changeAutoOpenSidebar, "playerAutoOpenSidebar")}
-              />
-              <span aria-hidden="true" />
-            </label>
-          </article>
-
-          <article className="settings-row">
-            <div className="settings-row-copy">
-              <h3>Autoplay / Endless Radio</h3>
-              <p>Keep playing similar or random tracks when your queue ends.</p>
-            </div>
-            <label className="settings-switch" aria-label="Autoplay / Endless Radio">
-              <input
-                type="checkbox"
-                checked={isAutoplayEnabled}
-                onChange={(event) => handleQueuePreferenceChange(event, setIsAutoplayEnabled, changeAutoplayEnabled, "playerAutoplayEnabled")}
               />
               <span aria-hidden="true" />
             </label>

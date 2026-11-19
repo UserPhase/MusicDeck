@@ -187,6 +187,57 @@ test("defers Web Audio until user activation and routes a restored track without
   }
 });
 
+test("a pending Web Audio resume keeps the active element audible at the same position", async () => {
+  const ctx = new FakeAudioContext();
+  ctx.state = "suspended";
+  let resume!: () => void;
+  jest.spyOn(ctx, "resume").mockReturnValue(new Promise<void>((resolve) => { resume = resolve; }));
+  const capture = jest.spyOn(ctx, "createMediaElementSource");
+  const { engine, audios } = setup({ audioContext: ctx as unknown as AudioContext });
+  try {
+    await engine.load(track("direct"), { startAt: 24 });
+    audios[0].loaded(120);
+    await engine.unlock();
+    expect(capture).not.toHaveBeenCalled();
+    expect(engine.getAudioDiagnostics().path).toBe("HTML Audio");
+    expect(engine.getSnapshot()).toMatchObject({ state: "playing", position: 24 });
+    expect(ctx.resume).toHaveBeenCalledTimes(1);
+
+    ctx.state = "running";
+    resume();
+    await Promise.resolve();
+    expect(capture).not.toHaveBeenCalled();
+    engine.pause();
+    await engine.play();
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(engine.getAudioDiagnostics().path).toBe("Web Audio");
+    expect(engine.getPosition()).toBe(24);
+    expect(audios[0].load).toHaveBeenCalledTimes(1);
+  } finally {
+    engine.destroy();
+  }
+});
+
+test.each([
+  ["rejects", () => Promise.reject(new Error("Audio context blocked"))],
+  ["throws", () => { throw new Error("Audio context blocked"); }],
+])("when Web Audio resume %s, playback stays on the direct path", async (_failure, resume) => {
+  const ctx = new FakeAudioContext();
+  ctx.state = "suspended";
+  jest.spyOn(ctx, "resume").mockImplementation(resume);
+  const capture = jest.spyOn(ctx, "createMediaElementSource");
+  const { engine, audios } = setup({ audioContext: ctx as unknown as AudioContext });
+  try {
+    await expect(engine.unlock()).resolves.toBeUndefined();
+    await expect(engine.load(track("audio"))).resolves.toBeUndefined();
+    expect(capture).not.toHaveBeenCalled();
+    expect(audios[0].paused).toBe(false);
+    expect(engine.getSnapshot()).toMatchObject({ state: "playing", key: "audio" });
+  } finally {
+    engine.destroy();
+  }
+});
+
 describe("sleep automation", () => {
   test("schedules the five-second master fade on the audio clock and pauses at the deadline", async () => {
     jest.useFakeTimers();
@@ -362,7 +413,7 @@ function setup(options: PlaybackEngineOptions = {}) {
   });
   const events: Array<[PlaybackEngineEvent, unknown]> = [];
   const names: PlaybackEngineEvent[] = [
-    "stateChange", "trackEnd", "sleepStop", "bufferStall", "streamRecovered", "recoveryFailed",
+    "stateChange", "trackEnd", "silenceSkipped", "sleepStop", "bufferStall", "streamRecovered", "recoveryFailed",
     "transitionStart", "transitionCommit", "transitionCancel", "error",
   ];
   names.forEach((name) => engine.on(name, (payload) => events.push([name, payload])));
@@ -516,6 +567,18 @@ describe("PlaybackEngine basics", () => {
     engine.destroy();
   });
 
+  test("duplicate ended events on the current deck notify the queue once", async () => {
+    const { engine, audios, of } = setup();
+    try {
+      await engine.load(track("a"));
+      audios[0].finish();
+      audios[0].finish();
+      expect(of("trackEnd")).toEqual([{ key: "a" }]);
+    } finally {
+      engine.destroy();
+    }
+  });
+
   test("applies a resume position once metadata is available", async () => {
     const { engine, audios } = setup();
     await engine.load(track("a"), { startAt: 42 });
@@ -526,6 +589,99 @@ describe("PlaybackEngine basics", () => {
 });
 
 describe("crossfade path", () => {
+  test("preloads and starts on the media clock without another timeupdate", async () => {
+    const ctx = new FakeAudioContext();
+    ctx.state = "suspended";
+    jest.spyOn(ctx, "resume").mockReturnValue(new Promise<void>(() => {}));
+    const { engine, audios, of } = setup({
+      audioContext: ctx as unknown as AudioContext, transitionMode: "crossfade", crossfadeSeconds: 5,
+    });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      engine.setUpcoming(track("b"));
+      outgoing.progress(85);
+      expect(incoming.src).toBe("");
+
+      outgoing.currentTime = 87;
+      jest.advanceTimersByTime(2000);
+      expect(incoming.src).toBe("/stream/b");
+      expect(incoming.volume).toBe(0);
+      expect(incoming.play).not.toHaveBeenCalled();
+
+      outgoing.currentTime = 95;
+      jest.advanceTimersByTime(8000);
+      await flush();
+      expect(engine.getAudioDiagnostics().path).toBe("HTML Audio");
+      expect(of("transitionStart")).toEqual([{ kind: "crossfade", fromKey: "a", toKey: "b" }]);
+
+      jest.advanceTimersByTime(2500);
+      expect(outgoing.volume).toBeCloseTo(Math.SQRT1_2, 1);
+      expect(incoming.volume).toBeCloseTo(Math.SQRT1_2, 1);
+      outgoing.finish();
+      outgoing.finish();
+      jest.advanceTimersByTime(3000);
+      expect(of("transitionCommit")).toHaveLength(1);
+      expect(of("trackEnd")).toEqual([]);
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test("recalculates the gain ramps if the incoming stream buffers before starting", async () => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 5 });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      let startIncoming!: () => void;
+      incoming.playResult = () => new Promise<void>((resolve) => { startIncoming = resolve; });
+      engine.setUpcoming(track("b"));
+      outgoing.progress(95);
+      jest.advanceTimersByTime(3000);
+      expect(outgoing.volume).toBe(1);
+      expect(incoming.volume).toBe(0);
+
+      outgoing.currentTime = 98;
+      startIncoming();
+      await flush();
+      jest.advanceTimersByTime(1000);
+      expect(outgoing.volume).toBeCloseTo(Math.SQRT1_2, 1);
+      expect(incoming.volume).toBeCloseTo(Math.SQRT1_2, 1);
+      jest.advanceTimersByTime(1000);
+      expect(of("transitionCommit")).toEqual([{ kind: "crossfade", fromKey: "a", toKey: "b" }]);
+      expect(incoming.volume).toBe(1);
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test("uses the media playback rate and ignores catalog hints for live streams", async () => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 5 });
+    try {
+      await engine.load(track("a", 100));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(Infinity);
+      engine.setUpcoming(track("b"));
+      outgoing.progress(97);
+      jest.advanceTimersByTime(5000);
+      expect(incoming.src).toBe("");
+
+      outgoing.loaded(120);
+      outgoing.playbackRate = 2;
+      outgoing.progress(108);
+      expect(incoming.src).toBe("/stream/b");
+      expect(incoming.play).not.toHaveBeenCalled();
+      outgoing.currentTime = 110;
+      jest.advanceTimersByTime(1000);
+      await flush();
+      expect(of("transitionStart")).toHaveLength(1);
+    } finally {
+      engine.destroy();
+    }
+  });
+
   test("ramps both decks over the configured window and commits the incoming track", async () => {
     const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 2 });
     await engine.load(track("a"));
@@ -579,6 +735,63 @@ describe("crossfade path", () => {
     jest.advanceTimersByTime(5000);
     expect(of("transitionCommit")).toEqual([]);
     engine.destroy();
+  });
+
+  test.each(["seek", "skip", "off"])("%s cancels an active fade and prevents a delayed handoff", async (action) => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 4 });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      engine.setUpcoming(track("b"));
+      outgoing.progress(96);
+      await flush();
+      jest.advanceTimersByTime(1000);
+
+      if (action === "seek") engine.seek(30);
+      else if (action === "skip") await engine.load(track("c"));
+      else engine.setTransitionMode("off");
+
+      jest.advanceTimersByTime(5000);
+      expect(of("transitionCancel")).toHaveLength(1);
+      expect(of("transitionCommit")).toEqual([]);
+      expect(of("trackEnd")).toEqual([]);
+      expect(audios.filter(audio => !audio.paused)).toHaveLength(1);
+      if (action === "skip") {
+        expect(outgoing.src).toBe("");
+        expect(incoming.src).toBe("/stream/c");
+      } else {
+        expect(incoming.src).toBe("");
+        expect(outgoing.volume).toBe(1);
+        expect(outgoing.currentTime).toBe(action === "seek" ? 30 : 96);
+      }
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test("a short incoming track that ends during crossfade falls back to normal queue advance", async () => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 4 });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      engine.setUpcoming(track("b"));
+      outgoing.progress(96);
+      await flush();
+      incoming.finish();
+      outgoing.progress(99);
+      expect(incoming.play).toHaveBeenCalledTimes(1);
+      expect(incoming.src).toBe("");
+      expect(outgoing.volume).toBe(1);
+      outgoing.finish();
+      outgoing.finish();
+      jest.advanceTimersByTime(5000);
+      expect(of("transitionCommit")).toEqual([]);
+      expect(of("trackEnd")).toEqual([{ key: "a" }]);
+    } finally {
+      engine.destroy();
+    }
   });
 
   test("Web Audio cancels both active fades at the current sample when playback stops", async () => {
@@ -998,6 +1211,101 @@ describe("per-track gain and silence trimming", () => {
   const withSettings = (name: string, settings: { gain?: number; trimStart?: number; trimEnd?: number | null }) => ({
     ...track(name),
     ...settings,
+  });
+
+  test("automatic trim keeps source timestamps and respects an explicit seek into the outro", async () => {
+    const { engine, audios, of } = setup();
+    try {
+      await engine.load({ ...track("a"), silenceTrim: { leading: 2, trailing: 10, analyzedDuration: 100 } });
+      const [deck] = audios;
+      deck.loaded(100);
+      expect(engine.getPosition()).toBeCloseTo(1.9);
+      expect(engine.getSnapshot().duration).toBe(100);
+      expect(of("silenceSkipped")).toEqual([{ key: "a" }]);
+      engine.seek(95);
+      deck.progress(96);
+      expect(engine.getPosition()).toBe(96);
+      expect(of("trackEnd")).toEqual([]);
+
+      engine.seek(89);
+      deck.progress(90);
+      expect(of("trackEnd")).toEqual([]);
+      deck.progress(90.2);
+      deck.finish();
+      expect(of("trackEnd")).toEqual([{ key: "a" }]);
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test.each([
+    ["live", Infinity, { leading: 2, trailing: 10, analyzedDuration: 100 }, 95],
+    ["short", 1.2, { leading: 0.5, trailing: 0.5, analyzedDuration: 1.2 }, 1.1],
+    ["mismatched analysis", 120, { leading: 2, trailing: 10, analyzedDuration: 100 }, 115],
+    ["overlapping analysis", 100, { leading: 75, trailing: 75 }, 95],
+  ] as const)("%s media uses the untrimmed stream", async (_kind, duration, silenceTrim, position) => {
+    const { engine, audios, of } = setup();
+    try {
+      await engine.load({ ...track("a", 100), silenceTrim });
+      const [deck] = audios;
+      deck.loaded(duration);
+      expect(engine.getPosition()).toBe(0);
+      deck.progress(position);
+      expect(of("trackEnd")).toEqual([]);
+      expect(deck.paused).toBe(false);
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test("crossfade waits for the shorter trimmed incoming track and commits only once", async () => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 5 });
+    try {
+      await engine.load({ ...track("a"), silenceTrim: { leading: 0, trailing: 20 } });
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(120);
+      engine.setUpcoming({ ...track("b", 4), silenceTrim: { leading: 1.2, trailing: 0.8 } });
+      outgoing.progress(93);
+      incoming.loaded(4);
+      expect(incoming.currentTime).toBeCloseTo(1.1);
+      outgoing.progress(96);
+      expect(incoming.play).not.toHaveBeenCalled();
+      outgoing.progress(99.2);
+      await flush();
+      expect(of("transitionStart")).toHaveLength(1);
+      outgoing.progress(100.2);
+      outgoing.finish();
+      expect(of("transitionCommit")).toEqual([{ kind: "crossfade", fromKey: "a", toKey: "b" }]);
+      expect(of("trackEnd")).toEqual([]);
+      expect(engine.getSnapshot()).toMatchObject({ key: "b", duration: 4 });
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  test("late metadata for a short incoming track cannot cut the outgoing track early", async () => {
+    const { engine, audios, of } = setup({ transitionMode: "crossfade", crossfadeSeconds: 5 });
+    try {
+      await engine.load(track("a"));
+      const [outgoing, incoming] = audios;
+      outgoing.loaded(100);
+      let startIncoming!: () => void;
+      incoming.playResult = () => new Promise<void>((resolve) => { startIncoming = resolve; });
+      engine.setUpcoming({ ...track("b"), silenceTrim: { leading: 1, trailing: 1 } });
+      outgoing.progress(95);
+      incoming.loaded(4);
+      startIncoming();
+      await flush();
+      jest.advanceTimersByTime(1000);
+      expect(outgoing.volume).toBe(1);
+      expect(incoming.src).toBe("");
+      expect(of("transitionCommit")).toEqual([]);
+      expect(of("trackEnd")).toEqual([]);
+      outgoing.finish();
+      expect(of("trackEnd")).toEqual([{ key: "a" }]);
+    } finally {
+      engine.destroy();
+    }
   });
 
   test("diagnostics expose graph rate, not source/hardware rate, and sample the applied gain ramp", async () => {

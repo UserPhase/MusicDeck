@@ -95,6 +95,20 @@ test("starting playback creates no counted listen; heartbeat reports actual cumu
   expect(onCounted).toHaveBeenCalledTimes(1);
 });
 
+test("sends string IDs, nullable duration and ISO timestamps with cumulative seconds", async () => {
+  const startedAt = new Date(clock).toISOString();
+  audio.duration = 90_000;
+  tracker.begin({ ...song, id: 42, artistId: 17, albumId: 0, coverUrl: null, duration: 90_000 }, audio);
+  advance(10);
+  await settle();
+  const [payload] = report.mock.calls[0];
+  expect(payload).toMatchObject({ ownerUserId: "user-1", trackId: "42", startedAt, reportedAt: new Date(clock).toISOString(),
+    listenedSeconds: 10, durationSeconds: null, finished: false,
+    track: { title: "Test", artistId: "17", albumId: "0", coverUrl: null },
+  });
+  expect(payload).not.toHaveProperty("eventType");
+});
+
 test("seeking forward and stalling do not invent listening time", async () => {
   tracker.begin(song, audio);
   advance(5);
@@ -228,18 +242,32 @@ test("short tracks use the full track duration and playback speed still measures
   expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ listenedSeconds: 10 }));
 });
 
-test("failed reports are logged and the next report retries with the same cumulative session", async () => {
+test("failed reports back off quietly and retry with the same cumulative session", async () => {
   const log = jest.spyOn(console, "error").mockImplementation(() => {});
-  report.mockRejectedValueOnce(new Error("offline"));
+  report.mockRejectedValueOnce(Object.assign(new Error("Storage busy"), { status: 503 }));
   tracker.begin(song, audio);
   advance(10);
   await settle();
-  expect(log).toHaveBeenCalled();
+  expect(log).not.toHaveBeenCalled();
   const id = report.mock.calls[0][0].playbackSessionId;
   advance(10);
   await settle();
   expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ playbackSessionId: id, listenedSeconds: 20 }));
   log.mockRestore();
+});
+
+test("a malformed queued report does not delay the next playback session", async () => {
+  report.mockRejectedValueOnce(Object.assign(new Error("Invalid report"), { status: 422 }));
+  tracker.begin(song, audio);
+  tracker.finish();
+  await settle();
+  expect(JSON.parse(sessionStorage.getItem("musicdeck:listening-pending:user-1"))).toEqual([]);
+
+  tracker.begin({ ...song, id: "next-track" }, audio);
+  tracker.finish();
+  await settle();
+  expect(report).toHaveBeenCalledTimes(2);
+  expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ trackId: "next-track", finished: true }));
 });
 
 test("dispose removes listeners and timers; user sessions remain isolated", () => {

@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use flate2::Compression;
@@ -42,7 +43,6 @@ use url::Url;
 
 use crate::catalog::LibraryService;
 use crate::db::{DbError, DbPool, create_id};
-use crate::playlists::smart::MixOrder;
 
 /// Maximum uncompressed JSON payload size (`32 MiB`) for a single queue content snapshot.
 pub const MAX_QUEUE_CONTENT_BYTES: usize = 32 * 1024 * 1024;
@@ -65,6 +65,8 @@ pub const CLOCK_SKEW_TOLERANCE_MS: i64 = 5 * 60_000;
 /// One day in milliseconds (`86,400,000` ms).
 pub const DAY_MS: i64 = 86_400_000;
 
+const SESSION_WRITER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Monotonic sequence and wall-clock vector used to order multi-device queue checkpoints (`ClockVector`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +83,9 @@ pub struct ClockVector {
 pub struct QueueEntry {
     /// Unique occurrence identifier within the queue (`1..=160` chars).
     pub entry_id: String,
+    /// Original position of a shuffled occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unshuffled_index: Option<usize>,
     /// Track payload object (`id`, `title`, `artist`, `album`, `previewUrl`, etc.).
     pub track: Value,
 }
@@ -111,6 +116,9 @@ pub struct QueueContextInfo {
     pub name: String,
     /// Optional cover artwork URL/ID.
     pub cover_art: Option<String>,
+    /// Playlist source of a filtered or sorted collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_loop_id: Option<String>,
 }
 
 /// Shuffle mode in a [`QueueCheckpoint`].
@@ -133,6 +141,12 @@ pub struct QueueCheckpoint {
     pub position: f64,
     /// Whether single-track repeat is enabled.
     pub repeat_one: bool,
+    /// Whether the queue repeats at its end. Absent in older checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_all: Option<bool>,
+    /// Playlist selected for scoped repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_playlist_id: Option<String>,
     /// Whether shuffle is enabled.
     pub shuffle: bool,
     /// Optional 32-bit shuffle PRNG seed (`0..=0xFFFF_FFFF`).
@@ -234,13 +248,26 @@ impl QueueSyncError {
 
 impl From<sqlx::Error> for QueueSyncError {
     fn from(err: sqlx::Error) -> Self {
-        Self::new(format!("Queue database error: {err}"), 500)
+        let request_id = crate::error::current_request_id();
+        if crate::db::playback_storage_unavailable(&err) {
+            tracing::warn!(%request_id, error = %err, "Queue storage temporarily unavailable");
+            Self::new("Queue storage is temporarily unavailable. Retry shortly.", 503)
+        } else {
+            tracing::error!(%request_id, error = %err, "Queue storage operation failed");
+            Self::new("Could not access queue storage.", 500)
+        }
     }
 }
 
 impl From<DbError> for QueueSyncError {
     fn from(err: DbError) -> Self {
-        Self::new(err.to_string(), 500)
+        match err {
+            DbError::Sqlx(error) => error.into(),
+            other => {
+                tracing::error!(request_id = %crate::error::current_request_id(), error = %other, "Queue storage operation failed");
+                Self::new("Could not access queue storage.", 500)
+            }
+        }
     }
 }
 
@@ -429,13 +456,24 @@ impl QueueSyncService {
         sequence: u64,
         now_ms: i64,
     ) -> Result<(bool, u64), QueueSyncError> {
-        let mut tx = crate::db::begin_sqlite_write(
-            self.db.inner(),
-            "UPDATE queue_sessions SET sequence = sequence WHERE 0",
+        let stored_sequence = i64::try_from(sequence)
+            .map_err(|_| QueueSyncError::new("Queue sequence is outside the supported range.", 400))?;
+        let cp_json = encode_checkpoint(checkpoint, now_ms)?;
+        // Take the writer lock before validating the content reference and comparing clocks.
+        let mut tx = tokio::time::timeout(
+            SESSION_WRITER_TIMEOUT,
+            crate::db::begin_sqlite_write(
+                self.db.inner(),
+                "UPDATE queue_sessions SET sequence = sequence WHERE 0",
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            tracing::warn!(request_id = %crate::error::current_request_id(), "Timed out acquiring the queue session writer");
+            QueueSyncError::new("Queue storage is temporarily unavailable. Retry shortly.", 503)
+        })??;
 
-        self.validate_checkpoint_on_conn(&mut tx, user_id, content_id, checkpoint, now_ms)
+        Self::validate_checkpoint_index(&mut tx, user_id, content_id, checkpoint.index)
             .await?;
 
         let existing = sqlx::query(
@@ -450,8 +488,10 @@ impl QueueSyncService {
             let old_seq_i64: i64 = old_row.try_get("sequence")?;
             let old_seq = u64::try_from(old_seq_i64.max(0)).unwrap_or(0);
             let old_cp_json: String = old_row.try_get("checkpoint_json")?;
-            let old_captured_at = serde_json::from_str::<QueueCheckpoint>(&old_cp_json)
-                .map_or(0, |cp| cp.captured_at);
+            let old_captured_at = serde_json::from_str::<Value>(&old_cp_json)
+                .ok()
+                .and_then(|cp| cp.get("capturedAt")?.as_i64())
+                .unwrap_or(0);
 
             if old_seq >= sequence || old_captured_at > checkpoint.captured_at {
                 tx.commit().await?;
@@ -473,7 +513,6 @@ impl QueueSyncService {
             }
         }
 
-        let cp_json = serde_json::to_string(checkpoint).unwrap_or_default();
         sqlx::query(
             r"
             INSERT INTO queue_sessions
@@ -492,7 +531,7 @@ impl QueueSyncService {
         .bind(device_name.trim())
         .bind(content_id)
         .bind(&cp_json)
-        .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
+        .bind(stored_sequence)
         .bind(now_ms)
         .execute(&mut *tx)
         .await?;
@@ -522,14 +561,16 @@ impl QueueSyncService {
 
         let mut sessions = Vec::with_capacity(rows.len());
         for row in rows {
+            let device_id: String = row.try_get("device_id")?;
             let cp_json: String = row.try_get("checkpoint_json")?;
-            let checkpoint: QueueCheckpoint = serde_json::from_str(&cp_json)
-                .map_err(|_| QueueSyncError::new("Stored queue checkpoint is invalid.", 500))?;
             let seq_i64: i64 = row.try_get("sequence")?;
             let tc_i64: i64 = row.try_get("track_count")?;
+            let Some(checkpoint) = decode_stored_checkpoint(&cp_json, tc_i64, &device_id) else {
+                continue;
+            };
 
             sessions.push(DeviceQueueSession {
-                device_id: row.try_get("device_id")?,
+                device_id,
                 device_name: row.try_get("device_name")?,
                 content_id: row.try_get("content_id")?,
                 checkpoint,
@@ -573,14 +614,16 @@ impl QueueSyncService {
 
         let mut named = Vec::with_capacity(rows.len());
         for row in rows {
+            let id: String = row.try_get("id")?;
             let cp_json: String = row.try_get("checkpoint_json")?;
-            let checkpoint: QueueCheckpoint = serde_json::from_str(&cp_json)
-                .map_err(|_| QueueSyncError::new("Stored queue checkpoint is invalid.", 500))?;
             let rev_i64: i64 = row.try_get("revision")?;
             let tc_i64: i64 = row.try_get("track_count")?;
+            let Some(checkpoint) = decode_stored_checkpoint(&cp_json, tc_i64, &id) else {
+                continue;
+            };
 
             named.push(NamedQueueRecord {
-                id: row.try_get("id")?,
+                id,
                 name: row.try_get("name")?,
                 content_id: row.try_get("content_id")?,
                 checkpoint,
@@ -604,13 +647,14 @@ impl QueueSyncService {
         operation_id: &str,
         now_ms: i64,
     ) -> Result<String, QueueSyncError> {
+        let cp_json = encode_checkpoint(checkpoint, now_ms)?;
         let mut tx = crate::db::begin_sqlite_write(
             self.db.inner(),
             "UPDATE named_queues SET revision = revision WHERE 0",
         )
         .await?;
 
-        self.validate_checkpoint_on_conn(&mut tx, user_id, content_id, checkpoint, now_ms)
+        Self::validate_checkpoint_index(&mut tx, user_id, content_id, checkpoint.index)
             .await?;
 
         let existing = sqlx::query(
@@ -651,7 +695,6 @@ impl QueueSyncService {
         }
 
         let id = create_id("queue");
-        let cp_json = serde_json::to_string(checkpoint).unwrap_or_default();
         sqlx::query(
             r"
             INSERT INTO named_queues
@@ -927,35 +970,12 @@ impl QueueSyncService {
         Ok(())
     }
 
-    async fn validate_checkpoint_on_conn(
-        &self,
+    async fn validate_checkpoint_index(
         conn: &mut sqlx::SqliteConnection,
         user_id: &str,
         content_id: &str,
-        checkpoint: &QueueCheckpoint,
-        now_ms: i64,
+        index: i64,
     ) -> Result<(), QueueSyncError> {
-        if !checkpoint.position.is_finite()
-            || !(0.0..=(7.0 * DAY_MS as f64 / 1000.0)).contains(&checkpoint.position)
-            || !checkpoint.volume.is_finite()
-            || !(0.0..=1.0).contains(&checkpoint.volume)
-            || checkpoint.captured_at < 0
-        {
-            return Err(QueueSyncError::new(
-                "Invalid queue playback checkpoint.",
-                400,
-            ));
-        }
-
-        if let Some(seed) = checkpoint.shuffle_seed
-            && seed > u64::from(u32::MAX)
-        {
-            return Err(QueueSyncError::new(
-                "Invalid queue playback checkpoint.",
-                400,
-            ));
-        }
-
         let row = sqlx::query(
             "SELECT track_count FROM queue_contents WHERE user_id = ? AND content_id = ?;",
         )
@@ -971,25 +991,47 @@ impl QueueSyncService {
         })?;
 
         let count: i64 = row.try_get("track_count")?;
-        if (count == 0 && checkpoint.index != -1)
-            || (count > 0 && (checkpoint.index < 0 || checkpoint.index >= count))
-        {
+        if !checkpoint_index_matches(index, count) {
             return Err(QueueSyncError::new(
                 "The playback index does not belong to this queue.",
                 400,
             ));
         }
-
-        if checkpoint.captured_at > now_ms + CLOCK_SKEW_TOLERANCE_MS {
-            return Err(QueueSyncError::new(
-                "The device clock is ahead of the server. Correct the clock and retry queue sync.",
-                400,
-            ));
-        }
-
-        let _ = MixOrder::Variety;
         Ok(())
     }
+}
+
+fn checkpoint_index_matches(index: i64, count: i64) -> bool {
+    if count == 0 { index == -1 } else { (0..count).contains(&index) }
+}
+
+fn encode_checkpoint(checkpoint: &QueueCheckpoint, now_ms: i64) -> Result<String, QueueSyncError> {
+    let invalid = || QueueSyncError::new("Invalid queue playback checkpoint.", 400);
+    if !(0.0..=(7.0 * DAY_MS as f64 / 1000.0)).contains(&checkpoint.position)
+        || !(0.0..=1.0).contains(&checkpoint.volume)
+        || checkpoint.captured_at < 0
+        || checkpoint.loop_playlist_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 1024)
+        || checkpoint.shuffle_seed.is_some_and(|seed| seed > u64::from(u32::MAX))
+    {
+        return Err(invalid());
+    }
+    if checkpoint.captured_at > now_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS) {
+        return Err(QueueSyncError::new(
+            "The device clock is ahead of the server. Correct the clock and retry queue sync.",
+            400,
+        ));
+    }
+    serde_json::to_string(checkpoint).map_err(|_| invalid())
+}
+
+fn decode_stored_checkpoint(raw: &str, count: i64, id: &str) -> Option<QueueCheckpoint> {
+    let checkpoint = serde_json::from_str::<QueueCheckpoint>(raw)
+        .ok()
+        .filter(|checkpoint| checkpoint_index_matches(checkpoint.index, count));
+    if checkpoint.is_none() {
+        tracing::warn!(request_id = %crate::error::current_request_id(), queue_id = %id, "Ignoring invalid stored queue checkpoint");
+    }
+    checkpoint
 }
 
 fn validate_queue_content(raw_input: &Value) -> Result<QueueContent, QueueSyncError> {
@@ -1024,7 +1066,7 @@ fn validate_queue_content(raw_input: &Value) -> Result<QueueContent, QueueSyncEr
             return Err(invalid());
         }
 
-        if let Some(preview_val) = track_obj.get("previewUrl") {
+        if let Some(preview_val) = track_obj.get("previewUrl").filter(|value| !value.is_null()) {
             let Some(preview_str) = preview_val.as_str() else {
                 return Err(invalid());
             };
@@ -1141,7 +1183,7 @@ mod tests {
             "version": 2,
             "entries": [
                 { "entryId": "occ_1", "track": { "id": "md_track_1", "title": "Song A" } },
-                { "entryId": "occ_2", "track": { "id": "md_track_2", "title": "Song B" } }
+                { "entryId": "occ_2", "unshuffledIndex": 1, "track": { "id": "md_track_2", "title": "Song B" } }
             ]
         });
 
@@ -1157,11 +1199,15 @@ mod tests {
             .await
             .expect("decompress and verify queue");
         assert_eq!(restored.entries.len(), 2);
+        assert_eq!(restored.entries[0].unshuffled_index, None);
+        assert_eq!(restored.entries[1].unshuffled_index, Some(1));
 
         let cp_v1 = QueueCheckpoint {
             index: 0,
             position: 12.5,
             repeat_one: false,
+            repeat_all: None,
+            loop_playlist_id: None,
             shuffle: false,
             shuffle_seed: None,
             shuffle_mode: QueueShuffleMode::Standard,
@@ -1186,6 +1232,15 @@ mod tests {
             .expect("stale sequence check");
         assert!(!saved_stale);
         assert_eq!(kept_seq, 10);
+
+        let cp_v2 = QueueCheckpoint { loop_playlist_id: Some("playlist-1".into()), ..cp_v1 };
+        let (saved, _) = service
+            .save_session_at("u1", "dev_1", "Desktop", &content_id, &cp_v2, 11, now_ms + 1000)
+            .await
+            .expect("save playlist loop");
+        assert!(saved);
+        let sessions = service.list_sessions("u1").await.expect("load queue sessions");
+        assert_eq!(sessions[0].checkpoint.loop_playlist_id.as_deref(), Some("playlist-1"));
 
         pool.close().await;
     }

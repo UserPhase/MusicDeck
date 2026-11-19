@@ -27,13 +27,18 @@ import {
   getCurrentSession,
   getRecentlyPlayed,
   getAutoplayTracks,
+  getPlaylist,
+  getRandomSongs,
   getStarred,
   getStreamUrl,
+  inspectAudioStream,
   prepareNormalizedPlayback,
   getUserSettings,
   updateUserSettings,
   getSilenceAnalysis,
+  SILENCE_ANALYZED_EVENT,
   analyzeSilence,
+  USER_SETTINGS_CHANGED_EVENT,
   getPlayableSources,
   reportPlaybackSession as recordListeningEvent,
   getListeningConfig,
@@ -48,14 +53,19 @@ jest.mock("../api/musicdeck", () => ({
   request: jest.fn(),
   getRecentlyPlayed: jest.fn(),
   getAutoplayTracks: jest.fn(),
+  getPlaylist: jest.fn(),
+  getRandomSongs: jest.fn(),
   RECOMMENDATION_FEEDBACK_CHANGED_EVENT: "musicdeck:recommendation-feedback-changed",
   getStarred: jest.fn(),
   getStreamUrl: jest.fn(),
+  inspectAudioStream: jest.fn(),
   prepareNormalizedPlayback: jest.fn(),
   getUserSettings: jest.fn(),
   updateUserSettings: jest.fn(async () => []),
   getSilenceAnalysis: jest.fn(),
+  SILENCE_ANALYZED_EVENT: "musicdeck:silence-analyzed",
   analyzeSilence: jest.fn(),
+  USER_SETTINGS_CHANGED_EVENT: "musicdeck:user-settings-changed",
   getPlayableSources: jest.fn(),
   reportPlaybackSession: jest.fn(),
   getListeningConfig: jest.fn(async () => ({ thresholdSeconds: 30 })),
@@ -172,7 +182,9 @@ function PlayerHarness() {
     changeShuffleMode,
     toggleLoop,
     togglePlaylistLoop,
+    loopPlaylistId,
     isLooping,
+    repeatMode,
     queue,
     queueIndex,
     recentlyPlayed,
@@ -183,6 +195,7 @@ function PlayerHarness() {
     isPlaying,
     playbackMessage,
     currentTime,
+    seekToSeconds,
     volume,
     changeVolume,
     togglePlay,
@@ -203,8 +216,8 @@ function PlayerHarness() {
     changeLayoutDensity,
     autoOpenSidebar,
     changeAutoOpenSidebar,
-    isAutoplayEnabled,
-    changeAutoplayEnabled,
+    isEndlessPlaybackEnabled,
+    changeEndlessPlaybackEnabled,
     autoDownloadLiked,
     changeAutoDownloadLiked,
     activeSidebar,
@@ -217,6 +230,7 @@ function PlayerHarness() {
         direct
       </button>
       <button onClick={togglePlay}>toggle-play</button>
+      <button onClick={() => seekToSeconds(15.5)}>seek-local</button>
       <button onClick={() => changeVolume(0.5)}>volume-half</button>
       <button onClick={() => changeVolume(0)}>volume-mute</button>
       <button onClick={() => changeVolume(1)}>volume-full</button>
@@ -248,6 +262,15 @@ function PlayerHarness() {
         togglePlaylistLoop("test-playlist");
         void playQueue(songs, songs.length - 1, { type: "playlist", id: "test-playlist", name: "Test playlist", coverArt: null });
       }}>loop-playlist-from-end</button>
+      <button onClick={() => playContext(songs, songs.length - 1, { type: "playlist", id: "test-playlist", name: "Test playlist", coverArt: null })}>
+        playlist-from-last
+      </button>
+      <button onClick={() => togglePlaylistLoop("test-playlist")} aria-pressed={loopPlaylistId === "test-playlist"}>loop-only-playlist</button>
+      <button onClick={() => playContext([songs[2]], 0, { type: "collection", id: "test-playlist", playlistLoopId: "test-playlist",
+        name: "Test playlist", coverArt: null })}>filtered-playlist</button>
+      <button onClick={() => playQueue(songs, 0, { type: "playlist", id: "test-playlist", name: "Test playlist", coverArt: null })}>
+        playlist-from-start
+      </button>
       <button onClick={() => resumeMedia(songs, 1, { type: "album", id: "long-album", name: "Long Album", coverArt: null }, 102.125)}>
         resume-collection
       </button>
@@ -308,7 +331,7 @@ function PlayerHarness() {
       <button onClick={() => changeAutoOpenSidebar(true)}>
         enable-auto-open-sidebar
       </button>
-      <button onClick={() => changeAutoplayEnabled(false)}>
+      <button onClick={() => changeEndlessPlaybackEnabled(false)}>
         disable-autoplay
       </button>
       <button onClick={() => changeAutoDownloadLiked(true)}>
@@ -324,6 +347,7 @@ function PlayerHarness() {
       <div data-testid="loop-enabled">
         {String(isLooping)}
       </div>
+      <div data-testid="repeat-mode">{repeatMode}</div>
       <div data-testid="queue">
         {queue.map((song) => song.id).join(",")}
       </div>
@@ -370,7 +394,7 @@ function PlayerHarness() {
         {String(autoOpenSidebar)}
       </div>
       <div data-testid="autoplay-enabled">
-        {String(isAutoplayEnabled)}
+        {String(isEndlessPlaybackEnabled)}
       </div>
       <div data-testid="auto-download-liked">
         {String(autoDownloadLiked)}
@@ -386,8 +410,10 @@ function renderPlayer({
   silenceAnalysis = null,
   children = <PlayerHarness />,
   normalize = false,
+  endless = false,
 } = {}) {
   if (!normalize) localStorage.setItem("playerNormalizationEnabled", "false");
+  if (endless) localStorage.setItem("playerAutoplayEnabled", "true");
   prepareNormalizedPlayback.mockResolvedValue({ status: "unavailable" });
   getCurrentSession.mockResolvedValue({
     authenticated: true,
@@ -400,6 +426,8 @@ function renderPlayer({
   });
 
   getAutoplayTracks.mockResolvedValue([]);
+  getPlaylist.mockResolvedValue(null);
+  getRandomSongs.mockResolvedValue([]);
   getRecentlyPlayed.mockResolvedValue(recentHistory);
   getStarred.mockResolvedValue([]);
   getUserSettings.mockResolvedValue(userSettings);
@@ -504,7 +532,7 @@ test("desktop time updates keep the exact audio position without rerendering pla
   }
 });
 
-test("smart shuffle excludes account recency without interrupting the current track and keeps backward history order", async () => {
+test("live Smart Shuffle moves recent tracks later without interrupting playback or losing them", async () => {
   const { container } = renderPlayer({
     recentHistory: [{ ...songs[1], playedAt: new Date().toISOString() }],
     userSettings: [{ key: "playback.shuffleMode", value: '"smart"' }],
@@ -515,15 +543,16 @@ test("smart shuffle excludes account recency without interrupting the current tr
   await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
   const plays = HTMLMediaElement.prototype.play.mock.calls.length;
   fireEvent.click(screen.getByText("shuffle"));
-  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3");
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-3,song-2");
   expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(plays);
-  expect(screen.getByTestId("playback-message")).toHaveTextContent(/left out 1/);
   fireEvent.click(screen.getByText("next"));
   await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-3"));
   activeAudio(container).currentTime = 0;
   fireEvent.click(screen.getByText("previous"));
   await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
-  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3");
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-3,song-2");
+  fireEvent.click(screen.getByText("shuffle"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3");
 });
 
 test("records actually started tracks before scrobbling and excludes them from a replacement smart queue", async () => {
@@ -648,6 +677,7 @@ test("preserves manual ordering under shuffle and repeat-one, with manual Next s
   expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3");
   expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("true");
   fireEvent.click(screen.getByText("loop"));
+  fireEvent.click(screen.getByText("loop"));
   fireEvent.ended(audioDecks(container)[0]);
   await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2));
   expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
@@ -656,7 +686,7 @@ test("preserves manual ordering under shuffle and repeat-one, with manual Next s
 });
 
 test("a pending autoplay refill cannot overwrite a newer queue order", async () => {
-  renderPlayer();
+  renderPlayer({ endless: true });
   fireEvent.click(screen.getByText("duplicates"));
   await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-1,song-3"));
   let finishRefill;
@@ -760,6 +790,36 @@ test("shows the latest account queue automatically and starts it only when Play 
   expect(audio.currentTime).toBeCloseTo(106.5);
 });
 
+test("editing a paused cloud queue publishes the local edit and ignores newer peer snapshots", async () => {
+  const random = jest.spyOn(Math, "random").mockReturnValue(0);
+  let checkpoint = { index: 0, position: 15, repeatOne: false, shuffle: false, shuffleSeed: null,
+    shuffleMode: "standard", albumAware: false, volume: .65, wasPlaying: false, context: null, capturedAt: Date.now() };
+  const content = { version: 2, entries: songs.map((track, index) => ({ entryId: `desk-${index}`, track })) };
+  request.mockImplementation(async (url, options) => {
+    if (url.endsWith("/content/peer-content")) return content;
+    if (options?.method === "POST") return { contentId: "local-content" };
+    if (options?.method === "PUT") return { saved: true, sequence: JSON.parse(options.body).sequence };
+    return { sessions: [{ deviceId: "peer", contentId: "peer-content", checkpoint, trackCount: 3 }], namedQueues: [] };
+  });
+  renderPlayer();
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  fireEvent.click(screen.getByText("shuffle"));
+  fireEvent.click(screen.getByText("loop"));
+  checkpoint = { ...checkpoint, capturedAt: Date.now() + 60_000 };
+  await act(async () => queueSyncClient.refresh());
+  expect(screen.getByTestId("repeat-mode")).toHaveTextContent("all");
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-3,song-2");
+  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  await waitFor(() => expect(request.mock.calls.some(([url, options]) => {
+    if (!url.endsWith("/queue-session") || options?.method !== "PUT") return false;
+    const saved = JSON.parse(options.body).checkpoint;
+    return saved.repeatAll === true && saved.shuffle === true && saved.index === 0 && saved.position === 15;
+  })).toBe(true));
+  fireEvent.click(screen.getByText("shuffle"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3");
+  random.mockRestore();
+});
+
 test("restores the remembered account's local queue when the server cannot authenticate offline", async () => {
   await rememberDownloadOwner("user-1");
   localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({ currentSong: songs[2], queue: songs, queueIndex: 2, currentTime: 17.25, volume: 0.4 })));
@@ -791,7 +851,7 @@ test("resumes a previously playing track after restoring its media position", as
   await waitFor(async () => expect((await savedQueue()).wasPlaying).toBe(true));
 });
 
-test("waits for the device list before resuming a saved browser queue", async () => {
+test("resumes a saved browser queue without waiting for the device list", async () => {
   localStorage.setItem(queueStorageKey("user-1"), JSON.stringify(createQueueSnapshot({
     currentSong: songs[1], queue: songs, queueIndex: 1,
     currentTime: 42.75, wasPlaying: true,
@@ -807,7 +867,8 @@ test("waits for the device list before resuming a saved browser queue", async ()
   await waitFor(() => expect(audio).toHaveAttribute("src", "/stream/song-2"));
   Object.defineProperty(audio, "duration", { configurable: true, value: 180 });
   await act(async () => { fireEvent.loadedMetadata(audio); });
-  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
+  expect(audio.currentTime).toBeCloseTo(42.75);
 
   const desktop = {
     device_id: "desk", device_name: "MusicDeck Desktop", device_type: "computer", is_active_player: true,
@@ -817,7 +878,7 @@ test("waits for the device list before resuming a saved browser queue", async ()
   remote.mockReturnValue({ ...connection, status: "connected", devices: [desktop], activeDevice: desktop, isRemote: true });
   rerenderPlayer(<PlayerHarness />);
   expect(screen.getByTestId("current-song")).toHaveTextContent("desktop-song");
-  expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
   fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
   expect(connection.command).toHaveBeenCalledWith({ type: "PAUSE" });
 });
@@ -957,7 +1018,7 @@ test("direct playback creates a single-song queue and replaces an old queue", as
   });
 });
 
-test("automatically analyzes an unscanned library track when silence trimming is enabled", async () => {
+test("requests analysis for an unscanned library track when silence trimming is enabled", async () => {
   renderPlayer({
     userSettings: [
       { key: "playback.silenceTrim.enabled", value: "true" },
@@ -996,6 +1057,65 @@ test("uses saved silence analysis without rescanning an analyzed track", async (
 
   await waitFor(() => expect(getSilenceAnalysis).toHaveBeenCalledWith("song-1", { thresholdDb: -35, minSilenceSeconds: 0.5 }));
   expect(analyzeSilence).not.toHaveBeenCalled();
+});
+
+test("applies manual analysis to the active stream even after its automatic attempt failed", async () => {
+  const { container } = renderPlayer({
+    userSettings: [{ key: "playback.silenceTrim.enabled", value: "true" }],
+  });
+  analyzeSilence.mockResolvedValueOnce({ status: "failed" });
+  await playerReady();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(analyzeSilence).toHaveBeenCalledWith("song-1", expect.anything()));
+  const audio = activeAudio(container);
+  startDeckPlaying(audio, 100, 0);
+  Object.defineProperty(audio, "readyState", { configurable: true, value: 4 });
+  fireEvent.loadedMetadata(audio);
+  expect(audio.currentTime).toBe(0);
+  jest.spyOn(Date, "now").mockReturnValue(Date.now() + 500);
+  act(() => window.dispatchEvent(new CustomEvent(SILENCE_ANALYZED_EVENT, {
+    detail: { trackId: "song-1", analysis: {
+      status: "completed", thresholdDb: -35, minSilenceSeconds: 0.5,
+      leadingSilenceSeconds: 1.5, trailingSilenceSeconds: 2, durationSeconds: 100,
+    } },
+  })));
+  await waitFor(() => expect(audio.currentTime).toBeCloseTo(1.4));
+  expect(activeAudio(container)).toBe(audio);
+  expect(analyzeSilence.mock.calls.filter(([id]) => id === "song-1")).toHaveLength(1);
+});
+
+test("a saved trim toggle applies to the active stream and preserves original listening timestamps", async () => {
+  const { container } = renderPlayer({
+    silenceAnalysis: {
+      status: "completed", leadingSilenceSeconds: 0.8, trailingSilenceSeconds: 20, durationSeconds: 100,
+    },
+  });
+  await playerReady();
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  const audio = activeAudio(container);
+  startDeckPlaying(audio, 100, 0);
+  Object.defineProperty(audio, "readyState", { configurable: true, value: 4 });
+  fireEvent.loadedMetadata(audio);
+  expect(getSilenceAnalysis).not.toHaveBeenCalled();
+
+  const setTrim = (enabled) => window.dispatchEvent(new CustomEvent(USER_SETTINGS_CHANGED_EVENT, {
+    detail: { "playback.silenceTrim.enabled": enabled },
+  }));
+  jest.spyOn(Date, "now").mockReturnValue(Date.now() + 500);
+  act(() => setTrim(true));
+  await waitFor(() => expect(audio.currentTime).toBeCloseTo(0.7));
+
+  act(() => setTrim(false));
+  audio.currentTime = 90;
+  fireEvent.timeUpdate(audio);
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(activeAudio(container)).toBe(audio);
+  fireEvent.ended(audio);
+  await waitFor(() => expect(recordListeningEvent).toHaveBeenCalledWith(expect.objectContaining({
+    trackId: "song-1", durationSeconds: 100, listenedSeconds: 0, finished: true,
+  })));
+  expect(recordListeningEvent.mock.calls.filter(([report]) => report.finished)).toHaveLength(1);
 });
 
 test("playing the active track toggles playback without rebuilding its queue", async () => {
@@ -1236,6 +1356,35 @@ test("playlist loop wraps from the last track to the first", async () => {
   expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
 });
 
+test.each([false, true])("playlist loop replays the full filtered playlist and clears queued radio tracks with Endless Playback %s", async (endless) => {
+  const { container } = renderPlayer({ endless, children: <><PlayerHarness /><RadioQueueHarness /></> });
+  function RadioQueueHarness() {
+    const { queueTracks } = usePlayer();
+    return <button onClick={() => queueTracks([{ id: "outside-playlist", autoplayGenerated: true }])}>queue-radio-track</button>;
+  }
+  await playerReady();
+  getPlaylist.mockResolvedValue({ entry: songs });
+  fireEvent.click(screen.getByText("filtered-playlist"));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-3"));
+  fireEvent.click(screen.getByText("queue-radio-track"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-3,outside-playlist");
+
+  const loop = screen.getByRole("button", { name: "loop-only-playlist" });
+  fireEvent.click(loop);
+  expect(loop).toHaveAttribute("aria-pressed", "true");
+  await waitFor(() => expect(screen.getByTestId("queue").textContent).toBe("song-3"));
+  await waitFor(async () => expect((await readLocalQueue("user-1"))?.head.checkpoint).toMatchObject({
+    loopPlaylistId: "test-playlist", context: { playlistLoopId: "test-playlist" },
+  }));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3");
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
+  expect(getRandomSongs).not.toHaveBeenCalled();
+  fireEvent.click(loop);
+  expect(loop).toHaveAttribute("aria-pressed", "false");
+});
+
 test("looped endings replay the active track while manual next still advances", async () => {
   const { container } = renderPlayer();
 
@@ -1244,6 +1393,7 @@ test("looped endings replay the active track while manual next still advances", 
     expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
   });
 
+  fireEvent.click(screen.getByText("loop"));
   fireEvent.click(screen.getByText("loop"));
   const audio = container.querySelector("audio");
   Object.defineProperty(audio, "currentTime", {
@@ -1295,42 +1445,200 @@ test("a depleted queue stops without fetching random tracks when autoplay is dis
   expect(screen.getByTestId("queue-index")).toHaveTextContent("-1");
   expect(screen.getByTestId("is-playing")).toHaveTextContent("false");
   expect(getAutoplayTracks).not.toHaveBeenCalled();
+  expect(getRandomSongs).not.toHaveBeenCalled();
 });
 
 
-test("a depleted queue fetches another track only when autoplay is enabled", async () => {
-  const { container } = renderPlayer();
+test("Endless Playback appends seeded recommendations before a single track ends", async () => {
+  const { container } = renderPlayer({ endless: true });
   await playerReady();
-
+  getAutoplayTracks.mockResolvedValueOnce([songs[0], {
+    ...songs[2], recommendationGenerated: true, autoplayGenerated: true,
+  }, ...Array.from({ length: 24 }, (_, index) => ({ id: `recommended-${index}` }))]);
   fireEvent.click(screen.getByText("direct"));
-  await waitFor(() => {
-    expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
-  });
-  // The background refill found nothing, so the queue really ends.
-  await waitFor(() => expect(getAutoplayTracks).toHaveBeenCalledTimes(1));
 
-  getAutoplayTracks.mockClear();
-  getAutoplayTracks.mockResolvedValue([songs[1]]);
+  await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-3"));
+  expect(screen.getByTestId("queue").textContent.split(",")).toHaveLength(26);
+  expect(getAutoplayTracks).toHaveBeenCalledWith("song-1", 30, ["song-1"], {}, expect.any(AbortSignal));
+  expect(getRandomSongs).not.toHaveBeenCalled();
+  expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1");
+
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-3"));
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+});
+
+test("a short recommendation list queues immediately and library tracks fill the sidebar preview", async () => {
+  const { container } = renderPlayer({ endless: true });
+  await playerReady();
+  getAutoplayTracks.mockResolvedValueOnce([songs[1], songs[2]]);
+  let finishLibraryRefill;
+  getRandomSongs.mockImplementationOnce(() => new Promise((resolve) => { finishLibraryRefill = resolve; }));
+  fireEvent.click(screen.getByText("direct"));
+
+  await waitFor(() => expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3"));
+  expect(getRandomSongs).toHaveBeenCalledWith(28, expect.any(AbortSignal));
+  expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1");
+
+  const library = Array.from({ length: 25 }, (_, index) => ({ id: `library-${index}` }));
+  await act(async () => finishLibraryRefill([
+    songs[0], songs[1], { id: "unavailable", availability: { libraryAvailable: false } }, ...library,
+  ]));
+  expect(screen.getByTestId("queue").textContent.split(",")).toEqual([
+    "song-1", "song-2", "song-3", ...library.slice(0, 23).map(({ id }) => id),
+  ]);
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-2"));
+});
+
+test.each([
+  ["empty", () => Promise.resolve([])],
+  ["failed", () => Promise.reject(new Error("Recommendations offline"))],
+])("an %s recommendation refill falls back to library tracks before the queue ends", async (_result, refill) => {
+  const { container } = renderPlayer({ endless: true });
+  await playerReady();
+  getAutoplayTracks.mockImplementationOnce(refill);
+  getRandomSongs.mockResolvedValueOnce([songs[1]]);
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2"));
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(getRandomSongs).toHaveBeenCalledWith(30, expect.any(AbortSignal));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-2"));
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+});
+
+test("library playback continues at the queue end while a random-track refill is pending", async () => {
+  localStorage.setItem("musicdeck:playback:autoplayRecommendations", "false");
+  const { container } = renderPlayer({ endless: true });
+  let finishRefill;
+  getRandomSongs.mockImplementationOnce(() => new Promise((resolve) => { finishRefill = resolve; }));
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(finishRefill).toBeDefined());
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("queue-index")).toHaveTextContent("1"));
+  expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-1");
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+
+  await act(async () => finishRefill([songs[2]]));
+  expect(screen.getByTestId("queue")).not.toHaveTextContent("song-3");
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
+});
+
+test("a pending refill at the end of a preview cannot block or extend a new queue", async () => {
+  const { container } = renderPlayer({ endless: true });
+  let finishRefill;
+  getRandomSongs.mockImplementationOnce(() => new Promise((resolve) => { finishRefill = resolve; }));
+  fireEvent.click(screen.getByText("catalog-with-preview"));
+  await waitFor(() => expect(finishRefill).toBeDefined());
   fireEvent.ended(activeAudio(container));
 
-  await waitFor(() => {
-    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
-  });
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1"));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("queue-index")).toHaveTextContent("1"));
+  await act(async () => finishRefill([songs[2]]));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-1");
+});
 
-  expect(getAutoplayTracks).toHaveBeenNthCalledWith(1, "song-1", 10, ["song-1"]);
+test("disabling Endless Playback removes the prepared refill and lets the current track finish", async () => {
+  const { container } = renderPlayer({ endless: true });
+  getAutoplayTracks.mockResolvedValueOnce([songs[1]]);
+  fireEvent.click(screen.getByText("direct"));
+  await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2"));
+
+  fireEvent.click(screen.getByText("disable-autoplay"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1");
+  expect(screen.getByTestId("is-playing")).toHaveTextContent("true");
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("none"));
+});
+
+test("Endless Playback wraps a partial playlist from its full first track", async () => {
+  const { container } = renderPlayer({ endless: true });
+  fireEvent.click(screen.getByText("playlist-from-last"));
+  await waitFor(() => expect(screen.getByTestId("queue").textContent).toBe("song-3"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  fireEvent.ended(activeAudio(container));
+
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3");
+  expect(screen.getByTestId("queue-index")).toHaveTextContent("0");
+  expect(getPlaylist).not.toHaveBeenCalled();
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
+  expect(getRandomSongs).not.toHaveBeenCalled();
+});
+
+test("a restored playlist preloads its full order before wrapping a saved tail", async () => {
+  const context = { type: "playlist", id: "test-playlist", name: "Test playlist", coverArt: null };
+  await writeLocalQueue("user-1", {
+    version: 2, entries: [{ entryId: "saved-tail", track: { ...songs[2], tastePlaylistId: context.id } }],
+  }, {
+    index: 0, position: 12, repeatOne: false, shuffle: false, shuffleSeed: null, shuffleMode: "standard",
+    albumAware: false, volume: 1, wasPlaying: false, context, capturedAt: Date.now(),
+  });
+  const { container } = renderPlayer({ userSettings: [{ key: "playback.autoplay.enabled", value: "true" }] });
+  getPlaylist.mockResolvedValueOnce({ entry: songs });
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-3"));
+  await waitFor(() => expect(screen.getByTestId("autoplay-enabled")).toHaveTextContent("true"));
+  fireEvent.click(screen.getByText("toggle-play"));
+  await waitFor(() => expect(getPlaylist).toHaveBeenCalledWith(context.id, expect.any(AbortSignal)));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-3"));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3"));
+  expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+  expect(getRandomSongs).not.toHaveBeenCalled();
+});
+
+test.each([false, true])("Endless Playback reshuffles a playlist with repeat queue set to %s", async (repeatQueue) => {
+  jest.spyOn(Math, "random").mockReturnValue(0.99);
+  const { container } = renderPlayer({ endless: true });
+  fireEvent.click(screen.getByText("shuffle"));
+  fireEvent.click(screen.getByText("playlist-from-start"));
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("song-1"));
+  if (repeatQueue) fireEvent.click(screen.getByText("loop"));
+  const original = screen.getByTestId("queue").textContent.split(",");
+  for (const id of original.slice(1)) {
+    fireEvent.ended(activeAudio(container));
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent(id));
+  }
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(screen.getByTestId("queue-index")).toHaveTextContent("0"));
+
+  const reshuffled = screen.getByTestId("queue").textContent.split(",");
+  expect(reshuffled).not.toEqual(original);
+  expect([...reshuffled].sort()).toEqual([...original].sort());
+  expect(screen.getByTestId("current-song")).toHaveTextContent(reshuffled[0]);
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
+  expect(getRandomSongs).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByText("shuffle"));
+  expect(screen.getByTestId("queue").textContent.split(",")).toEqual([
+    reshuffled[0], ...songs.map(song => song.id).filter(id => id !== reshuffled[0]),
+  ]);
+});
+
+test("a playlist finishes with Endless Playback off by default", async () => {
+  const { container } = renderPlayer();
+  fireEvent.click(screen.getByText("playlist-from-last"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  fireEvent.ended(activeAudio(container));
+
+  await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("none"));
+  expect(getPlaylist).not.toHaveBeenCalled();
+  expect(getRandomSongs).not.toHaveBeenCalled();
 });
 
 test("auto-refill appends new tracks once two or fewer remain without interrupting playback", async () => {
   const refill = [songs[1], { id: "refill-1", title: "Refill One" }, { id: "refill-2", title: "Refill Two" }];
-  const { container } = renderPlayer();
+  const { container } = renderPlayer({ endless: true });
   await playerReady();
   getAutoplayTracks.mockResolvedValue(refill);
 
   fireEvent.click(screen.getByText("album-start"));
   await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("song-1,song-2,song-3,refill-1,refill-2"));
-  // Two upcoming tracks: ask for enough to reach ten upcoming, plus spares for duplicates.
+  // Two upcoming tracks: ask for enough to fill the sidebar, plus spares for duplicates.
   expect(getAutoplayTracks).toHaveBeenCalledTimes(1);
-  expect(getAutoplayTracks).toHaveBeenCalledWith("song-1", 13, ["song-1", "song-2", "song-3"]);
+  expect(getAutoplayTracks).toHaveBeenCalledWith("song-1", 28, ["song-1", "song-2", "song-3"], {}, expect.any(AbortSignal));
   expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
   expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
   expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1");
@@ -1350,7 +1658,7 @@ test("smart refill excludes recent candidates without reordering the manually ed
   localStorage.setItem("musicdeck:shuffle-history:v1:user-1", JSON.stringify([
     { id: "heard", artist: "Recent artist", playedAt: Date.now() - 1000 },
   ]));
-  const { container } = renderPlayer();
+  const { container } = renderPlayer({ endless: true });
   await playerReady();
   fireEvent.click(screen.getByText("smart-shuffle"));
   fireEvent.click(screen.getByText("shuffle"));
@@ -1373,7 +1681,7 @@ test("smart refill excludes recent candidates without reordering the manually ed
 });
 
 test("hidden recommendations are removed from upcoming autoplay without interrupting the current track", async () => {
-  const { container } = renderPlayer();
+  const { container } = renderPlayer({ endless: true });
   await playerReady();
   getAutoplayTracks.mockResolvedValue([
     { id: "auto-1", recommendationGenerated: true, artistId: "hidden-artist" },
@@ -1392,7 +1700,7 @@ test("hidden recommendations are removed from upcoming autoplay without interrup
 });
 
 test("feedback arriving during a refill prevents stale recommendations from entering the queue", async () => {
-  renderPlayer();
+  renderPlayer({ endless: true });
   await playerReady();
   let finish;
   getAutoplayTracks.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
@@ -1436,10 +1744,10 @@ test("context playback shuffles only tracks after the clicked track", async () =
 });
 
 
-test("shuffle mode stays active and randomizes only upcoming songs", async () => {
+test("shuffle toggles only the upcoming order and preserves the current audio position", async () => {
   const random = jest.spyOn(Math, "random").mockReturnValue(0);
 
-  renderPlayer();
+  const { container } = renderPlayer();
 
   fireEvent.click(screen.getByText("album-start"));
 
@@ -1448,6 +1756,9 @@ test("shuffle mode stays active and randomizes only upcoming songs", async () =>
       "song-1,song-2,song-3"
     );
   });
+  const audio = activeAudio(container);
+  audio.currentTime = 13.5;
+  const playCount = HTMLMediaElement.prototype.play.mock.calls.length;
 
   fireEvent.click(screen.getByText("shuffle"));
 
@@ -1460,19 +1771,36 @@ test("shuffle mode stays active and randomizes only upcoming songs", async () =>
   fireEvent.click(screen.getByText("shuffle"));
 
   expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("false");
+  expect(screen.getByTestId("queue").textContent).toBe("song-1,song-2,song-3");
+  expect(activeAudio(container)).toBe(audio);
+  expect(audio.currentTime).toBe(13.5);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(playCount);
 
   random.mockRestore();
 });
 
 
-test("loop mode toggles independently of playback queue state", () => {
+test("loop mode cycles off, queue, and one", () => {
   renderPlayer();
-
+  expect(screen.getByTestId("repeat-mode")).toHaveTextContent("off");
   fireEvent.click(screen.getByText("loop"));
-  expect(screen.getByTestId("loop-enabled")).toHaveTextContent("true");
-
+  expect(screen.getByTestId("repeat-mode")).toHaveTextContent("all");
   fireEvent.click(screen.getByText("loop"));
-  expect(screen.getByTestId("loop-enabled")).toHaveTextContent("false");
+  expect(screen.getByTestId("repeat-mode")).toHaveTextContent("one");
+  fireEvent.click(screen.getByText("loop"));
+  expect(screen.getByTestId("repeat-mode")).toHaveTextContent("off");
+});
+
+test("repeat queue wraps a normal queue before Endless Playback can refill it", async () => {
+  const { container } = renderPlayer({ endless: true });
+  fireEvent.click(screen.getByText("loop"));
+  fireEvent.click(screen.getByText("album"));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-2"));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-3"));
+  fireEvent.ended(activeAudio(container));
+  await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", "/stream/song-1"));
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
 });
 
 
@@ -1808,6 +2136,37 @@ test("already prepared upcoming tracks start from the normalized cache without d
   expect(activeAudio(container).volume).toBe(1);
 });
 
+test("an expired normalized stream falls back at the same position and applies only the original gain", async () => {
+  jest.useFakeTimers();
+  try {
+    const { container } = renderPlayer({ normalize: true });
+    prepareNormalizedPlayback.mockImplementation(id => Promise.resolve(id === "song-2"
+      ? { status: "ready", streamUrl: normalizedUrl("b"), gainDb: -6,
+        integratedLufs: -16, truePeakDb: -2,
+        loudness: { integratedLufs: -10, truePeakDb: -1, gainDb: -6 } }
+      : { status: "unavailable" }));
+    await playerReady();
+    fireEvent.click(screen.getByText("album-start"));
+    await act(async () => {});
+    fireEvent.click(screen.getByText("next"));
+    await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", normalizedUrl("b")));
+    const { audio, loads } = streamingDeck(container);
+    startDeckPlaying(audio, 180, 24);
+    fireEvent.timeUpdate(audio);
+    expect(audio.volume).toBe(1);
+    Object.defineProperty(audio, "error", { configurable: true, value: { code: 4 } });
+    fireEvent.error(audio);
+
+    expect(loads).toEqual([expect.stringMatching(/\/stream\/song-2$/)]);
+    audio.currentTime = 0;
+    await act(async () => fireEvent.loadedMetadata(audio));
+    expect(audio.currentTime).toBe(24);
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-2");
+    await act(async () => jest.advanceTimersByTime(16000));
+    expect(audio.volume).toBeCloseTo(10 ** (-6 / 20));
+  } finally { jest.useRealTimers(); }
+});
+
 test("crossfade starts the next deck even while both normalization jobs are pending", async () => {
   const { container } = renderPlayer({ normalize: true });
   prepareNormalizedPlayback.mockImplementation(() => new Promise(() => {}));
@@ -1824,11 +2183,14 @@ test("crossfade starts the next deck even while both normalization jobs are pend
 });
 
 test("starting an album never waits for optional autoplay recommendations", async () => {
-  const { container } = renderPlayer();
-  getAutoplayTracks.mockImplementation(() => new Promise(() => {}));
+  const { container } = renderPlayer({ endless: true });
+  let finishRefill;
+  getAutoplayTracks.mockImplementationOnce(() => new Promise((resolve) => { finishRefill = resolve; }));
   fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => expect(finishRefill).toBeDefined());
   expect(container.querySelector("audio")).toHaveAttribute("src", "/stream/song-1");
   expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
+  await act(async () => finishRefill([]));
 });
 
 test("resuming a collection seeks the engine to fractional seconds after metadata and syncs the correct track on pause", async () => {
@@ -2059,6 +2421,7 @@ test("crossfade starts the next queued track on the idle deck and hands it off",
     expect(getStreamUrl).toHaveBeenCalledWith("song-2", null, "original");
     expect(incoming).toHaveAttribute("src", "/stream/song-2");
     expect(screen.getByTestId("current-song")).toHaveTextContent("song-1");
+    startDeckPlaying(incoming, 100, 0);
 
     // Equal-power ramp: both decks sit at cos(pi/4) halfway through the 3 s window.
     await act(async () => jest.advanceTimersByTime(1500));
@@ -2081,6 +2444,69 @@ test("crossfade starts the next queued track on the idle deck and hands it off",
   }
 });
 
+
+test.each([false, true])("crossfade with silence trimming %s sends one completion and both checkpoints during a pending inspection", async (trim) => {
+  jest.useFakeTimers();
+  try {
+    const { container } = renderPlayer(trim ? {
+      userSettings: [{ key: "playback.silenceTrim.enabled", value: "true" }],
+      silenceAnalysis: { status: "completed", leadingSilenceSeconds: 1, trailingSilenceSeconds: 20, durationSeconds: 180 },
+    } : {});
+    inspectAudioStream.mockImplementation(() => new Promise(() => {}));
+    getStreamUrl.mockImplementation((id) => `/api/tracks/${id}/stream`);
+    await playerReady();
+    fireEvent.click(screen.getByText("transition-crossfade"));
+    fireEvent.click(screen.getByText("crossfade-three"));
+    fireEvent.click(screen.getByText("resume-collection"));
+    await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+    const firstInspection = inspectAudioStream.mock.calls.find(([id]) => id === "song-2");
+    expect(firstInspection).toBeDefined();
+    const outgoing = activeAudio(container);
+    const incoming = idleAudio(container, outgoing);
+    startDeckPlaying(outgoing, 180, 102.125);
+    fireEvent.loadedMetadata(outgoing);
+    fireEvent.playing(outgoing);
+    fireEvent.timeUpdate(outgoing);
+    if (trim) await waitFor(() => expect(getSilenceAnalysis).toHaveBeenCalledWith("song-2", expect.any(Object)));
+
+    await act(async () => {
+      jest.advanceTimersByTime(31_000);
+      outgoing.currentTime = trim ? 157.2 : 177;
+      fireEvent.timeUpdate(outgoing);
+    });
+    expect(incoming).toHaveAttribute("src", expect.stringMatching(/^\/api\/tracks\/song-3\/stream\?inspectionId=/));
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("1");
+
+    startDeckPlaying(incoming, 180, 2.5);
+    await act(async () => {
+      if (trim) {
+        outgoing.currentTime = 160.2;
+        fireEvent.timeUpdate(outgoing);
+      }
+      fireEvent.ended(outgoing);
+      fireEvent.ended(outgoing);
+      jest.advanceTimersByTime(3500);
+    });
+    expect(screen.getByTestId("current-song")).toHaveTextContent("song-3");
+    expect(screen.getByTestId("queue-index")).toHaveTextContent("2");
+    expect(outgoing).not.toHaveAttribute("src");
+    expect(firstInspection[2].aborted).toBe(true);
+    expect(inspectAudioStream).toHaveBeenLastCalledWith("song-3", expect.any(String), expect.any(AbortSignal));
+
+    const completed = () => recordListeningEvent.mock.calls.map(([body]) => body).filter((body) => body.finished);
+    await waitFor(() => expect(completed()).toEqual([expect.objectContaining({ trackId: "song-2", durationSeconds: 180 })]));
+    fireEvent.click(screen.getByText("toggle-play"));
+    await waitFor(() => expect(saveMediaCheckpoint).toHaveBeenCalledWith(expect.objectContaining({
+      type: "album", mediaId: "long-album", trackId: "song-3", trackIndex: 2, positionSeconds: 2.5, durationSeconds: 180,
+    }), expect.any(AbortSignal)));
+    await waitFor(() => expect(request.mock.calls.some(([url, options]) =>
+      url === "/api/v1/user/queue-session" && options?.method === "PUT" && JSON.parse(options.body).checkpoint.index === 2
+    )).toBe(true));
+    expect(completed()).toHaveLength(1);
+  } finally {
+    jest.useRealTimers();
+  }
+});
 
 test("reordering during crossfade keeps current progress and cancels the stale incoming track", async () => {
   jest.useFakeTimers();
@@ -2375,6 +2801,47 @@ test("reconnects a stalled stream at the saved position without changing the que
   }
 });
 
+test.each([false, true])("reloads the same URL and then a fresh stream with inspection set to %s", async (inspect) => {
+  localStorage.setItem("musicdeck:playback:streamInspection", String(inspect));
+  inspectAudioStream.mockResolvedValue({ source: null, output: null, delivery: null });
+  const view = renderPlayer();
+  getStreamUrl.mockImplementation((songId) => `/api/tracks/${songId}/stream?source=primary`);
+  fireEvent.click(screen.getByText("album-start"));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  const { audio, loads } = streamingDeck(view.container);
+  const original = audio.src;
+  const originalId = new URL(original, window.location.origin).searchParams.get("inspectionId");
+  expect(originalId).toBeTruthy();
+  if (inspect) await waitFor(() => expect(inspectAudioStream).toHaveBeenCalledWith("song-1", originalId, expect.any(AbortSignal)));
+
+  jest.useFakeTimers();
+  try {
+    act(() => fireEvent.waiting(audio));
+    act(() => jest.advanceTimersByTime(3500));
+    expect(loads).toEqual([original]);
+
+    act(() => fireEvent.error(audio));
+    act(() => jest.advanceTimersByTime(1000));
+    expect(loads).toHaveLength(2);
+    const fresh = new URL(loads[1], window.location.origin);
+    const freshId = fresh.searchParams.get("inspectionId");
+    expect(freshId).toBeTruthy();
+    expect(freshId).not.toBe(originalId);
+    expect(fresh.searchParams.get("retryFrom")).toBe(originalId);
+    expect(fresh.searchParams.get("inspect")).toBe(inspect ? null : "false");
+
+    audio.currentTime = 0;
+    await act(async () => fireEvent.loadedMetadata(audio));
+    expect(audio.currentTime).toBe(95);
+    expect(screen.getByTestId("playback-message")).toBeEmptyDOMElement();
+    if (inspect) expect(inspectAudioStream).toHaveBeenLastCalledWith("song-1", freshId, expect.any(AbortSignal));
+    else expect(inspectAudioStream).not.toHaveBeenCalled();
+  } finally {
+    view.unmount();
+    jest.useRealTimers();
+  }
+});
+
 test("retries network errors with backoff, then keeps the position for a manual resume", async () => {
   const { container } = await startAlbum();
   const { audio, loads } = streamingDeck(container);
@@ -2531,6 +2998,8 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
       Object.defineProperty(this, "paused", { configurable: true, value: false });
       return Promise.resolve();
     });
+    saveMediaCheckpoint.mockClear();
+    recordListeningEvent.mockClear();
     await act(async () => { await adapter.start({ ...snapshot, exactPositionMs: 125789.123 }, transfer.signal); });
     expect(audio.currentTime).toBe(125.789123);
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
@@ -2538,6 +3007,9 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
     expect(screen.getByTestId("volume")).toHaveTextContent("0.4");
     await act(async () => { await adapter.command({ type: "SEEK", position_ms: 321789.456 }); });
     expect(audio.currentTime).toBe(321789.456 / 1000);
+    fireEvent.timeUpdate(audio);
+    expect(saveMediaCheckpoint).not.toHaveBeenCalled();
+    expect(recordListeningEvent).not.toHaveBeenCalled();
     await act(async () => { transfer.abort(); });
     expect(screen.getByTestId("queue")).toHaveTextContent(previousQueue);
     expect(screen.getByTestId("volume")).toHaveTextContent(previousVolume);
@@ -2547,6 +3019,7 @@ test("remote preparation restores duplicate queue occurrences paused, waits for 
 
 test("remote now-playing and transport controls reflect the selected device without echoing target commands", async () => {
   let adapter;
+  let playback;
   const active = { device_id: "desk", queue_device_id: "desk-queue", device_name: "Desk", device_type: "computer", is_active_player: true, can_receive: true,
     current_track: { id: "remote-song", title: "Remote set", artist: "Remote artist", cover_art: "mdart_remote" },
     position_ms: 42125, duration_ms: 600000, playing: true, volume: .8 };
@@ -2558,7 +3031,7 @@ test("remote now-playing and transport controls reflect the selected device with
   const command = jest.fn(async () => {});
   const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
     adapter = player;
-    return { status: "connected", devices: [active], deviceId: "phone", activeDevice: active, isRemote: true,
+    return { status: "connected", devices: [active], deviceId: "phone", activeDevice: active, isRemote: true, playback,
       enabled: true, busy: false, error: "", name: "Phone", command, transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
   });
   function LocalRestore() {
@@ -2577,6 +3050,13 @@ test("remote now-playing and transport controls reflect the selected device with
     expect(screen.getByTestId("current-time")).toHaveTextContent("42.125");
     expect(screen.getByTestId("volume")).toHaveTextContent("0.8");
     await waitFor(() => expect(screen.getByTestId("queue")).toHaveTextContent("remote-song,song-1,song-2"));
+    fireEvent.click(screen.getByText("loop"));
+    expect(command).toHaveBeenLastCalledWith({ type: "TOGGLE_REPEAT" });
+    fireEvent.click(screen.getByText("shuffle"));
+    expect(command).toHaveBeenLastCalledWith({ type: "TOGGLE_SHUFFLE" });
+    fireEvent.click(screen.getByRole("button", { name: "loop-only-playlist" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "SET_PLAYLIST_LOOP", playlist_id: "test-playlist", enabled: true });
+    expect(screen.getByTestId("repeat-mode")).toHaveTextContent("off");
     fireEvent.click(screen.getByText("move-later"));
     expect(command).toHaveBeenCalledWith({ type: "MOVE_QUEUE_ENTRY", entry_id: "desk-1", target_id: "desk-2" });
     fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
@@ -2596,6 +3076,23 @@ test("remote now-playing and transport controls reflect the selected device with
       type: "PLAY_SELECTION", tracks: songs.map(song => expect.objectContaining({ id: song.id })),
       start_index: 1, from_here: true, context: { type: "album", id: "", name: "Album", coverArt: null },
     });
+    const commandsSent = command.mock.calls.length;
+    playback = { ...active, track: active.current_track, is_playing: true, revision: 2, queue: {
+      ...checkpoint, repeatAll: true, shuffle: true, loopPlaylistId: "test-playlist",
+      entries: [active.current_track, songs[1], songs[0]].map((track, index) => ({
+        occurrenceId: `live-${index}`, trackId: track.id, title: track.title,
+      })),
+    } };
+    view.rerenderPlayer();
+    await act(async () => queueSyncClient.refresh());
+    expect(screen.getByTestId("queue").textContent).toBe("remote-song,song-2,song-1");
+    expect(screen.getByTestId("repeat-mode")).toHaveTextContent("all");
+    expect(screen.getByTestId("shuffle-enabled")).toHaveTextContent("true");
+    expect(command).toHaveBeenCalledTimes(commandsSent);
+    const loopPlaylist = screen.getByRole("button", { name: "loop-only-playlist" });
+    expect(loopPlaylist).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(loopPlaylist);
+    expect(command).toHaveBeenLastCalledWith({ type: "SET_PLAYLIST_LOOP", playlist_id: "test-playlist", enabled: false });
     expect(adapter.state().current_track).toBe(null);
     expect(getStreamUrl).not.toHaveBeenCalled();
     expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
@@ -2603,6 +3100,44 @@ test("remote now-playing and transport controls reflect the selected device with
     expect(screen.getByTestId("current-song")).toHaveTextContent("remote-song");
     fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
     expect(command).toHaveBeenLastCalledWith({ type: "PAUSE" });
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test("disconnecting a remote command that is waiting for a local load leaves that load alone", async () => {
+  let adapter;
+  const mock = remoteSessionModule.useRemoteSession;
+  const session = mock();
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return session;
+  });
+  const view = renderPlayer();
+  try {
+    await playerReady();
+    let finishPlay;
+    HTMLMediaElement.prototype.play.mockImplementationOnce(() => new Promise(resolve => { finishPlay = resolve; }));
+    fireEvent.click(screen.getByText("context-first"));
+    await waitFor(() => expect(finishPlay).toBeDefined());
+    await act(async () => { await adapter.command({ type: "TOGGLE_REPEAT" }); });
+    expect(adapter.queue()).toMatchObject({ repeatAll: true, repeatOne: false });
+    await act(async () => { await adapter.command({ type: "TOGGLE_SHUFFLE" }); });
+    expect(adapter.queue()).toMatchObject({ shuffle: true, index: 0 });
+    expect(adapter.queue().entries.slice(1)).toEqual([
+      expect.objectContaining({ unshuffledIndex: expect.any(Number) }),
+      expect.objectContaining({ unshuffledIndex: expect.any(Number) }),
+    ]);
+    await act(async () => { await adapter.command({ type: "SET_PLAYLIST_LOOP", playlist_id: "test-playlist", enabled: true }); });
+    expect(adapter.queue()).toMatchObject({ loopPlaylistId: "test-playlist", repeatOne: false });
+    expect(adapter.queue()).not.toHaveProperty("repeatAll");
+    const paused = HTMLMediaElement.prototype.pause.mock.calls.length;
+    const controller = new AbortController();
+    const operation = adapter.command({ type: "SEEK", position_ms: 10000 }, controller.signal);
+    const cancelled = expect(operation).rejects.toThrow("cancelled");
+    await act(async () => { controller.abort(); });
+    await cancelled;
+    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledTimes(paused);
+    expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1");
+    await act(async () => { finishPlay(); });
   } finally { view.unmount(); hook.mockRestore(); }
 });
 
@@ -2639,50 +3174,79 @@ test("loads a controller's selection on the active player from the requested tra
   } finally { view.unmount(); hook.mockRestore(); }
 });
 
-test("the selected desktop sends local pause and skip through the hub before applying them", async () => {
-  let adapter;
-  const command = jest.fn(async () => {});
+test("default collection playback seeks and saves playback while a quality request is pending", async () => {
+  localStorage.clear();
+  const { container } = renderPlayer();
+  inspectAudioStream.mockImplementation(() => new Promise(() => {}));
+  getStreamUrl.mockImplementation((id) => `/api/tracks/${id}/stream`);
+  await playerReady();
+  fireEvent.click(screen.getByRole("button", { name: "resume-collection" }));
+  await waitFor(() => expect(screen.getByTestId("is-playing")).toHaveTextContent("true"));
+  const audio = activeAudio(container);
+  startDeckPlaying(audio, 180, 0);
+  fireEvent.loadedMetadata(audio);
+  const original = audio.src;
+  fireEvent.click(screen.getByRole("button", { name: "seek-local" }));
+  expect(audio.currentTime).toBeCloseTo(15.5);
+  expect(audio.src).toBe(original);
+  fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
+
+  await waitFor(() => expect(recordListeningEvent).toHaveBeenCalledWith(expect.objectContaining({
+    ownerUserId: "user-1", trackId: "song-2", finished: false,
+  })));
+  await waitFor(() => expect(request.mock.calls.some(([url, options]) =>
+    url === "/api/v1/user/queue-session" && options?.method === "PUT"
+  )).toBe(true));
+  await waitFor(() => expect(saveMediaCheckpoint).toHaveBeenCalledWith(expect.objectContaining({
+    type: "album", mediaId: "long-album", trackId: "song-2", positionSeconds: 15.5, completed: false,
+  }), expect.any(AbortSignal)));
+  expect(inspectAudioStream).toHaveBeenCalledWith("song-2", expect.any(String), expect.any(AbortSignal));
+  expect(getAutoplayTracks).not.toHaveBeenCalled();
+});
+
+test("local controls play, seek and advance without the hub or background endpoints", async () => {
+  localStorage.clear();
+  localStorage.setItem("musicdeck:playback:remoteControl", "false");
+  localStorage.setItem("musicdeck:playback:serverNormalization", "false");
+  localStorage.setItem("musicdeck:playback:streamInspection", "false");
+  localStorage.setItem("musicdeck:playback:queueCloudSync", "false");
+  localStorage.setItem("musicdeck:playback:listeningEvents", "false");
+  localStorage.setItem("musicdeck:playback:mediaSessions", "false");
+  localStorage.setItem("musicdeck:playback:autoplayRecommendations", "false");
+  localStorage.setItem("musicdeck:playback:audioEffects", "false");
+  localStorage.setItem("musicdeck:playback:silenceTrimming", "false");
+  const command = jest.fn(async () => { throw new Error("Device control offline"); });
   const active = { device_id: "desk", device_name: "Desk", device_type: "computer", is_active_player: true,
     can_receive: true, current_track: null, position_ms: 0, duration_ms: 0, playing: false, volume: 1 };
-  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
-    adapter = player;
-    return { status: "connected", devices: [active], deviceId: "desk", activeDevice: active, isRemote: false,
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockReturnValue({
+    status: "connected", devices: [active], deviceId: "desk", activeDevice: active, isRemote: false,
       enabled: true, ordersCommands: true, busy: false, error: "", name: "Desk", command, transfer: jest.fn(),
-      enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
+      enable: jest.fn(), rename: jest.fn(), clearError: jest.fn(),
   });
-  const view = renderPlayer();
+  const view = renderPlayer({ normalize: true, userSettings: [{ key: "playback.silenceTrim.enabled", value: "true" }] });
+  getStreamUrl.mockImplementation((songId) => `/api/tracks/${songId}/stream`);
   try {
-    await playerReady();
-    fireEvent.click(screen.getByRole("button", { name: "album-start" }));
-    expect(command).toHaveBeenLastCalledWith(expect.objectContaining({ type: "PLAY_SELECTION", start_index: 0 }));
-    expect(getStreamUrl).not.toHaveBeenCalled();
-    let starting;
-    await act(async () => { starting = adapter.command(command.mock.lastCall[0]); });
-    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-1"));
+    await waitFor(() => expect(getStarred).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "context-first" }));
+    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", expect.stringMatching(/^\/api\/tracks\/song-1\/stream\?/)));
     const audio = activeAudio(view.container);
     startDeckPlaying(audio, 200, 10);
+    fireEvent.loadedMetadata(audio);
     fireEvent.playing(audio);
-    await act(async () => { await starting; });
-    await waitFor(() => expect(adapter.state().playing).toBe(true));
-
-    fireEvent.click(screen.getByRole("button", { name: "toggle-play" }));
-    expect(command).toHaveBeenLastCalledWith({ type: "PAUSE" });
-    expect(adapter.state().playing).toBe(true);
-    let skipping;
-    await act(async () => { skipping = adapter.command({ type: "SKIP", direction: "next" }); });
-    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", "/stream/song-2"));
-    let pausing;
-    let paused = false;
-    await act(async () => { pausing = adapter.command({ type: "PAUSE" }).then(() => { paused = true; }); });
-    expect(paused).toBe(false);
-    const next = activeAudio(view.container);
-    startDeckPlaying(next, 200, 0);
-    fireEvent.playing(next);
-    await act(async () => { await Promise.all([skipping, pausing]); });
-    expect(adapter.state().current_track.id).toBe("song-2");
-    expect(adapter.state().playing).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "next" }));
-    expect(command).toHaveBeenLastCalledWith({ type: "SKIP", direction: "next" });
-    expect(adapter.state().current_track.id).toBe("song-2");
+    fireEvent.click(screen.getByRole("button", { name: "seek-local" }));
+    expect(audio.currentTime).toBeCloseTo(15.5);
+    fireEvent.ended(audio);
+    await waitFor(() => expect(activeAudio(view.container)).toHaveAttribute("src", expect.stringMatching(/^\/api\/tracks\/song-2\/stream\?/)));
+    expect(command).not.toHaveBeenCalled();
+    expect(inspectAudioStream).not.toHaveBeenCalled();
+    expect(prepareNormalizedPlayback).not.toHaveBeenCalled();
+    expect(getSilenceAnalysis).not.toHaveBeenCalled();
+    expect(saveMediaCheckpoint).not.toHaveBeenCalled();
+    expect(recordListeningEvent).not.toHaveBeenCalled();
+    expect(getListeningConfig).not.toHaveBeenCalled();
+    expect(getRecentlyPlayed).not.toHaveBeenCalled();
+    expect(getAutoplayTracks).not.toHaveBeenCalled();
+    expect(hook.mock.calls.every(([userId]) => userId === null)).toBe(true);
+    expect(request.mock.calls.some(([url]) => url.includes("/queue-session"))).toBe(false);
   } finally { view.unmount(); hook.mockRestore(); }
 });

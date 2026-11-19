@@ -6,6 +6,8 @@ import type { EngineState, PlayableTrack } from "../services/audio/types";
 import { weightedShuffle } from "../utils/shuffle";
 import type { ShuffleTrack, SmartShuffleOptions } from "../utils/shuffle";
 
+export const QUEUE_PREVIEW_SIZE = 25;
+
 export const PLAYBACK_STATUSES = [
   "PLAYING",
   "PAUSED",
@@ -79,11 +81,17 @@ export function nextStatus(status: PlaybackStatus, event: StatusEvent): Playback
 }
 
 export type QueueTrackLike = ShuffleTrack;
+export type RepeatMode = "off" | "all" | "one";
+
+export function repeatModeOf(queue: { repeatOne: boolean; repeatAll?: boolean }): RepeatMode {
+  return queue.repeatOne ? "one" : queue.repeatAll ? "all" : "off";
+}
 
 export interface QueueEntry<T extends QueueTrackLike> {
   /** Stable, unique per position in the queue; doubles as the engine track key. */
   readonly entryId: string;
   readonly track: T;
+  readonly unshuffledIndex?: number;
 }
 
 export interface LoadRequest {
@@ -104,6 +112,7 @@ export interface QueueState<T extends QueueTrackLike> {
   readonly generation: number;
   /** Repeat-one: a finished track reloads instead of advancing, and no transition is prepared. */
   readonly repeatOne: boolean;
+  readonly repeatAll: boolean;
   /** The engine command the store owes; a new sequence means "load this now". */
   readonly loadRequest: LoadRequest | null;
   readonly lastError: string | null;
@@ -115,17 +124,7 @@ export interface QueueState<T extends QueueTrackLike> {
 
 export type QueueAction<T extends QueueTrackLike> =
   | { type: "HYDRATE_QUEUE"; entries: readonly QueueEntry<T>[]; index: number; options?: SetQueueOptions }
-  | {
-    type: "SET_QUEUE";
-    tracks: readonly T[];
-    startIndex?: number;
-    autoplay?: boolean;
-    startAt?: number;
-    /** Select the start entry without asking the engine to load it (e.g. a restored, paused queue). */
-    deferLoad?: boolean;
-    shuffleSeed?: number | null;
-    smartShuffle?: SmartShuffleOptions;
-  }
+  | ({ type: "SET_QUEUE"; tracks: readonly T[]; startIndex?: number } & SetQueueOptions)
   | { type: "PLAY_NEXT" }
   | { type: "PLAY_PREVIOUS"; position: number; restartThresholdSeconds?: number }
   | { type: "JUMP_TO_INDEX"; index: number }
@@ -136,9 +135,10 @@ export type QueueAction<T extends QueueTrackLike> =
   /** `randoms` are precomputed values in [0, 1) so the reducer stays pure. */
   | { type: "SHUFFLE_UPCOMING"; randoms: readonly number[] }
   | { type: "SMART_SHUFFLE_UPCOMING"; options: SmartShuffleOptions }
+  | { type: "UNSHUFFLE_UPCOMING" }
   | { type: "REMOVE_TRACKS"; ids: readonly (string | number)[] }
   | { type: "REMOVE_ENTRIES"; ids: readonly string[] }
-  | { type: "SET_REPEAT_ONE"; enabled: boolean }
+  | { type: "SET_REPEAT_MODE"; mode: RepeatMode }
   | { type: "LOAD_CURRENT"; startAt?: number; autoplay?: boolean }
   | { type: "CANCEL_LOAD"; sequence: number }
   | { type: "STOP" }
@@ -163,6 +163,7 @@ export function createQueueState<T extends QueueTrackLike>(): QueueState<T> {
     revision: 0,
     generation: 0,
     repeatOne: false,
+    repeatAll: false,
     loadRequest: null,
     lastError: null,
     nextEntrySequence: 0,
@@ -179,18 +180,18 @@ function clearedState<T extends QueueTrackLike>(state: QueueState<T>): QueueStat
     revision: state.revision + 1,
     generation: state.generation + 1,
     repeatOne: state.repeatOne,
+    repeatAll: state.repeatAll,
     nextEntrySequence: state.nextEntrySequence,
     loadSequence: state.loadSequence,
   };
 }
 
 /**
- * Fisher–Yates over the entries after `currentIndex`, driven by caller-supplied
- * random values so the same inputs always produce the same order.
+ * Fisher-Yates over the entries after `currentIndex` (-1 for the whole list).
  */
 export function shuffleUpcoming<E>(items: readonly E[], currentIndex: number, randoms: readonly number[]): E[] {
   const start = currentIndex + 1;
-  if (currentIndex < 0 || items.length - start < 2) return [...items];
+  if (currentIndex < -1 || items.length - start < 2) return [...items];
   const upcoming = items.slice(start);
   for (let index = upcoming.length - 1, step = 0; index > 0; index -= 1, step += 1) {
     const random = randoms[step] ?? 0;
@@ -198,6 +199,12 @@ export function shuffleUpcoming<E>(items: readonly E[], currentIndex: number, ra
     [upcoming[index], upcoming[swap]] = [upcoming[swap], upcoming[index]];
   }
   return [...items.slice(0, start), ...upcoming];
+}
+
+function rememberUpcomingOrder<T extends QueueTrackLike>(entries: readonly QueueEntry<T>[], start: number) {
+  const upcoming = entries.slice(start);
+  if (upcoming.some(entry => entry.unshuffledIndex !== undefined)) return upcoming;
+  return upcoming.map((entry, index) => ({ ...entry, unshuffledIndex: start + index }));
 }
 
 export function currentEntryOf<T extends QueueTrackLike>(state: QueueState<T>): QueueEntry<T> | null {
@@ -299,15 +306,21 @@ export function queueReducer<T extends QueueTrackLike>(
       let entries = action.tracks.map((track, offset) => ({
         entryId: `q${state.nextEntrySequence + offset}`,
         track,
+        ...(action.unshuffledIndices?.[offset] === undefined ? {} : { unshuffledIndex: action.unshuffledIndices[offset] }),
       }));
       const requested = action.startIndex ?? 0;
       const startIndex = Number.isInteger(requested) && requested >= 0 && requested < entries.length
         ? requested
         : 0;
-      const result = action.smartShuffle ? weightedShuffle(entries.slice(startIndex + 1), {
+      const result = action.smartShuffle ? weightedShuffle(rememberUpcomingOrder(entries, startIndex + 1), {
         ...action.smartShuffle, currentTrack: entries[startIndex].track,
       }, (entry) => entry.track) : null;
       if (result) entries = [...entries.slice(0, startIndex + 1), ...result.tracks];
+      else if (action.shuffleOrder) {
+        entries = action.shuffleOrder.map((index, position) => position > startIndex
+          ? { ...entries[index], unshuffledIndex: index }
+          : entries[index]);
+      }
       const base = {
         ...state,
         generation: state.generation + 1,
@@ -438,9 +451,10 @@ export function queueReducer<T extends QueueTrackLike>(
 
     case "SHUFFLE_UPCOMING": {
       if (state.entries.length - state.currentIndex - 1 < 2 || state.currentIndex < 0) return state;
+      const start = state.currentIndex + 1;
       return {
         ...state,
-        entries: shuffleUpcoming(state.entries, state.currentIndex, action.randoms),
+        entries: [...state.entries.slice(0, start), ...shuffleUpcoming(rememberUpcomingOrder(state.entries, start), -1, action.randoms)],
         revision: state.revision + 1,
         shuffleSeed: null,
         shuffleExcludedCount: 0,
@@ -450,16 +464,37 @@ export function queueReducer<T extends QueueTrackLike>(
     case "SMART_SHUFFLE_UPCOMING": {
       const current = currentEntryOf(state);
       if (!current) return state;
-      const result = weightedShuffle(state.entries.slice(state.currentIndex + 1), {
+      const start = state.currentIndex + 1;
+      const upcoming = rememberUpcomingOrder(state.entries, start);
+      const result = weightedShuffle(upcoming, {
         ...action.options, currentTrack: current.track,
       }, (entry) => entry.track);
+      const ranked = new Set(result.tracks);
       return {
         ...state,
-        entries: [...state.entries.slice(0, state.currentIndex + 1), ...result.tracks],
+        entries: [...state.entries.slice(0, start), ...result.tracks, ...upcoming.filter(entry => !ranked.has(entry))],
         revision: state.revision + 1,
         shuffleSeed: action.options.seed,
-        shuffleExcludedCount: result.excludedCount,
+        shuffleExcludedCount: 0,
       };
+    }
+
+    case "UNSHUFFLE_UPCOMING": {
+      if (!state.entries.some(entry => entry.unshuffledIndex !== undefined)) {
+        return state.shuffleSeed === null && state.shuffleExcludedCount === 0 ? state
+          : { ...state, shuffleSeed: null, shuffleExcludedCount: 0 };
+      }
+      const start = state.currentIndex + 1;
+      const upcoming = state.entries.slice(start);
+      const ordered = upcoming.filter(entry => entry.unshuffledIndex !== undefined)
+        .sort((a, b) => (a.unshuffledIndex ?? 0) - (b.unshuffledIndex ?? 0));
+      let index = 0;
+      const entries = state.entries.map((entry, position) => {
+        if (entry.unshuffledIndex === undefined) return entry;
+        const { unshuffledIndex: _, ...rest } = position < start ? entry : ordered[index++];
+        return rest;
+      });
+      return { ...state, entries, revision: state.revision + 1, shuffleSeed: null, shuffleExcludedCount: 0 };
     }
 
     case "REMOVE_TRACKS":
@@ -498,8 +533,10 @@ export function queueReducer<T extends QueueTrackLike>(
       };
     }
 
-    case "SET_REPEAT_ONE":
-      return state.repeatOne === action.enabled ? state : { ...state, repeatOne: action.enabled };
+    case "SET_REPEAT_MODE":
+      return repeatModeOf(state) === action.mode ? state : {
+        ...state, repeatOne: action.mode === "one", repeatAll: action.mode === "all",
+      };
 
     case "CANCEL_LOAD":
       return state.loadRequest?.sequence === action.sequence
@@ -613,9 +650,12 @@ export interface UseQueueStoreOptions<T extends QueueTrackLike> {
 export interface SetQueueOptions {
   autoplay?: boolean;
   startAt?: number;
+  /** Select the entry without loading its audio, e.g. for a restored paused queue. */
   deferLoad?: boolean;
   shuffleSeed?: number | null;
   smartShuffle?: SmartShuffleOptions;
+  shuffleOrder?: readonly number[];
+  unshuffledIndices?: readonly (number | undefined)[];
 }
 
 export interface QueueStore<T extends QueueTrackLike> {
@@ -633,11 +673,12 @@ export interface QueueStore<T extends QueueTrackLike> {
   move: (from: number, to: number) => void;
   shuffleUpcoming: (randoms: readonly number[]) => void;
   smartShuffleUpcoming: (options: SmartShuffleOptions) => void;
+  unshuffleUpcoming: () => void;
   removeTracks: (ids: readonly (string | number)[]) => void;
   removeEntries: (ids: readonly string[]) => void;
-  setRepeatOne: (enabled: boolean) => void;
+  setRepeatMode: (mode: RepeatMode) => void;
   loadCurrent: (options?: { startAt?: number; autoplay?: boolean }) => void;
-  waitForLoad: (sequence: number, signal?: AbortSignal) => Promise<void>;
+  waitForLoad: (sequence: number, signal?: AbortSignal, cancelOnAbort?: boolean) => Promise<void>;
   cancelPendingLoad: () => void;
   stop: () => void;
   play: () => void;
@@ -693,7 +734,7 @@ export function useQueueStore<T extends QueueTrackLike>(
     dispatch({ type: "CANCEL_LOAD", sequence: request.sequence });
   }, []);
 
-  const waitForLoad = useCallback((sequence: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const waitForLoad = useCallback((sequence: number, signal?: AbortSignal, cancelOnAbort = true) => new Promise<void>((resolve, reject) => {
     const finish = (error?: Error) => {
       loadListeners.current.delete(check);
       signal?.removeEventListener("abort", abort);
@@ -711,7 +752,8 @@ export function useQueueStore<T extends QueueTrackLike>(
     };
     const abort = () => {
       finish(new Error("Playback command cancelled."));
-      if (stateRef.current.loadRequest?.sequence === sequence) {
+      if (cancelOnAbort && stateRef.current.loadRequest?.sequence === sequence &&
+          (load.current?.sequence !== sequence || load.current.phase === "LOADING")) {
         engine?.pause();
         cancelPendingLoad();
       }
@@ -836,9 +878,10 @@ export function useQueueStore<T extends QueueTrackLike>(
     move: (from: number, to: number) => dispatch({ type: "MOVE", from, to }),
     shuffleUpcoming: (randoms: readonly number[]) => dispatch({ type: "SHUFFLE_UPCOMING", randoms }),
     smartShuffleUpcoming: (shuffleOptions: SmartShuffleOptions) => dispatch({ type: "SMART_SHUFFLE_UPCOMING", options: shuffleOptions }),
+    unshuffleUpcoming: () => dispatch({ type: "UNSHUFFLE_UPCOMING" }),
     removeTracks: (ids: readonly (string | number)[]) => dispatch({ type: "REMOVE_TRACKS", ids }),
     removeEntries: (ids: readonly string[]) => dispatch({ type: "REMOVE_ENTRIES", ids }),
-    setRepeatOne: (enabled: boolean) => dispatch({ type: "SET_REPEAT_ONE", enabled }),
+    setRepeatMode: (mode: RepeatMode) => dispatch({ type: "SET_REPEAT_MODE", mode }),
     loadCurrent: (loadOptions: { startAt?: number; autoplay?: boolean } = {}) =>
       dispatch({ type: "LOAD_CURRENT", ...loadOptions }),
     stop: () => dispatch({ type: "STOP" }),
@@ -903,7 +946,8 @@ export function usePersistentQueue<T extends QueueTrackLike>(store: QueueStore<T
       if (savedEntries.current !== entries) {
         const encoded: PersistedQueueEntry[] = [];
         for (let index = 0; index < entries.length; index++) {
-          encoded.push({ entryId: entries[index].entryId, track: sanitizeQueueTrack(entries[index].track) });
+          const { track, ...entry } = entries[index];
+          encoded.push({ ...entry, track: sanitizeQueueTrack(track) });
           if (index > 0 && index % 500 === 0) await new Promise(resolve => setTimeout(resolve, 0));
           if (version !== epoch.current || latest.current.store.state.entries !== entries ||
               latest.current.binding.canPersist?.() === false) return null;
@@ -924,7 +968,7 @@ export function usePersistentQueue<T extends QueueTrackLike>(store: QueueStore<T
     if (!binding.ownerId || readyOwner !== binding.ownerId) return;
     const timer = setTimeout(() => { void flush().catch(() => undefined); }, 100);
     return () => clearTimeout(timer);
-  }, [binding.ownerId, binding.checkpointKey, readyOwner, store.state.entries, store.state.currentIndex, store.state.repeatOne, store.state.status, flush]);
+  }, [binding.ownerId, binding.checkpointKey, readyOwner, store.state.entries, store.state.currentIndex, store.state.repeatOne, store.state.repeatAll, store.state.status, flush]);
   return { ready: readyOwner === binding.ownerId, flush,
     getHead: () => savedEntries.current === latest.current.store.state.entries ? head.current : null };
 }

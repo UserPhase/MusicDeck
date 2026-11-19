@@ -89,14 +89,18 @@ test("the progress thumb follows fractional playback positions and can still see
   }
 });
 
-test("the main player toggles shuffle without showing a shuffle-mode dropdown", () => {
+test("the main player can toggle shuffle and repeat for a remote output", () => {
   const changeShuffleMode = jest.fn();
   const toggleShuffle = jest.fn();
-  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" }, shuffleMode: "smart", changeShuffleMode, toggleShuffle });
+  const toggleLoop = jest.fn();
+  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" }, isRemotePlayback: true,
+    shuffleMode: "smart", changeShuffleMode, toggleShuffle, repeatMode: "all", isLooping: true, toggleLoop });
   render(<MemoryRouter><Player /></MemoryRouter>);
   expect(screen.queryByRole("button", { name: /Shuffle mode/ })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Turn on shuffle" }));
   expect(toggleShuffle).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Repeat queue. Switch to repeat one" }));
+  expect(toggleLoop).toHaveBeenCalledTimes(1);
   expect(changeShuffleMode).not.toHaveBeenCalled();
   expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 });

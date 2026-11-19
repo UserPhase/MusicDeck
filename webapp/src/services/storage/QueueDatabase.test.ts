@@ -20,6 +20,17 @@ test("progress-only writes retain the content identity and reject stale content 
   expect(await writeQueueCheckpoint("alice", "old-content", checkpoint(1))).toBeNull();
   expect(await writeQueueCheckpoint("alice", head.contentKey, { ...checkpoint(1), capturedAt: 0 })).toBeNull();
 });
+test("a repeat-queue checkpoint and per-occurrence shuffle order survive reload", async () => {
+  const original = content(4);
+  original.entries[3].unshuffledIndex = 1;
+  const old = { ...checkpoint(0), repeatOne: false };
+  const head = await writeLocalQueue("alice", original, old);
+  await writeQueueCheckpoint("alice", head.contentKey, { ...old, repeatAll: true });
+  const saved = await readLocalQueue("alice");
+  expect(saved?.content).toEqual(original);
+  expect(saved?.head.checkpoint.repeatAll).toBe(true);
+  expect(saved?.head.sequence).toBe(head.sequence + 1);
+});
 test("legacy queues migrate once without truncating or removing the original until committed", async () => {
   const queue = content(601).entries.map(entry => entry.track);
   localStorage.setItem(queueStorageKey("alice"), JSON.stringify(createQueueSnapshot({ queue, currentSong: queue[600], queueIndex: 600, currentTime: 17.5, volume: 1, isShuffleEnabled: false, isLooping: false })));

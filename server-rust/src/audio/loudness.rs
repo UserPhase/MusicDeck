@@ -11,14 +11,13 @@
 //!   - [`measured_playback_gain`]: $\max(-60, \min(12, I_{\text{target}} - I_{\text{in}}, \text{TP}_{\text{limit}} - \text{TP}_{\text{in}}))$
 //!   - [`playback_identity`], [`is_allowed_preview`], and [`LoudnessService`]
 //! - `server/src/services/media/libraryAnalysisScanService.ts` & `loudnessScanService.ts`:
-//!   - [`LibraryScanStatus`], [`ScanParametersConflict`], and [`LibraryAnalysisScanService`]
+//!   - [`LibraryScanStatus`] and [`ScanParametersConflict`]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use nanoid::nanoid;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -26,7 +25,11 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use url::Url;
 
-use crate::db::DbPool;
+use super::ffmpeg::{AUDIO_INPUT_FORMATS, Ffmpeg};
+use super::silence::stage_audio;
+use crate::catalog::SourceResolver;
+use crate::db::{DbPool, begin_sqlite_write};
+use crate::error::ServerError;
 use crate::providers::Track;
 use crate::tasks::{DefaultProcessRunner, ProcessOptions, ProcessRunner};
 
@@ -115,13 +118,21 @@ impl LoudnessMeasurement {
     /// Parses `input_i` as a finite `f64`.
     #[must_use]
     pub fn integrated_lufs(&self) -> Option<f64> {
-        self.input_i.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+        self.input_i
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
     }
 
     /// Parses `input_tp` as a finite `f64`.
     #[must_use]
     pub fn true_peak_db(&self) -> Option<f64> {
-        self.input_tp.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+        self.input_tp
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
     }
 }
 
@@ -138,7 +149,11 @@ pub struct LoudnessMetadata {
 /// 7 EBU R128 fields (`input_i`, `input_tp`, `input_lra`, `input_thresh`, `target_offset`,
 /// `output_i`, `output_tp`) contain finite numbers.
 pub fn parse_loudness(stderr: &str) -> Result<LoudnessMeasurement, String> {
-    let re = Regex::new(r#"\{[^{}]*"input_i"[^{}]*\}"#).expect("valid regex");
+    static PATTERN: std::sync::OnceLock<Option<Regex>> = std::sync::OnceLock::new();
+    let re = PATTERN
+        .get_or_init(|| Regex::new(r#"\{[^{}]*"input_i"[^{}]*\}"#).ok())
+        .as_ref()
+        .ok_or_else(|| "Loudness measurement parser unavailable".to_owned())?;
     let last_match = re
         .find_iter(stderr)
         .last()
@@ -170,11 +185,7 @@ pub fn parse_loudness(stderr: &str) -> Result<LoudnessMeasurement, String> {
 /// Computes the headroom-safe linear playback gain in dB:
 /// $$\text{gain}_{\text{dB}} = \max\bigl(-60.0,\; \min(12.0,\; I_{\text{target}} - I_{\text{in}},\; -1.0 - \text{TP}_{\text{in}})\bigr)$$
 #[must_use]
-pub fn measured_playback_gain(
-    integrated_lufs: f64,
-    true_peak_db: f64,
-    target_lufs: f64,
-) -> f64 {
+pub fn measured_playback_gain(integrated_lufs: f64, true_peak_db: f64, target_lufs: f64) -> f64 {
     let lufs_delta = target_lufs - integrated_lufs;
     let peak_headroom = TRUE_PEAK_LIMIT - true_peak_db;
     lufs_delta.min(peak_headroom).clamp(-60.0, 12.0)
@@ -252,13 +263,13 @@ pub fn loudness_stream_cache_key(
 pub struct LoudnessService {
     db: Option<DbPool>,
     pub(super) runner: Arc<dyn ProcessRunner>,
-    pub(super) ffmpeg_bin: String,
+    ffmpeg: Ffmpeg,
 }
 
 impl std::fmt::Debug for LoudnessService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoudnessService")
-            .field("ffmpeg_bin", &self.ffmpeg_bin)
+            .field("ffmpeg", &self.ffmpeg)
             .finish()
     }
 }
@@ -270,7 +281,7 @@ impl LoudnessService {
         Self {
             db,
             runner: Arc::new(DefaultProcessRunner::new()),
-            ffmpeg_bin: std::env::var("FFMPEG_PATH").unwrap_or_else(|_| String::from("ffmpeg")),
+            ffmpeg: Ffmpeg::from_env("loudnorm"),
         }
     }
 
@@ -284,8 +295,12 @@ impl LoudnessService {
         Self {
             db,
             runner,
-            ffmpeg_bin: ffmpeg_bin.into(),
+            ffmpeg: Ffmpeg::configured("loudnorm", ffmpeg_bin.into()),
         }
+    }
+
+    pub(super) async fn executable(&self) -> Result<&str, String> {
+        self.ffmpeg.resolve(self.runner.as_ref()).await
     }
 
     /// Reads a cached [`LoudnessMetadata`] for `identity` from `playback_loudness_measurements`.
@@ -296,7 +311,10 @@ impl LoudnessService {
         target_lufs: f64,
     ) -> Option<LoudnessMetadata> {
         let pool = self.db.as_ref()?;
-        let m = read_measurement(pool, identity, external_tag).await.ok().flatten()?;
+        let m = read_measurement(pool, identity, external_tag)
+            .await
+            .ok()
+            .flatten()?;
         let i_lufs = m.integrated_lufs()?;
         let tp_db = m.true_peak_db()?;
 
@@ -322,13 +340,21 @@ impl LoudnessService {
             return Ok(cached);
         }
 
-        let filter = format!("loudnorm=I={LOUDNESS_TARGET}:TP={TRUE_PEAK_LIMIT}:LRA=20:print_format=json");
+        let filter =
+            format!("loudnorm=I={LOUDNESS_TARGET}:TP={TRUE_PEAK_LIMIT}:LRA=20:print_format=json");
         let args = vec![
             String::from("-nostdin"),
             String::from("-hide_banner"),
             String::from("-nostats"),
+            String::from("-xerror"),
+            String::from("-threads"),
+            String::from("1"),
+            String::from("-filter_threads"),
+            String::from("1"),
             String::from("-protocol_whitelist"),
             String::from("file,pipe"),
+            String::from("-format_whitelist"),
+            AUDIO_INPUT_FORMATS.into(),
             String::from("-i"),
             file_path.to_string_lossy().into_owned(),
             String::from("-map"),
@@ -343,7 +369,7 @@ impl LoudnessService {
         let res = self
             .runner
             .run(
-                &self.ffmpeg_bin,
+                self.executable().await?,
                 &args,
                 ProcessOptions {
                     timeout_ms: Some(180_000),
@@ -366,7 +392,8 @@ impl LoudnessService {
             .ok_or_else(|| String::from("Audio has no measurable loudness"))?;
 
         if let Some(pool) = &self.db {
-            store_measurement(pool, identity, external_tag, &measurement).await
+            store_measurement(pool, identity, external_tag, &measurement)
+                .await
                 .map_err(|error| error.to_string())?;
         }
 
@@ -377,9 +404,86 @@ impl LoudnessService {
         })
     }
 
+    /// Precompute the default library measurement without transcoding any audio.
+    pub(super) async fn scan_track(
+        &self,
+        resolver: &SourceResolver,
+        track_id: &str,
+    ) -> Result<bool, ServerError> {
+        let revision = resolver
+            .library()
+            .track_content_revision(track_id)
+            .await
+            .map_err(loudness_storage_error)?
+            .ok_or_else(|| ServerError::NotFound("Library track not found".into()))?;
+        let identity = playback_identity(
+            track_id,
+            (!revision.is_empty()).then_some(revision.as_str()),
+            None,
+            None,
+            None,
+        );
+        let pool = self
+            .db
+            .as_ref()
+            .ok_or_else(|| loudness_storage_error("Database unavailable"))?;
+        if read_measurement(pool, &identity, "false")
+            .await
+            .map_err(loudness_storage_error)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        // The default playback identity refers to the first source. Do not cache
+        // an alternate provider's measurement under the default representation.
+        let Some(source) = resolver
+            .try_candidate_sources(track_id, None)
+            .await
+            .map_err(loudness_storage_error)?
+            .into_iter()
+            .next()
+        else {
+            return Err(ServerError::NotFound(
+                "Original library audio is unavailable".into(),
+            ));
+        };
+        self.executable()
+            .await
+            .map_err(ServerError::ServiceUnavailable)?;
+        let (_staging, file) = match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            stage_audio(vec![source], track_id),
+        )
+        .await
+        {
+            Ok(Ok(staged)) => staged,
+            Ok(Err(super::silence::StageError::Storage)) => {
+                return Err(ServerError::ServiceUnavailable(
+                    "Could not stage audio for loudness analysis".into(),
+                ));
+            }
+            _ => {
+                return Err(ServerError::BadGateway(
+                    "Original library audio could not be read for loudness analysis".into(),
+                ));
+            }
+        };
+        self.analyze_file(&file, &identity, "false", LOUDNESS_TARGET)
+            .await
+            .map_err(ServerError::BadGateway)?;
+        Ok(false)
+    }
+
     /// Returns cached or inline loudness metadata for a catalog [`Track`].
-    pub async fn track_loudness(&self, track: &Track, target_lufs: f64) -> Option<LoudnessMetadata> {
-        if let Some(loudness) = track.loudness {
+    pub async fn track_loudness(
+        &self,
+        track: &Track,
+        target_lufs: f64,
+    ) -> Option<LoudnessMetadata> {
+        if let Some(loudness) = track.loudness
+            && loudness.integrated_lufs.is_finite()
+            && loudness.true_peak_db.is_finite()
+        {
             return Some(LoudnessMetadata {
                 integrated_lufs: loudness.integrated_lufs,
                 true_peak_db: loudness.true_peak_db,
@@ -410,7 +514,9 @@ impl LoudnessService {
 }
 
 pub(super) async fn read_measurement(
-    pool: &DbPool, identity: &str, tag: &str,
+    pool: &DbPool,
+    identity: &str,
+    tag: &str,
 ) -> Result<Option<LoudnessMeasurement>, sqlx::Error> {
     let raw: Option<String> = sqlx::query_scalar(
         "SELECT measurement_json FROM playback_loudness_measurements WHERE cache_key = ? AND expires_at > ?",
@@ -420,17 +526,30 @@ pub(super) async fn read_measurement(
 }
 
 pub(super) async fn store_measurement(
-    pool: &DbPool, identity: &str, tag: &str, measurement: &LoudnessMeasurement,
+    pool: &DbPool,
+    identity: &str,
+    tag: &str,
+    measurement: &LoudnessMeasurement,
 ) -> Result<(), sqlx::Error> {
+    let encoded =
+        serde_json::to_string(measurement).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
     let now = Utc::now().timestamp_millis();
+    let mut tx = begin_sqlite_write(
+        pool.inner(),
+        "UPDATE playback_loudness_measurements SET expires_at=expires_at WHERE 0",
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO playback_loudness_measurements (cache_key, measurement_json, expires_at)
          VALUES (?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET
          measurement_json=excluded.measurement_json, expires_at=excluded.expires_at",
-    ).bind(loudness_measurement_key(identity, tag))
-        .bind(serde_json::to_string(measurement).expect("loudness measurement only contains strings"))
-        .bind(now + LOUDNESS_CACHE_TTL_MS).execute(pool.inner()).await?;
-    Ok(())
+    )
+    .bind(loudness_measurement_key(identity, tag))
+    .bind(encoded)
+    .bind(now + LOUDNESS_CACHE_TTL_MS)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 // ============================================================================
@@ -458,137 +577,7 @@ pub struct LibraryScanStatus {
 #[error("Another scan is already running. Wait for it to finish before starting this scan.")]
 pub struct ScanParametersConflict;
 
-/// Shared persistence service for `loudness_scan_jobs` and `silence_scan_jobs`.
-#[derive(Debug, Clone)]
-pub struct LibraryAnalysisScanService {
-    db: Option<DbPool>,
-    jobs_table: &'static str,
-}
-
-impl LibraryAnalysisScanService {
-    /// Creates a new scan service for `"loudness"` or `"silence"`.
-    #[must_use]
-    pub const fn new(db: Option<DbPool>, kind: &'static str) -> Self {
-        let jobs_table = if matches!(kind.as_bytes(), b"silence") {
-            "silence_scan_jobs"
-        } else {
-            "loudness_scan_jobs"
-        };
-        Self { db, jobs_table }
-    }
-
-    fn map_row(row: &sqlx::sqlite::SqliteRow) -> Option<LibraryScanStatus> {
-        let opts_str: String = row.try_get("options_json").unwrap_or_default();
-        let parameters =
-            serde_json::from_str::<HashMap<String, f64>>(&opts_str).unwrap_or_default();
-
-        Some(LibraryScanStatus {
-            id: row.try_get("id").ok()?,
-            status: row.try_get("status").unwrap_or_else(|_| String::from("completed")),
-            total_tracks: row.try_get("total_tracks").unwrap_or(0),
-            completed_tracks: row.try_get("completed_tracks").unwrap_or(0),
-            skipped_tracks: row.try_get("skipped_tracks").unwrap_or(0),
-            failed_tracks: row.try_get("failed_tracks").unwrap_or(0),
-            current_track: row.try_get("current_track").ok(),
-            warning: row.try_get("warning").ok(),
-            parameters,
-        })
-    }
-
-    /// Reads the latest [`LibraryScanStatus`] visible to `user_id` (`is_admin`).
-    pub async fn status(&self, user_id: &str, is_admin: bool) -> Option<LibraryScanStatus> {
-        let pool = self.db.as_ref()?;
-        let row = if is_admin {
-            let sql = format!(
-                "SELECT * FROM {} ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                self.jobs_table
-            );
-            sqlx::query(&sql)
-                .fetch_optional(pool.inner())
-                .await
-                .ok()
-                .flatten()?
-        } else {
-            let sql = format!(
-                "SELECT * FROM {} WHERE user_id = ? AND scope = 'playlists' ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                self.jobs_table
-            );
-            sqlx::query(&sql)
-                .bind(user_id)
-                .fetch_optional(pool.inner())
-                .await
-                .ok()
-                .flatten()?
-        };
-
-        Self::map_row(&row)
-    }
-
-    /// Starts or joins an analysis scan job, returning [`ScanParametersConflict`] on parameter mismatch.
-    pub async fn start(
-        &self,
-        user_id: &str,
-        is_admin: bool,
-        parameters: HashMap<String, f64>,
-    ) -> Result<LibraryScanStatus, ScanParametersConflict> {
-        let Some(pool) = &self.db else {
-            return Err(ScanParametersConflict);
-        };
-        let scope = if is_admin { "library" } else { "playlists" };
-        let options_json =
-            serde_json::to_string(&parameters).unwrap_or_else(|_| String::from("{}"));
-
-        let active_sql = format!(
-            "SELECT * FROM {} WHERE status IN ('discovering', 'running') LIMIT 1",
-            self.jobs_table
-        );
-        if let Ok(Some(active)) = sqlx::query(&active_sql).fetch_optional(pool.inner()).await {
-            let act_scope: String = active.try_get("scope").unwrap_or_default();
-            let act_user: String = active.try_get("user_id").unwrap_or_default();
-            let act_opts: String = active.try_get("options_json").unwrap_or_default();
-            let act_parsed =
-                serde_json::from_str::<HashMap<String, f64>>(&act_opts).unwrap_or_default();
-
-            if act_scope != scope
-                || (scope == "playlists" && act_user != user_id)
-                || act_parsed != parameters
-            {
-                return Err(ScanParametersConflict);
-            }
-            if let Some(status) = Self::map_row(&active) {
-                return Ok(status);
-            }
-        }
-
-        let id = format!("analysis_{}", nanoid!(16));
-        let now = Utc::now().to_rfc3339();
-        let insert_sql = format!(
-            r"
-            INSERT INTO {} (id, user_id, scope, status, options_json, created_at, updated_at)
-            VALUES (?, ?, ?, 'completed', ?, ?, ?)
-            ",
-            self.jobs_table
-        );
-        let _ = sqlx::query(&insert_sql)
-            .bind(&id)
-            .bind(user_id)
-            .bind(scope)
-            .bind(&options_json)
-            .bind(&now)
-            .bind(&now)
-            .execute(pool.inner())
-            .await;
-
-        Ok(self.status(user_id, is_admin).await.unwrap_or(LibraryScanStatus {
-            id,
-            status: String::from("completed"),
-            total_tracks: 0,
-            completed_tracks: 0,
-            skipped_tracks: 0,
-            failed_tracks: 0,
-            current_track: None,
-            warning: None,
-            parameters,
-        }))
-    }
+pub(super) fn loudness_storage_error(error: impl std::fmt::Display) -> ServerError {
+    tracing::warn!(%error, "Loudness analysis database operation failed");
+    ServerError::ServiceUnavailable("Loudness analysis storage is unavailable".into())
 }

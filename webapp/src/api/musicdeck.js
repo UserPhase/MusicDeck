@@ -96,7 +96,7 @@ export async function request(path, options = {}) {
 
 export const taskStreamUrl = () => resolveDesktopApiUrl("/api/v1/admin/tasks/stream");
 export const inspectAudioStream = (trackId, inspectionId, signal) =>
-  request(`/api/v1/stream/inspect/${encodeURIComponent(trackId)}?${new URLSearchParams({ inspectionId })}`, { signal });
+  request(`/api/v1/stream/inspect/${encodeURIComponent(trackId)}?${new URLSearchParams({ inspectionId })}`, { signal, priority: "low" });
 export const getMediaCheckpoints = (signal, type, mediaId) => {
   const query = type && mediaId ? `?${new URLSearchParams({ type, mediaId })}` : "";
   return request(`/api/v1/user/media-sessions${query}`, { signal });
@@ -574,6 +574,7 @@ export async function prepareNormalizedPlayback(songId, source, previewUrl, sign
   return request("/api/playback/normalize", {
     method: "POST",
     signal,
+    priority: "low",
     body: JSON.stringify({
       trackId: String(songId),
       ...playbackSourceParams(source),
@@ -651,6 +652,8 @@ export async function getTrackArtistBiography(songId) {
   return typeof data.biography === "string" ? data.biography : null;
 }
 
+export const SILENCE_ANALYZED_EVENT = "musicdeck:silence-analyzed";
+
 export async function getSilenceAnalysis(songId, options) {
   if (!songId) {
     return null;
@@ -702,8 +705,8 @@ export async function getAlbums(limit = 20) {
   return (data.albums || []).map((album) => toAlbum(album));
 }
 
-export async function getRandomSongs(limit = 10) {
-  const data = await request(`/api/library/random-tracks?limit=${encodeURIComponent(limit)}`);
+export async function getRandomSongs(limit = 10, signal) {
+  const data = await request(`/api/library/random-tracks?limit=${encodeURIComponent(limit)}`, { signal });
   return (data.tracks || []).map(toSong);
 }
 
@@ -807,9 +810,10 @@ export async function startRadio(seed, limit = 20) {
 
 export const RECOMMENDATION_FEEDBACK_CHANGED_EVENT = "musicdeck:recommendation-feedback-changed";
 
-export async function getAutoplayTracks(seedId, limit = 10, excludeIds = [], taste = {}) {
+export async function getAutoplayTracks(seedId, limit = 10, excludeIds = [], taste = {}, signal) {
   const data = await request("/api/recommendations/autoplay", {
     method: "POST",
+    signal,
     body: JSON.stringify({ seedId: String(seedId), limit, excludeIds: excludeIds.map(String).slice(-500),
       ...(taste.playlistId ? { playlistId: String(taste.playlistId), excludeFromTaste: Boolean(taste.excludeFromTaste) } : {}) }),
   });

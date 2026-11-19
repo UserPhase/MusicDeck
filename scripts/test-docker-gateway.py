@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import http.client
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -95,13 +96,42 @@ def seed(database):
             )
 
 
-def verify(origin):
-    target = urlsplit(origin)
+def send_ws_frame(conn, opcode, payload):
+    mask = os.urandom(4)
+    size = len(payload)
+    length = bytes((size | 0x80,)) if size < 126 else b"\xfe" + size.to_bytes(2, "big")
+    conn.send(bytes((0x80 | opcode,)) + length + mask
+              + bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload)))
+
+
+def read_ws_message(conn, stream):
+    while True:
+        header = stream.read(2)
+        assert len(header) == 2, "WebSocket closed while writes were in flight"
+        first, second = header
+        assert first & 0x80 and not second & 0x80, header
+        size = second & 0x7F
+        if size >= 126:
+            size = int.from_bytes(stream.read(2 if size == 126 else 8), "big")
+        payload = stream.read(size)
+        assert len(payload) == size, "Truncated WebSocket frame"
+        opcode = first & 0xF
+        if opcode == 0x9:
+            send_ws_frame(conn, 0xA, payload)
+        else:
+            assert opcode == 0x1, (opcode, payload[:120])
+            return json.loads(payload)
+
+
+def verify(connect_url, browser_origin=None):
+    target = urlsplit(connect_url)
+    origin = browser_origin or connect_url
+    browser_host = urlsplit(origin).netloc
     cookie = None
 
     def request(method, path, *, payload=None, headers=None, expected=200):
         conn = http.client.HTTPConnection(target.hostname, target.port, timeout=11)
-        request_headers = {"Origin": origin, **(headers or {})}
+        request_headers = {"Origin": origin, "Host": browser_host, **(headers or {})}
         if cookie:
             request_headers["Cookie"] = cookie
         if payload is not None:
@@ -121,17 +151,6 @@ def verify(origin):
     cookie = response.getheader("Set-Cookie").split(";", 1)[0]
     user = json.loads(body)["user"]["id"]
 
-    with closing(http.client.HTTPConnection(target.hostname, target.port, timeout=5)) as conn:
-        conn.request("GET", "/api/v1/remote", headers={
-            "Origin": origin, "Cookie": cookie, "Connection": "Upgrade",
-            "Upgrade": "websocket", "Sec-WebSocket-Version": "13",
-            "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-        })
-        response = conn.getresponse()
-        assert response.status == 101, (response.status, response.read())
-        digest = hashlib.sha1(b"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
-        assert response.getheader("Sec-WebSocket-Accept") == base64.b64encode(digest).decode()
-
     track = {"id": "md_normal", "title": "Smoke track", "artist": "Fixture", "album": "Fixture"}
     queue = "/api/v1/user/queue-session"
     _, body = request("POST", f"{queue}/content?{urlencode({'ownerId': user})}", payload={
@@ -139,8 +158,36 @@ def verify(origin):
     })
     content_id = json.loads(body)["contentId"]
     started = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)).isoformat()
-    all_workers_ready = threading.Barrier(8, timeout=10)
+    all_workers_ready = threading.Barrier(10, timeout=10)
     stream = "/api/tracks/md_normal/stream?inspectionId=ci-smoke"
+
+    def remote_playback():
+        with closing(http.client.HTTPConnection(target.hostname, target.port, timeout=10)) as conn:
+            key = base64.b64encode(os.urandom(16)).decode()
+            conn.request("GET", "/api/v1/remote", headers={
+                "Origin": origin, "Host": browser_host, "Cookie": cookie, "Connection": "Upgrade",
+                "Upgrade": "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": key,
+            })
+            with closing(conn.getresponse()) as response:
+                assert response.status == 101, (response.status, response.read())
+                digest = hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode()).digest()
+                assert response.getheader("Sec-WebSocket-Accept") == base64.b64encode(digest).decode()
+                send_ws_frame(conn, 0x1, json.dumps({
+                    "type": "REGISTER", "device_id": "ci-player", "queue_device_id": "ci-player",
+                    "device_name": "CI player", "device_type": "web", "can_receive": True,
+                    "live_sync": True, "playback_lease": True, "playbackLeaseProtocol": 1,
+                    "state": {"current_track": track, "playing": True, "position_ms": 0,
+                              "duration_ms": 180000, "volume": 1},
+                }).encode())
+                while (message := read_ws_message(conn, response.fp))["type"] != "INITIAL_STATE":
+                    assert message["type"] == "DEVICES", message
+                assert message["state"]["is_playing"] and message["state"]["device_id"] == "ci-player"
+                all_workers_ready.wait()
+                changes = 0
+                while changes < 3 * 12:
+                    message = read_ws_message(conn, response.fp)
+                    changes += message["type"] == "QUEUE_CHANGED"
+                send_ws_frame(conn, 0x8, b"\x03\xe8")
 
     def queue_writes(device):
         all_workers_ready.wait()
@@ -164,6 +211,17 @@ def verify(origin):
             })
             assert json.loads(body)["listenedSeconds"] == seconds
 
+    def media_sessions():
+        all_workers_ready.wait()
+        for position in range(1, 13):
+            _, body = request("POST", "/api/v1/user/media-sessions", payload={
+                "type": "album", "mediaId": "ci-album", "title": "Fixture", "trackId": track["id"],
+                "trackIndex": 0, "trackCount": 1, "positionSeconds": position, "durationSeconds": 180,
+                "capturedAt": int(time.time() * 1000) + position,
+            })
+            assert json.loads(body)["checkpoint"]["positionSeconds"] == position
+            request("GET", f"/api/v1/stream/inspect/{track['id']}?inspectionId=ci-smoke")
+
     def ranges():
         all_workers_ready.wait()
         for _ in range(6):
@@ -175,10 +233,11 @@ def verify(origin):
             response, _ = request("GET", stream, headers={"Range": "bytes=999999-"}, expected=416)
             assert response.getheader("Content-Range") == f"bytes */{len(MEDIA)}"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as workers:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as workers:
         jobs = [workers.submit(queue_writes, i) for i in range(3)]
         jobs += [workers.submit(listening_writes, i) for i in range(3)]
         jobs += [workers.submit(ranges) for _ in range(2)]
+        jobs += [workers.submit(media_sessions), workers.submit(remote_playback)]
         for job in jobs:
             job.result()
 
@@ -194,7 +253,7 @@ def verify(origin):
     conn = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
     try:
         conn.request("GET", "/api/tracks/md_truncated/stream", headers={
-            "Cookie": cookie, "Range": "bytes=0-8191",
+            "Host": browser_host, "Cookie": cookie, "Range": "bytes=0-8191",
         })
         response = conn.getresponse()
         assert response.status == 206, response.status
@@ -218,6 +277,6 @@ if __name__ == "__main__":
     elif operation == "seed":
         seed(sys.argv[2])
     elif operation == "verify":
-        verify(sys.argv[2])
+        verify(sys.argv[2], *sys.argv[3:])
     else:
         raise ValueError(operation)

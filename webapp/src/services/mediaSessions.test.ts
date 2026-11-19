@@ -98,11 +98,11 @@ test("a rejected checkpoint surfaces immediately and is not retried", async () =
   }
 });
 
-test("a 502 retries the newest position while paused without surfacing a warning", async () => {
+test("a 503 retries the newest position while paused without surfacing a warning", async () => {
   jest.useFakeTimers();
   const fixture = setup();
   try {
-    const error = Object.assign(new Error("Bad Gateway"), { status: 502 });
+    const error = Object.assign(new Error("Storage busy"), { status: 503 });
     fixture.save.mockImplementationOnce(() => Promise.reject(error));
     fixture.emit("timeUpdate", { key: "entry-b", position: 102.125, duration: 600 });
     await Promise.resolve();
@@ -120,6 +120,29 @@ test("a 502 retries the newest position while paused without surfacing a warning
     fixture.tracker.destroy();
     jest.useRealTimers();
   }
+});
+
+test("a final engine pause and pagehide cannot reopen a completed checkpoint", async () => {
+  const fixture = setup();
+  fixture.track.mediaResume.trackIndex = 2;
+  fixture.position(599);
+  fixture.emit("timeUpdate", { key: "entry-b", position: 599, duration: 600 });
+  await Promise.resolve();
+  fixture.emit("trackEnd", { key: "entry-b" });
+  await Promise.resolve();
+  expect(fixture.save).toHaveBeenLastCalledWith(expect.objectContaining({ completed: true }));
+  const count = fixture.save.mock.calls.length;
+
+  fixture.emit("stateChange", { key: "entry-b", state: "paused" });
+  fixture.emit("timeUpdate", { key: "entry-b", position: 599, duration: 600 });
+  window.dispatchEvent(new Event("pagehide"));
+  expect(fixture.save).toHaveBeenCalledTimes(count);
+
+  fixture.position(1);
+  fixture.emit("stateChange", { key: "entry-b", state: "loading" });
+  fixture.tracker.flush();
+  expect(fixture.save).toHaveBeenLastCalledWith(expect.objectContaining({ completed: false, positionSeconds: 1 }));
+  fixture.tracker.destroy();
 });
 
 test("a lasting failure surfaces after backoff, and disposing the tracker cancels pending retries", async () => {

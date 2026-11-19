@@ -19,6 +19,11 @@ interface PendingCheckpoint {
 }
 export const MEDIA_CHECKPOINT_CHANGED = "musicdeck:media-checkpoint-changed";
 const CHECKPOINT_RETRY_DELAYS_MS = [1000, 2000, 4000];
+const MAX_MEDIA_SECONDS = 86_400;
+
+function knownDuration(value: unknown): number | null {
+  return typeof value === "number" && value > 0 && value <= MAX_MEDIA_SECONDS ? value : null;
+}
 
 function isTemporaryCheckpointError(error: unknown): boolean {
   const status = (error as { status?: number } | null)?.status;
@@ -44,8 +49,8 @@ export function isMediaResumeContext(value: unknown): value is MediaResumeContex
     typeof context.mediaId === "string" && context.mediaId.length > 0 && context.mediaId.length <= 300 &&
     typeof context.title === "string" && context.title.trim().length > 0 && context.title.length <= 500 &&
     typeof context.trackIndex === "number" && Number.isInteger(context.trackIndex) && context.trackIndex >= 0 &&
-    typeof context.trackCount === "number" && Number.isInteger(context.trackCount) && context.trackCount > context.trackIndex &&
-    (context.occurrenceId === null || typeof context.occurrenceId === "string");
+    typeof context.trackCount === "number" && Number.isInteger(context.trackCount) && context.trackCount > context.trackIndex && context.trackCount <= 1_000_001 &&
+    (context.occurrenceId === null || (typeof context.occurrenceId === "string" && context.occurrenceId.length > 0 && context.occurrenceId.length <= 300));
 }
 
 /** Subscribe without React time-tick renders. Capture identity and position
@@ -56,10 +61,11 @@ export function createMediaSessionTracker({
   engine: Pick<PlaybackEngine, "on" | "getSnapshot" | "getPosition">;
   getTrack(key: string): { id: string | number; mediaResume?: unknown; duration?: number } | undefined;
   save(input: MediaCheckpointInput): Promise<void>;
-  onError(error: unknown): void;
+  onError?(error: unknown): void;
   now?: () => number;
 }) {
   let latest: (MediaCheckpointInput & { key: string }) | null = null;
+  let completedKey: string | null = null;
   let lastSent = 0;
   let lastCapture = 0;
   let destroyed = false;
@@ -85,7 +91,7 @@ export function createMediaSessionTracker({
           void sync(collection, job);
         }, delay);
       } else if (job.input === sent || temporary) {
-        onError(error);
+        onError?.(error);
       } else {
         // A later checkpoint may still be valid even if the previous one was rejected.
         followUp = true;
@@ -99,10 +105,12 @@ export function createMediaSessionTracker({
 
   const capture = (key: string, position: number, duration: number) => {
     const track = getTrack(key);
-    if (!track || !isMediaResumeContext(track.mediaResume) || !Number.isFinite(position) || position < 0) return null;
-    const total = duration > 0 && Number.isFinite(duration) ? duration : Number(track.duration) > 0 ? Number(track.duration) : null;
+    if (!track || !isMediaResumeContext(track.mediaResume) || !Number.isFinite(position) || position < 0 || position > MAX_MEDIA_SECONDS) return null;
+    const trackId = String(track.id);
+    if (!trackId || trackId.length > 300) return null;
+    const total = knownDuration(duration) ?? knownDuration(Number(track.duration));
     return {
-      ...track.mediaResume, trackId: String(track.id), key,
+      ...track.mediaResume, trackId, key,
       positionSeconds: total ? Math.min(position, total) : position,
       durationSeconds: total, capturedAt: Math.max(now(), lastCapture + 1), completed: false,
     };
@@ -133,17 +141,26 @@ export function createMediaSessionTracker({
     if (!latest || latest.key !== key) return;
     const snapshot = engine.getSnapshot();
     if (snapshot.key === key) latest = capture(key, engine.getPosition(), snapshot.duration) ?? latest;
-    if (latest.trackIndex === latest.trackCount - 1) latest = { ...latest, completed: true, capturedAt: Math.max(now(), lastCapture + 1) };
+    if (latest.trackIndex === latest.trackCount - 1) {
+      completedKey = key;
+      latest = { ...latest, completed: true, capturedAt: Math.max(now(), lastCapture + 1) };
+    }
     send(latest);
     latest = null;
   };
   const off = [
     engine.on("timeUpdate", ({ key, position, duration }) => {
+      if (key === completedKey) return;
       if (latest && latest.key !== key) send(latest);
       latest = capture(key, position, duration);
       if (latest && now() - lastSent >= 5000) send(latest);
     }),
     engine.on("stateChange", ({ key, state }) => {
+      if (key && key === completedKey) {
+        // The engine can emit a final pause after trackEnd. Reopen only on replay.
+        if (state !== "loading" && state !== "playing") return;
+        completedKey = null;
+      }
       if (state === "paused" || state === "error") flush();
       if (key && (!latest || latest.key !== key)) {
         if (latest) send(latest);
@@ -161,6 +178,13 @@ export function createMediaSessionTracker({
   document.addEventListener("visibilitychange", visibility);
   return {
     flush,
+    captureCurrent() {
+      const { key, duration } = engine.getSnapshot();
+      if (!key || key === completedKey) return;
+      if (latest && latest.key !== key) send(latest);
+      latest = capture(key, engine.getPosition(), duration);
+      send(latest);
+    },
     destroy({ flushPending = false } = {}) {
       if (flushPending) flush();
       destroyed = true;

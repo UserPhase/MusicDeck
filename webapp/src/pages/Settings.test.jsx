@@ -5,12 +5,14 @@ import {
   getUserSettings,
   updateUserSettings,
   getDataExportSummary,
+  USER_SETTINGS_CHANGED_EVENT,
 } from "../api/musicdeck";
 import { calculateStorageUsage, clearImageCache } from "../services/storage/StorageManager";
 
 
 jest.mock("../api/musicdeck", () => ({
   USER_SETTINGS_CHANGED_EVENT: "musicdeck:user-settings-changed",
+  SILENCE_ANALYZED_EVENT: "musicdeck:silence-analyzed",
   analyzeSilence: jest.fn(async () => ({ status: "completed" })),
   getUserSettings: jest.fn(),
   getDataExportSummary: jest.fn(async () => ({
@@ -164,9 +166,13 @@ test("loads and updates user settings", async () => {
   fireEvent.click(screen.getByRole("radio", { name: /vinyl mint/i }));
   expect(localStorage.getItem("playerAccentColor")).toBe("#10B981");
   fireEvent.click(screen.getByRole("checkbox", { name: /auto-open now playing sidebar/i }));
-  fireEvent.click(screen.getByRole("checkbox", { name: /autoplay \/ endless radio/i }));
+  const endless = screen.getByRole("checkbox", { name: "Endless Playback" });
+  expect(endless).not.toBeChecked();
+  fireEvent.click(endless);
   expect(localStorage.getItem("playerAutoOpenSidebar")).toBe("true");
   expect(localStorage.getItem("playerAutoplayEnabled")).toBe("true");
+  const savedSilence = jest.fn();
+  window.addEventListener(USER_SETTINGS_CHANGED_EVENT, savedSilence, { once: true });
   fireEvent.click(screen.getByRole("button", { name: /save settings/i }));
 
   await waitFor(() => {
@@ -189,6 +195,9 @@ test("loads and updates user settings", async () => {
     });
   });
   expect(await screen.findByText(/settings saved/i)).toBeInTheDocument();
+  expect(savedSilence).toHaveBeenCalledWith(expect.objectContaining({
+    detail: { "playback.silenceTrim.enabled": true, "playback.silenceTrim.thresholdDb": -35, "playback.silenceTrim.minSilenceSeconds": 0.5 },
+  }));
 });
 
 

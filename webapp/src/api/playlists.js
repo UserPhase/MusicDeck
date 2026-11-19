@@ -15,8 +15,22 @@ import {
 
 export { reorderPlaylistItems, editPlaylistTracks };
 
-export function getPlaylistRecommendations(playlistId, source = "library", signal) {
-  return request(`/api/v1/playlists/${encodeURIComponent(playlistId)}/recommendations?${new URLSearchParams({ source })}`, { signal });
+export async function getPlaylistRecommendations(playlistId, source = "library", signal) {
+  const invalidResponse = (message) => Object.assign(new Error(message), { code: "INVALID_PLAYLIST_RECOMMENDATIONS" });
+  const result = await request(`/api/v1/playlists/${encodeURIComponent(playlistId)}/recommendations?${new URLSearchParams({ source })}`, {
+    cache: "no-store",
+    signal,
+  }).catch((error) => {
+    if (error instanceof SyntaxError) {
+      throw invalidResponse("The server returned an empty or unreadable recommendations response.");
+    }
+    throw error;
+  });
+  if (Array.isArray(result?.items)) return result;
+  if (Array.isArray(result?.tracks)) {
+    throw invalidResponse("This server is running an older playlist recommendations API.");
+  }
+  throw invalidResponse("The server returned an empty or unreadable recommendations response.");
 }
 
 

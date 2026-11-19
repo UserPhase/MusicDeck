@@ -1,5 +1,15 @@
 node_modules
 build
 .env
+**/.env*
+**/*.env
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+dist
 coverage
 npm-debug.log

@@ -19,7 +19,9 @@ import {
   MediaDeck,
   clamp,
   createDefaultAudioContext,
+  closeOwnedAudioContext,
   playableEnd,
+  resumeAudioContext,
 } from "./outputs";
 import type { PlaybackOutput } from "./outputs";
 import type { FetchLike } from "./resumableFetch";
@@ -139,8 +141,11 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   private sleepStoppedKey: string | null = null;
   private fallbackFade: { start: number; end: number; from: number; to: number } | null = null;
   private fallbackFadeTimer: ReturnType<typeof setTimeout> | undefined;
-  private graph: AudioGraph | null;
+  private graph: AudioGraph | null = null;
   private createAudioContext: (() => AudioContext | null) | null;
+  private pendingAudioContext: AudioContext | null;
+  private resumingAudioContext: AudioContext | null = null;
+  private readonly ownsAudioContext: boolean;
   private readonly decks: readonly [MediaDeck, MediaDeck];
   private readonly detachers: Array<() => void> = [];
   private readonly listeners = new Map<PlaybackEngineEvent, Set<AnyListener>>();
@@ -179,17 +184,20 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.crossfadeCurve = options.crossfadeCurve ?? "equal-power";
     this.volume = clamp(options.volume ?? 1, 0, 1);
 
-    this.createAudioContext = options.audioContext === undefined ? createDefaultAudioContext : null;
-    const ctx = options.audioContext;
-    this.graph = ctx ? new AudioGraph(ctx, false) : null;
-    this.graph?.setVolume(this.volume);
+    this.ownsAudioContext = options.audioContext === undefined;
+    this.createAudioContext = this.ownsAudioContext ? createDefaultAudioContext : null;
+    this.pendingAudioContext = options.audioContext ?? null;
 
     const createElement = options.createAudioElement ?? (() => new Audio());
     const masterVolume = () => this.volume * this.fallbackSleepLevel();
     const makeDeck = () => {
       const element = createElement();
       if (options.crossOrigin) element.crossOrigin = options.crossOrigin;
-      const deck = new MediaDeck(element, this.graph, masterVolume);
+      const deck = new MediaDeck(element, null, masterVolume, (skippedDeck) => {
+        if (this.active !== skippedDeck) return;
+        this.emit("silenceSkipped", { key: skippedDeck.key });
+        this.emitTime();
+      });
       deck.gain.reset();
       return deck;
     };
@@ -201,7 +209,14 @@ export class PlaybackEngine implements QueuePlaybackEngine {
         wantsPlayback: () => this.wantsPlayback,
         recoverySource: (key) => {
           const track = this.activeSourceTrack;
-          if (!track?.offlineTrackId || track.key !== key ||
+          if (track?.key !== key) return null;
+          if (track.normalizedFallback && this.active instanceof MediaDeck && this.active.src === track.src) {
+            const fallback = track.normalizedFallback();
+            this.activeSourceTrack = { ...track, ...fallback, normalizedFallback: undefined };
+            this.updateTrack(key, { gain: fallback.gain });
+            return fallback.src;
+          }
+          if (!track.offlineTrackId ||
             !offlineDownloadEngine.getSnapshot().tracks.some(item => item.track_id === track.offlineTrackId && item.status === "verified")) return null;
           return offlineDownloadEngine.localPlaybackUrl(track.offlineTrackId);
         },
@@ -251,9 +266,12 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.crossfade = new CrossfadeTransition(host, {
       seconds: () => this.crossfadeSeconds,
       curve: () => this.crossfadeCurve,
+      canPlan: () => this.wantsPlayback && (this.state === "playing" || this.state === "loading") &&
+        this.effectiveMode() === "crossfade" &&
+        !this.recovery.isRecovering() && !this.recovery.hasFailed() &&
+        !(this.active instanceof MediaDeck && (this.active.element.seeking || this.pendingStartAt)),
       preloadLeadSeconds: CROSSFADE_PRELOAD_LEAD_SECONDS,
     });
-    this.graph?.equalizer?.setSettings(this.equalizerSettings);
     this.sleepTimer = new SleepTimerService({
       fade: (delay, duration) => this.setSleepEnvelope(0, delay, duration),
       restore: () => this.setSleepEnvelope(1, 0, 0.08),
@@ -268,7 +286,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       document.addEventListener("visibilitychange", this.realignSleepClock);
       this.detachers.push(() => document.removeEventListener("visibilitychange", this.realignSleepClock));
     }
-    if (ctx) this.watchAudioClock(ctx);
+    if (this.pendingAudioContext?.state === "running") this.initializeAudioGraph();
   }
 
   private readonly realignSleepClock = () => {
@@ -278,34 +296,62 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   };
 
   private watchAudioClock(ctx: AudioContext): void {
-    ctx.addEventListener?.("statechange", this.realignSleepClock);
-    this.detachers.push(() => ctx.removeEventListener?.("statechange", this.realignSleepClock));
+    const onStateChange = () => {
+      if (ctx.state !== "running" && this.wantsPlayback) {
+        this.cancelTransition("audio-context-suspended");
+        this.requestContextResume(ctx);
+      }
+      this.realignSleepClock();
+      this.crossfade.replan();
+    };
+    ctx.addEventListener?.("statechange", onStateChange);
+    this.detachers.push(() => ctx.removeEventListener?.("statechange", onStateChange));
   }
 
-  private initializeAudioGraph(): void {
-    if (!this.createAudioContext || this.destroyed || this.remoteOutput ||
-      typeof navigator === "undefined" || !navigator.userActivation?.hasBeenActive) return;
+  private initializeAudioGraph(fromGesture = false): void {
+    if (this.graph || this.destroyed || this.remoteOutput) return;
     // Keep the current audio path through a transition or a sleep fade.
     if (this.transition || this.active?.isPlaying() ||
       (this.fallbackFade && (this.fallbackFade.to !== 1 || this.fallbackFade.end > Date.now())) ||
       !this.decks.every(deck => deck.canAttachGraph())) return;
 
-    const context = this.createAudioContext();
-    this.createAudioContext = null;
-    if (!context) return;
-    let graph: AudioGraph;
+    if (!this.pendingAudioContext && this.createAudioContext &&
+      (fromGesture || (typeof navigator !== "undefined" && navigator.userActivation?.hasBeenActive))) {
+      this.pendingAudioContext = this.createAudioContext();
+      this.createAudioContext = null;
+    }
+    const context = this.pendingAudioContext;
+    if (!context || context.state === "closed") return;
+    // Capturing an element with createMediaElementSource is permanent. Keep
+    // playing directly until its context is running and neither deck is fading.
+    if (context.state !== "running") {
+      this.requestContextResume(context);
+      return;
+    }
+    this.pendingAudioContext = null;
+    let graph: AudioGraph | undefined;
     try {
-      graph = new AudioGraph(context, true);
+      graph = new AudioGraph(context, this.ownsAudioContext);
+      graph.setVolume(this.volume);
+      graph.equalizer?.setSettings(this.equalizerSettings);
     } catch {
-      void context.close().catch(() => undefined);
+      if (graph) graph.dispose();
+      else if (this.ownsAudioContext) void closeOwnedAudioContext(context);
       return;
     }
     this.graph = graph;
-    graph.setVolume(this.volume);
-    graph.equalizer?.setSettings(this.equalizerSettings);
     this.decks.forEach(deck => deck.attachGraph(graph));
     this.watchAudioClock(context);
     this.realignSleepClock();
+  }
+
+  private requestContextResume(context: AudioContext): void {
+    if (context.state === "running" || context.state === "closed" || this.resumingAudioContext === context) return;
+    this.resumingAudioContext = context;
+    void resumeAudioContext(context).then(() => {
+      if (this.resumingAudioContext === context) this.resumingAudioContext = null;
+      if (this.pendingAudioContext === context && context.state === "running") this.initializeAudioGraph();
+    }).catch(() => undefined);
   }
 
   get equalizerAvailable(): boolean {
@@ -361,12 +407,17 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     if (!decks.length) return;
     const start = Date.now() + delay * 1000;
     this.fallbackFade = { start, end: start + duration * 1000, from: delay > 0 ? 1 : this.fallbackSleepLevel(), to };
+    const refresh = () => {
+      for (const deck of decks) {
+        if (deck.gain instanceof ElementVolumeGain) deck.gain.refresh();
+      }
+    };
     const tick = () => {
-      for (const deck of decks) (deck.gain as ElementVolumeGain).refresh();
+      refresh();
       if (Date.now() < start + duration * 1000) this.fallbackFadeTimer = setTimeout(tick, 40);
     };
     if (delay > 0) {
-      for (const deck of decks) (deck.gain as ElementVolumeGain).refresh();
+      refresh();
       this.fallbackFadeTimer = setTimeout(tick, delay * 1000);
     }
     else tick();
@@ -586,7 +637,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       if (end !== null && output.position() >= end - 0.05) output.seek(output.trim().start);
     }
     this.wantsPlayback = true;
-    this.graph?.resume();
+    if (this.graph) this.requestContextResume(this.graph.ctx);
     if (this.recovery.retryNow() || this.recovery.isRecovering()) {
       this.setState("stalled");
       return;
@@ -597,8 +648,8 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   }
 
   async unlock(): Promise<void> {
-    this.initializeAudioGraph();
-    if (this.graph?.ctx.state === "suspended") await this.graph.ctx.resume();
+    this.initializeAudioGraph(true);
+    if (this.graph) this.requestContextResume(this.graph.ctx);
   }
 
   isReadyForResume(): boolean {
@@ -630,10 +681,12 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     if (!output || !Number.isFinite(seconds)) return;
     this.sleepTimer.resetBoundaryFade();
     if (this.recovery.isRecovering() || this.recovery.hasFailed()) {
+      if (output instanceof MediaDeck) output.rememberSeek(Math.max(0, seconds));
       this.recovery.updatePosition(seconds);
       return;
     }
     this.cancelTransition("seek");
+    this.crossfade.abort();
     this.trimEndedOutput = null;
     if (output instanceof MediaDeck && this.pendingStartAt?.deck === output) {
       this.pendingStartAt = { deck: output, seconds: Math.max(0, seconds) };
@@ -641,6 +694,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     }
     output.seek(seconds);
     this.emitTime();
+    this.crossfade.replan();
   }
 
   /** Tells the engine which entry follows the active one; `null` at the end of the queue. */
@@ -676,12 +730,17 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     }
     this.gapless.discardPrepared();
     this.crossfade.discardPrepared();
+    this.crossfade.replan();
   }
 
   setTransitionMode(mode: TransitionMode): void {
-    if (this.transition) {
+    if (this.transition && mode !== "off") {
       this.stagedMode = mode === this.mode ? null : mode;
       return;
+    }
+    if (mode === "off") {
+      this.stagedMode = null;
+      this.cancelTransition("transition-off");
     }
     this.applyMode(mode);
   }
@@ -695,14 +754,16 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.upcoming = this.upcomingSourceTrack ? this.albumTrack(this.upcomingSourceTrack) : null;
     if (this.activeSourceTrack) this.active?.configure(this.albumTrack(this.activeSourceTrack));
     this.trimEndedOutput = null;
+    this.crossfade.replan();
   }
 
   private albumTrack(track: PlayableTrack): PlayableTrack {
-    return this.albumAware && track.albumPlaybackId ? { ...track, trimStart: 0, trimEnd: null } : track;
+    return this.albumAware && track.albumPlaybackId ? { ...track, trimStart: 0, trimEnd: null, silenceTrim: null } : track;
   }
 
   private effectiveMode(): TransitionMode {
-    if (this.sleepTimer.blocksTransition(this.active?.key ?? null)) return "off";
+    if (this.sleepTimer.blocksTransition(this.active?.key ?? null) ||
+      (this.graph && this.graph.ctx.state !== "running")) return "off";
     const current = this.activeSourceTrack;
     return this.albumAware && current?.albumPlaybackId && current.albumPlaybackId === this.upcoming?.albumPlaybackId &&
       current.albumTrackIndex !== undefined && this.upcoming?.albumTrackIndex === current.albumTrackIndex + 1
@@ -722,10 +783,10 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     if (this.upcomingSourceTrack?.key === key) this.upcomingSourceTrack = { ...this.upcomingSourceTrack, ...settings };
     if (this.albumAware && ((this.active?.key === key && this.activeSourceTrack?.albumPlaybackId) ||
       (this.upcoming?.key === key && this.upcoming.albumPlaybackId))) {
-      settings = { ...settings, trimStart: undefined, trimEnd: undefined };
+      settings = { ...settings, trimStart: undefined, trimEnd: undefined, silenceTrim: undefined };
     }
     if (this.upcoming?.key === key) this.upcoming = { ...this.upcoming, ...settings };
-    const trimChanged = settings.trimStart !== undefined || settings.trimEnd !== undefined;
+    const trimChanged = settings.trimStart !== undefined || settings.trimEnd !== undefined || settings.silenceTrim !== undefined;
     const transition = this.transition;
     if (trimChanged && transition && (transition.fromKey === key || transition.toKey === key)) {
       this.cancelTransition("track-updated");
@@ -737,11 +798,15 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     outputs.forEach((output) => {
       if (output.key === key) output.configure(settings);
     });
-    if (trimChanged && this.active?.key === key) this.trimEndedOutput = null;
+    if (trimChanged) {
+      if (this.active?.key === key) this.trimEndedOutput = null;
+      this.crossfade.replan();
+    }
   }
 
   setCrossfadeSeconds(seconds: number): void {
     this.crossfadeSeconds = clampCrossfadeSeconds(seconds);
+    this.crossfade.replan();
   }
 
   setCrossfadeCurve(curve: CrossfadeCurve): void {
@@ -764,6 +829,10 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     const saved = this.recovery.savedPosition();
     if (saved !== null) return saved;
     return this.active?.position() ?? 0;
+  }
+
+  getTrimmedStart(): number {
+    return this.active?.trim().start ?? 0;
   }
 
   getSnapshot(): PlaybackSnapshot {
@@ -816,6 +885,10 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.detachers.splice(0).forEach((detach) => detach());
     this.decks.forEach((deck) => deck.dispose());
     this.graph?.dispose();
+    const pendingContext = this.pendingAudioContext;
+    this.pendingAudioContext = null;
+    this.resumingAudioContext = null;
+    if (pendingContext && this.ownsAudioContext) void closeOwnedAudioContext(pendingContext);
     this.listeners.clear();
   }
 
@@ -838,6 +911,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.state = state;
     this.updateSleepBoundary();
     this.emit("stateChange", { key: this.remoteOutput ? this.activeSourceTrack?.key ?? null : this.active?.key ?? null, state });
+    this.crossfade.replan();
   }
 
   private emitTime(): void {
@@ -858,6 +932,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     this.mode = mode;
     if (mode !== "gapless") this.gapless.discardPrepared();
     if (mode !== "crossfade") this.crossfade.discardPrepared();
+    else this.crossfade.replan();
   }
 
   private adoptPrepared(track: PlayableTrack): PlaybackOutput | null {
@@ -866,7 +941,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     if (this.upcoming?.key === track.key && this.upcoming.src !== track.src) return null;
     const gapless = this.gapless.takePrepared(track.key);
     if (gapless && "buffer" in gapless) {
-      return this.graph ? new BufferVoice(this.graph, track, gapless.buffer) : null;
+      return this.graph?.ctx.state === "running" ? new BufferVoice(this.graph, track, gapless.buffer) : null;
     }
     if (gapless) return gapless.deck;
     return this.crossfade.takePrepared(track.key);
@@ -890,7 +965,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   private async startOutput(output: PlaybackOutput): Promise<void> {
     const key = output.key;
     this.initializeAudioGraph();
-    this.graph?.resume();
+    if (this.graph) this.requestContextResume(this.graph.ctx);
     try {
       await output.play();
       if (output === this.active && output.key === key && !this.wantsPlayback) output.pause();
@@ -918,10 +993,12 @@ export class PlaybackEngine implements QueuePlaybackEngine {
 
   private recoverMediaError(deck: MediaDeck, code: number | undefined): boolean {
     const track = this.activeSourceTrack;
-    const retryAtStart = Boolean(track?.key === deck.key && track.offlineTrackId && !track.offlineOnly &&
-      deck.src && !/^(blob:|data:|asset:|file:)/i.test(deck.src));
+    const prepared = track?.key === deck.key && track.normalizedFallback && deck.src === track.src;
+    const retryAtStart = Boolean(prepared || (track?.key === deck.key && track.offlineTrackId && !track.offlineOnly &&
+      deck.src && !/^(blob:|data:|asset:|file:)/i.test(deck.src)));
     const pending = this.pendingStartAt?.deck === deck ? this.pendingStartAt : null;
-    if (!this.wantsPlayback || !this.recovery.notifyError(code, retryAtStart, pending?.seconds)) return false;
+    const retryCode = prepared ? MEDIA_ERR_SRC_NOT_SUPPORTED : code;
+    if (!this.wantsPlayback || !this.recovery.notifyError(retryCode, retryAtStart, pending?.seconds)) return false;
     if (pending) this.pendingStartAt = null;
     return true;
   }
@@ -936,7 +1013,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
   }
 
   private handleOutputEnded(output: PlaybackOutput): void {
-    if (output !== this.active || this.destroyed) return;
+    if (output !== this.active || this.destroyed || !output.key || !this.wantsPlayback) return;
     if (this.sleepStoppedKey === output.key || this.sleepTimer.endBoundary(output.key)) return;
     if (this.transition?.kind === "crossfade" && this.crossfade.onActiveEnded()) return;
     if (this.effectiveMode() === "gapless" && this.gapless.onActiveEnded()) return;
@@ -963,7 +1040,7 @@ export class PlaybackEngine implements QueuePlaybackEngine {
    */
   private endAtTrim(deck: MediaDeck): void {
     const end = deck.trim().end;
-    if (end === null || this.trimEndedOutput === deck || deck.position() < end) return;
+    if (end === null || this.trimEndedOutput === deck || deck.element.seeking || deck.position() < end) return;
     if (!deck.isPlaying() || !this.wantsPlayback) return;
     this.trimEndedOutput = deck;
     this.handleOutputEnded(deck);
@@ -1078,14 +1155,28 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       if (deck !== this.active) return;
       this.recovery.notifyProgress();
       this.sleepTimer.resetBoundaryFade();
+      this.crossfade.replan();
     });
-    listen("seeked", () => { if (deck === this.active) this.updateSleepBoundary(); });
+    listen("seeked", () => {
+      if (deck !== this.active) return;
+      this.updateSleepBoundary();
+      this.crossfade.replan();
+    });
+    listen("durationchange", () => {
+      if (deck === this.active) this.crossfade.replan();
+    });
+    listen("ratechange", () => {
+      if (deck === this.active) this.crossfade.replan();
+    });
     listen("loadedmetadata", () => {
       const pending = this.pendingStartAt;
-      if (deck !== this.active || pending?.deck !== deck || this.recovery.isRecovering()) return;
-      this.pendingStartAt = null;
-      deck.seek(pending.seconds);
-      this.emitTime();
+      if (deck !== this.active || this.recovery.isRecovering()) return;
+      if (pending?.deck === deck) {
+        this.pendingStartAt = null;
+        deck.seek(pending.seconds);
+        this.emitTime();
+      }
+      this.crossfade.replan();
     });
     listen("playing", () => {
       if (deck !== this.active || this.recovery.isRecovering() || !this.wantsPlayback) return;
@@ -1093,8 +1184,8 @@ export class PlaybackEngine implements QueuePlaybackEngine {
     });
     listen("waiting", () => {
       if (deck !== this.active || this.recovery.isRecovering() || !this.wantsPlayback) return;
-      // A scheduled gapless start would cut into audio the element has not played yet.
-      if (this.transition?.kind === "gapless") this.cancelTransition("buffering");
+      // The outgoing media clock stopped. Avoid fading or handing off on its old deadline.
+      this.cancelTransition("buffering");
       if (this.state !== "loading") this.setState("buffering");
       this.recovery.notifyWaiting();
     });
@@ -1111,7 +1202,10 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       this.cancelTransition("paused");
       this.setState("paused");
     });
-    listen("ended", () => this.handleOutputEnded(deck));
+    listen("ended", () => {
+      if (deck === this.active) this.handleOutputEnded(deck);
+      else this.crossfade.onDeckEnded(deck);
+    });
     listen("error", () => {
       if (deck !== this.active) {
         this.gapless.onPreparedDeckError(deck);

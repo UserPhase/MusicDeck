@@ -9,22 +9,36 @@ const MAX_BACKOFF_MS = 16_000;
 const PROGRESS_EPSILON_SECONDS = 0.25;
 const HAVE_FUTURE_DATA = 3;
 
-export function createPlaybackSessionId() {
+function createPlaybackSessionId() {
   return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function replacementPlaybackUrl(source) {
+export function parsePlaybackUrl(source) {
   if (!source) return null;
-  let url;
   try {
-    url = new URL(source, "https://musicdeck.invalid");
+    const url = new URL(source, "https://musicdeck.invalid");
+    return /\/api\/(?:tracks\/[^/]+\/stream|stream\/[^/]+)$/.test(url.pathname) ? url : null;
   } catch {
     return null;
   }
+}
+
+export function initialPlaybackUrl(source, inspect = false) {
+  const url = parsePlaybackUrl(source);
+  if (!url) return source;
+  // The server's existing inspectionId parameter also identifies the playback attempt.
+  url.searchParams.set("inspectionId", createPlaybackSessionId());
+  if (!inspect) url.searchParams.set("inspect", "false");
+  return source.split(/[?#]/, 1)[0] + url.search;
+}
+
+export function replacementPlaybackUrl(source) {
+  const url = parsePlaybackUrl(source);
+  if (!url) return null;
   const session = url.searchParams.get("inspectionId");
-  if (!session || !/\/api\/(?:tracks\/[^/]+\/stream|stream\/[^/]+)$/.test(url.pathname)) return null;
+  if (!session) return null;
   url.searchParams.set("inspectionId", createPlaybackSessionId());
   url.searchParams.set("retryFrom", session);
   // Keep the desktop proxy prefix and origin, when present.

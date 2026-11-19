@@ -136,6 +136,7 @@ function Player({
     isShuffleEnabled,
     toggleLoop,
     isLooping,
+    repeatMode,
 
     volume,
     changeVolume,
@@ -322,7 +323,7 @@ function Player({
             }
 
             disabled={
-              !currentSong || isRemotePlayback
+              !currentSong
             }
 
             aria-label={
@@ -429,13 +430,12 @@ function Player({
             }
 
             disabled={
-              !currentSong || isRemotePlayback
+              !currentSong
             }
 
             aria-label={
-              isLooping
-                ? "Turn off repeat"
-                : "Turn on repeat"
+              repeatMode === "all" ? "Repeat queue. Switch to repeat one"
+                : repeatMode === "one" ? "Repeat one. Turn off repeat" : "Turn on repeat"
             }
 
             aria-pressed={
@@ -450,6 +450,7 @@ function Player({
               <path d="M3 7h18" />
               <path d="M7 21l-4-4 4-4" />
               <path d="M21 17H3" />
+              {repeatMode === "one" && <path d="M11 11l1-1v5m-1 0h2" />}
             </svg>
           </button>
 

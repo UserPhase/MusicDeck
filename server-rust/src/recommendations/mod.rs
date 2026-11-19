@@ -2,7 +2,7 @@
 //!
 //! Exports [`RecommendationEngine`], [`AffinityVector`], [`TasteProfile`],
 //! [`RecommendationScore`], [`LocalRecommendation`], [`RecommendationService`],
-//! [`RecommendationRegistry`], and [`recommend_for_playlist`].
+//! and [`RecommendationRegistry`].
 
 pub mod engine;
 pub mod service;
@@ -15,7 +15,7 @@ pub use engine::{
 pub use service::{
     DiscoverySeed, FeedbackAction, RecommendationContext, RecommendationKind,
     RecommendationProvider, RecommendationRegistry, RecommendationSection, RecommendationSeed,
-    RecommendationService, diversify_results, playlist_recording_key, recommend_for_playlist,
+    RecommendationService, diversify_results, playlist_recording_key,
 };
 
 #[cfg(test)]

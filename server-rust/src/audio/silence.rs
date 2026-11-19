@@ -13,14 +13,23 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
+use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 
-use crate::db::DbPool;
-use crate::tasks::{DefaultProcessRunner, ProcessOptions, ProcessRunner};
+use super::ffmpeg::{AUDIO_INPUT_FORMATS, Ffmpeg};
+
+use crate::catalog::{CandidateSource, SourceResolver};
+use crate::db::{DbPool, begin_sqlite_write};
+use crate::error::ServerError;
+use crate::providers::{MEDIA_BODY_IDLE_TIMEOUT, MEDIA_HEADER_BUDGET};
+use crate::streaming::http::bounded_media_body;
+use crate::tasks::{DefaultProcessRunner, ProcessError, ProcessOptions, ProcessRunner};
 
 /// Default silence detection noise threshold (`-35.0 dB`).
 pub const DEFAULT_SILENCE_THRESHOLD_DB: f64 = -35.0;
@@ -103,8 +112,10 @@ pub struct SilenceAnalysisRow {
 /// Parses FFmpeg `silencedetect` stderr output into ordered [`SilenceInterval`] pairs.
 #[must_use]
 pub fn parse_silence_intervals(stderr: &str) -> Vec<SilenceInterval> {
-    let start_re = Regex::new(r"silence_start:\s*(-?\d+(?:\.\d+)?)").expect("valid regex");
-    let end_re = Regex::new(r"silence_end:\s*(-?\d+(?:\.\d+)?)").expect("valid regex");
+    let start_re =
+        Regex::new(r"silence_start:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)").expect("valid regex");
+    let end_re =
+        Regex::new(r"silence_end:\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)").expect("valid regex");
 
     let starts: Vec<f64> = start_re
         .captures_iter(stderr)
@@ -179,13 +190,14 @@ pub fn derive_trim_bounds(
 pub struct SilenceAnalysisService {
     db: Option<DbPool>,
     runner: Arc<dyn ProcessRunner>,
-    ffmpeg_bin: String,
+    ffmpeg: Ffmpeg,
+    slots: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for SilenceAnalysisService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SilenceAnalysisService")
-            .field("ffmpeg_bin", &self.ffmpeg_bin)
+            .field("ffmpeg", &self.ffmpeg)
             .finish()
     }
 }
@@ -197,7 +209,8 @@ impl SilenceAnalysisService {
         Self {
             db,
             runner: Arc::new(DefaultProcessRunner::new()),
-            ffmpeg_bin: std::env::var("FFMPEG_PATH").unwrap_or_else(|_| String::from("ffmpeg")),
+            ffmpeg: Ffmpeg::from_env("silencedetect"),
+            slots: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -211,83 +224,127 @@ impl SilenceAnalysisService {
         Self {
             db,
             runner,
-            ffmpeg_bin: ffmpeg_bin.into(),
+            ffmpeg: Ffmpeg::configured("silencedetect", ffmpeg_bin.into()),
+            slots: Arc::new(Semaphore::new(2)),
         }
     }
 
-    async fn revision(&self, track_id: &str) -> String {
-        let Some(pool) = &self.db else {
-            return String::new();
-        };
-        sqlx::query("SELECT content_revision FROM library_items WHERE id = ? AND type = 'track'")
-            .bind(track_id)
-            .fetch_optional(pool.inner())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.try_get::<String, _>("content_revision").ok())
-            .unwrap_or_default()
-    }
-
-    /// Retrieves cached silence analysis for `track_id` (optionally scoped to specific `params`).
+    /// Gets a cached profile for the current content revision. With no parameters, read the latest.
     pub async fn get_analysis(
         &self,
         track_id: &str,
         params: Option<SilenceParameters>,
-    ) -> Option<SilenceAnalysisRow> {
-        let pool = self.db.as_ref()?;
-        if let Some(p) = params {
-            let rev = self.revision(track_id).await;
-            let row = sqlx::query(
-                r"
-                SELECT analysis_json FROM track_silence_analysis_profiles
-                WHERE track_id = ? AND threshold_db = ? AND min_silence_seconds = ? AND revision = ?
-                ",
-            )
-            .bind(track_id)
-            .bind(p.threshold_db)
-            .bind(p.min_silence_seconds)
-            .bind(rev)
-            .fetch_optional(pool.inner())
-            .await
-            .ok()
-            .flatten()?;
-            let json_str: String = row.try_get("analysis_json").ok()?;
-            return serde_json::from_str::<SilenceAnalysisRow>(&json_str).ok();
-        }
-
-        let row = sqlx::query("SELECT * FROM track_silence_analysis WHERE track_id = ?")
-            .bind(track_id)
-            .fetch_optional(pool.inner())
-            .await
-            .ok()
-            .flatten()?;
-
-        Some(SilenceAnalysisRow {
-            track_id: row.try_get("track_id").ok()?,
-            status: row.try_get("status").ok()?,
-            leading_silence_seconds: row.try_get("leading_silence_seconds").ok(),
-            trailing_silence_seconds: row.try_get("trailing_silence_seconds").ok(),
-            duration_seconds: row.try_get("duration_seconds").ok(),
-            threshold_db: row.try_get("threshold_db").unwrap_or(DEFAULT_SILENCE_THRESHOLD_DB),
-            min_silence_seconds: row
-                .try_get("min_silence_seconds")
-                .unwrap_or(DEFAULT_MIN_SILENCE_SECONDS),
-            error_message: row.try_get("error_message").ok(),
-            analyzed_at: row.try_get("analyzed_at").unwrap_or_default(),
-            updated_at: row.try_get("updated_at").unwrap_or_default(),
-        })
+    ) -> Result<Option<SilenceAnalysisRow>, ServerError> {
+        let pool = self.db.as_ref().ok_or_else(silence_unavailable)?;
+        let json = sqlx::query_scalar::<_, String>(
+            "SELECT p.analysis_json FROM track_silence_analysis_profiles p
+             JOIN library_items i ON i.id = p.track_id AND i.content_revision = p.revision
+             JOIN track_silence_analysis a ON a.track_id = p.track_id
+             WHERE p.track_id = ? AND i.type = 'track'
+               AND p.threshold_db = COALESCE(?, a.threshold_db)
+               AND p.min_silence_seconds = COALESCE(?, a.min_silence_seconds)",
+        )
+        .bind(track_id)
+        .bind(params.map(|p| p.threshold_db))
+        .bind(params.map(|p| p.min_silence_seconds))
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(silence_storage_error)?;
+        json.map(|value| serde_json::from_str(&value).map_err(silence_storage_error))
+            .transpose()
     }
 
-    /// Analyzes a local audio file on disk for lead-in/lead-out silence and persists the result.
-    pub async fn analyze_file(
+    pub(crate) async fn analyze_track(
         &self,
+        resolver: &SourceResolver,
+        track_id: &str,
+        params: SilenceParameters,
+        force: bool,
+        admission_wait: Duration,
+    ) -> Result<(SilenceAnalysisRow, bool), ServerError> {
+        if !force {
+            if let Some(saved) = self.get_analysis(track_id, Some(params)).await? {
+                if saved.status == "completed" {
+                    return Ok((saved, true));
+                }
+            }
+        }
+        let pool = self.db.as_ref().ok_or_else(silence_unavailable)?;
+        let revision = sqlx::query_scalar::<_, String>(
+            "SELECT content_revision FROM library_items WHERE id = ? AND type = 'track'",
+        )
+        .bind(track_id)
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(silence_storage_error)?
+        .ok_or_else(|| ServerError::NotFound("Library track not found".into()))?;
+
+        let _permit = tokio::time::timeout(admission_wait, self.slots.acquire())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
+                ServerError::ServiceUnavailable(
+                    "Silence analysis is busy. Try again shortly.".into(),
+                )
+            })?;
+        let sources = resolver
+            .try_candidate_sources(track_id, None)
+            .await
+            .map_err(|_| silence_unavailable())?;
+        if sources.is_empty() {
+            return Ok((unavailable_audio(track_id, params), false));
+        }
+
+        // A matching cache entry never requires FFmpeg. For new work, check the
+        // decoder before fetching audio or opening a temporary file.
+        let ffmpeg = self
+            .ffmpeg
+            .resolve(self.runner.as_ref())
+            .await
+            .map_err(ServerError::ServiceUnavailable)?;
+        let (dir, path) =
+            match tokio::time::timeout(Duration::from_secs(45), stage_audio(sources, track_id))
+                .await
+            {
+                Ok(Ok(input)) => input,
+                Ok(Err(StageError::Storage)) => {
+                    return Err(ServerError::ServiceUnavailable(
+                        "Could not stage audio for silence analysis".into(),
+                    ));
+                }
+                Ok(Err(StageError::Audio)) => {
+                    return Ok((unavailable_audio(track_id, params), false));
+                }
+                Err(_) => {
+                    return Ok((
+                        analysis_failure(
+                            track_id,
+                            params,
+                            "unavailable",
+                            "Timed out reading original library audio",
+                        ),
+                        false,
+                    ));
+                }
+            };
+        let row = self.decode_file(ffmpeg, track_id, &path, params).await?;
+        drop(dir);
+        if row.status == "completed" {
+            self.persist_row(pool, &row, &revision).await?;
+            tracing::debug!(%track_id, "Track silence analysis completed");
+        }
+        Ok((row, false))
+    }
+
+    async fn decode_file(
+        &self,
+        ffmpeg: &str,
         track_id: &str,
         file_path: &Path,
         params: SilenceParameters,
-    ) -> SilenceAnalysisRow {
+    ) -> Result<SilenceAnalysisRow, ServerError> {
         let now = Utc::now().to_rfc3339();
-        let rev = self.revision(track_id).await;
 
         let filter = format!(
             "silencedetect=noise={}dB:d={}",
@@ -296,8 +353,12 @@ impl SilenceAnalysisService {
         let args = vec![
             String::from("-nostdin"),
             String::from("-hide_banner"),
+            String::from("-nostats"),
+            String::from("-xerror"),
             String::from("-protocol_whitelist"),
             String::from("file,pipe"),
+            String::from("-format_whitelist"),
+            AUDIO_INPUT_FORMATS.into(),
             String::from("-i"),
             file_path.to_string_lossy().into_owned(),
             String::from("-map"),
@@ -312,7 +373,7 @@ impl SilenceAnalysisService {
         let outcome = self
             .runner
             .run(
-                &self.ffmpeg_bin,
+                ffmpeg,
                 &args,
                 ProcessOptions {
                     timeout_ms: Some(60_000),
@@ -339,41 +400,59 @@ impl SilenceAnalysisService {
                     updated_at: now,
                 }
             }
-            Ok(_) => SilenceAnalysisRow {
-                track_id: track_id.to_owned(),
-                status: String::from("failed"),
-                leading_silence_seconds: None,
-                trailing_silence_seconds: None,
-                duration_seconds: None,
-                threshold_db: params.threshold_db,
-                min_silence_seconds: params.min_silence_seconds,
-                error_message: Some(String::from("FFmpeg silence analysis failed")),
-                analyzed_at: now.clone(),
-                updated_at: now,
-            },
-            Err(err) => SilenceAnalysisRow {
-                track_id: track_id.to_owned(),
-                status: String::from("failed"),
-                leading_silence_seconds: None,
-                trailing_silence_seconds: None,
-                duration_seconds: None,
-                threshold_db: params.threshold_db,
-                min_silence_seconds: params.min_silence_seconds,
-                error_message: Some(err.to_string()),
-                analyzed_at: now.clone(),
-                updated_at: now,
-            },
+            Ok(res) => {
+                tracing::warn!(%track_id, exit_code = ?res.exit_code, "FFmpeg could not decode audio for silence analysis");
+                analysis_failure(
+                    track_id,
+                    params,
+                    "failed",
+                    "FFmpeg could not decode the library audio",
+                )
+            }
+            Err(error @ ProcessError::SpawnFailed { .. }) => {
+                tracing::warn!(%track_id, %error, "FFmpeg silence analysis could not start");
+                return Err(ServerError::ServiceUnavailable(
+                    "FFmpeg stopped being runnable. Check the server executable and FFMPEG_PATH, then restart MusicDeck.".into(),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%track_id, %error, "FFmpeg silence analysis could not run");
+                analysis_failure(
+                    track_id,
+                    params,
+                    "failed",
+                    "FFmpeg silence analysis could not run. Check the server logs and FFmpeg installation.",
+                )
+            }
         };
-
-        self.persist_row(&row, &rev).await;
-        row
+        Ok(row)
     }
 
-    async fn persist_row(&self, row: &SilenceAnalysisRow, revision: &str) {
-        let Some(pool) = &self.db else {
-            return;
-        };
-        let _ = sqlx::query(
+    async fn persist_row(
+        &self,
+        pool: &DbPool,
+        row: &SilenceAnalysisRow,
+        revision: &str,
+    ) -> Result<(), ServerError> {
+        let mut tx = begin_sqlite_write(
+            pool.inner(),
+            "UPDATE track_silence_analysis SET status = status WHERE 0",
+        )
+        .await
+        .map_err(silence_storage_error)?;
+        let latest = sqlx::query_scalar::<_, String>(
+            "SELECT content_revision FROM library_items WHERE id = ?",
+        )
+        .bind(&row.track_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(silence_storage_error)?;
+        if latest.as_deref() != Some(revision) {
+            return Err(ServerError::Conflict(
+                "Track changed during silence analysis. Try again.".into(),
+            ));
+        }
+        sqlx::query(
             r"
             INSERT INTO track_silence_analysis (
                 track_id, status, leading_silence_seconds, trailing_silence_seconds,
@@ -403,11 +482,12 @@ impl SilenceAnalysisService {
         .bind(&row.error_message)
         .bind(&row.analyzed_at)
         .bind(&row.updated_at)
-        .execute(pool.inner())
-        .await;
+        .execute(&mut *tx)
+        .await
+        .map_err(silence_storage_error)?;
 
-        let json_str = serde_json::to_string(row).unwrap_or_default();
-        let _ = sqlx::query(
+        let json_str = serde_json::to_string(row).map_err(silence_storage_error)?;
+        sqlx::query(
             r"
             INSERT OR REPLACE INTO track_silence_analysis_profiles (
                 track_id, threshold_db, min_silence_seconds, revision, analysis_json
@@ -420,7 +500,128 @@ impl SilenceAnalysisService {
         .bind(row.min_silence_seconds)
         .bind(revision)
         .bind(json_str)
-        .execute(pool.inner())
-        .await;
+        .execute(&mut *tx)
+        .await
+        .map_err(silence_storage_error)?;
+        tx.commit().await.map_err(silence_storage_error)
     }
+}
+
+fn unavailable_audio(track_id: &str, params: SilenceParameters) -> SilenceAnalysisRow {
+    analysis_failure(
+        track_id,
+        params,
+        "unavailable",
+        "Original library audio could not be read for silence analysis",
+    )
+}
+
+fn analysis_failure(
+    track_id: &str,
+    params: SilenceParameters,
+    status: &str,
+    message: &str,
+) -> SilenceAnalysisRow {
+    tracing::warn!(%track_id, %status, %message, "Track silence analysis did not complete");
+    let now = Utc::now().to_rfc3339();
+    SilenceAnalysisRow {
+        track_id: track_id.into(),
+        status: status.into(),
+        leading_silence_seconds: None,
+        trailing_silence_seconds: None,
+        duration_seconds: None,
+        threshold_db: params.threshold_db,
+        min_silence_seconds: params.min_silence_seconds,
+        error_message: Some(message.into()),
+        analyzed_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+pub(crate) fn silence_storage_error(error: impl std::fmt::Display) -> ServerError {
+    tracing::warn!(%error, "Silence analysis database operation failed");
+    silence_unavailable()
+}
+
+pub(crate) fn silence_unavailable() -> ServerError {
+    ServerError::ServiceUnavailable("Silence analysis storage is unavailable".into())
+}
+
+pub(super) enum StageError {
+    Audio,
+    Storage,
+}
+
+pub(super) async fn stage_audio(
+    candidates: Vec<CandidateSource>,
+    track_id: &str,
+) -> Result<(tempfile::TempDir, std::path::PathBuf), StageError> {
+    for candidate in candidates.into_iter().take(3) {
+        let response = tokio::time::timeout(
+            MEDIA_HEADER_BUDGET,
+            candidate.provider.provider.fetch_stream(
+                &candidate.source.provider_item_id,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await;
+        let Ok(Ok(stream)) = response else {
+            tracing::debug!(%track_id, connection_id = %candidate.source.connection_id, "Audio analysis source did not return audio");
+            continue;
+        };
+        let max = super::MAX_LOUDNESS_INPUT_BYTES;
+        let length = stream.response.content_length();
+        if stream.status != http::StatusCode::OK
+            || stream.headers.contains_key(http::header::CONTENT_RANGE)
+            || length.is_some_and(|length| length == 0 || length > max)
+        {
+            tracing::debug!(%track_id, status = %stream.status, ?length, "Audio analysis source returned unusable audio");
+            continue;
+        }
+
+        let dir = tempfile::tempdir().map_err(|error| {
+            tracing::warn!(%track_id, %error, "Could not create audio analysis staging directory");
+            StageError::Storage
+        })?;
+        let path = dir.path().join("audio");
+        let mut file = tokio::fs::File::create(&path).await.map_err(|error| {
+            tracing::warn!(%track_id, %error, "Could not create audio analysis input");
+            StageError::Storage
+        })?;
+        let mut body = bounded_media_body(
+            Box::pin(stream.response.bytes_stream()),
+            max,
+            length,
+            None,
+            MEDIA_BODY_IDLE_TIMEOUT,
+        );
+        let mut bytes = 0;
+        let mut complete = true;
+        while let Some(chunk) = body.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    tracing::debug!(%track_id, %error, "Audio analysis source ended before staging completed");
+                    complete = false;
+                    break;
+                }
+            };
+            file.write_all(&chunk).await.map_err(|error| {
+                tracing::warn!(%track_id, %error, "Could not write audio analysis input");
+                StageError::Storage
+            })?;
+            bytes += chunk.len();
+        }
+        file.flush().await.map_err(|error| {
+            tracing::warn!(%track_id, %error, "Could not flush audio analysis input");
+            StageError::Storage
+        })?;
+        drop(file);
+        if complete && bytes > 0 {
+            return Ok((dir, path));
+        }
+    }
+    Err(StageError::Audio)
 }

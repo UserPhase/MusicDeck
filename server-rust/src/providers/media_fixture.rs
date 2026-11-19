@@ -161,8 +161,9 @@ macro_rules! media_fixture_impl {
             }
 
             async fn get_track(&self, id: &str) -> Result<Option<Track>, ProviderError> {
-                let catalog = self.catalog.as_ref().expect("catalog fixture").read().unwrap();
-                Ok(catalog.tracks.iter().find(|track| track.id == id).cloned())
+                Ok(self.catalog.as_ref().and_then(|catalog| {
+                    catalog.read().unwrap().tracks.iter().find(|track| track.id == id).cloned()
+                }))
             }
 
             $(

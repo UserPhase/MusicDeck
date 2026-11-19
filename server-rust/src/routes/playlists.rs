@@ -120,7 +120,7 @@ pub fn playlist_routes() -> Router<AppState> {
         .merge(artwork_upload_route)
 }
 
-fn build_playlist_service(state: &AppState) -> Result<PlaylistService, Response> {
+pub(super) fn build_playlist_service(state: &AppState) -> Result<PlaylistService, Response> {
     let Some(db) = state.db().cloned() else {
         return Err(send_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -135,7 +135,7 @@ fn build_playlist_service(state: &AppState) -> Result<PlaylistService, Response>
     Ok(PlaylistService::new(db, catalog, library, resolver))
 }
 
-fn map_playlist_error(err: PlaylistError) -> Response {
+pub(super) fn map_playlist_error(err: PlaylistError) -> Response {
     let (status, code, message) = match err {
         PlaylistError::Validation(msg) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg),
         PlaylistError::Conflict(msg) => (StatusCode::CONFLICT, "PLAYLIST_CONFLICT", msg),

@@ -170,6 +170,8 @@ pub enum RemoteCommand {
     ToggleShuffle,
     /// Toggle repeat-one on the active device.
     ToggleRepeat,
+    /// Set whether the selected playlist repeats on the active device.
+    SetPlaylistLoop { playlist_id: String, enabled: bool },
     /// Play a specific occurrence in the active queue.
     PlayQueueEntry { entry_id: String },
     /// Reorder the active queue using occurrence identities.
@@ -200,10 +202,12 @@ pub struct RemoteSelectionContext {
     pub id: String,
     pub name: String,
     pub cover_art: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_loop_id: Option<String>,
 }
 
 impl RemoteCommand {
-    fn valid_queue_command(&self) -> bool {
+    fn valid(&self) -> bool {
         let valid_id = |id: &str| !id.is_empty() && id.len() <= 160;
         let valid_tracks = |tracks: &[Value]| {
             !tracks.is_empty()
@@ -216,8 +220,10 @@ impl RemoteCommand {
                 })
         };
         match self {
+            Self::Skip { direction } => matches!(direction.as_str(), "next" | "previous"),
             Self::Seek { position_ms } => (0.0..=604_800_000.0).contains(position_ms),
             Self::SetVolume { volume } => (0.0..=1.0).contains(volume),
+            Self::SetPlaylistLoop { playlist_id, .. } => !playlist_id.is_empty() && playlist_id.len() <= 1024,
             Self::PlayQueueEntry { entry_id } => valid_id(entry_id),
             Self::MoveQueueEntry {
                 entry_id,
@@ -235,6 +241,7 @@ impl RemoteCommand {
                         context.kind.len() <= 80
                             && context.id.len() <= 1024
                             && context.name.len() <= 500
+                            && context.playlist_loop_id.as_ref().is_none_or(|id| context.kind == "collection" && id == &context.id)
                             && context
                                 .cover_art
                                 .as_ref()
@@ -253,6 +260,9 @@ impl RemoteCommand {
 pub struct TransferQueueEntry {
     /// Unique occurrence ID (`1..=160` chars).
     pub occurrence_id: String,
+    /// Original position of a shuffled occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unshuffled_index: Option<usize>,
     /// Track ID (`1..=160` chars).
     pub track_id: String,
     /// Track title.
@@ -284,6 +294,12 @@ pub struct TransferQueueState {
     pub index: usize,
     /// Repeat-one toggle.
     pub repeat_one: bool,
+    /// Repeat the queue at its end. Absent for older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_all: Option<bool>,
+    /// Playlist selected for scoped repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_playlist_id: Option<String>,
     /// Shuffle toggle.
     pub shuffle: bool,
     /// Shuffle mode (`"standard"` or `"smart"`).
@@ -385,6 +401,8 @@ pub enum RemoteClientMessage {
         playback_lease_protocol: Option<u8>,
         #[serde(default, rename = "leaseGeneration")]
         lease_generation: Option<Uuid>,
+        #[serde(default, rename = "leaseServerId")]
+        lease_server_id: Option<Uuid>,
     },
     /// Request a lease acknowledgement for the active output.
     RenewPlaybackLease {
@@ -563,6 +581,7 @@ struct DetachedPlayer {
     lease: PlayerLease,
     state: RemotePlaybackState,
     queue: Option<Arc<TransferQueueState>>,
+    paused_transfer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -584,6 +603,7 @@ impl PlayerLease {
 
 #[derive(Debug, Default)]
 struct HubState {
+    server_id: Uuid,
     clients: HashMap<String, ConnectedClient>,
     active_player_by_user: HashMap<String, String>,
     detached_players: HashMap<String, DetachedPlayer>,
@@ -594,16 +614,27 @@ struct HubState {
 
 /// Thread-safe, user-isolated WebSocket control plane coordinating device discovery,
 /// command forwarding, and the 4-stage playback transfer handshake.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RemoteControlHub {
     state: Arc<Mutex<HubState>>,
+}
+
+impl Default for RemoteControlHub {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RemoteControlHub {
     /// Creates a new [`RemoteControlHub`].
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Arc::new(Mutex::new(HubState {
+                server_id: Uuid::new_v4(),
+                ..HubState::default()
+            })),
+        }
     }
 
     /// Admits a new authenticated WebSocket connection for `(user_id, session_id)`,
@@ -747,6 +778,7 @@ impl RemoteControlHub {
                 playback_lease,
                 playback_lease_protocol,
                 lease_generation,
+                lease_server_id: _,
             } => {
                 // Sequence-only clients cannot prove ownership across sockets.
                 let playback_lease = playback_lease && playback_lease_protocol == Some(1);
@@ -779,7 +811,8 @@ impl RemoteControlHub {
                     return;
                 }
 
-                let session_id = guard.clients[conn_id].session_id.clone();
+                let Some(client) = guard.clients.get(conn_id) else { return };
+                let session_id = client.session_id.clone();
                 if guard.detached_players.get(&user_id).is_some_and(|owner| {
                     owner.device_id == device_id
                         && (!playback_lease
@@ -812,31 +845,39 @@ impl RemoteControlHub {
                     return;
                 }
                 let duplicate_id = duplicate.map(|peer| peer.conn_id.clone());
-                let (retained_queue, retained_lease) =
-                    if guard.detached_players.get(&user_id).is_some_and(|owner| {
-                        playback_lease
-                            && owner.device_id == device_id
-                            && owner.session_id == session_id
-                            && lease_generation == Some(owner.lease.generation)
-                    }) {
-                        let lease = guard.detached_players.remove(&user_id).unwrap();
-                        guard
-                            .active_player_by_user
-                            .insert(user_id.clone(), conn_id.to_owned());
-                        (lease.queue, Some(lease.lease))
-                    } else if let Some(old) = duplicate_id
-                        .as_ref()
-                        .filter(|old| guard.active_player_by_user.get(&user_id) == Some(*old))
-                    {
-                        guard
-                            .active_player_by_user
-                            .insert(user_id.clone(), conn_id.to_owned());
-                        let old = guard.clients.get_mut(old).unwrap();
-                        (old.queue.clone(), old.lease.take())
-                    } else {
-                        (None, None)
-                    };
+                let can_rejoin_detached = guard.detached_players.get(&user_id).is_some_and(|owner| {
+                    playback_lease
+                        && owner.device_id == device_id
+                        && owner.session_id == session_id
+                        && lease_generation == Some(owner.lease.generation)
+                });
+                let mut retained_queue = None;
+                let mut retained_lease = None;
+                let mut paused_transfer = None;
+                if can_rejoin_detached {
+                    if let Some(owner) = guard.detached_players.remove(&user_id) {
+                        retained_queue = owner.queue;
+                        retained_lease = Some(owner.lease);
+                        paused_transfer = owner.paused_transfer;
+                        guard.active_player_by_user.insert(user_id.clone(), conn_id.to_owned());
+                    }
+                } else if let Some(old) = duplicate_id.as_ref()
+                    .filter(|old| guard.active_player_by_user.get(&user_id) == Some(*old))
+                    && let Some(previous) = guard.clients.get_mut(old)
+                {
+                    retained_queue = previous.queue.clone();
+                    retained_lease = previous.lease.take();
+                    guard.active_player_by_user.insert(user_id.clone(), conn_id.to_owned());
+                }
 
+                let Some(client) = guard.clients.get(conn_id) else { return };
+                // A fresh socket can reclaim an unowned account after a long outage or restart.
+                // A live/detached player or a transfer fence must still be respected.
+                let unowned_reconnect = playback_lease
+                    && client.device_id.is_none()
+                    && !guard.active_player_by_user.contains_key(&user_id)
+                    && !guard.detached_players.contains_key(&user_id)
+                    && !guard.transfers_by_user.contains_key(&user_id);
                 let reported_stopped = !state.playing;
                 if state.playing
                     && (guard
@@ -845,19 +886,18 @@ impl RemoteControlHub {
                         .is_some_and(|active| active != conn_id)
                         || (lease_generation.is_some()
                             && retained_lease.is_none()
-                            && guard.clients[conn_id]
-                                .lease
-                                .as_ref()
-                                .map(|lease| lease.generation)
-                                != lease_generation)
-                        || guard.clients[conn_id].must_report_stopped
+                            && !unowned_reconnect
+                            && client.lease.as_ref().map(|lease| lease.generation) != lease_generation)
+                        || client.must_report_stopped
                         || Self::handoff_blocks_playback(&guard, &user_id, conn_id))
                     && !Self::is_starting_transfer_target(&guard, &user_id, conn_id)
                 {
                     // A reconnecting player follows the device that still owns playback.
                     state.playing = false;
                     Self::send_frame_locked(&guard, conn_id, json!({ "type": "DEACTIVATE" }));
-                    guard.clients.get_mut(conn_id).unwrap().must_report_stopped = true;
+                    if let Some(client) = guard.clients.get_mut(conn_id) {
+                        client.must_report_stopped = true;
+                    }
                 }
                 let is_playing = state.playing && state.current_track.is_some();
                 let initialize = guard
@@ -898,6 +938,21 @@ impl RemoteControlHub {
 
                 Self::broadcast_devices_locked(&guard, &user_id);
                 Self::sync_playback_locked(&mut guard, &user_id, initialize.then_some(conn_id));
+                if let Some(transfer_id) = paused_transfer {
+                    match guard.transfers_by_user.get_mut(&user_id) {
+                        Some(transfer) if transfer.id == transfer_id && transfer.stage == TransferStage::Rollback => {
+                            // Keep the target's provisional fence. Its rollback acknowledgement
+                            // or deadline will resume the verified source on its new socket.
+                            transfer.source_conn_id = conn_id.to_owned();
+                        }
+                        None => {
+                            Self::send_frame_locked(&guard, conn_id, json!({
+                                "type": "ABORT_TRANSFER", "transferId": transfer_id, "resume": true,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
             }
             other => {
                 if !guard
@@ -927,7 +982,9 @@ impl RemoteControlHub {
                             lease.last_sequence = sequence;
                             lease.expires =
                                 Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS);
-                            guard.clients[conn_id].deadline_changed.notify_one();
+                            if let Some(client) = guard.clients.get(conn_id) {
+                                client.deadline_changed.notify_one();
+                            }
                             Self::send_frame_locked(
                                 &guard,
                                 conn_id,
@@ -997,7 +1054,7 @@ impl RemoteControlHub {
                             },
                             command => command,
                         };
-                        if !command.valid_queue_command() {
+                        if !command.valid() {
                             Self::send_error_locked(
                                 &guard,
                                 conn_id,
@@ -1389,6 +1446,7 @@ impl RemoteControlHub {
     }
 
     fn select_player_locked(guard: &mut HubState, user_id: &str, conn_id: &str) {
+        if !guard.clients.contains_key(conn_id) { return; }
         if let Some(previous) = guard
             .active_player_by_user
             .insert(user_id.to_owned(), conn_id.to_owned())
@@ -1397,8 +1455,8 @@ impl RemoteControlHub {
         {
             client.lease = None;
         }
-        let client = guard.clients.get_mut(conn_id).unwrap();
-        if client.playback_lease && client.lease.is_none() {
+        if let Some(client) = guard.clients.get_mut(conn_id)
+            && client.playback_lease && client.lease.is_none() {
             client.lease = Some(PlayerLease::new());
             client.deadline_changed.notify_one();
         }
@@ -1422,13 +1480,21 @@ impl RemoteControlHub {
         if let Some(client) = guard.clients.get_mut(conn_id) {
             let generation = client.lease.take().map(|lease| lease.generation);
             client.state.playing = false;
-            client.must_report_stopped = true;
+            client.must_report_stopped = !expired;
             if expired {
                 Self::send_to_client(
                     client,
                     json!({ "type": "PLAYBACK_LEASE_EXPIRED", "leaseGeneration": generation }),
                 );
             }
+        }
+        if let Some(command) = guard.commands.get(user_id).and_then(VecDeque::front)
+            .filter(|command| command.target_conn_id == conn_id && command.deadline.is_some()
+                && !matches!(command.command, RemoteCommand::SetVolume { .. }))
+        {
+            Self::expire_command_locked(guard, command);
+        } else {
+            Self::dispatch_command_locked(guard, user_id);
         }
         Self::broadcast_devices_locked(guard, user_id);
         Self::sync_playback_locked(guard, user_id, None);
@@ -1454,13 +1520,14 @@ impl RemoteControlHub {
             return;
         }
         // During handoff, the target starts before the server commits ownership.
+        let Some(client) = guard.clients.get(conn_id) else { return };
         let reported_stopped = !state.playing;
         if state.playing
             && (guard
                 .active_player_by_user
                 .get(user_id)
                 .is_some_and(|active| active != conn_id)
-                || guard.clients[conn_id].must_report_stopped
+                || client.must_report_stopped
                 || Self::handoff_blocks_playback(guard, user_id, conn_id))
             && !Self::is_starting_transfer_target(guard, user_id, conn_id)
         {
@@ -1506,27 +1573,28 @@ impl RemoteControlHub {
                 }
                 return;
             }
-            if cmd.expires <= now || cmd.expires_at <= now_ms {
-                let expired = guard
-                    .commands
-                    .get_mut(user_id)
-                    .unwrap()
-                    .pop_front()
-                    .unwrap();
-                Self::send_error_locked(
-                    guard,
-                    &expired.controller_conn_id,
-                    "Playback command expired in the queue",
-                    Some(&expired.client_request_id),
-                );
+            let expired = cmd.expires <= now || cmd.expires_at <= now_ms;
+            let connected = guard.clients.get(&cmd.target_conn_id)
+                .is_some_and(|client| !*client.disconnected.borrow());
+            let still_active = matches!(cmd.command, RemoteCommand::SetVolume { .. })
+                || guard.active_player_by_user.get(user_id) == Some(&cmd.target_conn_id);
+            if expired || !connected || !still_active {
+                let Some(rejected) = guard.commands.get_mut(user_id).and_then(VecDeque::pop_front) else {
+                    return;
+                };
+                let message = if expired {
+                    "Playback command expired in the queue"
+                } else if !connected {
+                    "The selected device is no longer connected"
+                } else {
+                    "The selected device is no longer the active player"
+                };
+                Self::send_error_locked(guard, &rejected.controller_conn_id, message, Some(&rejected.client_request_id));
                 continue;
             }
-            let cmd = guard
-                .commands
-                .get_mut(user_id)
-                .unwrap()
-                .front_mut()
-                .unwrap();
+            let Some(cmd) = guard.commands.get_mut(user_id).and_then(VecDeque::front_mut) else {
+                return;
+            };
             let budget = cmd
                 .expires
                 .saturating_duration_since(now)
@@ -1598,7 +1666,8 @@ impl RemoteControlHub {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let user_id = &guard.clients.get(conn_id)?.user_id;
+        let client = guard.clients.get(conn_id)?;
+        let user_id = &client.user_id;
         guard
             .transfers_by_user
             .get(user_id)
@@ -1614,8 +1683,7 @@ impl RemoteControlHub {
                     .and_then(|cmd| cmd.deadline),
             )
             .chain(
-                guard.clients[conn_id]
-                    .lease
+                client.lease
                     .as_ref()
                     .map(|lease| lease.expires),
             )
@@ -1685,16 +1753,15 @@ impl RemoteControlHub {
             _ => return,
         };
 
-        let is_matching_transfer = guard
-            .transfers_by_user
-            .get(user_id)
-            .is_some_and(|t| t.id == msg_transfer_id);
-
-        if !is_matching_transfer {
+        let Some(transfer) = guard.transfers_by_user.get(user_id)
+            .filter(|transfer| transfer.id == msg_transfer_id) else {
             Self::send_error_locked(guard, conn_id, "Stale playback transfer", None);
             return;
+        };
+        if conn_id != transfer.source_conn_id && conn_id != transfer.target_conn_id {
+            Self::send_error_locked(guard, conn_id, "Not a participant in this transfer", None);
+            return;
         }
-        let transfer = guard.transfers_by_user.get(user_id).unwrap();
         if transfer.deadline <= Instant::now() {
             let resume = matches!(transfer.stage, TransferStage::Pause | TransferStage::Start);
             Self::abort_transfer_locked(guard, user_id, "Playback transfer timed out", resume);
@@ -1704,7 +1771,7 @@ impl RemoteControlHub {
             if matches!(message, RemoteClientMessage::TransferRolledBack { .. })
                 && conn_id == transfer.target_conn_id
             {
-                let transfer = guard.transfers_by_user.remove(user_id).unwrap();
+                let Some(transfer) = guard.transfers_by_user.remove(user_id) else { return };
                 let detail = transfer
                     .failure
                     .as_deref()
@@ -1717,22 +1784,8 @@ impl RemoteControlHub {
 
         match message {
             RemoteClientMessage::TransferFailed { message: msg, .. } => {
-                let (is_participant, resume_source) = {
-                    let t = guard.transfers_by_user.get(user_id).unwrap();
-                    let part = conn_id == t.source_conn_id || conn_id == t.target_conn_id;
-                    let resume = conn_id == t.target_conn_id
-                        && matches!(t.stage, TransferStage::Pause | TransferStage::Start);
-                    (part, resume)
-                };
-                if !is_participant {
-                    Self::send_error_locked(
-                        guard,
-                        conn_id,
-                        "Not a participant in this transfer",
-                        None,
-                    );
-                    return;
-                }
+                let resume_source = conn_id == transfer.target_conn_id
+                    && matches!(transfer.stage, TransferStage::Pause | TransferStage::Start);
                 Self::abort_transfer_locked(guard, user_id, &msg, resume_source);
             }
             RemoteClientMessage::Snapshot { snapshot, .. } => {
@@ -1741,7 +1794,7 @@ impl RemoteControlHub {
                     return;
                 }
                 let target_conn_opt = {
-                    let t = guard.transfers_by_user.get_mut(user_id).unwrap();
+                    let Some(t) = guard.transfers_by_user.get_mut(user_id) else { return };
                     if conn_id == t.source_conn_id && t.stage == TransferStage::Snapshot {
                         t.snapshot = Some(snapshot.clone());
                         t.stage = TransferStage::Prepare;
@@ -1770,11 +1823,11 @@ impl RemoteControlHub {
                 }
             }
             RemoteClientMessage::Ready { .. } => {
-                let playback_until = guard.clients[conn_id]
-                    .playback_lease
+                let playback_until = guard.clients.get(conn_id)
+                    .is_some_and(|client| client.playback_lease)
                     .then(|| Instant::now() + Duration::from_millis(PLAYBACK_LEASE_MS));
                 let source_conn_opt = {
-                    let t = guard.transfers_by_user.get_mut(user_id).unwrap();
+                    let Some(t) = guard.transfers_by_user.get_mut(user_id) else { return };
                     if conn_id == t.target_conn_id && t.stage == TransferStage::Prepare {
                         t.stage = TransferStage::Pause;
                         t.target_playback_until = playback_until;
@@ -1807,7 +1860,7 @@ impl RemoteControlHub {
                     return;
                 }
                 let step = {
-                    let t = guard.transfers_by_user.get_mut(user_id).unwrap();
+                    let Some(t) = guard.transfers_by_user.get_mut(user_id) else { return };
                     if conn_id == t.source_conn_id && t.stage == TransferStage::Pause {
                         let drifted = t.snapshot.as_ref().is_none_or(|prev| {
                             prev.track_id != snapshot.track_id
@@ -1838,9 +1891,8 @@ impl RemoteControlHub {
 
                 match step {
                     Some(Ok((target_conn, tid, bounded))) => {
-                        if let Some(controller) = guard
-                            .clients
-                            .get(&guard.transfers_by_user[user_id].controller_conn_id)
+                        if let Some(controller) = guard.transfers_by_user.get(user_id)
+                            .and_then(|transfer| guard.clients.get(&transfer.controller_conn_id))
                         {
                             controller.deadline_changed.notify_one();
                         }
@@ -1879,23 +1931,16 @@ impl RemoteControlHub {
                 }
             }
             RemoteClientMessage::Started { queue, .. } => {
-                let can_complete = guard.transfers_by_user.get(user_id).is_some_and(|t| {
-                    conn_id == t.target_conn_id
-                        && t.stage == TransferStage::Start
-                        && t.snapshot.is_some()
-                });
-                if !can_complete {
-                    Self::send_error_locked(
-                        guard,
-                        conn_id,
-                        "Unexpected playback transfer acknowledgement",
-                        None,
-                    );
+                let Some(entry) = transfer.snapshot.as_ref().filter(|snapshot| {
+                    transfer.target_conn_id == conn_id && transfer.stage == TransferStage::Start
+                        && snapshot.track_id == snapshot.queue_state.entries.get(snapshot.queue_state.index)
+                            .map_or("", |entry| entry.track_id.as_str())
+                }).and_then(|snapshot| snapshot.queue_state.entries.get(snapshot.queue_state.index)).cloned() else {
+                    Self::send_error_locked(guard, conn_id, "Unexpected playback transfer acknowledgement", None);
                     return;
-                }
-
-                let transfer = guard.transfers_by_user.remove(user_id).unwrap();
-                let snapshot = transfer.snapshot.unwrap();
+                };
+                let Some(transfer) = guard.transfers_by_user.remove(user_id) else { return };
+                let Some(snapshot) = transfer.snapshot.as_ref() else { return };
 
                 Self::select_player_locked(guard, user_id, &transfer.target_conn_id);
 
@@ -1910,7 +1955,6 @@ impl RemoteControlHub {
                 }
 
                 if let Some(tgt) = guard.clients.get_mut(&transfer.target_conn_id) {
-                    let entry = &snapshot.queue_state.entries[snapshot.queue_state.index];
                     let dur = if tgt.state.duration_ms > 0.0 {
                         tgt.state.duration_ms
                     } else {
@@ -1918,10 +1962,10 @@ impl RemoteControlHub {
                     };
                     tgt.state = RemotePlaybackState {
                         current_track: Some(source_track.unwrap_or_else(|| RemoteTrackSummary {
-                            id: snapshot.track_id,
-                            title: entry.title.clone(),
-                            artist: Some(entry.artist.clone()),
-                            album: Some(entry.album.clone()),
+                            id: snapshot.track_id.clone(),
+                            title: entry.title,
+                            artist: Some(entry.artist),
+                            album: Some(entry.album),
                             cover_art: None,
                         })),
                         position_ms: snapshot.exact_position_ms,
@@ -2090,6 +2134,11 @@ impl RemoteControlHub {
         let user_id = removed.user_id;
         removed.disconnected.send_replace(true);
 
+        let paused_transfer = guard.transfers_by_user.get(&user_id)
+            .filter(|transfer| transfer.source_conn_id == conn_id
+                && matches!(transfer.stage, TransferStage::Pause | TransferStage::Start | TransferStage::Rollback)
+                && transfer.snapshot.as_ref().is_some_and(|snapshot| snapshot.playing))
+            .map(|transfer| transfer.id.clone());
         if let Some(transfer) = guard.transfers_by_user.get(&user_id)
             && (transfer.source_conn_id == conn_id
                 || transfer.target_conn_id == conn_id
@@ -2148,6 +2197,7 @@ impl RemoteControlHub {
                         lease,
                         state: removed.state,
                         queue: removed.queue,
+                        paused_transfer,
                     },
                 );
             } else {
@@ -2279,7 +2329,7 @@ impl RemoteControlHub {
                 },
             );
         }
-        let playback = &guard.playback_by_user[user_id];
+        let Some(playback) = guard.playback_by_user.get(user_id) else { return };
         let owner = guard
             .active_player_by_user
             .get(user_id)
@@ -2307,6 +2357,7 @@ impl RemoteControlHub {
                     "playbackLeaseProtocol": guard.clients.get(conn_id).is_some_and(|client| client.playback_lease)
                         .then_some(1),
                     "leaseGeneration": generation(conn_id),
+                    "leaseServerId": guard.server_id,
                 }),
             );
         }
@@ -2397,6 +2448,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restarted_hub_accepts_the_inflight_owner_only_while_uncontested() {
+        let register = |device: &str, last: Option<&Value>| {
+            serde_json::from_value(json!({
+                "type": "REGISTER", "device_id": device, "device_type": "web", "device_name": device,
+                "can_receive": true, "live_sync": true, "playback_lease": true, "playbackLeaseProtocol": 1,
+                "leaseGeneration": last.map(|frame| &frame["leaseGeneration"]),
+                "leaseServerId": last.map(|frame| &frame["leaseServerId"]),
+                "state": {"playing": true, "current_track": {"id": "track", "title": "Track"},
+                    "position_ms": 1000, "duration_ms": 100000, "volume": 1}
+            })).unwrap()
+        };
+        let previous = RemoteControlHub::new();
+        let (source, mut frames) = previous.connect_client("alice", "player-session", 0).unwrap();
+        previous.handle_message(&source, register("desk", None));
+        let initial = std::iter::from_fn(|| frames.try_recv().ok())
+            .find(|frame| frame["type"] == "INITIAL_STATE").unwrap();
+
+        let restarted = RemoteControlHub::new();
+        let (source, mut frames) = restarted.connect_client("alice", "player-session", 0).unwrap();
+        restarted.handle_message(&source, register("desk", Some(&initial)));
+        let frames: Vec<_> = std::iter::from_fn(|| frames.try_recv().ok()).collect();
+        assert!(!frames.iter().any(|frame| frame["type"] == "DEACTIVATE"));
+        let active = frames.iter().find(|frame| frame["type"] == "INITIAL_STATE").unwrap();
+        assert_ne!(active["leaseServerId"], initial["leaseServerId"]);
+        assert_ne!(active["leaseGeneration"], initial["leaseGeneration"]);
+        assert_eq!(active["state"]["is_playing"], true);
+
+        let (other, mut frames) = restarted.connect_client("alice", "other-session", 0).unwrap();
+        restarted.handle_message(&other, register("phone", Some(&initial)));
+        assert!(std::iter::from_fn(|| frames.try_recv().ok()).any(|frame| frame["type"] == "DEACTIVATE"));
+    }
+
+    #[test]
     fn queued_commands_and_reordered_acknowledgements_cannot_outlive_their_deadlines() {
         let hub = RemoteControlHub::new();
         let send =
@@ -2442,6 +2526,10 @@ mod tests {
             receive(&mut phone_rx, "ERROR")["requestId"],
             "admission-expired"
         );
+        send(&phone, json!({
+            "type": "COMMAND", "requestId": "invalid-skip", "command": { "type": "SKIP", "direction": "sideways" },
+        }));
+        assert_eq!(receive(&mut phone_rx, "ERROR")["requestId"], "invalid-skip");
         command("first", epoch_ms() + 10_000);
         command("queued", epoch_ms() + 10_000);
         let first = receive(&mut desk_rx, "EXECUTE");
@@ -2652,9 +2740,9 @@ mod tests {
         let queue = json!({
             "entries": [
                 { "occurrenceId": "entry", "trackId": "one", "title": "Song", "artist": "", "album": "", "duration": 60.0 },
-                { "occurrenceId": "next", "trackId": "two", "title": "Song", "artist": "", "album": "", "duration": 60.0 },
+                { "occurrenceId": "next", "trackId": "two", "title": "Song", "artist": "", "album": "", "duration": 60.0, "unshuffledIndex": 1 },
             ],
-            "index": 0, "repeatOne": false, "shuffle": false, "shuffleMode": "standard",
+            "index": 0, "repeatOne": false, "loopPlaylistId": "playlist-1", "shuffle": true, "shuffleMode": "standard",
             "shuffleSeed": null, "albumAware": false, "context": null,
         });
         send(
@@ -2665,6 +2753,15 @@ mod tests {
         assert_eq!(first["state"]["device_id"], "desktop");
         assert_eq!(first["queue"], queue);
         assert!(outsider.try_recv().is_err());
+
+        send(&phone, json!({ "type": "COMMAND", "requestId": "loop", "command": {
+            "type": "SET_PLAYLIST_LOOP", "playlist_id": "playlist-1", "enabled": true,
+        } }));
+        let loop_command = receive(&mut audio, "EXECUTE");
+        assert_eq!(loop_command["command"]["playlist_id"], "playlist-1");
+        assert_eq!(loop_command["command"]["enabled"], true);
+        send(&desktop, json!({ "type": "COMMAND_RESULT", "requestId": loop_command["requestId"],
+            "ok": true, "state": state("one", 1000, true) }));
 
         send(
             &phone,
@@ -2861,6 +2958,83 @@ mod tests {
         let initial = receive(&mut stale_rx, "INITIAL_STATE");
         assert_eq!(initial["state"]["device_id"], "phone");
         assert_eq!(initial["state"]["is_playing"], true);
+    }
+
+    #[tokio::test]
+    async fn uncontested_reconnect_after_expiry_keeps_playing_with_a_fresh_lease() {
+        let hub = RemoteControlHub::new();
+        let register = |conn: &str, lease: Value| {
+            hub.handle_message(conn, serde_json::from_value(json!({
+                "type": "REGISTER", "device_id": "desk", "device_name": "Desk", "device_type": "computer",
+                "can_receive": true, "live_sync": true, "playback_lease": true, "playbackLeaseProtocol": 1,
+                "leaseGeneration": lease, "state": {
+                    "current_track": { "id": "track", "title": "Track" }, "position_ms": 30000,
+                    "duration_ms": 60000, "playing": true, "volume": 1.0,
+                },
+            })).unwrap());
+        };
+        let (old, mut frames) = hub.connect_client("alice", "session", 0).unwrap();
+        register(&old, Value::Null);
+        let lease = std::iter::from_fn(|| frames.try_recv().ok())
+            .find(|frame| frame["type"] == "INITIAL_STATE").unwrap()["leaseGeneration"].clone();
+        hub.disconnect_client(&old);
+        hub.state.lock().unwrap().detached_players.get_mut("alice").unwrap().lease.expires = Instant::now();
+
+        let (new, mut frames) = hub.connect_client("alice", "session", 0).unwrap();
+        register(&new, lease.clone());
+        let events: Vec<_> = std::iter::from_fn(|| frames.try_recv().ok()).collect();
+        assert!(events.iter().all(|frame| frame["type"] != "DEACTIVATE"));
+        let initial = events.iter().find(|frame| frame["type"] == "INITIAL_STATE").unwrap();
+        assert_eq!(initial["state"]["device_id"], "desk");
+        assert_eq!(initial["state"]["is_playing"], true);
+        assert_ne!(initial["leaseGeneration"], lease);
+        assert!(initial["leaseGeneration"].is_string());
+    }
+
+    #[tokio::test]
+    async fn paused_handoff_source_rejoins_before_confirmed_target_rollback() {
+        let hub = RemoteControlHub::new();
+        let (source, mut source_frames) = hub.connect_client("alice", "desk-session", 0).unwrap();
+        let (target, mut target_frames) = hub.connect_client("alice", "phone-session", 0).unwrap();
+        let send = |conn: &str, msg: Value| hub.handle_message(conn, serde_json::from_value(msg).unwrap());
+        let register = |conn: &str, device: &str, playing: bool, lease: Value| send(conn, json!({
+            "type": "REGISTER", "device_id": device, "device_name": device, "device_type": "computer",
+            "can_receive": true, "live_sync": true, "playback_lease": true, "playbackLeaseProtocol": 1,
+            "leaseGeneration": lease, "state": {
+                "current_track": { "id": "track", "title": "Track" }, "position_ms": 30000,
+                "duration_ms": 60000, "playing": playing, "volume": 1.0,
+            },
+        }));
+        register(&source, "desk", true, Value::Null);
+        let lease = std::iter::from_fn(|| source_frames.try_recv().ok())
+            .find(|frame| frame["type"] == "INITIAL_STATE").unwrap()["leaseGeneration"].clone();
+        register(&target, "phone", false, Value::Null);
+        send(&source, json!({ "type": "TRANSFER_PLAYBACK", "targetId": "phone", "requestId": "switch" }));
+        let transfer_id = std::iter::from_fn(|| source_frames.try_recv().ok())
+            .find(|frame| frame["type"] == "REQUEST_SNAPSHOT").unwrap()["transferId"].clone();
+        let snapshot = json!({
+            "trackId": "track", "exactPositionMs": 30000, "volume": 1.0, "playing": true,
+            "queueState": {
+                "entries": [{ "occurrenceId": "first", "trackId": "track", "title": "Track",
+                    "artist": "", "album": "", "duration": 60.0 }],
+                "index": 0, "repeatOne": false, "shuffle": false, "shuffleMode": "standard",
+                "shuffleSeed": null, "albumAware": false, "context": null,
+            },
+        });
+        send(&source, json!({ "type": "SNAPSHOT", "transferId": transfer_id, "snapshot": snapshot }));
+        send(&target, json!({ "type": "READY", "transferId": transfer_id }));
+        send(&source, json!({ "type": "SOURCE_PAUSED", "transferId": transfer_id, "snapshot": snapshot }));
+        assert!(std::iter::from_fn(|| target_frames.try_recv().ok()).any(|frame| frame["type"] == "START_TRANSFER"));
+
+        hub.disconnect_client(&source);
+        assert!(std::iter::from_fn(|| target_frames.try_recv().ok()).any(|frame| frame["type"] == "ABORT_TRANSFER"));
+        let (rejoined, mut frames) = hub.connect_client("alice", "desk-session", 0).unwrap();
+        register(&rejoined, "desk", false, lease);
+        assert!(std::iter::from_fn(|| frames.try_recv().ok()).all(|frame| frame["type"] != "ABORT_TRANSFER"));
+        send(&target, json!({ "type": "TRANSFER_ROLLED_BACK", "transferId": transfer_id }));
+        let resumed = std::iter::from_fn(|| frames.try_recv().ok()).find(|frame| frame["type"] == "ABORT_TRANSFER").unwrap();
+        assert_eq!(resumed["transferId"], transfer_id);
+        assert_eq!(resumed["resume"], true);
     }
 
     #[test]

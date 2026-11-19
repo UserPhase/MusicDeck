@@ -123,6 +123,12 @@ async fn run_server() -> Result<(), ServerError> {
 /// Reconcile persisted job state before starting task dispatch.
 async fn recover_background_work(state: &AppState) {
     state.tasks().recover_interrupted_tasks().await;
+    if let Err(error) = state.recover_loudness_scan().await {
+        tracing::warn!(%error, "Could not resume interrupted loudness scan");
+    }
+    if let Err(error) = state.recover_silence_scan().await {
+        tracing::warn!(%error, "Could not resume interrupted silence scan");
+    }
     if let Err(error) = state.acquisitions().recover_interrupted_jobs().await {
         tracing::warn!(%error, "Could not reconcile interrupted acquisition jobs");
     }

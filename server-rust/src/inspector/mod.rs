@@ -303,8 +303,7 @@ pub fn inspect_audio_header(data: &[u8]) -> Option<AudioMetadata> {
                 ));
                 let sample_rate_hz =
                     u32::from_le_bytes(data[offset + 12..offset + 16].try_into().ok()?);
-                let byte_rate =
-                    u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?);
+                let byte_rate = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?);
                 let bit_depth = u32::from(u16::from_le_bytes(
                     data[offset + 22..offset + 24].try_into().ok()?,
                 ));
@@ -350,10 +349,14 @@ pub fn inspect_audio_header(data: &[u8]) -> Option<AudioMetadata> {
         {
             let channels = u32::from(data[vorbis_offset + 11]);
             let sample_rate_hz = u32::from_le_bytes(
-                data[vorbis_offset + 12..vorbis_offset + 16].try_into().ok()?,
+                data[vorbis_offset + 12..vorbis_offset + 16]
+                    .try_into()
+                    .ok()?,
             );
             let nominal_bitrate = i32::from_le_bytes(
-                data[vorbis_offset + 20..vorbis_offset + 24].try_into().ok()?,
+                data[vorbis_offset + 20..vorbis_offset + 24]
+                    .try_into()
+                    .ok()?,
             );
             let bitrate_kbps = (nominal_bitrate > 0)
                 .then(|| u32::try_from(nominal_bitrate / 1000).ok())
@@ -575,12 +578,9 @@ struct StreamObservation {
     bytes: u64,
     state: DeliveryState,
     samples: Vec<ThroughputSample>,
-    header_buf: Vec<u8>,
+    header_buf: Arc<Vec<u8>>,
     from_start: bool,
-    observed_properties: Option<AudioMetadata>,
     pipe: Option<AudioStreamInfo>,
-    source: Option<AudioMetadata>,
-    source_failed: bool,
 }
 
 type SourceMetadata = Result<Option<AudioMetadataSummary>, ()>;
@@ -655,13 +655,11 @@ impl AudioMetadataInspector {
         );
 
         let from_start = status_code == 200
-            || range_header.is_none_or(|r| {
-                let lower = r.trim().to_ascii_lowercase();
-                lower.starts_with("bytes=0-")
-            }) && content_range_header.is_none_or(|cr| {
-                let lower = cr.trim().to_ascii_lowercase();
-                !lower.starts_with("bytes ") || lower.starts_with("bytes 0-")
-            });
+            || content_range_header
+                .and_then(crate::streaming::http::parse_content_range)
+                .is_some_and(|range| range.start == 0)
+                && range_header
+                    .is_none_or(|r| r.trim().to_ascii_lowercase().starts_with("bytes=0-"));
 
         let mut guard = self
             .observations
@@ -669,20 +667,12 @@ impl AudioMetadataInspector {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::prune_locked(&mut guard, now);
 
-        let old = guard.get(&key);
-        let same_pipe = status_code == 206
-            && old
-                .and_then(|o| o.pipe.as_ref().zip(pipe.as_ref()))
-                .is_some_and(|(old_p, new_p)| old_p == new_p);
-
-        let preserved_props = if same_pipe {
-            old.and_then(|o| o.observed_properties.clone())
-        } else {
-            None
-        };
-        let preserved_source = old
-            .filter(|o| o.pipe == pipe)
-            .and_then(|o| o.source.clone());
+        // A seek keeps header evidence only if the same representation served it.
+        let header_buf = guard
+            .get(&key)
+            .filter(|old| !from_start && status_code == 206 && pipe.is_some() && old.pipe == pipe)
+            .map(|old| Arc::clone(&old.header_buf))
+            .unwrap_or_default();
 
         guard.insert(
             key,
@@ -695,12 +685,9 @@ impl AudioMetadataInspector {
                     time_ms: now,
                     bytes: 0,
                 }],
-                header_buf: Vec::new(),
+                header_buf,
                 from_start,
-                observed_properties: preserved_props,
                 pipe,
-                source: preserved_source,
-                source_failed: false,
             },
         );
         Self::prune_locked(&mut guard, now);
@@ -818,17 +805,12 @@ impl AudioMetadataInspector {
         }
 
         if obs.from_start
-            && obs.observed_properties.is_none()
             && !prefix.is_empty()
             && obs.header_buf.len() < MAX_HEADER_INSPECTION_BYTES
         {
             let remaining = MAX_HEADER_INSPECTION_BYTES - obs.header_buf.len();
             let take = prefix.len().min(remaining);
-            obs.header_buf.extend_from_slice(&prefix[..take]);
-            obs.observed_properties = inspect_audio_header(&obs.header_buf);
-            if obs.observed_properties.is_some() {
-                obs.header_buf.clear();
-            }
+            Arc::make_mut(&mut obs.header_buf).extend_from_slice(&prefix[..take]);
         }
     }
 
@@ -871,12 +853,12 @@ impl AudioMetadataInspector {
     /// Computes a [`StreamInspection`] report comparing `source_meta` with the observed
     /// stream header and rolling delivery bitrate.
     #[must_use]
-    pub fn inspect_snapshot(
+    pub(crate) fn inspect_snapshot(
         &self,
         user_id: &str,
         track_id: &str,
         inspection_id: &str,
-        source_meta: Result<Option<AudioMetadataSummary>, ()>,
+        source_meta: Option<(&AudioStreamInfo, SourceMetadata)>,
     ) -> StreamInspection {
         let now = (self.clock)();
         let key = (
@@ -891,27 +873,18 @@ impl AudioMetadataInspector {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::prune_locked(&mut guard, now);
 
-        if let Some(obs) = guard.get_mut(&key)
-            && obs.source.is_none()
-        {
-            match source_meta {
-                Ok(summary) => {
-                    obs.source = Some(source_properties(summary.as_ref()));
-                    obs.source_failed = false;
-                }
-                Err(()) => obs.source_failed = true,
-            }
-        }
-
         let obs = guard.get(&key).cloned();
         drop(guard);
 
-        let mut source = obs
+        let pipe = obs.as_ref().and_then(|o| o.pipe.as_ref());
+        let metadata = source_meta
+            .filter(|(metadata_pipe, _)| pipe == Some(*metadata_pipe))
+            .map(|(_, metadata)| metadata);
+        let source_failed = matches!(metadata, Some(Err(())));
+        let mut source = source_properties(metadata.and_then(Result::ok).flatten().as_ref());
+        let observed = obs
             .as_ref()
-            .and_then(|o| o.source.clone())
-            .unwrap_or_default();
-        let observed = obs.as_ref().and_then(|o| o.observed_properties.clone());
-        let pipe = obs.as_ref().and_then(|o| o.pipe.clone());
+            .and_then(|obs| inspect_audio_header(&obs.header_buf));
 
         let converted = observed.as_ref().is_some_and(|obs_p| {
             (source.codec.is_some() && obs_p.codec.is_some() && source.codec != obs_p.codec)
@@ -1037,10 +1010,7 @@ impl AudioMetadataInspector {
             track_id: track_id.to_owned(),
             inspection_id: inspection_id.to_owned(),
             source,
-            source_error: obs
-                .as_ref()
-                .is_some_and(|o| o.source_failed)
-                .then(|| {
+            source_error: source_failed.then(|| {
                     String::from(
                         "Source metadata could not be loaded. Delivered header inspection remains available.",
                     )
@@ -1069,10 +1039,7 @@ impl AudioMetadataInspector {
         }
     }
 
-    fn prune_locked(
-        map: &mut HashMap<(String, String, String), StreamObservation>,
-        now_ms: u64,
-    ) {
+    fn prune_locked(map: &mut HashMap<(String, String, String), StreamObservation>, now_ms: u64) {
         map.retain(|_, v| now_ms.saturating_sub(v.updated_at_ms) <= OBSERVATION_TTL_MS);
         while map.len() > MAX_OBSERVATIONS {
             if let Some(oldest_key) = map
@@ -1098,10 +1065,60 @@ mod tests {
         bytes[5] = 0;
         bytes[6] = 0;
         bytes[7] = 34;
-        let packed: u64 =
-            (u64::from(rate) << 44) | (1u64 << 41) | (u64::from(depth - 1) << 36);
+        let packed: u64 = (u64::from(rate) << 44) | (1u64 << 41) | (u64::from(depth - 1) << 36);
         bytes[18..26].copy_from_slice(&packed.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn inspection_preserves_header_on_seek_and_ignores_stale_source_metadata() {
+        let inspector = AudioMetadataInspector::new();
+        let pipe = AudioStreamInfo {
+            direct: true,
+            requested_bitrate_kbps: None,
+            source_connection_id: Some("one".into()),
+            source_item_id: Some("track".into()),
+        };
+        let original =
+            inspector.begin_observation("user", "track", "id", 200, None, None, Some(pipe.clone()));
+        let header = build_flac_header(44_100, 16);
+        inspector.record_chunk("user", "track", "id", &header);
+        let seek = inspector.begin_observation(
+            "user",
+            "track",
+            "id",
+            206,
+            Some("bytes=128-"),
+            Some("bytes 128-255/256"),
+            Some(pipe.clone()),
+        );
+        assert_ne!(original, seek);
+        inspector.record_chunk("user", "track", "id", &build_flac_header(96_000, 24));
+        inspector.finish_generation(
+            &("user".into(), "track".into(), "id".into()),
+            Some(original),
+            DeliveryState::Cancelled,
+        );
+        let report = inspector.inspect_snapshot("user", "track", "id", Some((&pipe, Err(()))));
+        assert_eq!(report.delivery.state, DeliveryState::Streaming);
+        assert_eq!(report.output.properties.sample_rate_hz, Some(44_100));
+        assert!(report.source_error.is_some());
+
+        let mut next = pipe.clone();
+        next.source_connection_id = Some("two".into());
+        inspector.begin_observation(
+            "user",
+            "track",
+            "id",
+            206,
+            Some("bytes=128-"),
+            Some("bytes 128-255/256"),
+            Some(next),
+        );
+        let report = inspector.inspect_snapshot("user", "track", "id", Some((&pipe, Err(()))));
+        assert!(report.source_error.is_none());
+        assert!(!report.output.observed);
+        assert_eq!(report.source.codec, None);
     }
 
     #[test]

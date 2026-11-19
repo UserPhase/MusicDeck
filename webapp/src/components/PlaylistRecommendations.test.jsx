@@ -112,6 +112,18 @@ test("privacy restrictions keep local recommendations and suppress external look
   expect(screen.queryByRole("button", { name: "Import New Song" })).not.toBeInTheDocument();
 });
 
+test("an empty response body is displayed as a server error instead of a missing match", async () => {
+  mockPolicy = { canMetadata: false, canImport: false, canArtwork: false };
+  getPlaylistRecommendations.mockRejectedValue(Object.assign(
+    new Error("The server returned an empty or unreadable recommendations response."),
+    { code: "INVALID_PLAYLIST_RECOMMENDATIONS" },
+  ));
+  view();
+  expect(await screen.findByText("The server returned an empty or unreadable recommendations response.", {}, { timeout: 5000 })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Retry recommendations" })).toBeEnabled();
+  expect(screen.queryByText("No matching songs found for this playlist.")).not.toBeInTheDocument();
+});
+
 test("download permission is respected and refreshing reveals more candidates", async () => {
   mockSession = { id: "listener", role: "user", externalSearchEnabled: true, externalPlaybackEnabled: false };
   getPlaylistRecommendations.mockImplementation(async (_id, source) => ({ canModify: true,
@@ -123,6 +135,21 @@ test("download permission is respected and refreshing reveals more candidates", 
   expect(screen.queryByText("Owned 9")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   expect(screen.getByText("Owned 9")).toBeInTheDocument();
+});
+
+test("the first recommendations page spreads artists across library and external results", async () => {
+  getPlaylistRecommendations.mockImplementation(async (_id, source) => ({
+    canModify: true,
+    items: source === "library"
+      ? Array.from({ length: 6 }, (_, index) => ({ ...owned, id: `owned-${index}`, title: `Owned ${index}` }))
+      : [{ ...missing, artist: "Artist" }, ...Array.from({ length: 5 }, (_, index) => ({
+          ...missing, id: `external_deezer_track_${index + 2}`, artist: `Related artist ${index}`, title: `Related song ${index}`,
+        }))],
+  }));
+  view();
+  expect(await screen.findByText("Related song 4")).toBeInTheDocument();
+  expect(screen.getByText("Owned 0")).toBeInTheDocument();
+  expect(screen.queryByText("Owned 1")).not.toBeInTheDocument();
 });
 
 test("failed Add leaves the recommendation available for retry", async () => {

@@ -159,55 +159,49 @@ impl CatalogService {
     /// Stamps a provider-native [`Track`] with stable MusicDeck `md_` / `mdart_` IDs.
     pub async fn stamp_track(
         &self,
-        mut track: Track,
+        track: Track,
         connection_id: &str,
     ) -> Result<Available<Track>, ProviderError> {
-        let md_id = self
-            .library
-            .ensure_id(
-                LibraryItemType::Track,
-                &SourceRef {
-                    connection_id: connection_id.to_owned(),
-                    provider_item_id: track.provider_id.clone(),
-                },
-                None,
-            )
-            .await
-            .map_err(|err| ProviderError::Configuration(err.to_string()))?;
+        self.resolve_track_ids(track, connection_id, true)
+            .await?
+            .ok_or_else(|| ProviderError::Configuration("Track identity is missing".into()))
+    }
+
+    async fn resolve_track_ids(
+        &self,
+        mut track: Track,
+        connection_id: &str,
+        register_missing: bool,
+    ) -> Result<Option<Available<Track>>, ProviderError> {
+        let resolve_id = async |item_type, provider_item_id: &str| {
+            let source = SourceRef {
+                connection_id: connection_id.to_owned(),
+                provider_item_id: provider_item_id.to_owned(),
+            };
+            let result = if register_missing {
+                self.library
+                    .ensure_id(item_type, &source, None)
+                    .await
+                    .map(Some)
+            } else {
+                self.library.find_id(item_type, &source).await
+            };
+            result.map_err(|err| ProviderError::Configuration(err.to_string()))
+        };
+        let Some(md_id) = resolve_id(LibraryItemType::Track, &track.provider_id).await? else {
+            return Ok(None);
+        };
 
         if let Some(ref artist_id) = track.artist_id {
-            let md_artist = self
-                .library
-                .ensure_id(
-                    LibraryItemType::Artist,
-                    &SourceRef {
-                        connection_id: connection_id.to_owned(),
-                        provider_item_id: artist_id.clone(),
-                    },
-                    None,
-                )
-                .await
-                .map_err(|err| ProviderError::Configuration(err.to_string()))?;
-            track.artist_id = Some(md_artist);
+            track.artist_id = resolve_id(LibraryItemType::Artist, artist_id).await?;
         }
 
         if let Some(ref mut credits) = track.artist_credits {
             for credit in credits.iter_mut() {
                 if let Some(ref raw_artist_id) = credit.id {
                     if !raw_artist_id.trim().is_empty() && !raw_artist_id.starts_with("md_") {
-                        if let Ok(md_credit_id) = self
-                            .library
-                            .ensure_id(
-                                LibraryItemType::Artist,
-                                &SourceRef {
-                                    connection_id: connection_id.to_owned(),
-                                    provider_item_id: raw_artist_id.clone(),
-                                },
-                                None,
-                            )
-                            .await
-                        {
-                            credit.id = Some(md_credit_id);
+                        if let Ok(id) = resolve_id(LibraryItemType::Artist, raw_artist_id).await {
+                            credit.id = id;
                         }
                     }
                 }
@@ -215,43 +209,24 @@ impl CatalogService {
         }
 
         if let Some(ref album_id) = track.album_id {
-            let md_album = self
-                .library
-                .ensure_id(
-                    LibraryItemType::Album,
-                    &SourceRef {
-                        connection_id: connection_id.to_owned(),
-                        provider_item_id: album_id.clone(),
-                    },
-                    None,
-                )
-                .await
-                .map_err(|err| ProviderError::Configuration(err.to_string()))?;
-            track.album_id = Some(md_album);
+            track.album_id = resolve_id(LibraryItemType::Album, album_id).await?;
         }
 
         if let Some(ref art_id) = track.artwork_id {
-            let md_art = self
-                .library
-                .ensure_artwork_id(&SourceRef {
-                    connection_id: connection_id.to_owned(),
-                    provider_item_id: art_id.clone(),
-                })
-                .await
-                .map_err(|err| ProviderError::Configuration(err.to_string()))?;
-            track.artwork_url = format_artwork_url(Some(&md_art));
-            track.artwork_id = Some(md_art);
+            let md_art = resolve_id(LibraryItemType::Artwork, art_id).await?;
+            track.artwork_url = format_artwork_url(md_art.as_deref());
+            track.artwork_id = md_art;
         }
 
         track.stream_url = format_stream_url(&md_id);
         track.id = md_id.clone();
 
         let (availability, sources) = self.availability_for_item(&md_id, connection_id).await;
-        Ok(Available {
+        Ok(Some(Available {
             item: track,
             availability,
             sources,
-        })
+        }))
     }
 
     /// Stamps a provider-native [`Album`] with stable MusicDeck `md_` / `mdart_` IDs.
@@ -559,6 +534,15 @@ impl CatalogService {
 
     /// Lists tracks across all enabled providers (infallible fallback returning empty list if unconfigured).
     pub async fn list_tracks(&self) -> CatalogListResult<Track> {
+        self.list_provider_tracks(true).await
+    }
+
+    /// Lists playable tracks with existing identities using only SQLite reads.
+    pub(crate) async fn list_mapped_tracks(&self) -> CatalogListResult<Track> {
+        self.list_provider_tracks(false).await
+    }
+
+    async fn list_provider_tracks(&self, register_missing: bool) -> CatalogListResult<Track> {
         let providers = self.registry.list();
         let mut items = Vec::new();
         let mut failures = 0usize;
@@ -570,8 +554,12 @@ impl CatalogService {
             match entry.provider.list_tracks().await {
                 Ok(tracks) => {
                     for track in tracks {
-                        match self.stamp_track(track, &entry.connection_id).await {
-                            Ok(stamped) => items.push(stamped),
+                        match self
+                            .resolve_track_ids(track, &entry.connection_id, register_missing)
+                            .await
+                        {
+                            Ok(Some(stamped)) => items.push(stamped),
+                            Ok(None) => {}
                             Err(_) => failures += 1,
                         }
                     }

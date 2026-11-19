@@ -3,18 +3,21 @@ import { readQueueSnapshot, queueStorageKey } from "../../utils/queuePersistence
 import { replayGainMetadata, validLoudness } from "../../utils/loudness";
 import { normalizeArtistCredits } from "../../utils/normalizeTrackData";
 export interface PersistedQueueTrack { id: string; [key: string]: unknown }
-export interface PersistedQueueEntry { entryId: string; track: PersistedQueueTrack }
+export interface PersistedQueueEntry { entryId: string; track: PersistedQueueTrack; unshuffledIndex?: number }
 export interface QueueCheckpoint {
-  index: number; position: number; repeatOne: boolean; shuffle: boolean; shuffleSeed: number | null;
+  index: number; position: number; repeatOne: boolean; repeatAll?: boolean; shuffle: boolean; shuffleSeed: number | null;
+  loopPlaylistId?: string;
   shuffleMode: "standard" | "smart"; albumAware: boolean; volume: number; wasPlaying: boolean;
-  context: { type: string; id: string; name: string; coverArt: string | null } | null; capturedAt: number;
+  context: { type: string; id: string; name: string; coverArt: string | null; playlistLoopId?: string } | null; capturedAt: number;
 }
 export interface QueueContent { version: 2; entries: PersistedQueueEntry[] }
 
 export function sameQueueCheckpoint(first: QueueCheckpoint, second: QueueCheckpoint): boolean {
+  if (Boolean(first.repeatAll) !== Boolean(second.repeatAll)) return false;
+  if (first.loopPlaylistId !== second.loopPlaylistId) return false;
   return Object.keys(first).every(key => {
     const field = key as keyof QueueCheckpoint;
-    if (field === "capturedAt") return true;
+    if (field === "capturedAt" || field === "repeatAll" || field === "loopPlaylistId") return true;
     return field === "context" ? JSON.stringify(first.context) === JSON.stringify(second.context)
       : first[field] === second[field];
   });
@@ -87,8 +90,8 @@ export function decodeQueueContent(serialized: string): QueueContent {
     const { tracks, occurrences } = value;
     if (!Array.isArray(tracks) || !Array.isArray(occurrences)) throw new Error("The saved queue format is invalid.");
     value = { version: 2, entries: occurrences.map((row: unknown) => {
-      if (!Array.isArray(row) || row.length !== 2 || !Number.isInteger(row[1]) || row[1] < 0 || row[1] >= tracks.length) throw new Error("The saved queue reference is invalid.");
-      return { entryId: row[0], track: tracks[row[1]] };
+      if (!Array.isArray(row) || (row.length !== 2 && row.length !== 3) || !Number.isInteger(row[1]) || row[1] < 0 || row[1] >= tracks.length) throw new Error("The saved queue reference is invalid.");
+      return { entryId: row[0], track: tracks[row[1]], ...(row.length === 3 ? { unshuffledIndex: row[2] } : {}) };
     }) };
   }
   if (value?.version !== 2 || !Array.isArray(value.entries)) throw new Error("The saved queue format is invalid.");
@@ -96,13 +99,18 @@ export function decodeQueueContent(serialized: string): QueueContent {
   for (const entry of value.entries) {
     if (!entry || typeof entry.entryId !== "string" || !entry.entryId || entry.entryId.length > 160 || seen.has(entry.entryId) || !entry.track || typeof entry.track.id !== "string" || !entry.track.id)
       throw new Error("The saved queue contains an invalid or duplicate occurrence.");
+    if (entry.unshuffledIndex !== undefined && (!Number.isSafeInteger(entry.unshuffledIndex) || entry.unshuffledIndex < 0))
+      throw new Error("The saved queue shuffle order is invalid.");
     seen.add(entry.entryId);
   }
   return value;
 }
 export function validateCheckpoint(raw: QueueCheckpoint, count: number): QueueCheckpoint {
   if (!raw || !Number.isInteger(raw.index) || (count ? raw.index < 0 || raw.index >= count : raw.index !== -1)) throw new Error("The saved queue position is invalid.");
-  return { ...raw, position: Math.max(0, finite(raw.position, 0)), volume: Math.min(1, Math.max(0, finite(raw.volume, 1))),
+  const { repeatAll, loopPlaylistId, ...checkpoint } = raw;
+  return { ...checkpoint, ...(repeatAll === true && raw.repeatOne !== true ? { repeatAll } : {}),
+    ...(typeof loopPlaylistId === "string" && loopPlaylistId.length > 0 ? { loopPlaylistId } : {}),
+    position: Math.max(0, finite(raw.position, 0)), volume: Math.min(1, Math.max(0, finite(raw.volume, 1))),
     wasPlaying: raw.wasPlaying === true, repeatOne: raw.repeatOne === true, shuffle: raw.shuffle === true, albumAware: raw.albumAware === true,
     shuffleMode: raw.shuffleMode === "smart" ? "smart" : "standard", shuffleSeed: Number.isInteger(raw.shuffleSeed) ? raw.shuffleSeed : null };
 }
@@ -133,12 +141,12 @@ export async function readLocalQueue(owner: string, migrate = true): Promise<Loc
 export async function writeLocalQueue(owner: string, content: QueueContent, checkpoint: QueueCheckpoint): Promise<QueueHead> {
   // Store identical metadata once, retaining every occurrence separately. Encoding
   // yields between batches; dictionary keys include resume/taste metadata, not just track IDs.
-  const tracks: string[] = [], dictionary = new Map<string, number>(), occurrences: [string, number][] = [];
+  const tracks: string[] = [], dictionary = new Map<string, number>(), occurrences: [string, number, number?][] = [];
   for (let i = 0; i < content.entries.length; i++) {
     const entry = content.entries[i], encoded = JSON.stringify(entry.track);
     let index = dictionary.get(encoded);
     if (index === undefined) { index = tracks.length; dictionary.set(encoded, index); tracks.push(encoded); }
-    occurrences.push([entry.entryId, index]);
+    occurrences.push(entry.unshuffledIndex === undefined ? [entry.entryId, index] : [entry.entryId, index, entry.unshuffledIndex]);
     if (i > 0 && i % 1000 === 0) await new Promise(resolve => setTimeout(resolve, 0));
   }
   const serialized = `{"version":3,"tracks":[${tracks.join(",")}],"occurrences":${JSON.stringify(occurrences)}}`, db = await openQueueDatabase();

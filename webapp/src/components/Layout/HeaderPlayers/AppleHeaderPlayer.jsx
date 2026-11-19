@@ -31,7 +31,7 @@ function HeaderScrubber({ player }) {
   );
 }
 
-function TransportIcon({ name }) {
+function TransportIcon({ name, repeatOne }) {
   if (name === "shuffle") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -49,6 +49,7 @@ function TransportIcon({ name }) {
         <path d="M3 11V9a2 2 0 0 1 2-2h16" />
         <path d="M7 21l-4-4 4-4" />
         <path d="M21 13v2a2 2 0 0 1-2 2H3" />
+        {repeatOne && <path d="M11 11l1-1v5m-1 0h2" />}
       </svg>
     );
   }
@@ -101,6 +102,7 @@ function AppleHeaderPlayer() {
     isShuffleEnabled,
     toggleLoop,
     isLooping,
+    repeatMode,
     volume,
     changeVolume,
     toggleLike,
@@ -130,7 +132,7 @@ function AppleHeaderPlayer() {
           type="button"
           className={`header-player-button header-player-mode${isShuffleEnabled ? " active" : ""}`}
           onClick={toggleShuffle}
-          disabled={!hasSong || isRemotePlayback}
+          disabled={!hasSong}
           aria-label={isShuffleEnabled ? "Turn off shuffle" : "Turn on shuffle"}
           aria-pressed={isShuffleEnabled}
         >
@@ -156,11 +158,12 @@ function AppleHeaderPlayer() {
           type="button"
           className={`header-player-button header-player-mode${isLooping ? " active" : ""}`}
           onClick={toggleLoop}
-          disabled={!hasSong || isRemotePlayback}
-          aria-label={isLooping ? "Turn off repeat" : "Turn on repeat"}
+          disabled={!hasSong}
+          aria-label={repeatMode === "all" ? "Repeat queue. Switch to repeat one"
+            : repeatMode === "one" ? "Repeat one. Turn off repeat" : "Turn on repeat"}
           aria-pressed={isLooping}
         >
-          <TransportIcon name="repeat" />
+          <TransportIcon name="repeat" repeatOne={repeatMode === "one"} />
         </button>
       </div>
 

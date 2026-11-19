@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { usePlayer } from "../../context/PlayerContext";
 import { queueSyncClient, useQueueSync, queueDeviceId, newQueueOperationId, type NamedQueueSummary, type QueueSessionSummary } from "../../services/QueueSyncClient";
+import { playbackFeatureEnabled } from "../../services/playbackFeatures";
 import "../../styles/queue-manager.css";
 const message = (error: unknown) => error instanceof Error ? error.message : "Could not update the saved queue.";
 export default function QueueManager() {
@@ -13,7 +14,8 @@ function Manager({ ownerId }: { ownerId: string }) {
   const player = usePlayer()!, state = useQueueSync();
   const [name, setName] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState(""), [playlistId, setPlaylistId] = useState("");
   const alive = useRef(true), lock = useRef(false), operation = useRef<{ name: string; kind: string; id: string } | null>(null);
-  useEffect(() => { alive.current = true; void queueSyncClient.refresh(); return () => { alive.current = false; }; }, [ownerId]);
+  const syncEnabled = playbackFeatureEnabled("queueCloudSync");
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, [ownerId]);
   const run = async (work: () => Promise<void>) => {
     if (lock.current) return; lock.current = true; setBusy(true); setError(""); setNotice("");
     try { await work(); } catch (reason) { if (alive.current) setError(message(reason)); }
@@ -34,11 +36,11 @@ function Manager({ ownerId }: { ownerId: string }) {
   };
   const sessions = state.owner === ownerId ? state.sessions.filter(row => row.deviceId !== queueDeviceId()) : [];
   const named = state.owner === ownerId ? state.named : [];
-  return <details className="queue-manager"><summary>Save & restore queues</summary>
+  return <details className="queue-manager" onToggle={event => { if (event.currentTarget.open) void queueSyncClient.refresh(); }}><summary>Save & restore queues</summary>
     <label htmlFor="queue-save-name">Queue name</label><input id="queue-save-name" value={name} maxLength={200} placeholder="Late Night Chill Queue" onChange={event => setName(event.target.value)} disabled={busy} />
     <div className="queue-manager-actions"><button type="button" disabled={busy || !player.queue.length} onClick={() => void run(() => save("playlist"))}>Save Queue as Playlist</button>
       <button type="button" disabled={busy || !player.queue.length} onClick={() => void run(() => save("named"))}>Save named queue</button>
-      <button type="button" disabled={busy || state.syncing} onClick={() => void run(async () => { await queueSyncClient.sync(); await queueSyncClient.refresh(); if (alive.current) setNotice("Queue synced to your account."); })}>{state.syncing ? "Syncing…" : "Sync queue now"}</button></div>
+      {syncEnabled && <button type="button" disabled={busy || state.syncing} onClick={() => void run(async () => { await queueSyncClient.sync(); await queueSyncClient.refresh(); if (alive.current) setNotice("Queue synced to your account."); })}>{state.syncing ? "Syncing…" : "Sync queue now"}</button>}</div>
     {playlistId && <Link to={`/playlist/${encodeURIComponent(playlistId)}`}>Open saved playlist →</Link>}
     <h4>Named queues</h4>{named.length ? <ul>{named.map(row => <li key={row.id}><span><strong>{row.name}</strong><small>{row.trackCount.toLocaleString()} tracks</small></span>
       <button type="button" disabled={busy} aria-label={`Load ${row.name}`} onClick={() => void run(() => restore(row))}>Load</button>

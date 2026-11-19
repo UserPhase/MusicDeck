@@ -75,10 +75,13 @@ async fn request(
     body: Option<&Value>,
 ) -> Response {
     music_routes()
+        .merge(crate::routes::audio_playback::audio_playback_routes())
         .merge(playlist_routes())
+        .merge(crate::routes::queue_and_media_session_routes())
         .merge(crate::routes::sonic_mixes::sonic_and_mixes_routes())
         .merge(crate::routes::playlist_collaboration::playlist_collaboration_routes())
         .merge(crate::routes::external_discovery::external_discovery_routes())
+        .merge(crate::routes::taste_and_recommendation_routes())
         .with_state(state.clone())
         .oneshot(
             Request::builder()
@@ -105,6 +108,231 @@ async fn json_response(response: Response) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).expect("JSON response"),
     )
+}
+
+#[tokio::test]
+async fn silence_analysis_routes_reject_invalid_profiles_and_explain_missing_audio() {
+    let (db, state, session) = playback_state(true).await;
+    let track = LibraryService::new(db, None)
+        .ensure_id(
+            LibraryItemType::Track,
+            &SourceRef { connection_id: "offline-source".into(), provider_item_id: "offline-track".into() },
+            None,
+        ).await.unwrap();
+    let path = format!("/api/tracks/{track}/silence-analysis");
+    let params = json!({"thresholdDb": -28, "minSilenceSeconds": 0.8});
+
+    let (status, data) = json_response(request(&state, &session, "GET", &format!("{path}?thresholdDb=-28&minSilenceSeconds=0.8"), None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data, json!({"analysis": null}));
+    let (status, data) = json_response(request(&state, &session, "POST", &path, Some(&params)).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["analysis"]["status"], "unavailable");
+    assert_eq!(data["analysis"]["thresholdDb"], -28.0);
+    assert!(data["analysis"]["errorMessage"].as_str().unwrap().contains("Original library audio"));
+    assert_eq!(request(&state, &session, "POST", &path, Some(&json!({"minSilenceSeconds": 0}))).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(request(&state, &session, "POST", "/api/tracks/missing/silence-analysis", Some(&params)).await.status(), StatusCode::NOT_FOUND);
+
+    let (status, scan) = json_response(request(&state, &session, "POST", "/api/playback/silence-scan", Some(&params)).await).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(scan["scan"]["status"], "discovering");
+    let terminal = tokio::time::timeout(Timeout::from_secs(3), async {
+        loop {
+            let (status, data) = json_response(request(&state, &session, "GET", "/api/playback/silence-scan", None).await).await;
+            assert_eq!(status, StatusCode::OK);
+            if data["scan"]["status"] == "completed" {
+                break data["scan"].clone();
+            }
+            tokio::time::sleep(Timeout::from_millis(10)).await;
+        }
+    }).await.expect("empty scan finishes");
+    assert_eq!(terminal["totalTracks"], 0);
+    assert!(terminal["warning"].as_str().unwrap().contains("No library tracks"));
+}
+
+#[tokio::test]
+#[ignore = "requires an installed FFmpeg with silencedetect"]
+async fn silence_analysis_and_scan_complete_with_host_ffmpeg() {
+    let (db, state, session) = playback_state(true).await;
+    let source = SourceRef {
+        connection_id: "silence-fixture".into(),
+        provider_item_id: "silence-wav".into(),
+    };
+    let track = LibraryService::new(db.clone(), None)
+        .ensure_id(LibraryItemType::Track, &source, None)
+        .await.unwrap();
+    let wav = silence_fixture_wav();
+    state.providers().replace_all(vec![media_fixture::provider(
+        "silence-fixture",
+        move |id, range, _, _| {
+            assert_eq!(id, "silence-wav");
+            assert!(range.is_none());
+            (Timeout::ZERO, media_fixture::response(StatusCode::OK, [], wav.clone()))
+        },
+    )]);
+    sqlx::query(
+        "INSERT INTO playlists (id, owner_user_id, name, created_at, updated_at)
+         VALUES ('analysis-fixture', 'listener', 'Analysis fixture', '', '')",
+    ).execute(db.inner()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO playlist_items (id, playlist_id, position, connection_id,
+            provider_track_id, library_track_id, created_at)
+         VALUES ('analysis-item', 'analysis-fixture', 0, ?, ?, ?, '')",
+    )
+    .bind(&source.connection_id).bind(&source.provider_item_id).bind(&track)
+    .execute(db.inner()).await.unwrap();
+
+    let path = format!("/api/tracks/{track}/silence-analysis");
+    let params = json!({"thresholdDb": -35, "minSilenceSeconds": 0.5, "force": true});
+    let (status, body) = json_response(request(&state, &session, "POST", &path, Some(&params)).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let analysis = &body["analysis"];
+    assert_eq!(analysis["status"], "completed", "{body}");
+    for field in ["leadingSilenceSeconds", "trailingSilenceSeconds"] {
+        assert!((analysis[field].as_f64().unwrap() - 1.0).abs() < 0.01, "{body}");
+    }
+    let query = format!("{path}?thresholdDb=-35&minSilenceSeconds=0.5");
+    let (status, cached) = json_response(request(&state, &session, "GET", &query, None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached, body);
+
+    // A different profile makes the background worker decode the fixture too.
+    let params = json!({"thresholdDb": -34, "minSilenceSeconds": 0.5});
+    let scan_path = "/api/playback/silence-scan";
+    let (status, body) = json_response(request(&state, &session, "POST", scan_path, Some(&params)).await).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job = tokio::time::timeout(Timeout::from_secs(20), async {
+        loop {
+            let (status, data) = json_response(request(&state, &session, "GET", scan_path, None).await).await;
+            assert_eq!(status, StatusCode::OK);
+            if matches!(data["scan"]["status"].as_str(), Some("completed" | "failed")) {
+                return data["scan"].clone();
+            }
+            tokio::time::sleep(Timeout::from_millis(30)).await;
+        }
+    }).await.expect("scan reaches a terminal status");
+    assert_eq!(job["id"], body["scan"]["id"]);
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["totalTracks"], 1);
+    assert_eq!(job["completedTracks"], 1);
+    assert_eq!(job["skippedTracks"], 0);
+    assert_eq!(job["failedTracks"], 0);
+}
+
+#[tokio::test]
+#[ignore = "requires an installed FFmpeg with loudnorm"]
+async fn normalization_prepares_verified_audio_and_scans_loudness_with_host_ffmpeg() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbPool::connect(&dir.path().join("loudness.sqlite")).await.unwrap();
+    let (db, state, session) = playback_state_with_db(db, true).await;
+    let source = SourceRef {
+        connection_id: "loudness-fixture".into(),
+        provider_item_id: "tone".into(),
+    };
+    let track = LibraryService::new(db.clone(), None)
+        .ensure_id(LibraryItemType::Track, &source, None)
+        .await.unwrap();
+    let wav = silence_fixture_wav();
+    state.providers().replace_all(vec![media_fixture::provider(
+        &source.connection_id,
+        move |id, _, _, _| {
+            assert_eq!(id, "tone");
+            (Timeout::ZERO, media_fixture::response(StatusCode::OK,
+                [(http::header::CONTENT_TYPE, "audio/wav")], wav.clone()))
+        },
+    )]);
+    sqlx::query(
+        "INSERT INTO playlists (id, owner_user_id, name, created_at, updated_at)
+         VALUES ('loudness-list', 'listener', 'Loudness fixture', '', '')",
+    ).execute(db.inner()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO playlist_items (id, playlist_id, position, connection_id,
+            provider_track_id, library_track_id, created_at)
+         VALUES ('loudness-item', 'loudness-list', 0, ?, ?, ?, '')",
+    )
+    .bind(&source.connection_id).bind(&source.provider_item_id).bind(&track)
+    .execute(db.inner()).await.unwrap();
+
+    let params = json!({"trackId": track, "source": source.connection_id, "background": true, "targetLufs": -16});
+    let normalize = "/api/playback/normalize";
+    let writer = crate::db::begin_sqlite_write(db.inner(), "UPDATE library_items SET id=id WHERE 0").await.unwrap();
+    let (status, body) = json_response(request(&state, &session, "POST", normalize, Some(&params)).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "processing");
+    let raw = request(&state, &session, "GET", &format!("/api/tracks/{track}/stream"), None).await;
+    assert_eq!(raw.status(), StatusCode::OK);
+    assert!(raw.into_body().collect().await.unwrap().to_bytes().starts_with(b"RIFF"));
+    writer.rollback().await.unwrap();
+
+    let ready = tokio::time::timeout(Timeout::from_secs(20), async {
+        loop {
+            let (status, body) = json_response(request(&state, &session, "POST", normalize, Some(&params)).await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body["status"] != "processing" {
+                return body;
+            }
+            tokio::time::sleep(Timeout::from_millis(50)).await;
+        }
+    }).await.expect("normalization finishes");
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert!((ready["integratedLufs"].as_f64().unwrap() + 16.0).abs() < 1.0);
+    assert!(ready["truePeakDb"].as_f64().unwrap() <= -0.9);
+    let asset = request(&state, &session, "GET", ready["streamUrl"].as_str().unwrap(), None).await;
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert!(asset.into_body().collect().await.unwrap().to_bytes().starts_with(b"fLaC"));
+
+    let scan_path = "/api/playback/loudness-scan";
+    let (status, scan) = json_response(request(&state, &session, "POST", scan_path, Some(&json!({}))).await).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{scan}");
+    assert_eq!(scan["scan"]["status"], "discovering");
+    let job = tokio::time::timeout(Timeout::from_secs(20), async {
+        loop {
+            let (status, data) = json_response(request(&state, &session, "GET", scan_path, None).await).await;
+            assert_eq!(status, StatusCode::OK);
+            if matches!(data["scan"]["status"].as_str(), Some("completed" | "failed")) {
+                return data["scan"].clone();
+            }
+            tokio::time::sleep(Timeout::from_millis(50)).await;
+        }
+    }).await.expect("loudness scan reaches a terminal state");
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["totalTracks"], 1);
+    assert_eq!(job["completedTracks"], 1);
+    assert_eq!(job["failedTracks"], 0);
+    let (status, measured) = json_response(request(&state, &session, "POST", normalize,
+        Some(&json!({"trackId": track, "background": true}))).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(measured["status"], "measured", "{measured}");
+    assert!(measured["gainDb"].as_f64().unwrap().is_finite());
+}
+
+fn silence_fixture_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 16_000;
+    const SAMPLES: u32 = 4 * SAMPLE_RATE;
+    const PCM_BYTES: u32 = 2 * SAMPLES;
+    let mut wav = Vec::with_capacity(44 + PCM_BYTES as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + PCM_BYTES).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&PCM_BYTES.to_le_bytes());
+    for i in 0..SAMPLES {
+        let sample = if (SAMPLE_RATE..3 * SAMPLE_RATE).contains(&i) {
+            let phase = std::f64::consts::TAU * 440.0 * f64::from(i) / f64::from(SAMPLE_RATE);
+            (phase.sin() * 8_000.0) as i16
+        } else {
+            0
+        };
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 #[tokio::test]
@@ -214,6 +442,248 @@ async fn media_checkpoint_json_contract_preserves_axum_statuses_and_request_ids(
     }
 }
 
+const MEDIA_SESSION_PATH: &str = "/api/v1/user/media-sessions";
+
+fn media_checkpoint_payload(captured_at: i64) -> Value {
+    json!({
+        "type": "album", "mediaId": "album", "title": "Fixture", "trackId": "track-1",
+        "occurrenceId": null, "trackIndex": 1, "trackCount": 3,
+        "positionSeconds": 42.125, "durationSeconds": 180, "capturedAt": captured_at,
+        "completed": false,
+    })
+}
+
+#[tokio::test]
+async fn media_checkpoint_round_trips_and_hides_expired_or_completed_sessions() {
+    let (db, state, session) = playback_state(true).await;
+    let path = format!("{MEDIA_SESSION_PATH}?type=album&mediaId=album");
+    let empty = (StatusCode::OK, json!({"items": []}));
+    assert_eq!(json_response(request(&state, &session, "GET", &path, None).await).await, empty);
+
+    let now = Utc::now().timestamp_millis();
+    let mut checkpoint = media_checkpoint_payload(now);
+    let (status, saved) = json_response(request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&checkpoint)).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["checkpoint"]["positionSeconds"], 42.125);
+    assert_eq!(saved["checkpoint"]["capturedAt"], now);
+    assert!(saved["checkpoint"]["updatedAt"].as_i64().is_some_and(|at| at >= now));
+    assert_eq!(json_response(request(&state, &session, "GET", &path, None).await).await,
+        (StatusCode::OK, json!({"items": [saved["checkpoint"]]})));
+
+    let mut stale = checkpoint.clone();
+    stale["capturedAt"] = json!(now - 1);
+    stale["positionSeconds"] = json!(10);
+    assert_eq!(json_response(request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&stale)).await).await,
+        (StatusCode::OK, saved));
+
+    checkpoint["completed"] = json!(true);
+    checkpoint["capturedAt"] = json!(now + 1);
+    let completed = (StatusCode::OK, json!({"checkpoint": null}));
+    for input in [&checkpoint, &stale] {
+        assert_eq!(json_response(request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(input)).await).await, completed);
+    }
+    assert_eq!(json_response(request(&state, &session, "GET", &path, None).await).await, empty);
+
+    let current = media_checkpoint_payload(now + 2);
+    assert_eq!(request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&current)).await.status(), StatusCode::OK);
+    sqlx::query("UPDATE media_sessions SET updated_at = 0;").execute(db.inner()).await.unwrap();
+    assert_eq!(json_response(request(&state, &session, "GET", MEDIA_SESSION_PATH, None).await).await, empty);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_sessions").fetch_one(db.inner()).await.unwrap();
+    assert_eq!(stored, 1, "GET filters expired rows without writing");
+}
+
+#[tokio::test]
+async fn media_checkpoint_read_and_save_respect_playlist_visibility() {
+    let (db, state, session) = playback_state(true).await;
+    sqlx::query("INSERT INTO playlists (id, name, sharing_mode, created_at, updated_at)
+        VALUES ('shared', 'Shared playlist', 'PUBLIC_SERVER', '2026-01-01', '2026-01-01');")
+        .execute(db.inner()).await.unwrap();
+    let now = Utc::now().timestamp_millis();
+    let mut checkpoint = media_checkpoint_payload(now);
+    checkpoint["type"] = json!("playlist");
+    checkpoint["mediaId"] = json!("shared");
+    checkpoint["occurrenceId"] = json!("slot-2");
+    let response = request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&checkpoint)).await;
+    let (status, saved) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["checkpoint"]["occurrenceId"], "slot-2");
+
+    sqlx::query("UPDATE playlists SET deleted_at = '2026-01-02' WHERE id = 'shared';")
+        .execute(db.inner()).await.unwrap();
+    let path = format!("{MEDIA_SESSION_PATH}?type=playlist&mediaId=shared");
+    assert_eq!(json_response(request(&state, &session, "GET", &path, None).await).await,
+        (StatusCode::OK, json!({"items": []})));
+    assert_eq!(request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&checkpoint)).await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn media_checkpoint_reads_during_other_writes_and_retries_first_save_after_unlock() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = DbPool::connect(&directory.path().join("media.sqlite")).await.unwrap();
+    let (db, state, session) = playback_state_with_db(db, true).await;
+    let now = Utc::now().timestamp_millis();
+    let mut writer = db.inner().begin().await.unwrap();
+    sqlx::query("UPDATE queue_sessions SET sequence = sequence WHERE 0")
+        .execute(&mut *writer).await.unwrap();
+    let response = request(&state, &session, "GET", MEDIA_SESSION_PATH, None).await;
+    assert_eq!(response.headers()[http::header::CACHE_CONTROL], "private, no-store");
+    assert_eq!(json_response(response).await, (StatusCode::OK, json!({"items": []})));
+
+    let checkpoint = media_checkpoint_payload(now);
+    let response = tokio::time::timeout(Timeout::from_secs(4),
+        request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&checkpoint))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+    writer.rollback().await.unwrap();
+
+    let response = request(&state, &session, "POST", MEDIA_SESSION_PATH, Some(&checkpoint)).await;
+    let (status, saved) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["checkpoint"]["positionSeconds"], 42.125);
+}
+
+#[tokio::test]
+async fn playback_write_routes_return_service_unavailable_for_read_only_storage() {
+    let (db, state, session) = playback_state(true).await;
+    sqlx::query("PRAGMA query_only = ON").execute(db.inner()).await.unwrap();
+    let router = crate::create_router(state.clone());
+    let now = Utc::now().timestamp_millis();
+    let operations = [
+        ("PUT", "/api/v1/user/queue-session", json!({
+            "ownerId": "listener", "deviceId": "device", "deviceName": "Desktop",
+            "contentId": "a".repeat(64), "sequence": 1,
+            "checkpoint": {"index": 0, "position": 0, "repeatOne": false, "shuffle": false,
+                "shuffleMode": "standard", "albumAware": false, "volume": 1, "wasPlaying": true, "capturedAt": now}
+        })),
+        ("POST", "/api/listening-events", playback_event(1.0, false)),
+        ("POST", "/api/v1/user/media-sessions", json!({
+            "type": "album", "mediaId": "album", "title": "Album", "trackId": "track-1",
+            "trackIndex": 0, "trackCount": 1, "positionSeconds": 1, "capturedAt": now
+        })),
+    ];
+    for (method, path, body) in operations {
+        let response = router.clone().oneshot(Request::builder().method(method).uri(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("{SESSION_COOKIE}={session}"))
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let request_id = response.headers()["x-request-id"].to_str().unwrap().to_owned();
+        let (status, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path} {payload}");
+        assert_eq!(payload["error"]["requestId"], request_id);
+        assert!(!payload.to_string().contains("readonly database"));
+    }
+    sqlx::query("PRAGMA query_only = OFF").execute(db.inner()).await.unwrap();
+    let (status, _) = report(&state, &session, &playback_event(1.0, false)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+const QUEUE_SESSION_PATH: &str = "/api/v1/user/queue-session";
+
+fn queue_session_payload(
+    content_id: &Value,
+    sequence: u64,
+    index: i64,
+    position: f64,
+    captured_at: i64,
+) -> Value {
+    json!({
+        "ownerId": "listener", "deviceId": "browser", "deviceName": "Desktop",
+        "contentId": content_id, "sequence": sequence,
+        "checkpoint": {"index": index, "position": position, "repeatOne": false, "shuffle": false,
+            "shuffleSeed": null, "shuffleMode": "standard", "albumAware": false, "volume": 0.75,
+            "wasPlaying": index >= 0, "context": null, "capturedAt": captured_at}
+    })
+}
+
+#[tokio::test]
+async fn queue_session_routes_round_trip_browser_checkpoints_and_empty_queues() {
+    let (db, state, session) = playback_state(true).await;
+    let response = request(&state, &session, "GET", QUEUE_SESSION_PATH, None).await;
+    assert_eq!(
+        response.headers()[http::header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    let empty_listing = json!({"sessions": [], "namedQueues": []});
+    assert_eq!(json_response(response).await, (StatusCode::OK, empty_listing.clone()));
+
+    let first = json!({"entryId": "first", "track": {"id": "track-1"}});
+    let second = json!({"entryId": "second", "track": {"id": "track-2", "title": "Song", "previewUrl": null}});
+    let now = Utc::now().timestamp_millis();
+    for (sequence, index, position, tracks) in [
+        (1, 0, 0.0, vec![&first, &second]),
+        (2, 0, 0.0, vec![&second, &first]),
+        (3, 1, 12.875, vec![&second, &first]),
+        (4, -1, 0.0, vec![]),
+    ] {
+        let content = json!({"version": 2, "entries": tracks});
+        let (status, uploaded) = upload_queue_content(&state, &session, &content).await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        let content_id = &uploaded["contentId"];
+        let update = queue_session_payload(content_id, sequence, index, position, now + sequence as i64);
+        let response = request(&state, &session, "PUT", QUEUE_SESSION_PATH, Some(&update)).await;
+        assert_eq!(json_response(response).await, (StatusCode::OK, json!({"saved": true, "sequence": sequence})));
+        let response = request(&state, &session, "GET", QUEUE_SESSION_PATH, None).await;
+        let (status, listing) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listing["sessions"][0]["deviceId"], "browser");
+        assert_eq!(listing["sessions"][0]["contentId"], *content_id);
+        assert_eq!(listing["sessions"][0]["checkpoint"], update["checkpoint"]);
+        assert_eq!(listing["sessions"][0]["sequence"], sequence);
+        assert_eq!(listing["sessions"][0]["trackCount"], tracks.len());
+        assert!(listing["sessions"][0]["updatedAt"].as_i64().is_some_and(|timestamp| timestamp >= now));
+        let path = format!("{QUEUE_SESSION_PATH}/content/{}", content_id.as_str().unwrap());
+        assert_eq!(json_response(request(&state, &session, "GET", &path, None).await).await,
+            (StatusCode::OK, content));
+        if sequence == 4 {
+            let wrong_index = queue_session_payload(content_id, 5, 0, 0.0, now + 5);
+            let stale_clock = queue_session_payload(content_id, 5, -1, 0.0, now);
+            let malformed = json!({"owner_id": "listener", "checkpoint": null});
+            for (value, expected) in [
+                (wrong_index, StatusCode::BAD_REQUEST),
+                (malformed, StatusCode::UNPROCESSABLE_ENTITY),
+            ] {
+                let response = request(&state, &session, "PUT", QUEUE_SESSION_PATH, Some(&value)).await;
+                assert_eq!(response.status(), expected);
+            }
+            let response = request(&state, &session, "PUT", QUEUE_SESSION_PATH, Some(&stale_clock)).await;
+            assert_eq!(json_response(response).await, (StatusCode::OK, json!({"saved": false, "sequence": 4})));
+        }
+    }
+
+    sqlx::query("UPDATE queue_sessions SET checkpoint_json = '{'")
+        .execute(db.inner()).await.unwrap();
+    let response = request(&state, &session, "GET", QUEUE_SESSION_PATH, None).await;
+    assert_eq!(json_response(response).await, (StatusCode::OK, empty_listing));
+}
+
+#[tokio::test]
+async fn queue_session_writer_returns_retryable_response_while_sqlite_is_locked() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = DbPool::connect(&directory.path().join("queue.sqlite")).await.unwrap();
+    let (db, state, session) = playback_state_with_db(db, true).await;
+    let content = json!({"version": 2, "entries": []});
+    let (status, uploaded) = upload_queue_content(&state, &session, &content).await;
+    assert_eq!(status, StatusCode::OK);
+    let update = queue_session_payload(&uploaded["contentId"], 1, -1, 0.0, Utc::now().timestamp_millis());
+
+    let mut writer = db.inner().begin().await.unwrap();
+    sqlx::query("UPDATE queue_sessions SET sequence = sequence WHERE 0")
+        .execute(&mut *writer).await.unwrap();
+    let response = tokio::time::timeout(Timeout::from_secs(4),
+        request(&state, &session, "PUT", QUEUE_SESSION_PATH, Some(&update))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+    writer.rollback().await.unwrap();
+
+    let response = request(&state, &session, "PUT", QUEUE_SESSION_PATH, Some(&update)).await;
+    assert_eq!(json_response(response).await, (StatusCode::OK, json!({"saved": true, "sequence": 1})));
+}
+
+async fn upload_queue_content(state: &AppState, session: &str, content: &Value) -> (StatusCode, Value) {
+    json_response(request(state, session, "POST",
+        "/api/v1/user/queue-session/content?ownerId=listener", Some(content)).await).await
+}
+
 fn catalog_test_track(id: &str, title: &str) -> crate::providers::Track {
     serde_json::from_value(json!({
         "id": id, "providerId": id, "title": title, "artistName": "Fixture Artist",
@@ -245,6 +715,395 @@ fn set_catalog_fixture(
             fixture.clone(),
         )]);
     fixture
+}
+
+#[tokio::test]
+async fn playlist_recommendations_use_the_playlist_seeds_and_permissions() {
+    let (db, state, session) = playback_state(true).await;
+    let mut seed = catalog_test_track("seed", "Seed");
+    seed.genres = Some(vec!["Trip Hop".into()]);
+    let mut genre_match = catalog_test_track("genre", "Same Genre");
+    genre_match.artist_name = "Another Artist".into();
+    genre_match.genres = seed.genres.clone();
+    let mut unrelated = catalog_test_track("unrelated", "Unrelated");
+    unrelated.artist_name = "Another Artist".into();
+    set_catalog_fixture(
+        &state,
+        vec![
+            seed.clone(),
+            catalog_test_track("duplicate", "Seed"),
+            catalog_test_track("same-artist", "Same Artist"),
+            genre_match,
+            unrelated,
+        ],
+        vec![],
+    );
+    let (status, created) = json_response(
+        request(
+            &state,
+            &session,
+            "POST",
+            "/api/playlists",
+            Some(&json!({"name": "Fixture"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let playlist_id = created["playlist"]["id"].as_str().unwrap();
+    let path = format!("/api/v1/playlists/{playlist_id}/recommendations");
+    let empty = request(&state, &session, "GET", &path, None).await;
+    assert_eq!(
+        json_response(empty).await,
+        (
+            StatusCode::OK,
+            json!({"items": [], "message": null, "canModify": true})
+        )
+    );
+
+    let (catalog, _, _) = build_catalog_and_resolver(&state).unwrap();
+    let seed_id = catalog.stamp_track(seed, "fixture").await.unwrap().item.id;
+    let add = request(
+        &state,
+        &session,
+        "POST",
+        &format!("/api/v1/playlists/{playlist_id}/tracks/batch"),
+        Some(&json!({"action": "add", "trackIds": [seed_id]})),
+    )
+    .await;
+    assert_eq!(add.status(), StatusCode::OK);
+    let response = request(
+        &state,
+        &session,
+        "GET",
+        &format!("{path}?source=library"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.headers()[http::header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    let (status, payload) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["canModify"], true);
+    let items = payload["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["title"], "Same Artist");
+    assert_eq!(
+        items[0]["recommendationReason"],
+        "Fixture Artist is in this playlist"
+    );
+    assert_eq!(items[1]["title"], "Same Genre");
+
+    sqlx::query("UPDATE users SET external_search_enabled = 1 WHERE id = 'listener'")
+        .execute(db.inner())
+        .await
+        .unwrap();
+    let (_, external) = json_response(
+        request(
+            &state,
+            &session,
+            "GET",
+            &format!("{path}?source=external"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        external,
+        json!({"items": [], "message": "External suggestions are disabled.", "canModify": true})
+    );
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+         VALUES ('viewer', 'viewer', 'unused', 'Viewer', 'user', '2026-01-01', '2026-01-01')",
+    ).execute(db.inner()).await.unwrap();
+    let viewer = state
+        .session_store()
+        .unwrap()
+        .create_session("viewer", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&state, &viewer.id, "GET", &path, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    sqlx::query("UPDATE playlists SET sharing_mode = 'PUBLIC_SERVER' WHERE id = ?")
+        .bind(playlist_id)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    let (status, shared) =
+        json_response(request(&state, &viewer.id, "GET", &path, None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shared["canModify"], false);
+    assert_eq!(shared["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn playlist_recommendations_filter_external_recordings_and_preserve_import_metadata() {
+    use crate::recommendations::service::{
+        PlaylistRecommendationSeeds, recommend_external_for_playlist,
+    };
+    let (db, state, _) = playback_state(true).await;
+    set_catalog_fixture(&state, vec![catalog_test_track("owned", "Owned")], vec![]);
+    let (catalog, _, _) = build_catalog_and_resolver(&state).unwrap();
+    let inventory = catalog.list_tracks().await;
+    let seeds = PlaylistRecommendationSeeds::new(&[crate::playlists::PlaylistTrack {
+        playlist_item_id: "occurrence".into(),
+        playlist_added_at: "2026-01-01".into(),
+        added_by_user_id: None,
+        added_by: None,
+        track: json!({
+            "id": "external_seed", "title": "Seed", "artist": "Fixture Artist",
+            "artistCredits": [{"name": "Fixture Artist"}, {"name": "Guest Artist"}],
+            "identityHints": {"isrc": "ZZ0000000000"}
+        }),
+    }]);
+    assert_eq!(
+        seeds.external_artist_names(),
+        vec!["Fixture Artist", "Guest Artist"]
+    );
+    let external = |id: u64, title: &str, artist: &str| {
+        json!({
+            "id": format!("external_deezer_track_{id}"), "type": "track", "title": title, "artist": artist,
+            "source": {"kind": "external", "count": 0}, "provider": "external",
+            "previewUrl": "https://cdns-preview.dzcdn.net/preview.mp3", "metadata": {"deezerTrackId": id}
+        })
+    };
+    let mut duplicate_isrc = external(5, "Seed alternate", "Fixture Artist");
+    duplicate_isrc["identityHints"] = json!({"isrc": "zz0000000000"});
+    let candidates = [
+        external(1, "Seed", "Fixture Artist"),
+        external(2, "Owned", "Fixture Artist"),
+        external(3, "New Track", "Fixture Artist"),
+        external(4, "New Track", "Fixture Artist"),
+        duplicate_isrc,
+        external(6, "Unrelated", "Another Artist"),
+        external(8, "Guest Track", "Guest Artist"),
+        external(9, "Second Track", "Fixture Artist"),
+    ]
+    .into_iter()
+    .map(|track| (track, None))
+    .chain([(
+        external(7, "Related Track", "Related Artist"),
+        Some("Fixture Artist"),
+    )]);
+    let rows =
+        recommend_external_for_playlist(&db, "listener", &seeds, &inventory.items, candidates, 30)
+            .await;
+    assert_eq!(
+        rows.iter()
+            .map(|item| item["metadata"]["deezerTrackId"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3, 8, 7, 9]
+    );
+    assert_eq!(rows[0]["id"], "external_deezer_track_3");
+    assert_eq!(rows[0]["source"]["kind"], "external");
+    assert_eq!(rows[0]["metadata"]["deezerTrackId"], 3);
+    assert_eq!(
+        rows[0]["recommendationReason"],
+        "Fixture Artist is in this playlist"
+    );
+    assert_eq!(rows[2]["recommendationReason"], "Related to Fixture Artist");
+}
+
+#[tokio::test]
+async fn autoplay_returns_empty_for_missing_seeds_and_unanalyzed_tracks() {
+    let (_db, state, session) = playback_state(true).await;
+    set_catalog_fixture(&state, vec![], vec![]);
+    let response = request(
+        &state,
+        &session,
+        "POST",
+        "/api/recommendations/autoplay",
+        Some(&json!({"seedId": "missing"})),
+    )
+    .await;
+    assert_eq!(
+        response.headers()[http::header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert_eq!(
+        json_response(response).await,
+        (
+            StatusCode::OK,
+            json!({"tracks": [], "items": [], "degraded": false})
+        )
+    );
+
+    let (catalog, _, _) = build_catalog_and_resolver(&state).unwrap();
+    let track = catalog
+        .stamp_track(catalog_test_track("unanalyzed", "No vector"), "fixture")
+        .await
+        .unwrap();
+    state
+        .sonic()
+        .configure(
+            crate::sonic::SonicSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let path = format!("/api/sonic/similar/{}", track.item.id);
+    let response = request(&state, &session, "GET", &path, None).await;
+    assert_eq!(
+        json_response(response).await,
+        (
+            StatusCode::OK,
+            json!({"trackId": track.item.id, "matches": []})
+        )
+    );
+}
+
+#[tokio::test]
+async fn autoplay_honors_seed_queue_exclusions_and_taste_during_a_playback_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = DbPool::connect(&directory.path().join("autoplay.sqlite"))
+        .await
+        .unwrap();
+    let (db, state, session) = playback_state_with_db(db, true).await;
+    let seed = catalog_test_track("seed", "Seed");
+    let queued = catalog_test_track("queued", "Already queued");
+    let next = catalog_test_track("next", "Next track");
+    set_catalog_fixture(
+        &state,
+        vec![
+            catalog_test_track("unmapped", "Unmapped track"),
+            seed.clone(),
+            queued.clone(),
+            next.clone(),
+        ],
+        vec![],
+    );
+    let (catalog, _, _) = build_catalog_and_resolver(&state).unwrap();
+    let seed = catalog.stamp_track(seed, "fixture").await.unwrap().item.id;
+    let queued = catalog
+        .stamp_track(queued, "fixture")
+        .await
+        .unwrap()
+        .item
+        .id;
+    let next = catalog.stamp_track(next, "fixture").await.unwrap().item.id;
+    sqlx::query(
+        "INSERT INTO taste_track_exclusions (user_id, track_id, recording_key, title, artist, created_at)
+         VALUES ('listener', 'duplicate-id', ?, 'Seed', 'Fixture Artist', '2026-01-01')",
+    )
+    .bind(crate::profile::taste_recording_key("Seed", "Fixture Artist"))
+    .execute(db.inner()).await.unwrap();
+
+    let get_autoplay = async |body: Value| {
+        let response = request(
+            &state,
+            &session,
+            "POST",
+            "/api/recommendations/autoplay",
+            Some(&body),
+        )
+        .await;
+        let (status, payload) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["degraded"], false);
+        payload["tracks"].as_array().unwrap().clone()
+    };
+    let start_writer = || async {
+        let mut writer = db.inner().begin().await.unwrap();
+        sqlx::query("UPDATE queue_sessions SET sequence = sequence WHERE 0")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        writer
+    };
+    let writer = start_writer().await;
+    assert!(get_autoplay(json!({"seedId": seed})).await.is_empty());
+    writer.rollback().await.unwrap();
+    let settings_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taste_settings")
+        .fetch_one(db.inner())
+        .await
+        .unwrap();
+    assert_eq!(settings_count, 0);
+    sqlx::query("DELETE FROM taste_track_exclusions")
+        .execute(db.inner())
+        .await
+        .unwrap();
+
+    let writer = start_writer().await;
+    let tracks =
+        get_autoplay(json!({"seedId": seed, "limit": 2, "excludeIds": [seed, queued]})).await;
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0]["id"], next);
+    assert!(tracks[0]["metadata"]["recommendationReason"].is_string());
+    assert!(get_autoplay(json!({"seedId": "missing"})).await.is_empty());
+    assert!(
+        get_autoplay(json!({"seedId": seed, "excludeIds": [queued, next]}))
+            .await
+            .is_empty()
+    );
+    writer.rollback().await.unwrap();
+    let unmapped_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM library_item_sources WHERE provider_item_id = 'unmapped'",
+    )
+    .fetch_one(db.inner())
+    .await
+    .unwrap();
+    assert_eq!(unmapped_count, 0);
+}
+
+#[tokio::test]
+async fn autoplay_reuses_the_catalog_loaded_by_recently_added_tracks() {
+    let (_db, state, session) = playback_state(true).await;
+    let fixture = set_catalog_fixture(
+        &state,
+        vec![
+            catalog_test_track("seed", "Seed"),
+            catalog_test_track("next", "Next track"),
+        ],
+        vec![],
+    );
+    let response = request(
+        &state,
+        &session,
+        "GET",
+        "/api/tracks/recently-added?limit=1",
+        None,
+    )
+    .await;
+    let (status, recent) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recent["tracks"][0]["title"], "Seed");
+    assert_eq!(recent["tracks"].as_array().unwrap().len(), 1);
+    // The provider cannot return candidates now. Playback uses the completed library window.
+    fixture.write().unwrap().tracks.clear();
+    let response = request(
+        &state,
+        &session,
+        "POST",
+        "/api/recommendations/autoplay",
+        Some(&json!({"seedId": recent["tracks"][0]["id"]})),
+    )
+    .await;
+    let (status, refill) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(refill["tracks"].as_array().unwrap().len(), 1);
+    assert_eq!(refill["tracks"][0]["title"], "Next track");
+    let response = request(
+        &state,
+        &session,
+        "GET",
+        "/api/library/random-tracks?limit=2",
+        None,
+    )
+    .await;
+    let (status, fallback) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fallback["tracks"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -1142,9 +2001,9 @@ async fn playback_failover_requires_a_fresh_url_and_initial_byte_zero() {
         )
         .await
         .unwrap();
-    let old = format!("/api/tracks/{id}/stream?source=primary&maxBitRate=192&inspectionId=old");
+    let old = format!("/api/tracks/{id}/stream?source=primary&maxBitRate=192&inspectionId=old&inspect=false");
     let fresh = format!(
-        "/api/tracks/{id}/stream?source=primary&maxBitRate=192&inspectionId=fresh&retryFrom=old"
+        "/api/tracks/{id}/stream?source=primary&maxBitRate=192&inspectionId=fresh&retryFrom=old&inspect=false"
     );
     assert_eq!(
         request_playback_range(&state, &session, &old, None, None)
@@ -1191,12 +2050,15 @@ async fn playback_failover_requires_a_fresh_url_and_initial_byte_zero() {
         b"FGH"
     );
     assert_eq!(alternate_requests.load(Ordering::Relaxed), 2);
+    assert!(state.inspector().source_descriptor("listener", &id, "old").is_none());
+    assert!(state.inspector().source_descriptor("listener", &id, "fresh").is_none());
     assert_eq!(
-        request_playback_range(&state, &session, &old, Some("bytes=2-"), None)
+        request_playback_range(&state, &session, old.trim_end_matches("&inspect=false"), Some("bytes=2-"), None)
             .await
             .headers()[CONTENT_TYPE],
         "audio/mpeg"
     );
+    assert!(state.inspector().source_descriptor("listener", &id, "old").is_some());
 }
 
 #[tokio::test]
@@ -1366,6 +2228,7 @@ async fn playback_rejects_mismatched_partial_layout_and_preserves_full_responses
 #[tokio::test]
 async fn playback_ranges_survive_concurrent_wal_writes() {
     use http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE};
+    use crate::remote::RemoteClientMessage;
 
     let directory = tempfile::tempdir().unwrap();
     let db = DbPool::connect(&directory.path().join("playback.sqlite"))
@@ -1453,6 +2316,16 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
         )
     };
     let track = &tracks["normal"];
+    let hub = state.remote_hub();
+    let (remote, mut frames) = hub.connect_client("listener", &session, 0).unwrap();
+    hub.handle_message(&remote, serde_json::from_value::<RemoteClientMessage>(json!({
+        "type": "REGISTER", "device_id": "ws-device", "queue_device_id": "ws-device",
+        "device_name": "Browser", "device_type": "web", "can_receive": true,
+        "live_sync": true, "playback_lease": true, "playbackLeaseProtocol": 1,
+        "state": {"playing": true, "position_ms": 0, "duration_ms": 180_000, "volume": 1,
+            "current_track": {"id": track, "title": "Track"}}
+    })).unwrap());
+    assert!(std::iter::from_fn(|| frames.try_recv().ok()).any(|frame| frame["type"] == "INITIAL_STATE"));
     let (status, content) = json_response(
         send(
             "POST",
@@ -1476,6 +2349,11 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
         })
     };
     let started = Utc::now() - Duration::minutes(1);
+    // Older checkpoints may have a playback session ID without usable metadata.
+    sqlx::query("INSERT INTO listening_events
+        (id,user_id,track_id,event_type,created_at,playback_session_id,listened_seconds,track_json)
+        VALUES ('legacy-listen','listener',?,'progress',?,'playback-1',0,NULL)")
+        .bind(track).bind(started.to_rfc3339()).execute(db.inner()).await.unwrap();
     let listening = |device: u8, sequence: i64| {
         let mut event = playback_event(sequence as f64, false);
         event["playbackSessionId"] = json!(format!("playback-{device}"));
@@ -1486,6 +2364,7 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
     let stream_path =
         |track: &str| format!("/api/tracks/{}/stream?inspectionId=wal-test", tracks[track]);
     let normal = stream_path("normal");
+    let inspection = format!("/api/v1/stream/inspect/{track}?inspectionId=wal-test");
     let ranges = [
         (None, StatusCode::OK, None, "abcdefgh"),
         (
@@ -1505,7 +2384,7 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
         ranges.into_iter().cycle().take(9).enumerate()
     {
         let sequence = (index + 1) as i64;
-        let (stream, queue_one, queue_two, listen_one, listen_two) = tokio::join!(
+        let (stream, queue_one, queue_two, listen_one, listen_two, media, inspector) = tokio::join!(
             send("GET", &normal, None, range),
             send(
                 "PUT",
@@ -1531,6 +2410,12 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
                 Some(listening(2, sequence)),
                 None
             ),
+            send("POST", "/api/v1/user/media-sessions", Some(json!({
+                "type": "album", "mediaId": "album", "title": "Album", "trackId": track,
+                "trackIndex": 0, "trackCount": 1, "positionSeconds": sequence, "durationSeconds": 180,
+                "capturedAt": started.timestamp_millis() + sequence,
+            })), None),
+            send("GET", &inspection, None, None),
         );
         let stream = stream.unwrap();
         assert_eq!(stream.status(), status);
@@ -1555,7 +2440,23 @@ async fn playback_ranges_survive_concurrent_wal_writes() {
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["listenedSeconds"].as_f64(), Some(sequence as f64));
         }
+        let (status, body) = json_response(media.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["checkpoint"]["positionSeconds"].as_f64(), Some(sequence as f64));
+        let diagnostic = inspector.unwrap();
+        assert_eq!(diagnostic.status(), StatusCode::OK);
+        assert_eq!(diagnostic.headers()[http::header::CACHE_CONTROL], "private, no-store");
+        let (_, diagnostic) = json_response(diagnostic).await;
+        assert!(diagnostic["output"]["codec"].is_null());
+        assert!(diagnostic["sourceError"].is_null());
+        let notifications = std::iter::from_fn(|| frames.try_recv().ok())
+            .filter(|frame| frame["type"] == "QUEUE_CHANGED").count();
+        assert_eq!(notifications, 2);
     }
+    let repaired: String = sqlx::query_scalar("SELECT track_json FROM listening_events WHERE id='legacy-listen'")
+        .fetch_one(db.inner()).await.unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&repaired).unwrap()["title"], "Roygbiv");
+    hub.disconnect_client(&remote);
 
     let mismatch = send("GET", &stream_path("mismatch"), None, Some("bytes=2-5"))
         .await
@@ -2013,6 +2914,80 @@ async fn reported_seconds_are_clamped_before_scrobble_qualification() {
             < 90.0
     );
     assert_eq!(queue_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn listening_event_round_trips_browser_reports_and_ignores_stale_progress() {
+    let (db, state, session) = playback_state(true).await;
+    let mut event = playback_event(90.0, false);
+    let started = Utc::now() - Duration::minutes(1);
+    event["startedAt"] = json!(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    event["reportedAt"] = json!((started + Duration::milliseconds(12_500))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    event["clientName"] = json!("MusicDeck Web");
+    event["playlistId"] = json!("playlist-fixture");
+    event["privateListening"] = json!(false);
+    event["excludeFromTaste"] = json!(true);
+    event["track"]["coverArt"] = Value::Null;
+    event["track"]["artistId"] = json!("artist-fixture");
+    let (status, progress) = report(&state, &session, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(progress["listenedSeconds"], 12.5);
+    assert_eq!(progress["counted"], false);
+    assert_eq!(progress["tasteExcluded"], true);
+
+    event["reportedAt"] = json!((started + Duration::seconds(45)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    event["listenedSeconds"] = json!(40.0);
+    event["finished"] = json!(true);
+    let (status, finish) = report(&state, &session, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(finish["id"], progress["id"]);
+    assert_eq!(finish["newlyCounted"], true);
+
+    event["durationSeconds"] = Value::Null;
+    event["listenedSeconds"] = json!(10.0);
+    event["finished"] = json!(false);
+    let (status, stale) = report(&state, &session, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stale["listenedSeconds"], 40.0);
+    assert_eq!(stale["newlyCounted"], false);
+    let row = sqlx::query("SELECT track_id, event_type, finished, duration_seconds, context_playlist_id, client_name FROM listening_events")
+        .fetch_one(db.inner()).await.unwrap();
+    assert_eq!(row.get::<String, _>("track_id"), "track-1");
+    assert_eq!(row.get::<String, _>("event_type"), "complete");
+    assert_eq!(row.get::<i64, _>("finished"), 1);
+    assert_eq!(row.get::<f64, _>("duration_seconds"), 180.0);
+    assert_eq!(row.get::<String, _>("context_playlist_id"), "playlist-fixture");
+    assert_eq!(row.get::<String, _>("client_name"), "MusicDeck Web");
+
+    event["trackId"] = json!("other-track");
+    assert_eq!(report(&state, &session, &event).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn listening_event_writer_returns_retryable_response_until_sqlite_unlocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = DbPool::connect(&directory.path().join("listening.sqlite")).await.unwrap();
+    let (db, state, session) = playback_state_with_db(db, false).await;
+    let mut writer = db.inner().begin().await.unwrap();
+    sqlx::query("UPDATE queue_sessions SET sequence = sequence WHERE 0")
+        .execute(&mut *writer).await.unwrap();
+    let event = playback_event(120.0, true);
+    let response = tokio::time::timeout(Timeout::from_secs(4),
+        request(&state, &session, "POST", "/api/listening-events", Some(&event))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+    assert_eq!(queue_count(&db).await, 0);
+    writer.rollback().await.unwrap();
+
+    let (status, saved) = report(&state, &session, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["newlyCounted"], true);
+    let (status, retry) = report(&state, &session, &event).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retry["id"], saved["id"]);
+    assert_eq!(retry["newlyCounted"], false);
+    assert_eq!(queue_count(&db).await, 2);
 }
 
 #[tokio::test]

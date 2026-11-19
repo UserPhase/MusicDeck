@@ -9,7 +9,7 @@ use crate::error::ApiJson;
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::header::CACHE_CONTROL;
+use axum::http::header::{CACHE_CONTROL, RETRY_AFTER};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -21,7 +21,8 @@ use crate::auth::AuthenticatedUser;
 use crate::db::DbPool;
 use crate::error::{ApiErrorBody, ApiErrorEnvelope, ServerError};
 use crate::media::{
-    MediaCheckpointInput, MediaCollectionType, MediaSessionError, ResumableMediaService,
+    MEDIA_STORAGE_TIMEOUT, MediaCheckpointInput, MediaCollectionType, MediaSessionError,
+    ResumableMediaService,
 };
 use crate::playlists::collaboration::PlaylistCollaborationService;
 use crate::queue::{MAX_QUEUE_CONTENT_BYTES, QueueCheckpoint, QueueSyncError, SyncPayload};
@@ -137,7 +138,7 @@ fn with_no_store(mut response: Response) -> Response {
 fn map_queue_error(err: QueueSyncError) -> Response {
     let status =
         StatusCode::from_u16(err.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
+    let response = (
         status,
         Json(ApiErrorEnvelope {
             error: ApiErrorBody {
@@ -147,7 +148,12 @@ fn map_queue_error(err: QueueSyncError) -> Response {
             },
         }),
     )
-        .into_response()
+        .into_response();
+    let mut response = with_no_store(response);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 fn is_valid_sha256_hex(s: &str) -> bool {
@@ -157,6 +163,23 @@ fn is_valid_sha256_hex(s: &str) -> bool {
 // ============================================================================
 // Resumable Media Session Handlers (`/api/v1/user/media-sessions`)
 // ============================================================================
+
+fn map_media_error(operation: &'static str, error: MediaSessionError) -> Response {
+    let error = match error {
+        MediaSessionError::Validation(message) => ServerError::BadRequest(message),
+        MediaSessionError::NotFound(message) => ServerError::NotFound(message),
+        MediaSessionError::Sqlx(error) | MediaSessionError::Db(crate::db::DbError::Sqlx(error)) => {
+            ServerError::playback_storage(operation, error)
+        }
+        MediaSessionError::StorageUnavailable => ServerError::ServiceUnavailable(error.to_string()),
+        error => ServerError::Internal(error.to_string()),
+    };
+    let mut response = with_no_store(error.into_response());
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
+}
 
 async fn get_media_sessions_handler(
     State(state): State<AppState>,
@@ -181,8 +204,8 @@ async fn get_media_sessions_handler(
         );
     }
 
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let Some(db) = state.db() else {
+        return map_media_error("read media sessions", MediaSessionError::StorageUnavailable);
     };
     let service = ResumableMediaService::new(db.clone());
 
@@ -205,13 +228,13 @@ async fn get_media_sessions_handler(
         return match service.get(&auth.user.id, media_type, media_id).await {
             Ok(Some(item)) => with_no_store(Json(json!({ "items": [item] })).into_response()),
             Ok(None) => with_no_store(Json(json!({ "items": [] })).into_response()),
-            Err(err) => ServerError::Internal(err.to_string()).into_response(),
+            Err(err) => map_media_error("read media session", err),
         };
     }
 
     match service.list(&auth.user.id).await {
         Ok(items) => with_no_store(Json(json!({ "items": items })).into_response()),
-        Err(err) => ServerError::Internal(err.to_string()).into_response(),
+        Err(err) => map_media_error("list media sessions", err),
     }
 }
 
@@ -225,29 +248,34 @@ async fn post_media_session_handler(
         Err(rejection) => return rejection.into_response(),
     };
 
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let Some(db) = state.db() else {
+        return map_media_error("save media session", MediaSessionError::StorageUnavailable);
     };
 
     if input.media_type == MediaCollectionType::Playlist {
         let collab = PlaylistCollaborationService::new(db.clone());
-        let can_read = collab
-            .access(&input.media_id, &auth.user, false)
-            .await
-            .is_ok_and(|p| p.can_read);
-        if !can_read {
-            return send_error_response(StatusCode::NOT_FOUND, "Playlist not found.", "NOT_FOUND");
+        use crate::playlists::CollaborationError;
+        let access = tokio::time::timeout(MEDIA_STORAGE_TIMEOUT, collab.access(&input.media_id, &auth.user, false)).await;
+        let Ok(access) = access else {
+            return map_media_error("check media session access", MediaSessionError::StorageUnavailable);
+        };
+        match access {
+            Ok(permissions) if permissions.can_read => {}
+            Ok(_) | Err(CollaborationError::NotFound(_) | CollaborationError::Forbidden(_)) => {
+                return map_media_error("check media session access", MediaSessionError::NotFound("Playlist not found.".into()));
+            }
+            Err(CollaborationError::Sqlx(err) | CollaborationError::Db(crate::db::DbError::Sqlx(err))) => {
+                return map_media_error("check media session access", err.into());
+            }
+            Err(err) => return ServerError::Internal(err.to_string()).into_response(),
         }
     }
 
     let service = ResumableMediaService::new(db.clone());
     let now_ms = Utc::now().timestamp_millis();
     match service.save_at(&auth.user.id, input, now_ms).await {
-        Ok(checkpoint) => Json(json!({ "checkpoint": checkpoint })).into_response(),
-        Err(MediaSessionError::Validation(msg)) => {
-            send_error_response(StatusCode::BAD_REQUEST, msg, "BAD_REQUEST")
-        }
-        Err(err) => ServerError::Internal(err.to_string()).into_response(),
+        Ok(checkpoint) => with_no_store(Json(json!({ "checkpoint": checkpoint })).into_response()),
+        Err(err) => map_media_error("save media session", err),
     }
 }
 
@@ -278,13 +306,13 @@ async fn delete_media_session_handler(
         );
     }
 
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let Some(db) = state.db() else {
+        return map_media_error("delete media session", MediaSessionError::StorageUnavailable);
     };
     let service = ResumableMediaService::new(db.clone());
     match service.remove(&auth.user.id, media_type, media_id).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => ServerError::Internal(err.to_string()).into_response(),
+        Err(err) => map_media_error("delete media session", err),
     }
 }
 
@@ -296,8 +324,8 @@ async fn get_queue_sessions_handler(
     State(state): State<AppState>,
     auth: AuthenticatedUser,
 ) -> Response {
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let Some(db) = state.db() else {
+        return map_queue_error(QueueSyncError::new("Queue storage is temporarily unavailable.", 503));
     };
     let service = state.queue_sync_service(db.clone());
 
@@ -428,8 +456,8 @@ async fn put_queue_session_handler(
         );
     }
 
-    let Ok(db) = require_db(&state) else {
-        return ServerError::Internal(String::from("Database unavailable")).into_response();
+    let Some(db) = state.db() else {
+        return map_queue_error(QueueSyncError::new("Queue storage is temporarily unavailable.", 503));
     };
     let service = state.queue_sync_service(db.clone());
     let now_ms = Utc::now().timestamp_millis();
@@ -450,7 +478,7 @@ async fn put_queue_session_handler(
             if saved {
                 state.remote_hub().queue_changed(&auth.user.id, &body.device_id);
             }
-            Json(json!({ "saved": saved, "sequence": sequence })).into_response()
+            with_no_store(Json(json!({ "saved": saved, "sequence": sequence })).into_response())
         }
         Err(err) => map_queue_error(err),
     }

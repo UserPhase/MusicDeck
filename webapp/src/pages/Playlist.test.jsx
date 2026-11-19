@@ -131,6 +131,15 @@ const editablePlaylist = {
     { id: "same", playlistItemId: "third", title: "Third", artist: "Artist", isDownloaded: true },
   ],
 };
+test("the playlist loop control stays available while controlling another device", async () => {
+  const togglePlaylistLoop = jest.fn();
+  renderPlaylist(editablePlaylist, { isRemotePlayback: true, loopPlaylistId: editablePlaylist.id, togglePlaylistLoop });
+  const loop = await screen.findByRole("button", { name: "Loop playlist" });
+  expect(loop).toBeEnabled();
+  expect(loop).toHaveAttribute("aria-pressed", "true");
+  fireEvent.click(loop);
+  expect(togglePlaylistLoop).toHaveBeenCalledWith(editablePlaylist.id);
+});
 test("viewer access keeps playback available while withholding sharing, artwork and track edit controls", async () => {
   renderPlaylist({ ...editablePlaylist, sharingMode: "SHARED_READ", permissions: { canRead: true, canEditTracks: false, canManage: false } });
   await screen.findByRole("row", { name: "First by Artist" });

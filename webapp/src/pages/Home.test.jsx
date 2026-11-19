@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import Home from "./Home";
@@ -169,7 +169,7 @@ test("shows an empty listening state instead of recently added songs when histor
   });
 });
 
-test("shows the last six listened songs even when collection progress is saved", async () => {
+test("shows the last six listened songs without the album and playlist progress shelf", async () => {
   const history = Array.from({ length: 8 }, (_, index) => ({ ...song, id: `recent-${index}`, title: `Recent song ${index}` }));
   renderHome({ recentlyPlayed: history, checkpoints: [{
     type: "album", mediaId: album.id, title: album.name, trackId: song.id,
@@ -182,7 +182,9 @@ test("shows the last six listened songs even when collection progress is saved",
   expect(Array.from(section.querySelectorAll(".track-title")).map((title) => title.textContent)).toEqual(history.slice(0, 6).map((track) => track.title));
   expect(section.querySelectorAll(".track-cover-art")).toHaveLength(6);
   expect(section.querySelectorAll(".track-number-text")).toHaveLength(0);
-  expect(within(section).queryByRole("button", { name: /Resume from Track/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Resume albums and playlists" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Resume from Track/ })).not.toBeInTheDocument();
+  expect(getMediaCheckpoints).not.toHaveBeenCalled();
 });
 
 test("ranks local discover albums and artists from listening-based recommendations", async () => {

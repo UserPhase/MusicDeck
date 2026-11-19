@@ -551,7 +551,7 @@ async fn resolve_local_artist_snapshot(
     None
 }
 
-async fn find_external_artist_by_name(
+pub(super) async fn find_external_artist_by_name(
     state: &AppState,
     artist_name: &str,
 ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {

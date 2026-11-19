@@ -216,7 +216,7 @@ describe("queueReducer", () => {
     expect(currentEntryOf(shuffled)).toBe(currentEntryOf(state));
   });
 
-  test("SMART_SHUFFLE_UPCOMING removes recent duplicates atomically while retaining current/history identities and loads", () => {
+  test("smart shuffle ranks upcoming occurrences without deleting them and can restore their order", () => {
     const state = reduce(loaded(), { type: "PLAY_NEXT" }, { type: "APPEND", tracks: songs("a", "e", "e", "f") });
     const options = { seed: 123, now: 100_000, recentPlays: [{ id: "d", playedAt: 99_000 }], favoriteIds: ["f"] };
     const action: QueueAction<Track> = { type: "SMART_SHUFFLE_UPCOMING", options };
@@ -228,8 +228,11 @@ describe("queueReducer", () => {
     expect(shuffled.loadRequest).toBe(state.loadRequest);
     expect(shuffled.currentIndex).toBe(1);
     expect(shuffled.shuffleSeed).toBe(123);
-    expect(shuffled.shuffleExcludedCount).toBe(2);
-    expect(shuffled.entries.slice(2).map((entry) => entry.track.id).sort()).toEqual(["a", "c", "e", "f"]);
+    expect(shuffled.shuffleExcludedCount).toBe(0);
+    expect(ids(shuffled).slice(-2)).toEqual(["d", "e"]);
+    const restored = reduce(shuffled, { type: "UNSHUFFLE_UPCOMING" });
+    expect(restored.entries).toEqual(state.entries);
+    expect(restored.loadRequest).toBe(state.loadRequest);
     const order = ids(shuffled);
     const navigated = reduce(shuffled, { type: "PLAY_NEXT" }, { type: "PLAY_NEXT" }, { type: "PLAY_PREVIOUS", position: 0 });
     expect(ids(navigated)).toEqual(order);
@@ -254,13 +257,13 @@ describe("queueReducer", () => {
     expect(appended.entries.slice(-3).map((entry) => entry.entryId)).toEqual(["q5", "q6", "q7"]);
   });
 
-  test("smart exhaustion keeps the current track and rapid previous/next actions never resample the queue", () => {
+  test("smart exhaustion keeps the queue playable in its existing order", () => {
     const state = loaded();
     const shuffled = reduce(state, { type: "SMART_SHUFFLE_UPCOMING", options: {
       seed: 7, now: 100, favoriteIds: [], recentPlays: songs("b", "c", "d").map((track) => ({ ...track, playedAt: 99 })),
     } });
-    expect(ids(shuffled)).toEqual(["a"]);
-    expect(reduce(shuffled, { type: "PLAY_NEXT" })).toBe(shuffled);
+    expect(ids(shuffled)).toEqual(ids(state));
+    expect(reduce(shuffled, { type: "PLAY_NEXT" }).currentIndex).toBe(1);
     expect(reduce(shuffled, { type: "PLAY_PREVIOUS", position: 0 }).entries).toBe(shuffled.entries);
   });
 
@@ -325,7 +328,7 @@ describe("queueReducer", () => {
   });
 
   test("repeat-one reloads the finished entry and prepares no upcoming transition", () => {
-    const state = reduce(loaded(), { type: "SET_REPEAT_ONE", enabled: true });
+    const state = reduce(loaded(), { type: "SET_REPEAT_MODE", mode: "one" });
     expect(upcomingEntryOf(state)).toBeNull();
     const repeated = reduce(state, { type: "ENGINE_TRACK_END", key: "q0" });
     expect(repeated.currentIndex).toBe(0);
@@ -369,7 +372,7 @@ describe("queueReducer", () => {
         { type: "MOVE", from: Math.floor(random() * 7) - 1, to: Math.floor(random() * 7) - 1 },
         { type: "SHUFFLE_UPCOMING", randoms: [random(), random(), random(), random(), random()] },
         { type: "REMOVE_TRACKS", ids: [pick(["a", "b", "c", "d", "e", "x"])] },
-        { type: "SET_REPEAT_ONE", enabled: random() < 0.3 },
+        { type: "SET_REPEAT_MODE", mode: random() < 0.3 ? "one" : "off" },
         { type: "LOAD_CURRENT", startAt: random() * 5 },
         { type: "STOP" },
         { type: "SET_QUEUE", tracks: songs("a", "b", "c"), startIndex: 1, deferLoad: true },

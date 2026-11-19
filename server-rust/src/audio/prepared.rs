@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{OnceCell, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::ffmpeg::AUDIO_INPUT_FORMATS;
 use super::loudness::{
     LOUDNESS_CACHE_TTL_MS, LoudnessMeasurement, LoudnessService, MAX_LOUDNESS_INPUT_BYTES,
     TRUE_PEAK_LIMIT, loudness_stream_cache_key, parse_loudness, read_measurement,
@@ -218,6 +219,8 @@ impl PreparedAudio {
         if !metadata.is_file()
             || metadata.is_symlink()
             || row.bytes <= 0
+            || !row.integrated_lufs.is_finite()
+            || !row.true_peak_db.is_finite()
             || metadata.len() != row.bytes as u64
         {
             return Ok(None);
@@ -266,7 +269,7 @@ impl PreparedAudio {
             let result = async {
                 let _slot = tokio::time::timeout(QUEUE_TIMEOUT, worker.active.acquire()).await
                     .map_err(|_| PreparationError::Work("Playback preparation queue is busy".into()))?
-                    .expect("preparation semaphore stays open");
+                    .map_err(|_| PreparationError::Work("Playback preparation is shutting down".into()))?;
                 let work = tokio::time::timeout(JOB_TIMEOUT, worker.prepare(&key, request, permit.as_ref(), load));
                 tokio::select! {
                     biased;
@@ -305,6 +308,10 @@ impl PreparedAudio {
         if self.artifact(key).await?.is_some() {
             return Ok(());
         }
+        self.loudness
+            .executable()
+            .await
+            .map_err(PreparationError::Work)?;
         let directory = self.directory().await?;
         let staging = tempfile::Builder::new()
             .prefix(".preparing-")
@@ -404,10 +411,13 @@ impl PreparedAudio {
                 &format!("loudnorm=I={}:TP={TRUE_PEAK_LIMIT}:LRA=20", request.target),
             )
             .await?;
-        let lufs = verification
-            .integrated_lufs()
-            .expect("measurement validated");
-        let peak = verification.true_peak_db().expect("measurement validated");
+        let (Some(lufs), Some(peak)) =
+            (verification.integrated_lufs(), verification.true_peak_db())
+        else {
+            return Err(PreparationError::Work(
+                "Prepared audio has no valid loudness measurement".into(),
+            ));
+        };
         if (lufs - f64::from(request.target)).abs() > 1.0 || peak > TRUE_PEAK_LIMIT + 0.1 {
             return Err(PreparationError::Work(
                 "Prepared audio did not meet the loudness target".into(),
@@ -504,7 +514,10 @@ impl PreparedAudio {
             .loudness
             .runner
             .run(
-                &self.loudness.ffmpeg_bin,
+                self.loudness
+                    .executable()
+                    .await
+                    .map_err(PreparationError::Work)?,
                 args,
                 ProcessOptions {
                     timeout_ms: Some(120_000),
@@ -672,6 +685,7 @@ fn input_args(path: &Path, preview: bool) -> Vec<String> {
             "-nostdin",
             "-hide_banner",
             "-nostats",
+            "-xerror",
             "-y",
             "-threads",
             "1",
@@ -680,7 +694,7 @@ fn input_args(path: &Path, preview: bool) -> Vec<String> {
             "-protocol_whitelist",
             "file,pipe",
             "-format_whitelist",
-            "mp3,flac,mov,ogg,wav,aac,aiff,matroska,webm",
+            AUDIO_INPUT_FORMATS,
         ],
     );
     if preview {
@@ -708,6 +722,14 @@ mod tests {
             args: &[String],
             _: ProcessOptions,
         ) -> Result<ProcessExecutionResult, ProcessError> {
+            if args == ["-hide_banner", "-filters"] {
+                return Ok(ProcessExecutionResult {
+                    exit_code: Some(0),
+                    stdout: " ... loudnorm A->A".into(),
+                    stderr: String::new(),
+                    signal: None,
+                });
+            }
             self.0.fetch_add(1, Ordering::Relaxed);
             assert!(
                 args.windows(2)

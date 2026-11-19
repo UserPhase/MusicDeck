@@ -21,9 +21,10 @@ import {
 } from "../api/musicdeck";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useQueueReorder } from "../hooks/useQueueReorder";
+import { QUEUE_PREVIEW_SIZE } from "../hooks/useQueueStore";
 
 // Display caps only: playback still runs through the whole queue.
-export const QUEUE_DISPLAY_LIMIT = 25;
+export const QUEUE_DISPLAY_LIMIT = QUEUE_PREVIEW_SIZE;
 export const HISTORY_DISPLAY_LIMIT = 10;
 
 

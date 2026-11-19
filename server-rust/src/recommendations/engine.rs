@@ -239,6 +239,11 @@ impl RecommendationEngine {
             .unwrap_or(false)
     }
 
+    pub(crate) fn track_target(&self, track_id: &str) -> Option<TasteTarget> {
+        let guard = self.state.read().ok()?;
+        guard.tracks.get(track_id).map(|entry| entry.target.clone())
+    }
+
     async fn load_profile(&self, user_id: &str) -> TasteProfile {
         let Some(pool) = &self.db else {
             return TasteProfile {

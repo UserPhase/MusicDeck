@@ -13,14 +13,12 @@
 //!    - Delayed or out-of-order network reports with `captured_at <= completed.captured_at`
 //!      are ignored (`Ok(None)`) so a 5-second-delayed progress heartbeat can never
 //!      resurrect a completed album/playlist.
-//! 3. **Deleted/Unreadable Playlist Pruning**:
-//!    - Before serving `get` or `list`, [`ResumableMediaService`] removes any playlist
-//!      checkpoint whose target playlist was moved to Trash or is no longer readable by
-//!      the viewer.
+//! 3. **Read-Only Visibility**:
+//!    - `get` and `list` omit expired bookmarks and playlists that are no longer readable.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Acquire, Row};
+use sqlx::{Row, SqliteConnection};
 use thiserror::Error;
 
 use crate::db::{DbError, DbPool};
@@ -30,6 +28,9 @@ pub const MEDIA_SESSION_TTL_MS: i64 = 30 * 86_400_000;
 
 /// Maximum clock skew in the future (`5,000` ms) tolerated on `captured_at`.
 pub const MAX_FUTURE_DRIFT_MS: i64 = 5_000;
+
+pub(crate) const MEDIA_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PRUNE_BATCH_SIZE: i64 = 64;
 
 /// Media collection kind (`"album"` or `"playlist"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,6 +146,10 @@ pub enum MediaSessionError {
     /// Raw SQLx error.
     #[error("Media session database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    /// Storage could not provide a connection within the request budget.
+    #[error("Playback storage is temporarily unavailable. Retry shortly.")]
+    StorageUnavailable,
 }
 
 /// Service managing per-user resumable album/playlist bookmarks in `media_sessions`
@@ -163,15 +168,42 @@ impl ResumableMediaService {
 
     /// Prunes expired checkpoints and completion tombstones older than [`MEDIA_SESSION_TTL_MS`].
     pub async fn prune_at(&self, now_ms: i64) -> Result<u64, MediaSessionError> {
-        let cutoff = now_ms - MEDIA_SESSION_TTL_MS;
-        sqlx::query("DELETE FROM media_session_completions WHERE updated_at < ?;")
-            .bind(cutoff)
-            .execute(self.db.inner())
-            .await?;
+        let mut tx = self.begin_write().await?;
+        let expired = Self::prune_on(&mut tx, now_ms - MEDIA_SESSION_TTL_MS, -1).await?;
+        let completed = sqlx::query("DELETE FROM media_sessions WHERE progress >= 1.0;")
+            .execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(expired + completed)
+    }
 
-        let res = sqlx::query("DELETE FROM media_sessions WHERE updated_at < ? OR progress >= 1.0;")
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, MediaSessionError> {
+        let tx = tokio::time::timeout(
+            MEDIA_STORAGE_TIMEOUT,
+            crate::db::begin_sqlite_write(
+                self.db.inner(), "UPDATE media_sessions SET captured_at = captured_at WHERE 0",
+            ),
+        ).await.map_err(|_| {
+            tracing::warn!(request_id = %crate::error::current_request_id(), "Timed out acquiring the media session writer");
+            MediaSessionError::StorageUnavailable
+        })??;
+        Ok(tx)
+    }
+
+    async fn prune_on(connection: &mut SqliteConnection, cutoff: i64, limit: i64) -> Result<u64, MediaSessionError> {
+        sqlx::query("DELETE FROM media_session_completions WHERE rowid IN (
+            SELECT rowid FROM media_session_completions WHERE updated_at < ? ORDER BY updated_at LIMIT ?
+        );")
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&mut *connection)
+        .await?;
+
+        let res = sqlx::query("DELETE FROM media_sessions WHERE rowid IN (
+            SELECT rowid FROM media_sessions WHERE updated_at < ? ORDER BY updated_at LIMIT ?
+        );")
             .bind(cutoff)
-            .execute(self.db.inner())
+            .bind(limit)
+            .execute(connection)
             .await?;
 
         Ok(res.rows_affected())
@@ -184,37 +216,48 @@ impl ResumableMediaService {
         media_type: MediaCollectionType,
         media_id: &str,
     ) -> Result<Option<MediaCheckpoint>, MediaSessionError> {
-        let now_ms = Utc::now().timestamp_millis();
-        self.clean_for_user(user_id, now_ms).await?;
-
-        let row = sqlx::query(
-            "SELECT * FROM media_sessions WHERE user_id = ? AND media_type = ? AND media_id = ?;",
-        )
-        .bind(user_id)
-        .bind(media_type.as_str())
-        .bind(media_id)
-        .fetch_optional(self.db.inner())
-        .await?;
-
-        row.as_ref().map(map_session_row).transpose()
+        Ok(self.visible_sessions(user_id, Some((media_type, media_id))).await?.into_iter().next())
     }
 
     /// Lists up to 100 recent resumable media checkpoints for `user_id` ordered by `updated_at DESC`.
     pub async fn list(&self, user_id: &str) -> Result<Vec<MediaCheckpoint>, MediaSessionError> {
-        let now_ms = Utc::now().timestamp_millis();
-        self.clean_for_user(user_id, now_ms).await?;
+        self.visible_sessions(user_id, None).await
+    }
 
-        let rows = sqlx::query(
+    async fn visible_sessions(
+        &self,
+        user_id: &str,
+        collection: Option<(MediaCollectionType, &str)>,
+    ) -> Result<Vec<MediaCheckpoint>, MediaSessionError> {
+        let (media_type, media_id) = collection.map_or((None, None), |(kind, id)| (Some(kind.as_str()), Some(id)));
+        let cutoff = Utc::now().timestamp_millis() - MEDIA_SESSION_TTL_MS;
+        let query = sqlx::query(
             r"
-            SELECT * FROM media_sessions
-            WHERE user_id = ?
-            ORDER BY updated_at DESC, media_type ASC, media_id ASC
+            SELECT s.* FROM media_sessions s
+            JOIN users viewer ON viewer.id = s.user_id AND viewer.disabled = 0
+            WHERE s.user_id = ? AND s.updated_at >= ? AND s.progress < 1.0
+              AND (? IS NULL OR (s.media_type = ? AND s.media_id = ?))
+              AND (s.media_type <> 'playlist' OR EXISTS (
+                SELECT 1 FROM playlists p WHERE p.id = s.media_id AND p.deleted_at IS NULL
+                  AND (p.owner_user_id = viewer.id OR viewer.role = 'admin'
+                    OR p.sharing_mode = 'PUBLIC_SERVER'
+                    OR (p.sharing_mode IN ('SHARED_READ', 'COLLABORATIVE') AND EXISTS (
+                      SELECT 1 FROM playlist_permissions perm
+                      WHERE perm.playlist_id = p.id AND perm.user_id = viewer.id
+                        AND perm.role IN ('VIEWER', 'COLLABORATOR')
+                    )))
+              ))
+            ORDER BY s.updated_at DESC, s.media_type ASC, s.media_id ASC
             LIMIT 100;
             ",
         )
         .bind(user_id)
-        .fetch_all(self.db.inner())
-        .await?;
+        .bind(cutoff)
+        .bind(media_type)
+        .bind(media_type)
+        .bind(media_id);
+        let rows = tokio::time::timeout(MEDIA_STORAGE_TIMEOUT, query.fetch_all(self.db.inner()))
+            .await.map_err(|_| MediaSessionError::StorageUnavailable)??;
 
         rows.iter().map(map_session_row).collect()
     }
@@ -230,20 +273,19 @@ impl ResumableMediaService {
         now_ms: i64,
     ) -> Result<Option<MediaCheckpoint>, MediaSessionError> {
         validate_checkpoint_input(&mut input, now_ms)?;
-        self.prune_at(now_ms).await?;
-
-        let mut conn = self.db.inner().acquire().await?;
-        let mut tx = conn.begin().await?;
+        let cutoff = now_ms - MEDIA_SESSION_TTL_MS;
+        let mut tx = self.begin_write().await?;
 
         let completed_row = sqlx::query(
             r"
             SELECT captured_at FROM media_session_completions
-            WHERE user_id = ? AND media_type = ? AND media_id = ?;
+            WHERE user_id = ? AND media_type = ? AND media_id = ? AND updated_at >= ?;
             ",
         )
         .bind(user_id)
         .bind(input.media_type.as_str())
         .bind(&input.media_id)
+        .bind(cutoff)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -258,12 +300,13 @@ impl ResumableMediaService {
         let prev_row = sqlx::query(
             r"
             SELECT * FROM media_sessions
-            WHERE user_id = ? AND media_type = ? AND media_id = ?;
+            WHERE user_id = ? AND media_type = ? AND media_id = ? AND updated_at >= ? AND progress < 1.0;
             ",
         )
         .bind(user_id)
         .bind(input.media_type.as_str())
         .bind(&input.media_id)
+        .bind(cutoff)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -316,6 +359,7 @@ impl ResumableMediaService {
             .execute(&mut *tx)
             .await?;
 
+            Self::prune_on(&mut tx, cutoff, PRUNE_BATCH_SIZE).await?;
             tx.commit().await?;
             return Ok(None);
         }
@@ -366,6 +410,7 @@ impl ResumableMediaService {
         .execute(&mut *tx)
         .await?;
 
+        Self::prune_on(&mut tx, cutoff, PRUNE_BATCH_SIZE).await?;
         tx.commit().await?;
 
         Ok(Some(MediaCheckpoint {
@@ -391,57 +436,16 @@ impl ResumableMediaService {
         media_type: MediaCollectionType,
         media_id: &str,
     ) -> Result<(), MediaSessionError> {
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "DELETE FROM media_sessions WHERE user_id = ? AND media_type = ? AND media_id = ?;",
         )
         .bind(user_id)
         .bind(media_type.as_str())
         .bind(media_id)
-        .execute(self.db.inner())
+        .execute(&mut *tx)
         .await?;
-        Ok(())
-    }
-
-    async fn clean_for_user(&self, user_id: &str, now_ms: i64) -> Result<(), MediaSessionError> {
-        self.prune_at(now_ms).await?;
-
-        let is_admin = sqlx::query("SELECT 1 FROM users WHERE id = ? AND role = 'admin';")
-            .bind(user_id)
-            .fetch_optional(self.db.inner())
-            .await?
-            .is_some();
-
-        sqlx::query(
-            r"
-            DELETE FROM media_sessions
-            WHERE user_id = ?
-              AND media_type = 'playlist'
-              AND NOT EXISTS (
-                SELECT 1 FROM playlists p
-                WHERE p.id = media_sessions.media_id
-                  AND p.deleted_at IS NULL
-                  AND (
-                    p.owner_user_id = ?
-                    OR ? = 1
-                    OR p.sharing_mode = 'PUBLIC_SERVER'
-                    OR (
-                      p.sharing_mode IN ('SHARED_READ', 'COLLABORATIVE')
-                      AND EXISTS (
-                        SELECT 1 FROM playlist_permissions perm
-                        WHERE perm.playlist_id = p.id AND perm.user_id = ?
-                      )
-                    )
-                  )
-              );
-            ",
-        )
-        .bind(user_id)
-        .bind(user_id)
-        .bind(i64::from(is_admin))
-        .bind(user_id)
-        .execute(self.db.inner())
-        .await?;
-
+        tx.commit().await?;
         Ok(())
     }
 }

@@ -684,7 +684,7 @@ impl SourceResolver {
 
     /// Reads metadata for the exact provider item that served the representation.
     pub(crate) async fn stream_source_metadata(
-        &self,
+        registry: &BackendRegistry,
         pipe: &AudioStreamInfo,
     ) -> Result<Option<AudioMetadataSummary>, SourceUnavailableError> {
         let connection = pipe
@@ -695,8 +695,7 @@ impl SourceResolver {
             .source_item_id
             .as_deref()
             .ok_or_else(SourceUnavailableError::default)?;
-        let provider = self
-            .registry
+        let provider = registry
             .get_by_connection_id(connection)
             .filter(|provider| provider.enabled)
             .ok_or_else(SourceUnavailableError::default)?;

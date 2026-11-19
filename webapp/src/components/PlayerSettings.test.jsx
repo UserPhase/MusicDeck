@@ -63,6 +63,12 @@ test("album policy is an independent accessible toggle", () => {
   expect(onTransitionModeChange).not.toHaveBeenCalled();
 });
 
+test("crossfade explains the consecutive album exception when album-aware playback is enabled", () => {
+  renderSettings({ transitionMode: "crossfade", isAlbumAware: true });
+  expect(screen.getByRole("group", { name: "Track transitions" }))
+    .toHaveAccessibleDescription(/keeps consecutive tracks in an ordered album gapless/i);
+});
+
 test("the crossfade slider is limited to 1-10 seconds and only enabled in crossfade mode", () => {
   const { onCrossfadeDurationChange } = renderSettings({ transitionMode: "crossfade", crossfadeDuration: 3 });
   const slider = screen.getByRole("slider", { name: "Crossfade duration" });

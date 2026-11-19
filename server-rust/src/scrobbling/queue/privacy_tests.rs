@@ -117,6 +117,32 @@ async fn confirmed_success_stays_sent_when_policy_changes_before_bookkeeping() {
     db.close().await;
 }
 
+#[tokio::test]
+async fn pending_and_failed_external_delivery_leave_new_listens_writable() {
+    let (db, _, queue) = fixture().await;
+    let in_flight = queue.claim_next_job().await.unwrap();
+    let event: PlaybackEventInput = serde_json::from_value(json!({
+        "playbackSessionId": "session-new", "trackId": "track-new",
+        "startedAt": (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+        "listenedSeconds": 120, "durationSeconds": 180, "finished": true,
+        "track": {"title": "New Track", "artist": "Artist", "album": "Album"}
+    })).unwrap();
+    // A job can stay claimed while the worker waits for the provider. The
+    // listening write must still commit on this single-connection SQLite pool.
+    let outcome = timeout(Duration::from_secs(1),
+        record_playback_with_scrobbles(&db, "listener", &event, Some(&queue)))
+        .await.unwrap().unwrap();
+    assert!(outcome.newly_counted);
+
+    queue.finish_delivery(in_flight, Err(ScrobbleError::new(
+        "PROVIDER_OFFLINE", "Provider did not respond", FailureKind::Transient, None, 0,
+    ))).await;
+    let retry = record_playback_with_scrobbles(&db, "listener", &event, Some(&queue)).await.unwrap();
+    assert_eq!(retry.id, outcome.id);
+    assert!(!retry.newly_counted);
+    assert_eq!(states(&db).await, vec!["pending", "pending", "pending"]);
+}
+
 #[derive(Clone, Default)]
 struct FakeProvider {
     started: Arc<Notify>,

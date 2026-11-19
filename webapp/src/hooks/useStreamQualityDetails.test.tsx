@@ -4,8 +4,25 @@ import { useStreamQualityDetails } from "./useStreamQualityDetails";
 
 jest.mock("../api/musicdeck", () => ({ inspectAudioStream: jest.fn() }));
 const inspect = jest.mocked(inspectAudioStream);
-const props = { engine: null, trackId: "song", userId: "user", streamUrl: "/api/tracks/song/stream?inspectionId=first", preview: false, serverNormalized: false };
+const props = { engine: null, trackId: "song", userId: "user", streamUrl: "/api/tracks/song/stream?inspectionId=first", preview: false, serverNormalized: false, enabled: true };
 beforeEach(() => { inspect.mockReset(); });
+test("skips inspection when disabled even when the stream already has an inspection ID", () => {
+  const { result } = renderHook(() => useStreamQualityDetails({ ...props, enabled: false }));
+  expect(inspect).not.toHaveBeenCalled();
+  expect(result.current.loading).toBe(false);
+});
+test("inspects an eligible stream by default and accepts unavailable properties", async () => {
+  inspect.mockResolvedValueOnce({});
+  const { result, rerender } = renderHook(useStreamQualityDetails, {
+    initialProps: { ...props, enabled: undefined as boolean | undefined, streamUrl: "http://localhost:4535/proxy/api/stream/song?inspectionId=first" },
+  });
+  await waitFor(() => expect(result.current.loading).toBe(false));
+  expect(inspect).toHaveBeenCalledWith("song", "first", expect.any(AbortSignal));
+  expect(result.current).toMatchObject({ source: null, output: null, delivery: null, error: "" });
+  rerender({ ...props, streamUrl: props.streamUrl + "&inspect=false" });
+  expect(inspect).toHaveBeenCalledTimes(1);
+  expect(result.current.loading).toBe(false);
+});
 test("correlates each source/account and ignores late responses from rapid track changes", async () => {
   let resolve!: (value: unknown) => void;
   inspect.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
@@ -21,10 +38,10 @@ test("correlates each source/account and ignores late responses from rapid track
   unmount();
 });
 test("does not inspect previews or separate normalized files as library streams", async () => {
-  const { result, rerender } = renderHook(useStreamQualityDetails, { initialProps: { ...props, preview: true, streamUrl: "https://preview.invalid/file.mp3" } });
+  const { result, rerender } = renderHook(useStreamQualityDetails, { initialProps: { ...props, preview: true, streamUrl: props.streamUrl } });
   expect(inspect).not.toHaveBeenCalled();
   expect(result.current.note).toMatch(/preview/);
-  rerender({ ...props, preview: false, serverNormalized: true, streamUrl: "/api/normalized/song" });
+  rerender({ ...props, preview: false, serverNormalized: true, streamUrl: props.streamUrl });
   expect(inspect).not.toHaveBeenCalled();
   expect(result.current.note).toMatch(/separate processed/);
 });

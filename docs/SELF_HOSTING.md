@@ -354,8 +354,9 @@ access to the LAN. If the TLS proxy runs in another container or host, set
 `MUSICDECK_WEB_BIND` to an address reachable by that proxy and restrict the
 port with firewall rules or a private container network.
 
-Configure the reverse proxy to terminate TLS, forward the original
-`X-Forwarded-Proto: https` header to MusicDeck Web, and send HSTS to clients.
+Configure the reverse proxy to terminate TLS, preserve the public `Host` (including a
+non-default port) and browser `Origin`, set `X-Forwarded-Proto: https` toward
+MusicDeck Web, and send HSTS to clients.
 `webapp/nginx.conf` forwards the HTTPS scheme to MusicDeck Server and adds
 browser hardening headers (CSP, `X-Content-Type-Options`, referrer policy,
 and clickjacking protection). HSTS should be emitted by the external TLS
@@ -371,8 +372,10 @@ automatically. Remote device control uses a same-origin WebSocket at
 `Connection: upgrade` headers for that exact path with a one-hour read timeout.
 Any outer reverse proxy must forward these upgrades too. Use `wss:` behind
 HTTPS and preserve the browser's `Origin`; the hub accepts only the exact
-configured `MUSICDECK_PUBLIC_URL` / `MUSICDECK_CORS_ORIGIN` origins and the
-normal session cookie. No token belongs in the WebSocket URL.
+configured `MUSICDECK_PUBLIC_URL` / `MUSICDECK_CORS_ORIGIN` origins or a
+same-authority origin using the configured public scheme. The upgrade requires
+the normal session cookie. Production API CORS grants credentialed access only
+to explicitly configured HTTP(S) origins.
 
 The development Compose stack is intended for local development only and
 defaults secure cookies off for its HTTP URL. Never expose it to an untrusted
@@ -526,7 +529,7 @@ MusicDeck:
 Image selection:
 
 - `MUSICDECK_VERSION` — image tag to run; defaults to the published commit tag
-  `sha-bdfdbc6` in the provided compose file. Use a tag published for both the web
+  `sha-3e82c75` in the provided compose file. Use a tag published for both the web
   and server images; the package version does not imply a published image release.
   Keep this pinned to an explicit release or commit tag for controlled rollback.
 - `MUSICDECK_IMAGE_SERVER`, `MUSICDECK_IMAGE_WEB` — override only if you
@@ -726,16 +729,35 @@ that the restored database can be read/written.
 
 ## Updating
 
-Production (prebuilt GHCR images):
+Production pulls prebuilt GHCR images. Keep the existing Compose project name,
+deployment directory, and `.env` so the same database volumes and library mount
+are used. Back up the deployment data before applying an upgrade.
+
+For a deployment that is also a Git checkout, run `git pull --ff-only origin main`
+in the checkout. Wait for **Publish Docker images** to finish for the commit you
+want to deploy. Set `MUSICDECK_VERSION` in `.env` to that commit's published
+`sha-<7-character-commit>` tag. A Git pull updates the deployment files and the
+image tag selects the code that actually runs.
+
+From the existing deployment directory, update the two MusicDeck services:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose config --quiet
+docker compose pull musicdeck-web musicdeck-server
+docker compose up -d --wait --pull never musicdeck-server musicdeck-web
+docker compose ps
+docker compose exec -T musicdeck-server gosu musicdeck ffmpeg -hide_banner -filters | grep -E ' (silencedetect|loudnorm) '
 ```
 
-Update `MUSICDECK_VERSION`, `NAVIDROME_IMAGE`, and `JELLYFIN_IMAGE` explicitly
-when you want new images. This keeps upgrades and rollbacks reviewable instead
-of silently tracking mutable tags.
+Verify that both filters are listed. The image installs FFmpeg and the server
+detects it automatically. A native service needs FFmpeg visible to its service
+account. Set `FFMPEG_PATH` to the absolute path visible to that process only when
+using a custom executable.
+
+Open the configured public URL from another device, sign in and check that the
+`/api/v1/remote` WebSocket shows `101 Switching Protocols` and receives
+`INITIAL_STATE`. Use **Devices** and try controlling playback from a second
+signed-in client. Review MusicDeck and provider image upgrades separately.
 
 Developer source builds:
 

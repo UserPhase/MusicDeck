@@ -60,6 +60,11 @@ pub(crate) struct CatalogSnapshots {
 }
 
 impl CatalogSnapshots {
+    /// The last completed library window, available while playback continues.
+    pub fn cached_tracks(&self) -> Option<Arc<CatalogSnapshot<Track>>> {
+        self.tracks.try_lock().ok()?.clone()
+    }
+
     pub async fn tracks(&self, catalog: &CatalogService) -> Arc<CatalogSnapshot<Track>> {
         let mut cache = self.tracks.lock().await;
         if let Some(current) = cache

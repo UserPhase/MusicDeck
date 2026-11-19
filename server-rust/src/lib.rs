@@ -228,6 +228,15 @@ pub mod error {
     }
 
     impl ServerError {
+        pub(crate) fn playback_storage(operation: &'static str, error: sqlx::Error) -> Self {
+            if crate::db::playback_storage_unavailable(&error) {
+                tracing::warn!(operation, request_id = %current_request_id(), %error, "Playback storage temporarily unavailable");
+                Self::ServiceUnavailable("Playback storage is temporarily unavailable. Retry shortly.".into())
+            } else {
+                Self::Internal(format!("{operation}: {error}"))
+            }
+        }
+
         /// Maps each [`ServerError`] variant to its HTTP [`StatusCode`] and error code.
         #[must_use]
         pub const fn status_and_code(&self) -> (StatusCode, &'static str) {
@@ -259,7 +268,7 @@ pub mod error {
                 | Self::Bind { .. }
                 | Self::Configuration(_)
                 | Self::Database(_) => {
-                    tracing::error!(error = %self, "Unhandled internal server error");
+                    tracing::error!(request_id = %current_request_id(), error = %self, "Unhandled internal server error");
                     String::from("An unexpected internal server error occurred")
                 }
                 other => other.to_string(),
@@ -335,6 +344,8 @@ pub mod state {
         restore_state: crate::recovery::RestoreState,
         /// Optional SQLite database connection pool.
         pub db: Option<DbPool>,
+        silence_scan: Option<crate::audio::analysis_scan::AnalysisScanService>,
+        loudness_scan: Option<crate::audio::analysis_scan::AnalysisScanService>,
         prepared_audio: Option<Arc<crate::audio::prepared::PreparedAudio>>,
         /// Optional session store backed by SQLite and an in-memory `RwLock` cache.
         pub sessions: Option<SessionStore>,
@@ -527,6 +538,13 @@ pub mod state {
                 inner.prepared_audio = Some(Arc::new(crate::audio::prepared::PreparedAudio::new(
                     db.clone(),
                 )));
+                inner.silence_scan = Some(crate::audio::analysis_scan::AnalysisScanService::new_silence(
+                    db.clone(),
+                    inner.providers.clone(),
+                ));
+                inner.loudness_scan = Some(crate::audio::analysis_scan::AnalysisScanService::new_loudness(
+                    db.clone(), inner.providers.clone(),
+                ));
                 inner.db = Some(db);
                 inner.sessions = Some(sessions.with_remote_hub(inner.remote_hub.clone()));
             }
@@ -610,6 +628,8 @@ pub mod state {
                     restore_state: crate::recovery::RestoreState::default(),
                     db: None,
                     prepared_audio: None,
+                    silence_scan: None,
+                    loudness_scan: None,
                     sessions: None,
                     providers,
                     catalog_snapshots: Default::default(),
@@ -775,6 +795,30 @@ pub mod state {
         #[must_use]
         pub fn db(&self) -> Option<&DbPool> {
             self.inner.db.as_ref()
+        }
+
+        pub(crate) fn silence_scan(&self) -> Option<&crate::audio::analysis_scan::AnalysisScanService> {
+            self.inner.silence_scan.as_ref()
+        }
+
+        pub(crate) fn loudness_scan(&self) -> Option<&crate::audio::analysis_scan::AnalysisScanService> {
+            self.inner.loudness_scan.as_ref()
+        }
+
+        /// Restores any loudness scan interrupted by a server shutdown.
+        pub async fn recover_loudness_scan(&self) -> Result<(), crate::ServerError> {
+            if let Some(scan) = self.loudness_scan() {
+                scan.resume().await?;
+            }
+            Ok(())
+        }
+
+        /// Restores any silence scan interrupted by a server shutdown.
+        pub async fn recover_silence_scan(&self) -> Result<(), crate::ServerError> {
+            if let Some(scan) = self.silence_scan() {
+                scan.resume().await?;
+            }
+            Ok(())
         }
 
         pub(crate) fn prepared_audio(&self) -> Option<&Arc<crate::audio::prepared::PreparedAudio>> {
@@ -1182,7 +1226,7 @@ pub fn app() -> Router {
 ///    support matching [`AppConfig::cors_origin`].
 #[must_use]
 pub fn create_router(state: AppState) -> Router {
-    let cors_layer = build_cors_layer(state.config().cors_origin());
+    let cors_layer = build_cors_layer(&state.config());
 
     let sensitive_headers: Arc<[HeaderName]> =
         Arc::new([http::header::AUTHORIZATION, http::header::COOKIE]);
@@ -1237,26 +1281,31 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn build_cors_layer(origin: &str) -> CorsLayer {
-    let mut allowed: Vec<HeaderValue> = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://localhost:4534",
-        "http://127.0.0.1:4534",
-    ]
-    .iter()
-    .filter_map(|s| s.parse::<HeaderValue>().ok())
-    .collect();
-
-    if let Ok(configured) = origin.parse::<HeaderValue>() {
-        if !allowed.contains(&configured) {
-            allowed.push(configured);
+fn build_cors_layer(config: &AppConfig) -> CorsLayer {
+    let mut allowed = Vec::new();
+    if !config.is_production {
+        allowed.extend([
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:4534",
+            "http://127.0.0.1:4534",
+        ].map(HeaderValue::from_static));
+    }
+    for value in [&config.network.public_url, &config.network.cors_origin] {
+        if let Ok(url) = url::Url::parse(value)
+            && matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty() && url.password().is_none()
+            && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+            && let Ok(origin) = url.origin().ascii_serialization().parse::<HeaderValue>()
+            && !allowed.contains(&origin)
+        {
+            allowed.push(origin);
         }
     }
 
-    let allow_origin = if origin.trim() == "*" {
+    let allow_origin = if !config.is_production && config.cors_origin().trim() == "*" {
         AllowOrigin::mirror_request()
     } else {
         AllowOrigin::list(allowed)
@@ -1288,6 +1337,30 @@ mod tests {
     use http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn production_cors_uses_configured_http_origins() {
+        let mut config = AppConfig::default();
+        config.is_production = true;
+        config.network.public_url = "https://music.example.test".into();
+        config.network.cors_origin = "https://controller.example.test:8443".into();
+        for cors in [config.network.cors_origin.clone(), "*".into()] {
+            config.network.cors_origin = cors.clone();
+            let router = create_router(AppState::new(config.clone()));
+            for (origin, allowed) in [
+                ("https://music.example.test", true),
+                ("https://controller.example.test:8443", cors != "*"),
+                ("http://localhost:3000", false),
+                ("https://unrelated.example.test", false),
+            ] {
+                let response = router.clone().oneshot(Request::builder()
+                    .uri("/api/health").header(http::header::ORIGIN, origin)
+                    .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.headers().get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()), allowed.then_some(origin));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn health_endpoint_returns_ok_and_security_headers() {

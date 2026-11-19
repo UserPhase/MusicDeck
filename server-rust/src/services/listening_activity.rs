@@ -23,13 +23,15 @@ use sqlx::Row;
 use thiserror::Error;
 
 use crate::db::{DbError, DbPool, create_id};
-use crate::scrobbling::{ScrobbleError, ScrobbleQueueService};
+use crate::scrobbling::ScrobbleQueueService;
 
 /// Maximum listening time (`20.0` seconds) required before a track reaches its scrobble point.
 pub const SCROBBLE_MAX_SECONDS: f64 = 20.0;
 
 /// Default listening threshold (`30.0` seconds) for counting a play in listening statistics.
 pub const DEFAULT_LISTENING_THRESHOLD_SECONDS: f64 = 30.0;
+
+const LISTENING_WRITER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Supported time windows for listening history and statistics queries.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,8 +247,13 @@ pub enum ListeningActivityError {
     #[error("SQLite error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
-    #[error("Scrobble queue error: {0}")]
-    Scrobble(#[from] ScrobbleError),
+    /// The database could not provide a writer within the request budget.
+    #[error("Playback storage is temporarily unavailable. Retry shortly.")]
+    StorageUnavailable,
+
+    /// Failure to serialize the validated track snapshot.
+    #[error("Could not serialize listening track metadata: {0}")]
+    TrackSnapshot(#[from] serde_json::Error),
 }
 
 /// Computes the scrobble point in seconds: `min(20.0, duration_seconds / 2.0)` when
@@ -272,16 +279,13 @@ pub async fn listening_threshold(pool: &DbPool) -> Result<f64, ListeningActivity
     };
 
     let raw: String = row.try_get("value")?;
-    let val: f64 = serde_json::from_str(&raw).map_err(|_| {
-        ListeningActivityError::Validation(String::from("Invalid configured listening threshold"))
-    })?;
-
-    if !val.is_finite() || !(1.0..=240.0).contains(&val) {
-        return Err(ListeningActivityError::Validation(String::from(
-            "Invalid configured listening threshold",
-        )));
+    if let Ok(value) = serde_json::from_str::<f64>(&raw)
+        && (1.0..=240.0).contains(&value)
+    {
+        return Ok(value);
     }
-    Ok(val)
+    tracing::warn!("Invalid configured listening threshold, using the default");
+    Ok(DEFAULT_LISTENING_THRESHOLD_SECONDS)
 }
 
 /// Validates and records a cumulative [`PlaybackEventInput`] inside an atomic SQLite transaction.
@@ -315,7 +319,7 @@ pub async fn record_playback_with_scrobbles(
         )));
     }
 
-    if let Some(ref rep_str) = event.reported_at {
+    let heard_through = if let Some(ref rep_str) = event.reported_at {
         let rep_dt = DateTime::parse_from_rfc3339(rep_str)
             .map_err(|_| {
                 ListeningActivityError::Validation(String::from("Invalid reportedAt timestamp"))
@@ -326,16 +330,30 @@ pub async fn record_playback_with_scrobbles(
                 "Playback report timestamp is outside the supported session window",
             )));
         }
-    }
+        rep_dt.min(now)
+    } else {
+        now
+    };
+    let elapsed_wall_secs = ((heard_through - started_dt).num_milliseconds() as f64 / 1000.0).max(0.0);
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let track_json = serde_json::to_string(&event.track)?;
 
-    let threshold_cfg = listening_threshold(pool).await?;
-    let mut tx =
-        crate::db::begin_sqlite_write(pool.inner(), "UPDATE listening_events SET id = id WHERE 0")
-            .await?;
+    let (threshold_cfg, mut tx) = tokio::time::timeout(LISTENING_WRITER_TIMEOUT, async {
+        let threshold = listening_threshold(pool).await?;
+        // Acquire the SQLite writer before reading the session inside this transaction.
+        let tx = crate::db::begin_sqlite_write(pool.inner(), "UPDATE listening_events SET id = id WHERE 0").await?;
+        Ok::<_, ListeningActivityError>((threshold, tx))
+    })
+    .await
+    .map_err(|_| {
+        tracing::warn!(request_id = %crate::error::current_request_id(), "Timed out acquiring the listening event writer");
+        ListeningActivityError::StorageUnavailable
+    })??;
 
     let prev_row = sqlx::query(
         r"
-        SELECT id, track_id, created_at, listened_seconds, duration_seconds, counted, finished, taste_excluded
+        SELECT id, track_id, created_at, listened_seconds, duration_seconds, counted, finished,
+            taste_excluded, track_json
         FROM listening_events
         WHERE user_id = ? AND playback_session_id = ?;
         ",
@@ -344,9 +362,6 @@ pub async fn record_playback_with_scrobbles(
     .bind(&event.playback_session_id)
     .fetch_optional(&mut *tx)
     .await?;
-
-    let elapsed_wall_secs = ((now - started_dt).num_milliseconds() as f64 / 1000.0).max(0.0);
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     if let Some(prev) = prev_row {
         let prev_id: String = prev.try_get("id")?;
@@ -365,7 +380,14 @@ pub async fn record_playback_with_scrobbles(
         let prev_duration: Option<f64> = prev.try_get("duration_seconds")?;
         let prev_counted: i64 = prev.try_get("counted")?;
         let prev_finished: i64 = prev.try_get("finished")?;
-        let prev_excluded: i64 = prev.try_get("taste_excluded").unwrap_or(0);
+        let prev_excluded: i64 = prev.try_get("taste_excluded")?;
+        let previous_track: Option<String> = prev.try_get("track_json")?;
+        // Repair legacy metadata before the scrobble outbox reads the event.
+        // Keep the original snapshot when it can already be decoded.
+        let repaired_track = previous_track.as_deref()
+            .filter(|raw| serde_json::from_str::<PlaybackTrackSnapshot>(raw).is_ok())
+            .is_none()
+            .then_some(track_json.as_str());
 
         let seconds = prev_seconds.max(event.listened_seconds.min(elapsed_wall_secs));
         let duration = event.duration_seconds.or(prev_duration);
@@ -393,7 +415,8 @@ pub async fn record_playback_with_scrobbles(
                 event_type = ?,
                 completion_ratio = ?,
                 updated_at = ?,
-                taste_excluded = ?
+                taste_excluded = ?,
+                track_json = COALESCE(?, track_json)
             WHERE id = ? AND user_id = ?;
             ",
         )
@@ -405,6 +428,7 @@ pub async fn record_playback_with_scrobbles(
         .bind(ratio)
         .bind(&now_iso)
         .bind(i64::from(excluded))
+        .bind(repaired_track)
         .bind(&prev_id)
         .bind(user_id)
         .execute(&mut *tx)
@@ -421,6 +445,7 @@ pub async fn record_playback_with_scrobbles(
                 listened_seconds: seconds,
                 taste_excluded: excluded,
             },
+            duration,
             scrobbles,
         )
         .await;
@@ -452,7 +477,6 @@ pub async fn record_playback_with_scrobbles(
             )
         })
     });
-    let track_json = serde_json::to_string(&event.track).unwrap_or_else(|_| String::from("{}"));
 
     sqlx::query(
         r"
@@ -497,6 +521,7 @@ pub async fn record_playback_with_scrobbles(
             listened_seconds: seconds,
             taste_excluded: excluded,
         },
+        duration,
         scrobbles,
     )
     .await
@@ -506,15 +531,21 @@ async fn commit_playback(
     mut transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: &str,
     outcome: RecordPlaybackOutcome,
+    duration_seconds: Option<f64>,
     scrobbles: Option<&ScrobbleQueueService>,
 ) -> Result<RecordPlaybackOutcome, ListeningActivityError> {
-    if let Some(queue) = scrobbles {
+    // Persist only the local outbox entry with the listen. The worker owns delivery.
+    let enqueued = if let Some(queue) = scrobbles {
         queue
-            .enqueue_recorded_playback(&mut transaction, user_id, &outcome.id)
-            .await?;
-    }
+            .enqueue_recorded_playback(
+                &mut transaction, user_id, &outcome.id, outcome.listened_seconds, duration_seconds,
+            )
+            .await?
+    } else {
+        false
+    };
     transaction.commit().await?;
-    if let Some(queue) = scrobbles {
+    if enqueued && let Some(queue) = scrobbles {
         queue.kick();
     }
     Ok(outcome)
@@ -782,7 +813,7 @@ async fn query_trend_buckets(
 }
 
 fn validate_playback_event(event: &PlaybackEventInput) -> Result<(), ListeningActivityError> {
-    let sid = event.playback_session_id.trim();
+    let sid = &event.playback_session_id;
     if !(8..=100).contains(&sid.len())
         || !sid
             .bytes()

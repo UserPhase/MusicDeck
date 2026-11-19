@@ -4,24 +4,27 @@
 //! - [`RecommendationKind`] (`continue-listening`, `favorites-mix`, `forgotten-favorites`,
 //!   `discover`, `similar-tracks`, `similar-artists`, `radio-track`, `radio-artist`, `radio-album`)
 //! - [`RecommendationService`] & [`RecommendationRegistry`]
-//! - [`playlist_recording_key`] & [`PlaylistRecommendationService`]
+//! - Playlist-seeded library and external suggestions
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
+use tokio::sync::Mutex;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::catalog::{AvailabilityState, Available, CatalogService, normalize_music_text};
+use crate::catalog::snapshot::{CatalogSnapshot, CatalogSnapshots};
 use crate::db::DbPool;
-use crate::playlists::Playlist;
+use crate::playlists::PlaylistTrack;
 use crate::profile::{TasteProfileManager, TasteTarget};
 use crate::providers::Track;
-use crate::recommendations::engine::RecommendationEngine;
+use crate::recommendations::engine::{LocalRecommendation, RecommendationEngine};
 use crate::search::{UnifiedSearchResult, to_track_search_result};
 use crate::services::recently_played::{can_use_provider_history, listening_window_start_iso};
 
@@ -287,6 +290,13 @@ pub trait RecommendationProvider: Send + Sync {
 pub struct RecommendationService {
     db: Option<DbPool>,
     engine: RecommendationEngine,
+    playback_engine: RecommendationEngine,
+    playback_catalog: Arc<Mutex<Option<PlaybackCatalog>>>,
+}
+
+enum PlaybackCatalog {
+    LibraryWindow(Weak<CatalogSnapshot<Track>>),
+    MappedUntil(Instant),
 }
 
 impl std::fmt::Debug for RecommendationService {
@@ -300,7 +310,12 @@ impl RecommendationService {
     #[must_use]
     pub fn new(db: Option<DbPool>) -> Self {
         let engine = RecommendationEngine::new(db.clone());
-        Self { db, engine }
+        Self {
+            playback_engine: RecommendationEngine::new(db.clone()),
+            playback_catalog: Arc::new(Mutex::new(None)),
+            db,
+            engine,
+        }
     }
 
     /// Returns a reference to the underlying [`RecommendationEngine`].
@@ -312,6 +327,7 @@ impl RecommendationService {
     /// Invalidates cached listening taste profiles for `user_id`.
     pub fn invalidate_listening_taste(&self, user_id: &str) {
         self.engine.invalidate(user_id);
+        self.playback_engine.invalidate(user_id);
     }
 
     /// Refreshes the in-memory catalog snapshot from `catalog`.
@@ -340,6 +356,85 @@ impl RecommendationService {
             return Vec::new();
         };
 
+        Self::autoplay_results(selected)
+    }
+
+    /// Ranks already-mapped library tracks for playback without creating catalog identities.
+    pub(crate) async fn playback_autoplay(
+        &self,
+        catalog: &CatalogService,
+        snapshots: &CatalogSnapshots,
+        user_id: &str,
+        seed_id: &str,
+        limit: usize,
+        exclude_ids: &[String],
+        playlist_id: Option<&str>,
+    ) -> Vec<UnifiedSearchResult> {
+        let Some(pool) = &self.db else {
+            return Vec::new();
+        };
+        let taste = TasteProfileManager::new(pool.clone());
+        if taste.state(user_id).await.private_listening {
+            return Vec::new();
+        }
+        {
+            let mut loaded = self.playback_catalog.lock().await;
+            if let Some(snapshot) = snapshots.cached_tracks() {
+                let source = Arc::downgrade(&snapshot);
+                let already_loaded = matches!(
+                    loaded.as_ref(), Some(PlaybackCatalog::LibraryWindow(current)) if current.ptr_eq(&source)
+                );
+                if !already_loaded {
+                    self.playback_engine.replace_catalog(&snapshot.items);
+                    *loaded = Some(PlaybackCatalog::LibraryWindow(source));
+                }
+            } else if !matches!(
+                loaded.as_ref(), Some(PlaybackCatalog::MappedUntil(deadline)) if *deadline > Instant::now()
+            ) {
+                let tracks = catalog.list_mapped_tracks().await;
+                self.playback_engine.replace_catalog(&tracks.items);
+                let ttl = if tracks.items.is_empty() || tracks.degraded {
+                    5
+                } else {
+                    30
+                };
+                *loaded = Some(PlaybackCatalog::MappedUntil(
+                    Instant::now() + Duration::from_secs(ttl),
+                ));
+            }
+        }
+
+        let Some(seed) = self.playback_engine.track_target(seed_id) else {
+            return Vec::new();
+        };
+        let now = Utc::now().to_rfc3339();
+        if taste
+            .assess_exclusion(
+                user_id,
+                seed_id,
+                &now,
+                Some(&now),
+                false,
+                false,
+                playlist_id,
+                seed.title.as_deref(),
+                seed.artist.as_deref(),
+            )
+            .await
+            .excluded
+        {
+            return Vec::new();
+        }
+
+        let selected = self
+            .playback_engine
+            .select(user_id, seed_id, limit, exclude_ids, &[], 0.0)
+            .await
+            .unwrap_or_default();
+        Self::autoplay_results(selected)
+    }
+
+    fn autoplay_results(selected: Vec<LocalRecommendation>) -> Vec<UnifiedSearchResult> {
         selected
             .into_iter()
             .map(|rec| {
@@ -1011,8 +1106,7 @@ impl RecommendationService {
     }
 }
 
-/// Computes the normalized `<artist>:<title>` key used by [`PlaylistRecommendationService`]
-/// to prevent suggesting remastered duplicates of tracks already inside a playlist.
+/// Computes a normalized recording key for playlist suggestions.
 #[must_use]
 pub fn playlist_recording_key(title: &str, artist: &str) -> String {
     let norm_artist = normalize_music_text(Some(artist));
@@ -1020,148 +1114,318 @@ pub fn playlist_recording_key(title: &str, artist: &str) -> String {
     format!("{norm_artist}:{norm_title}")
 }
 
-/// Suggests up to 30 local library tracks that complement an existing [`Playlist`].
-pub async fn recommend_for_playlist(
+fn playlist_track_text<'a>(item: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        item.get(name)?
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
+}
+
+fn playlist_track_isrc(item: &Value) -> Option<String> {
+    item.pointer("/identityHints/isrc")
+        .or_else(|| item.pointer("/metadata/isrc"))
+        .and_then(Value::as_str)
+        .filter(|isrc| !isrc.is_empty())
+        .map(str::to_ascii_uppercase)
+}
+
+fn credited_artist_names(artist: &str) -> impl Iterator<Item = &str> {
+    artist
+        .split([';', '\u{0007}'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+#[derive(Default)]
+pub(crate) struct PlaylistRecommendationSeeds {
+    ids: HashSet<String>,
+    recordings: HashSet<String>,
+    isrcs: HashSet<String>,
+    artists: HashMap<String, (String, usize)>,
+    genres: HashSet<String>,
+    moods: HashSet<String>,
+}
+
+impl PlaylistRecommendationSeeds {
+    pub(crate) fn new(tracks: &[PlaylistTrack]) -> Self {
+        let mut seeds = Self::default();
+        for item in tracks {
+            let track = &item.track;
+            if let Some(id) = playlist_track_text(track, &["id"]) {
+                seeds.ids.insert(id.to_owned());
+            }
+            let artist = playlist_track_text(track, &["artistName", "artist"]);
+            if let (Some(title), Some(artist)) = (playlist_track_text(track, &["title"]), artist) {
+                seeds
+                    .recordings
+                    .insert(playlist_recording_key(title, artist));
+            }
+            if let Some(isrc) = playlist_track_isrc(track) {
+                seeds.isrcs.insert(isrc);
+            }
+            let credits = track
+                .get("artistCredits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|credit| playlist_track_text(credit, &["name"]));
+            let mut counted = HashSet::new();
+            for name in credits.chain(artist.into_iter().flat_map(credited_artist_names)) {
+                let normalized = normalize_music_text(Some(name));
+                if matches!(
+                    normalized.as_str(),
+                    "" | "unknown" | "unknown artist" | "various artists"
+                ) || !counted.insert(normalized.clone())
+                {
+                    continue;
+                }
+                seeds
+                    .artists
+                    .entry(normalized)
+                    .or_insert_with(|| (name.to_owned(), 0))
+                    .1 += 1;
+            }
+            for (tag_set, field) in [(&mut seeds.genres, "genres"), (&mut seeds.moods, "moods")] {
+                let tags = track
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .or_else(|| track.get("metadata")?.get(field)?.as_array());
+                tag_set.extend(
+                    tags.into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(|tag| normalize_music_text(Some(tag)))
+                        .filter(|tag| !tag.is_empty()),
+                );
+            }
+        }
+        seeds
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.artists.is_empty() && self.genres.is_empty() && self.moods.is_empty()
+    }
+
+    pub(crate) fn external_artist_names(&self) -> Vec<&str> {
+        let mut artists: Vec<_> = self.artists.values().collect();
+        artists.sort_by(|(a, count_a), (b, count_b)| count_b.cmp(count_a).then_with(|| a.cmp(b)));
+        artists
+            .into_iter()
+            .take(3)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    fn excludes(&self, id: &str, recording: &str, isrc: Option<&str>) -> bool {
+        self.ids.contains(id)
+            || self.recordings.contains(recording)
+            || isrc.is_some_and(|code| self.isrcs.contains(code))
+    }
+}
+
+pub(crate) async fn recommend_for_playlist(
     db: &DbPool,
-    catalog: &CatalogService,
     user_id: &str,
-    playlist: &Playlist,
-) -> (Vec<Value>, Option<String>) {
-    let Some(ref seeds) = playlist.tracks else {
-        return (Vec::new(), None);
-    };
-    if seeds.is_empty() {
-        return (Vec::new(), None);
-    }
-
-    let inventory = catalog.list_tracks().await;
-    let manager = TasteProfileManager::new(db.clone());
-    let filter = manager.feedback_filter(user_id, &[]).await;
-
-    let excluded_ids: HashSet<&str> = seeds.iter().map(|t| t.id.as_str()).collect();
-    let excluded_keys: HashSet<String> = seeds
-        .iter()
-        .map(|t| playlist_recording_key(&t.title, &t.artist_name))
-        .collect();
-
-    let mut artist_counts: HashSet<String> = HashSet::new();
-    let mut seed_genres: HashSet<String> = HashSet::new();
-    let mut seed_moods: HashSet<String> = HashSet::new();
-
-    for seed in seeds {
-        let norm_artist = normalize_music_text(Some(&seed.artist_name));
-        if !norm_artist.is_empty()
-            && !matches!(
-                norm_artist.as_str(),
-                "unknown" | "unknown artist" | "various artists"
-            )
-        {
-            artist_counts.insert(norm_artist);
-        }
-        for g in seed.genres.as_deref().unwrap_or(&[]) {
-            let ng = normalize_music_text(Some(g));
-            if !ng.is_empty() {
-                seed_genres.insert(ng);
-            }
-        }
-        for m in seed.moods.as_deref().unwrap_or(&[]) {
-            let nm = normalize_music_text(Some(m));
-            if !nm.is_empty() {
-                seed_moods.insert(nm);
-            }
-        }
-    }
-
-    let mut candidates: Vec<(Available<Track>, i32, String)> = Vec::new();
-    for avail in inventory.items {
+    seeds: &PlaylistRecommendationSeeds,
+    inventory: &[Available<Track>],
+    limit: usize,
+) -> Vec<Value> {
+    let filter = TasteProfileManager::new(db.clone())
+        .feedback_filter(user_id, &[])
+        .await;
+    let mut candidates = Vec::new();
+    for avail in inventory {
         if !avail.availability.library_available
             || avail.availability.state == AvailabilityState::Unavailable
         {
             continue;
         }
         let track = &avail.item;
-        if excluded_ids.contains(track.id.as_str())
-            || excluded_keys.contains(&playlist_recording_key(&track.title, &track.artist_name))
+        let recording = playlist_recording_key(&track.title, &track.artist_name);
+        let isrc = track
+            .identity_hints
+            .as_ref()
+            .and_then(|hints| hints.isrc.as_deref())
+            .map(str::to_ascii_uppercase);
+        if seeds.excludes(&track.id, &recording, isrc.as_deref())
             || !filter.allows(&TasteTarget::from_track(track))
         {
             continue;
         }
 
-        let same_artist = artist_counts.contains(&normalize_music_text(Some(&track.artist_name)));
+        let artist = normalize_music_text(Some(&track.artist_name));
+        let same_artist = track
+            .artist_credits
+            .iter()
+            .flatten()
+            .map(|credit| credit.name.as_str())
+            .chain(credited_artist_names(&track.artist_name))
+            .find_map(|name| seeds.artists.get(&normalize_music_text(Some(name))));
         let shared_genre = track
             .genres
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter(|g| seed_genres.contains(&normalize_music_text(Some(g))))
+            .filter(|g| seeds.genres.contains(&normalize_music_text(Some(g))))
             .count();
         let shared_mood = track
             .moods
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter(|m| seed_moods.contains(&normalize_music_text(Some(m))))
+            .filter(|m| seeds.moods.contains(&normalize_music_text(Some(m))))
             .count();
 
-        if !same_artist && shared_genre == 0 && shared_mood == 0 {
+        if same_artist.is_none() && shared_genre == 0 && shared_mood == 0 {
             continue;
         }
 
-        let score = (i32::from(same_artist) * 4)
+        let score = (i32::from(same_artist.is_some()) * 4)
             + (shared_genre.min(3) as i32 * 3)
             + (shared_mood.min(2) as i32 * 2);
-        let reason = if same_artist {
-            format!("{} is in this playlist", track.artist_name)
+        let reason = if let Some((name, _)) = same_artist {
+            format!("{name} is in this playlist")
         } else {
             String::from("Shares genres or moods with this playlist")
         };
-        candidates.push((avail, score, reason));
-    }
-
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.item.id.cmp(&b.0.item.id)));
-
-    let mut selected = Vec::new();
-    let mut seen_keys = HashSet::new();
-    let mut per_artist: HashMap<String, usize> = HashMap::new();
-
-    for cap in [2_usize, usize::MAX] {
-        for (avail, _, reason) in &candidates {
-            let rec_key = playlist_recording_key(&avail.item.title, &avail.item.artist_name);
-            if seen_keys.contains(&rec_key) {
-                continue;
-            }
-            let artist_norm = normalize_music_text(Some(&avail.item.artist_name));
-            let count = per_artist.get(&artist_norm).copied().unwrap_or(0);
-            if count >= cap {
-                continue;
-            }
-            seen_keys.insert(rec_key);
-            per_artist.insert(artist_norm, count + 1);
-            let mut val = serde_json::to_value(avail).unwrap_or(Value::Null);
-            if let Value::Object(ref mut map) = val {
-                map.insert(
-                    String::from("recommendationReason"),
-                    Value::String(reason.clone()),
-                );
-            }
-            selected.push(val);
-            if selected.len() >= 30 {
-                return (
-                    selected,
-                    inventory
-                        .degraded
-                        .then(|| String::from("Some library sources are unavailable.")),
-                );
-            }
+        if let Ok(Value::Object(mut item)) = serde_json::to_value(avail) {
+            item.insert("recommendationReason".into(), Value::String(reason));
+            candidates.push(PlaylistSuggestion {
+                item: Value::Object(item),
+                recording,
+                isrc,
+                artist,
+                score,
+            });
         }
     }
 
-    (
-        selected,
-        inventory
-            .degraded
-            .then(|| String::from("Some library sources are unavailable.")),
-    )
+    pick_playlist_suggestions(candidates, limit)
+}
+
+pub(crate) async fn recommend_external_for_playlist<'a>(
+    db: &DbPool,
+    user_id: &str,
+    seeds: &PlaylistRecommendationSeeds,
+    inventory: &[Available<Track>],
+    items: impl IntoIterator<Item = (Value, Option<&'a str>)>,
+    limit: usize,
+) -> Vec<Value> {
+    let owned: HashSet<_> = inventory
+        .iter()
+        .map(|track| playlist_recording_key(&track.item.title, &track.item.artist_name))
+        .collect();
+    let owned_isrcs: HashSet<_> = inventory
+        .iter()
+        .filter_map(|track| {
+            track
+                .item
+                .identity_hints
+                .as_ref()?
+                .isrc
+                .as_deref()
+                .map(str::to_ascii_uppercase)
+        })
+        .collect();
+    let targets: Vec<_> = inventory
+        .iter()
+        .map(|track| TasteTarget::from_track(&track.item))
+        .collect();
+    let filter = TasteProfileManager::new(db.clone())
+        .feedback_filter(user_id, &targets)
+        .await;
+    let mut candidates = Vec::new();
+    for (mut item, related_to) in items {
+        let (Some(id), Some(title), Some(artist_name)) = (
+            playlist_track_text(&item, &["id"]),
+            playlist_track_text(&item, &["title"]),
+            playlist_track_text(&item, &["artistName", "artist"]),
+        ) else {
+            continue;
+        };
+        let artist = normalize_music_text(Some(artist_name));
+        let (reason, score) = if seeds.artists.contains_key(&artist) {
+            (format!("{artist_name} is in this playlist"), 2)
+        } else if let Some(seed_artist) = related_to {
+            (format!("Related to {seed_artist}"), 1)
+        } else {
+            continue;
+        };
+        let recording = playlist_recording_key(title, artist_name);
+        let isrc = playlist_track_isrc(&item);
+        if seeds.excludes(id, &recording, isrc.as_deref())
+            || owned.contains(&recording)
+            || isrc.as_ref().is_some_and(|code| owned_isrcs.contains(code))
+        {
+            continue;
+        }
+        let target = TasteTarget {
+            id: id.to_owned(),
+            item_type: Some("track".into()),
+            title: Some(title.to_owned()),
+            artist: Some(artist_name.to_owned()),
+            album: playlist_track_text(&item, &["albumName", "album"]).map(str::to_owned),
+            artist_id: playlist_track_text(&item, &["artistId"]).map(str::to_owned),
+            album_id: playlist_track_text(&item, &["albumId"]).map(str::to_owned),
+        };
+        if !filter.allows(&target) {
+            continue;
+        }
+        if let Some(fields) = item.as_object_mut() {
+            fields.insert("recommendationReason".into(), Value::String(reason));
+            candidates.push(PlaylistSuggestion {
+                item,
+                recording,
+                isrc,
+                artist,
+                score,
+            });
+        }
+    }
+    pick_playlist_suggestions(candidates, limit)
+}
+
+struct PlaylistSuggestion {
+    item: Value,
+    recording: String,
+    isrc: Option<String>,
+    artist: String,
+    score: i32,
+}
+
+fn pick_playlist_suggestions(mut candidates: Vec<PlaylistSuggestion>, limit: usize) -> Vec<Value> {
+    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+    let mut selected = Vec::new();
+    let mut seen_keys = HashSet::new();
+    let mut seen_isrcs = HashSet::new();
+    let mut per_artist: HashMap<String, usize> = HashMap::new();
+
+    for cap in [1_usize, 2, usize::MAX] {
+        for candidate in &candidates {
+            let count = per_artist.entry(candidate.artist.clone()).or_default();
+            if *count >= cap
+                || seen_keys.contains(&candidate.recording)
+                || candidate
+                    .isrc
+                    .as_ref()
+                    .is_some_and(|code| seen_isrcs.contains(code))
+            {
+                continue;
+            }
+            *count += 1;
+            seen_keys.insert(candidate.recording.clone());
+            if let Some(code) = &candidate.isrc {
+                seen_isrcs.insert(code.clone());
+            }
+            selected.push(candidate.item.clone());
+            if selected.len() >= limit {
+                return selected;
+            }
+        }
+    }
+    selected
 }
 
 /// Provider-neutral recommendation registry wrapping [`RecommendationService`].

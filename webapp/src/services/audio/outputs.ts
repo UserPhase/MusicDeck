@@ -1,4 +1,4 @@
-import type { CrossfadeCurve, PlayableTrack, TrackAudioSettings } from "./types";
+import type { CrossfadeCurve, PlayableTrack, SilenceTrim, TrackAudioSettings } from "./types";
 import { EqualizerEngine } from "./EqualizerEngine";
 
 const CROSSFADE_SEGMENTS = 63;
@@ -78,6 +78,20 @@ export function trimWindow(settings: TrackAudioSettings, base: TrimWindow = FULL
   return { start, end };
 }
 
+function withSilenceTrim(base: TrimWindow, silence: SilenceTrim | null, duration: number, keepTail = false): TrimWindow {
+  if (!silence || !Number.isFinite(duration) || duration <= 0) return base;
+  const { leading, trailing, analyzedDuration } = silence;
+  if (!Number.isFinite(leading) || !Number.isFinite(trailing) || leading < 0 || trailing < 0 ||
+      duration - leading - trailing < Math.max(1, duration * 0.1) ||
+      (analyzedDuration !== undefined && (!Number.isFinite(analyzedDuration) || Math.abs(analyzedDuration - duration) > 0.5))) return base;
+
+  // Leave a short margin inside detected silence at both boundaries.
+  const padding = 0.1;
+  const start = Math.max(base.start, leading - padding);
+  const end = !keepTail && trailing > padding ? Math.min(base.end ?? duration, duration - trailing + padding) : base.end;
+  return start < (end ?? duration) ? { start, end } : base;
+}
+
 export function curveValue(
   from: number,
   to: number,
@@ -105,6 +119,24 @@ export function createDefaultAudioContext(): AudioContext | null {
   }
 }
 
+export async function resumeAudioContext(context: AudioContext): Promise<void> {
+  if (context.state === "running" || context.state === "closed") return;
+  try {
+    await context.resume();
+  } catch {
+    // HTML media can keep playing while Web Audio awaits browser permission.
+  }
+}
+
+export async function closeOwnedAudioContext(context: AudioContext): Promise<void> {
+  if (context.state === "closed") return;
+  try {
+    await context.close();
+  } catch {
+    // Some browsers already closed the context while the page was shutting down.
+  }
+}
+
 export class AudioGraph {
   readonly master: GainNode;
   readonly equalizer: EqualizerEngine | null;
@@ -126,13 +158,6 @@ export class AudioGraph {
 
   get now(): number {
     return this.ctx.currentTime;
-  }
-
-  /** Must be reached from a user gesture at least once to satisfy autoplay policies. */
-  resume(): void {
-    if (this.ctx.state === "suspended") {
-      this.ctx.resume().catch(() => undefined);
-    }
   }
 
   setVolume(volume: number): void {
@@ -163,9 +188,7 @@ export class AudioGraph {
     this.master.disconnect();
     this.equalizer?.dispose();
     this.sleep.disconnect();
-    if (this.ownsContext && this.ctx.state !== "closed") {
-      this.ctx.close().catch(() => undefined);
-    }
+    if (this.ownsContext) void closeOwnedAudioContext(this.ctx);
   }
 }
 
@@ -409,13 +432,16 @@ export class MediaDeck implements PlaybackOutput {
   private hint: number | null = null;
   private sourceNode: MediaElementAudioSourceNode | null = null;
   private window: TrimWindow = FULL_TRACK;
+  private silence: SilenceTrim | null = null;
+  private preserveTailAt = 0;
   private seekedSinceLoad = false;
   private readonly onMetadata = () => this.skipLeadingSilence();
 
   constructor(
     readonly element: HTMLAudioElement,
     graph: AudioGraph | null,
-    masterVolume: () => number
+    masterVolume: () => number,
+    private readonly onSilenceSkipped?: (deck: MediaDeck) => void,
   ) {
     element.preload = "auto";
     this.gainControl = new ElementVolumeGain(element, masterVolume);
@@ -483,6 +509,8 @@ export class MediaDeck implements PlaybackOutput {
       ? track.durationHint
       : null;
     this.window = trimWindow(track);
+    this.silence = track.silenceTrim ?? null;
+    this.preserveTailAt = 0;
     this.seekedSinceLoad = false;
     this.gain.reset();
     this.gain.setLevel(trackLevel(track.gain));
@@ -505,13 +533,17 @@ export class MediaDeck implements PlaybackOutput {
   }
 
   trim(): TrimWindow {
-    return this.window;
+    return withSilenceTrim(this.window, this.silence, this.element.duration, this.seeksPastSilenceTrim(this.preserveTailAt));
   }
 
   configure(settings: TrackAudioSettings): void {
     if (!this.trackKey) return;
     if (settings.gain !== undefined) this.gain.setLevel(trackLevel(settings.gain), true);
     this.window = trimWindow(settings, this.window);
+    if (settings.silenceTrim !== undefined) {
+      this.silence = settings.silenceTrim;
+      if (this.seeksPastSilenceTrim(this.position())) this.preserveTailAt = this.position();
+    }
     if (this.element.readyState >= HAVE_METADATA) this.skipLeadingSilence();
   }
 
@@ -561,11 +593,11 @@ export class MediaDeck implements PlaybackOutput {
   }
 
   seek(seconds: number): void {
-    this.seekedSinceLoad = true;
     const duration = this.duration();
     const target = Number.isFinite(duration)
       ? clamp(seconds, 0, Math.max(0, duration - 0.05))
       : Math.max(0, seconds);
+    this.rememberSeek(target);
     try {
       this.element.currentTime = target;
     } catch {
@@ -573,11 +605,18 @@ export class MediaDeck implements PlaybackOutput {
     }
   }
 
+  rememberSeek(position: number): void {
+    this.seekedSinceLoad = true;
+    this.preserveTailAt = position;
+  }
+
   release(): void {
     this.trackKey = null;
     this.source = null;
     this.hint = null;
     this.window = FULL_TRACK;
+    this.silence = null;
+    this.preserveTailAt = 0;
     this.seekedSinceLoad = false;
     this.element.pause();
     this.gain.reset();
@@ -597,18 +636,25 @@ export class MediaDeck implements PlaybackOutput {
     this.gain.dispose();
     this.sourceNode?.disconnect();
     this.sourceNode = null;
+    this.element.remove?.();
   }
 
   /** Starts after leading silence unless something already chose a position. */
   private skipLeadingSilence(): void {
     if (!this.trackKey || this.seekedSinceLoad) return;
-    const start = this.window.start;
+    const start = this.trim().start;
     if (start <= 0 || this.position() >= start) return;
     try {
       this.element.currentTime = start;
+      if (start > this.window.start) this.onSilenceSkipped?.(this);
     } catch {
       // Unseekable live transcodes play their leading silence.
     }
+  }
+
+  private seeksPastSilenceTrim(position: number): boolean {
+    const end = withSilenceTrim(this.window, this.silence, this.element.duration).end;
+    return end !== null && end !== this.window.end && position >= end;
   }
 }
 
@@ -622,6 +668,8 @@ export class BufferVoice implements PlaybackOutput {
   private node: AudioBufferSourceNode | null = null;
   private buffer: AudioBuffer | null;
   private window: TrimWindow;
+  private silence: SilenceTrim | null;
+  private keepTail = false;
   private startContextTime = 0;
   private offset: number;
   private running = false;
@@ -632,6 +680,7 @@ export class BufferVoice implements PlaybackOutput {
     this.src = track.src;
     this.buffer = buffer;
     this.window = trimWindow(track);
+    this.silence = track.silenceTrim ?? null;
     this.offset = this.startPoint();
     this.gain = new WebAudioGain(graph.ctx, graph.master);
     this.gain.setLevel(trackLevel(track.gain));
@@ -648,7 +697,7 @@ export class BufferVoice implements PlaybackOutput {
 
   /** Where playback begins by default: after any leading silence. */
   startPoint(): number {
-    return clamp(this.window.start, 0, this.endPoint());
+    return clamp(this.trim().start, 0, this.endPoint());
   }
 
   start(when: number, offset = this.startPoint()): void {
@@ -688,16 +737,20 @@ export class BufferVoice implements PlaybackOutput {
   }
 
   trim(): TrimWindow {
-    return this.window;
+    return withSilenceTrim(this.window, this.silence, this.duration(), this.keepTail);
   }
 
   configure(settings: TrackAudioSettings): void {
     if (!this.buffer) return;
     if (settings.gain !== undefined) this.gain.setLevel(trackLevel(settings.gain), true);
     const previousEnd = this.endPoint();
-    this.window = trimWindow(settings, this.window);
-    if (!this.running || this.endPoint() === previousEnd) return;
     const position = this.position();
+    this.window = trimWindow(settings, this.window);
+    if (settings.silenceTrim !== undefined) {
+      this.silence = settings.silenceTrim;
+      this.keepTail ||= this.seeksPastSilenceTrim(position);
+    }
+    if (!this.running || this.endPoint() === previousEnd) return;
     // Restart from the same sample so the new end is scheduled on the context clock.
     this.start(this.graph.now, position);
   }
@@ -727,6 +780,7 @@ export class BufferVoice implements PlaybackOutput {
 
   seek(seconds: number): void {
     const wasRunning = this.running;
+    this.keepTail = this.seeksPastSilenceTrim(seconds);
     const target = clamp(seconds, 0, this.endPoint());
     this.running = false;
     this.stopNode();
@@ -744,8 +798,13 @@ export class BufferVoice implements PlaybackOutput {
 
   private endPoint(): number {
     const duration = this.buffer?.duration ?? 0;
-    const end = this.window.end;
+    const end = this.trim().end;
     return end !== null && end < duration ? end : duration;
+  }
+
+  private seeksPastSilenceTrim(position: number): boolean {
+    const end = withSilenceTrim(this.window, this.silence, this.duration()).end;
+    return end !== null && end !== this.window.end && position >= end;
   }
 
   private stopNode(): void {

@@ -8,6 +8,7 @@ export type RemoteCommand =
   | { type: "SEEK"; position_ms: number }
   | { type: "SET_VOLUME"; volume: number }
   | { type: "TOGGLE_SHUFFLE" | "TOGGLE_REPEAT" }
+  | { type: "SET_PLAYLIST_LOOP"; playlist_id: string; enabled: boolean }
   | { type: "PLAY_QUEUE_ENTRY"; entry_id: string }
   | { type: "MOVE_QUEUE_ENTRY"; entry_id: string; target_id: string }
   | { type: "PLAY_SELECTION"; tracks: PersistedQueueTrack[]; start_index: number; from_here: boolean; context: QueueCheckpoint["context"] }
@@ -35,10 +36,11 @@ export interface PlaybackState {
 export interface RemotePlaybackSnapshot {
   queueState: {
     entries: { occurrenceId: string; trackId: string; title: string; artist: string; album: string; duration: number;
-      albumPlaybackId?: string; albumTrackIndex?: number; resume?: MediaResumeContext }[];
-    index: number; repeatOne: boolean; shuffle: boolean; shuffleMode: "standard" | "smart"; shuffleSeed: number | null;
+      albumPlaybackId?: string; albumTrackIndex?: number; resume?: MediaResumeContext; unshuffledIndex?: number }[];
+    index: number; repeatOne: boolean; repeatAll?: boolean; shuffle: boolean; shuffleMode: "standard" | "smart"; shuffleSeed: number | null;
+    loopPlaylistId?: string;
     albumAware: boolean;
-    context: { type: string; id: string; name: string; coverArt: string | null } | null;
+    context: QueueCheckpoint["context"];
   };
   trackId: string; exactPositionMs: number; playing: boolean; volume: number;
 }

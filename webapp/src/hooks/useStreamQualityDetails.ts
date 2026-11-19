@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { startVisualPolling } from "../services/visualActivity";
 import { inspectAudioStream } from "../api/musicdeck";
+import { parsePlaybackUrl } from "../utils/streamRecovery";
+import { playbackFeatureEnabled } from "../services/playbackFeatures";
 import type { PlaybackEngine } from "../services/audio/PlaybackEngine";
 
 const INSPECTION_INTERVAL_MS = 2000;
@@ -23,18 +25,18 @@ export interface StreamQualityDetails {
   preview: boolean;
 }
 export function useStreamQualityDetails({
-  engine, trackId, streamUrl, userId, preview, serverNormalized,
+  engine, trackId, streamUrl, userId, preview, serverNormalized, enabled = playbackFeatureEnabled("streamInspection"),
 }: {
   engine: PlaybackEngine | null; trackId: string | null; streamUrl: string | null;
-  userId: string | null; preview: boolean; serverNormalized: boolean;
+  userId: string | null; preview: boolean; serverNormalized: boolean; enabled?: boolean;
 }): StreamQualityDetails {
   const [state, setState] = useState<{ key: string; source: StreamQualityDetails["source"]; output: StreamQualityDetails["output"];
     delivery: StreamQualityDetails["delivery"]; sourceError?: string | null; loading: boolean; error: string; pipeline: StreamQualityDetails["pipeline"] }>({
     key: "", source: null, output: null, delivery: null, loading: false, error: "", pipeline: null,
   });
-  const key = JSON.stringify([userId, trackId, streamUrl]);
-  let inspectionId: string | null = null;
-  if (streamUrl?.startsWith("/api/tracks/")) inspectionId = new URL(streamUrl, window.location.origin).searchParams.get("inspectionId");
+  const url = enabled && !preview && !serverNormalized ? parsePlaybackUrl(streamUrl) as URL | null : null;
+  const inspectionId = url?.searchParams.get("inspect") === "false" ? null : url?.searchParams.get("inspectionId") ?? null;
+  const key = JSON.stringify([userId, trackId, streamUrl, inspectionId]);
   useEffect(() => {
     const pipeline = engine?.getAudioDiagnostics() ?? null;
     setState({ key, source: null, output: null, delivery: null, loading: Boolean(inspectionId && trackId && userId), error: "", pipeline });
@@ -57,7 +59,8 @@ export function useStreamQualityDetails({
         if (!cancelled) {
           retryDelay = INSPECTION_INTERVAL_MS;
           retryAt = 0;
-          setState({ key, ...data, loading: false, error: "", pipeline });
+          setState({ key, source: data?.source ?? null, output: data?.output ?? null,
+            delivery: data?.delivery ?? null, sourceError: data?.sourceError, loading: false, error: "", pipeline });
         }
       } catch (error) {
         if (!cancelled) {
@@ -82,5 +85,6 @@ export function useStreamQualityDetails({
     pipeline: inspectionId ? current.pipeline : engine?.getAudioDiagnostics() ?? null,
     note: preview ? "Provider preview: full-file source and output properties cannot be verified."
       : serverNormalized ? "Server-normalized asset: the library stream observer does not inspect this separate processed file."
+        : !enabled ? "Server stream inspection is disabled."
         : !inspectionId ? "No observable library stream is active." : "Delivery rate measures server-to-MusicDeck transfer speed, not encoded audio bitrate. Unknown properties are not inferred from settings." };
 }
