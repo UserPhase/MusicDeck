@@ -174,7 +174,8 @@ test("every preset falls back to the unified mobile shell below 768px", () => {
   const nav = screen.getByRole("navigation", { name: "Mobile navigation" });
   expect(nav).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Discover" })).toHaveAttribute("aria-current", "page");
-  expect(screen.getByRole("button", { name: "Open menu" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Search" })).toHaveAttribute("href", "/search");
+  expect(screen.queryByRole("button", { name: "Open menu" })).not.toBeInTheDocument();
 });
 
 test("auto-opens Now Playing on a new track only in docked-panel shells", () => {

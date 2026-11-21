@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 export default function PlaylistSearchBox({ label, placeholder = label, closeLabel = "Close playlist search", value, onChange }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => Boolean(value));
   const field = useRef(null);
   const trigger = useRef(null);
   const input = useRef(null);

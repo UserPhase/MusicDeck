@@ -256,12 +256,35 @@ test("opens the imported playlist when the background job completes", async () =
   fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123?si=link" } });
+  expect(screen.getByLabelText("Download timeout")).toHaveValue("auto");
+  expect(screen.getByLabelText("Download timeout")).toHaveAccessibleDescription(/no fixed time limit/i);
+  expect(screen.queryByLabelText(/maximum download time/i)).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
 
-  await waitFor(() => expect(startSpotifyPlaylistImport).toHaveBeenCalledWith("https://open.spotify.com/playlist/abc123?si=link"));
+  await waitFor(() => expect(startSpotifyPlaylistImport).toHaveBeenCalledWith("https://open.spotify.com/playlist/abc123?si=link", { mode: "auto" }));
   await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_imported"));
   expect(screen.getByText("Successfully imported 'Road Trip'!")).toHaveAttribute("role", "status");
   expect(getSpotifyPlaylistImport).not.toHaveBeenCalled();
+});
+
+test("validates and submits a manual Spotify import timeout", async () => {
+  startSpotifyPlaylistImport.mockResolvedValue({ id: "job-manual", status: "queued" });
+  renderSidebar([]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
+  fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
+  fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
+  fireEvent.change(screen.getByLabelText("Download timeout"), { target: { value: "manual" } });
+  const minutes = screen.getByLabelText(/maximum download time/i);
+  fireEvent.change(minutes, { target: { value: "121" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  expect(screen.getByRole("alert")).toHaveTextContent("between 1 and 120 minutes");
+  expect(startSpotifyPlaylistImport).not.toHaveBeenCalled();
+
+  fireEvent.change(minutes, { target: { value: "90" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  await waitFor(() => expect(startSpotifyPlaylistImport).toHaveBeenCalledWith(
+    "https://open.spotify.com/playlist/abc123", { mode: "manual", minutes: 90 },
+  ));
 });
 
 test("warns about missing songs while opening a partially imported playlist", async () => {

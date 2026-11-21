@@ -3,7 +3,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { HTMLAttributes } from "react";
+import type { HTMLAttributes, Ref } from "react";
 import type { Song } from "../context/PlayerContext";
 import QueueManager from "./queues/QueueManager";
 import { useVirtualWindow } from "../hooks/useVirtualWindow";
@@ -75,7 +75,9 @@ function CompactTrackRow({ song, index, variant = "queue", reorder, showHandle }
 }
 
 
-function QueueSidebar({ isOpen, onClose }: { isOpen: boolean; onClose(): void }) {
+function QueueSidebar({ isOpen, onClose, closeButtonRef }: {
+  isOpen: boolean; onClose(): void; closeButtonRef?: Ref<HTMLButtonElement>;
+}) {
   const [activeTab, setActiveTab] = useState("queue");
   const [showFullQueue, setShowFullQueue] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -127,6 +129,7 @@ function QueueSidebar({ isOpen, onClose }: { isOpen: boolean; onClose(): void })
         <button
           className="queue-sidebar-close"
           type="button"
+          ref={closeButtonRef}
           onClick={onClose}
           aria-label="Close queue sidebar"
         >

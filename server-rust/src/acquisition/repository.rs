@@ -18,12 +18,13 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Executor, Row, Sqlite};
-use tokio::{fs, sync::mpsc};
+use tokio::{fs, sync::mpsc, time::Instant};
 
 use super::playlist_files::{
     AcquisitionLibrary, cleanup_staging, navidrome_path, publish_staged_track,
     read_playlist_artifact, staged_playlist_path, staging_path,
 };
+use super::playlist_timeout::{PlaylistDeadline, PlaylistImportTimeout, PlaylistProgress};
 use crate::acquisition::spotdl::{
     AcquisitionProgress, SpotDLDownloadError, SpotDLDownloaderAdapter, TrackImportRequest,
     canonical_spotify_url, scan_downloaded_audio_files,
@@ -150,6 +151,17 @@ pub struct StoredImportJob {
     pub unreadable_manifest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) playlist_intent: Option<PlaylistCreationIntent>,
+    #[serde(default)]
+    pub(super) timeout: PlaylistImportTimeout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) download_sample: Option<PlaylistDownloadSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PlaylistDownloadSample {
+    elapsed_ms: u64,
+    downloaded_tracks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -372,6 +384,8 @@ impl SqliteImportJobRepository {
             },
             unreadable_manifest: Some(manifest_json),
             playlist_intent: None,
+            timeout: PlaylistImportTimeout::Auto,
+            download_sample: None,
         };
         if let Err(error) = self.save(&fallback).await {
             tracing::warn!(job_id = %fallback.job.id, %error, "Could not quarantine an invalid playlist import checkpoint");
@@ -395,6 +409,26 @@ impl SqliteImportJobRepository {
         let r_uid: String = row.try_get("user_id").ok()?;
         let m_json: String = row.try_get("manifest_json").ok()?;
         Some(self.decode_row(r_id, r_uid, m_json).await)
+    }
+
+    async fn historical_download_rate(&self, user_id: &str) -> Result<Option<u64>, sqlx::Error> {
+        let samples: Vec<String> = sqlx::query_scalar(
+            "SELECT json_extract(manifest_json, '$.downloadSample') FROM import_jobs
+             WHERE user_id=? AND json_type(CASE WHEN json_valid(manifest_json) THEN manifest_json END,
+                 '$.downloadSample')='object'
+             ORDER BY updated_at DESC, id DESC LIMIT 7",
+        )
+        .bind(user_id)
+        .fetch_all(self.db.inner())
+        .await?;
+        let mut rates: Vec<_> = samples
+            .iter()
+            .filter_map(|sample| serde_json::from_str::<PlaylistDownloadSample>(sample).ok())
+            .filter(|sample| sample.downloaded_tracks >= 5 && sample.elapsed_ms > 0)
+            .map(|sample| sample.elapsed_ms / sample.downloaded_tracks)
+            .collect();
+        rates.sort_unstable();
+        Ok(rates.get(rates.len() / 2).copied())
     }
 
     /// Retrieves a stored import job by `id` alone (used by background workers).
@@ -516,6 +550,18 @@ impl SpotifyPlaylistImportService {
         user: &UserRecord,
         tasks: Option<&TaskManager>,
     ) -> Result<ImportJob, String> {
+        self.start_with_timeout(playlist_url, PlaylistImportTimeout::Auto, user, tasks)
+            .await
+    }
+
+    /// Starts a Spotify playlist import with the timeout selected for this job.
+    pub async fn start_with_timeout(
+        &self,
+        playlist_url: &str,
+        timeout: PlaylistImportTimeout,
+        user: &UserRecord,
+        tasks: Option<&TaskManager>,
+    ) -> Result<ImportJob, String> {
         if user.disabled {
             return Err(String::from("Import owner is disabled"));
         }
@@ -527,6 +573,7 @@ impl SpotifyPlaylistImportService {
                 "Please enter a valid open.spotify.com/playlist URL",
             ));
         };
+        timeout.validate()?;
 
         if let (Some(pool), Some(manager)) = (&self.db, tasks) {
             let mut tx = crate::db::begin_sqlite_write(
@@ -603,6 +650,8 @@ impl SpotifyPlaylistImportService {
             }),
             unreadable_manifest: None,
             playlist_intent: None,
+            timeout,
+            download_sample: None,
         };
         if let Some(pool) = &self.db {
             let mut tx = pool.inner().begin().await.map_err(|err| err.to_string())?;
@@ -941,7 +990,19 @@ impl SpotifyPlaylistImportService {
         if record.job.manifest.is_some() {
             download_checkpointed_tracks(record, context, downloader, staging_dir).await?;
         } else {
-            download_playlist(record, context, downloader, staging_dir, &url).await?;
+            let historical_rate = if record.timeout == PlaylistImportTimeout::Auto {
+                match repo.historical_download_rate(&record.job.user_id).await {
+                    Ok(rate) => rate,
+                    Err(error) => {
+                        tracing::warn!(job_id = %record.job.id, %error, "Could not load playlist download history");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            download_playlist(record, context, downloader, staging_dir, &url, historical_rate)
+                .await?;
         }
         let job = &mut record.job;
         job.playlist_name.get_or_insert_with(|| {
@@ -1283,15 +1344,32 @@ async fn download_playlist(
     downloader: &SpotDLDownloaderAdapter,
     stage: &Path,
     url: &str,
+    historical_rate: Option<u64>,
 ) -> Result<(), TaskError> {
     let m3u_name = format!("musicdeck-{}.m3u8", record.job.id);
     let request = TrackImportRequest {
         spotify_track_url: Some(url.to_owned()),
         output_directory: stage.to_path_buf(),
         playlist_m3u_name: Some(m3u_name),
+        // An explicit zero disables the process runner's default timeout. Auto uses the progress deadline below.
+        timeout_ms: Some(record.timeout.maximum_ms().unwrap_or(0)),
         ..Default::default()
     };
-    let batch = download_manifest(context, downloader, &request, &record.job.id).await?;
+    let started = Instant::now();
+    let deadline = PlaylistDeadline::new(record.timeout, historical_rate, started);
+    let batch =
+        download_manifest(context, downloader, &request, &record.job.id, Some(deadline)).await?;
+    let downloaded_tracks = batch
+        .entries
+        .iter()
+        .filter(|entry| entry.file_path.is_some())
+        .count() as u64;
+    if downloaded_tracks >= 5 {
+        record.download_sample = Some(PlaylistDownloadSample {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            downloaded_tracks,
+        });
+    }
     if let Some(name) = batch.name {
         record.job.playlist_name.get_or_insert(name);
     }
@@ -1311,6 +1389,7 @@ pub(super) async fn download_manifest(
     downloader: &SpotDLDownloaderAdapter,
     request: &TrackImportRequest,
     job_id: &str,
+    deadline: Option<PlaylistDeadline>,
 ) -> Result<ManifestDownload, TaskError> {
     let m3u_name = request
         .playlist_m3u_name
@@ -1329,13 +1408,33 @@ pub(super) async fn download_manifest(
             .await;
         }
     });
-    let output = downloader
-        .download_with_cancel(request, context.cancel_token(), move |update| {
-            let _ = tx.send(update);
-        })
-        .await;
+    let cancel = context.cancel_token().child_token();
+    let (deadline_tx, mut deadline_rx) = mpsc::unbounded_channel();
+    let deadline_tx = deadline.as_ref().map(|_| deadline_tx);
+    let work = downloader.download_with_cancel(request, cancel.clone(), move |update| {
+        if let Some(tx) = &deadline_tx
+            && let Some(progress) = update.message.as_deref().and_then(PlaylistProgress::from_log)
+        {
+            let _ = tx.send(progress);
+        }
+        let _ = tx.send(update);
+    });
+    tokio::pin!(work);
+    let result = if let Some(deadline) = deadline {
+        tokio::select! {
+            biased;
+            result = &mut work => Ok(result),
+            error = deadline.wait(&mut deadline_rx) => {
+                cancel.cancel();
+                let _ = work.await;
+                Err(error)
+            }
+        }
+    } else {
+        Ok(work.await)
+    };
     let _ = progress.await;
-    let output = output.map_err(|err| match err {
+    let output = result?.map_err(|err| match err {
         SpotDLDownloadError::Process(crate::tasks::ProcessError::Cancelled) => TaskError::Cancelled,
         other => TaskError::ExecutionFailed(other.to_string()),
     })?;
@@ -1585,6 +1684,27 @@ mod playlist_intent_tests {
     use crate::providers::{Playlist, Track, media_fixture};
     use crate::tasks::{TaskDefinition, TaskStatus};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn playlist_timeout_history_uses_download_samples_from_the_import_owner() {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO import_jobs (id, user_id, status, manifest_json, created_at, updated_at) VALUES
+                ('1', 'alice', 'COMPLETED', '{\"downloadSample\":{\"elapsedMs\":60000,\"downloadedTracks\":10}}', '1', '1'),
+                ('2', 'alice', 'COMPLETED', '{\"downloadSample\":{\"elapsedMs\":20000,\"downloadedTracks\":10}}', '2', '2'),
+                ('3', 'alice', 'COMPLETED', '{\"downloadSample\":{\"elapsedMs\":40000,\"downloadedTracks\":10}}', '3', '3'),
+                ('4', 'alice', 'FAILED', 'invalid checkpoint', '4', '4'),
+                ('5', 'bob', 'COMPLETED', '{\"downloadSample\":{\"elapsedMs\":90000,\"downloadedTracks\":10}}', '5', '5');",
+        )
+        .execute(db.inner())
+        .await
+        .unwrap();
+        let repo = SqliteImportJobRepository::new(db);
+        assert_eq!(repo.historical_download_rate("alice").await.unwrap(), Some(4_000));
+        assert_eq!(repo.historical_download_rate("bob").await.unwrap(), Some(9_000));
+        assert_eq!(repo.historical_download_rate("new-user").await.unwrap(), None);
+    }
 
     struct ResumeImport(SpotifyPlaylistImportService);
 

@@ -116,11 +116,12 @@ pub async fn add_recently_played(
     Ok(id)
 }
 
-/// Queries distinct tracks from counted listening events and older recently played rows.
+/// Queries a page of distinct track IDs from counted listening events and legacy plays.
 pub async fn list_recently_played_entries(
     pool: &DbPool,
     user_id: &str,
     taste_only: bool,
+    offset: i64,
 ) -> Result<Vec<RecentlyPlayedEntry>, DbError> {
     let table = if taste_only {
         "taste_recently_played"
@@ -155,7 +156,7 @@ pub async fn list_recently_played_entries(
         FROM ranked
         WHERE play_rank = 1
         ORDER BY latest_played_at DESC, track_id
-        LIMIT ?3;
+        LIMIT ?3 OFFSET ?4;
         "
     );
 
@@ -163,6 +164,7 @@ pub async fn list_recently_played_entries(
         .bind(user_id)
         .bind(cutoff)
         .bind(RECENTLY_PLAYED_LIMIT)
+        .bind(offset)
         .fetch_all(pool.inner())
         .await?;
 

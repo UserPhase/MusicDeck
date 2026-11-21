@@ -296,10 +296,12 @@ a { color: inherit; }
 .playlist-modal-form label { margin-top: var(--space-2); color: var(--text); font-size: .78rem; font-weight: 700; }
 .playlist-modal-form label > span:not(.playlist-modal-optional) { color: var(--accent-text); }
 .playlist-modal-optional { margin-left: var(--space-2); color: var(--text-muted); font-size: .7rem; font-weight: 500; }
-.playlist-modal-form input, .playlist-modal-form textarea { width: 100%; padding: var(--space-3) var(--space-3); border: 1px solid var(--border-hover); border-radius: .55rem; outline: 0; background: var(--input-bg); color: var(--text); font: inherit; font-size: .85rem; resize: vertical; }
+.playlist-modal-form :is(input, textarea, select) { width: 100%; padding: var(--space-3) var(--space-3); border: 1px solid var(--border-hover); border-radius: .55rem; outline: 0; background: var(--input-bg); color: var(--text); font: inherit; font-size: .85rem; }
+.playlist-modal-form :is(input, textarea) { resize: vertical; }
 .playlist-modal-form input::placeholder, .playlist-modal-form textarea::placeholder { color: #92929d; }
-.playlist-modal-form input:focus, .playlist-modal-form textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+.playlist-modal-form :is(input, textarea, select):focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
 .playlist-modal-form input[aria-invalid="true"] { border-color: var(--danger); }
+.playlist-modal-help { margin: 0; color: var(--text-muted); font-size: .78rem; }
 .playlist-modal-error { margin: var(--space-1) 0; color: var(--danger-text-strong); font-size: .75rem; line-height: 1.4; }
 .playlist-modal-progress { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-1) 0; color: var(--text-soft); font-size: .75rem; }
 .playlist-modal-spinner { flex: none; width: .9rem; height: .9rem; border: 2px solid rgb(var(--tint-rgb) / 25%); border-top-color: var(--accent); border-radius: 50%; animation: playlist-modal-spin 800ms linear infinite; }

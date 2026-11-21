@@ -20,6 +20,8 @@ export interface VirtualizedTrackListProps {
   onQueue?: RowProps["onQueue"];
   onDownload?: RowProps["onDownload"];
   showDateAdded?: boolean;
+  showDuration?: boolean;
+  hasColumnHeader?: boolean;
   searchTokens?: readonly string[];
   renderMenu?(song: LibraryTrack, index: number): ReactNode;
   getItemKey?(index: number): string;
@@ -67,7 +69,7 @@ function VirtualizedTrackList({
   itemCount, getItem, onPlay, onToggleMenu, renderMenu, onRangeChange,
   estimateRowHeight = 64, dynamicHeight = false, dataKey, getItemKey,
   selection: suppliedSelection, onReorder, editingDisabled: editingDisabledProp = false, onToggleEntryMenu,
-  onQueue, onDownload, showDateAdded, searchTokens,
+  onQueue, onDownload, showDateAdded, showDuration, hasColumnHeader = true, searchTokens,
 }: VirtualizedTrackListProps) {
   const scope = useTrackActionScope();
   const visualActive = useVisualActivity();
@@ -165,19 +167,20 @@ function VirtualizedTrackList({
   if (drag && !indices.includes(drag.source)) indices.push(drag.source);
   for (const index of indices) {
     const song = getItem(index);
+    const ariaRowIndex = index + (hasColumnHeader ? 2 : 1);
     const pinned = index < windowed.start || index >= windowed.end;
     slots.push(<MeasuredSlot key={keyAt(index)} index={index}
       height={estimateRowHeight} dynamic={dynamicHeight} measure={windowed.measure}
       style={pinned ? { position: "absolute", top: windowed.offsets[index], left: 0, right: 0 } : undefined}>
-      {song ? <TrackRow song={song} index={index} onPlay={onPlay}
-        showDateAdded={showDateAdded}
+      {song ? <TrackRow song={song} index={index} ariaRowIndex={ariaRowIndex} onPlay={onPlay}
+        showDateAdded={showDateAdded} showDuration={showDuration}
         searchTokens={searchTokens}
         onQueue={onQueue} onDownload={onDownload}
         onToggleMenu={onToggleEntryMenu ? (track, event) => onToggleEntryMenu(track, index, event) : onToggleMenu}
         selected={selection ? selection.selectedIds.has(scope?.keyAt(index) ?? keyAt(index)) : undefined} onSelect={scope?.select || selection?.select}
         reorderable={Boolean(onReorder)} editingDisabled={editingDisabled}
         menu={renderMenu?.(song, index)} />
-        : <div className="track virtual-track-skeleton" role="row" aria-rowindex={index + 2}
+        : <div className="track virtual-track-skeleton" role="row" aria-rowindex={ariaRowIndex}
           aria-label={`Loading track ${index + 1}`} aria-busy="true"><span /><span /><span /></div>}
     </MeasuredSlot>);
   }

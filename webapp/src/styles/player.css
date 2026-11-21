@@ -24,6 +24,8 @@
 .control-buttons { display: flex; align-items: center; justify-content: center; gap: 20px; }
 .control { border: none; background: transparent; color: var(--text-subtle); font-size: 17px; cursor: pointer; transition: color 0.15s ease; }
 .control:hover { color: var(--text); }
+.skip-control { display: grid; place-items: center; }
+.skip-control svg, .play-button svg { width: 16px; height: 16px; fill: currentColor; }
 .shuffle-control { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; }
 .shuffle-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .shuffle-control.active { color: var(--accent-text); }

@@ -27,6 +27,7 @@ import {
 import FloatingPanel from "./ui/FloatingPanel";
 import UserAvatar from "./UserAvatar";
 import DesktopWindowControls from "./desktop/DesktopWindowControls";
+import PlayerAudioTools from "./player/PlayerAudioTools";
 import { useImport } from "../context/ImportContext";
 import { BrandWordmark } from "../context/BrandingContext";
 import { useViewStateValue } from "../hooks/useViewStateStore";
@@ -57,7 +58,7 @@ export function isHeaderNavItemActive(item, pathname) {
  *   showPrimaryNav – header navigation links (top-navigation shells).
  *   playerSlot     – transport controls rendered in the header (Apple Music).
  */
-function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
+function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null, mobile = false }) {
   const profileTriggerRef = useRef(null);
   const { job: importJob, isMinimized, openProgress } = useImport();
 
@@ -140,6 +141,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
    */
 
   useEffect(() => {
+    if (mobile) return;
 
     const query =
       searchQuery.trim();
@@ -202,7 +204,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
       clearTimeout(timeout);
     };
 
-  }, [searchQuery]);
+  }, [mobile, searchQuery]);
 
 
   /*
@@ -211,6 +213,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
    */
 
   useEffect(() => {
+    if (mobile) return;
 
     function handleOutsideClick(
       event
@@ -245,7 +248,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
     };
 
-  }, []);
+  }, [mobile]);
 
 
   /*
@@ -407,7 +410,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
       {/* CENTER */}
 
-      <div className="topbar-center">
+      {!mobile && <div className="topbar-center">
 
 
         {/* HOME */}
@@ -437,6 +440,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
             <input
               type="text"
+              enterKeyHint="search"
               value={searchQuery}
               onChange={(event) =>
                 setSearchQuery(
@@ -619,7 +623,7 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
 
         </div>
 
-      </div>
+      </div>}
 
 
       {/* PROFILE & DESKTOP WINDOW CONTROLS */}
@@ -636,7 +640,8 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
             <span>Importing 1 Playlist...</span>
           </button>
         )}
-        {user && <>
+        {user && mobile && <PlayerAudioTools />}
+        {user && !mobile && <>
           <Link to="/downloads" className="topbar-page-icon" aria-label="Downloads" title="Downloads"
             aria-current={location.pathname === "/downloads" ? "page" : undefined}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -705,6 +710,17 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null }) {
                 >
                   Settings
                 </Link>
+
+                {mobile && <>
+                  <Link to="/downloads" className="account-menu-item" role="menuitem"
+                    onClick={() => setShowAccountMenu(false)}>
+                    Downloads
+                  </Link>
+                  <Link to="/listening-activity" className="account-menu-item" role="menuitem"
+                    onClick={() => setShowAccountMenu(false)}>
+                    Listening Activity
+                  </Link>
+                </>}
 
                 {user.role === "admin" && (
 

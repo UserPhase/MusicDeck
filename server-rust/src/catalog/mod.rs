@@ -11,6 +11,7 @@ pub mod merge;
 pub mod resolver;
 pub mod service;
 pub(crate) mod snapshot;
+pub(crate) mod track_dedup;
 
 pub use identity::{
     CanonicalIdentity, CatalogEntityType, ContainerFileMetadata, IdentityStrength,

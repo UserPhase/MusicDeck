@@ -380,7 +380,7 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
         matched = true;
     }
 
-    if matched {
+    if matched || super::playlist_timeout::PlaylistProgress::from_log(trimmed).is_some() {
         progress.message = Some(trimmed.to_owned());
         Some(progress)
     } else {

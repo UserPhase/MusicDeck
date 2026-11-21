@@ -42,7 +42,10 @@ test("opens a saved definition and evaluates all pages afresh when playing", asy
   fireEvent.click(await screen.findByRole("button", { name: "Rediscovered" }));
   expect(screen.getByLabelText("Value 1.1")).toHaveValue("Synthwave");
   fireEvent.click(screen.getByRole("button", { name: "Play matching tracks" }));
-  await waitFor(() => expect(playQueue).toHaveBeenCalledWith([track, { ...track, id: "two" }], 0));
+  await waitFor(() => expect(playQueue).toHaveBeenCalledWith([
+    { ...track, tastePlaylistId: playlist.id },
+    { ...track, id: "two", tastePlaylistId: playlist.id },
+  ], 0));
   expect(getSmartPlaylistTracks.mock.calls.map((call) => call.slice(0, 2))).toEqual([["smart-1", 0], ["smart-1", 1]]);
 });
 

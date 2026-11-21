@@ -1,5 +1,5 @@
 use super::*;
-use crate::acquisition::{SpotDLDownloaderAdapter, SqliteImportJobRepository, StoredImportJob};
+use crate::acquisition::{PlaylistImportTimeout, SpotDLDownloaderAdapter, SqliteImportJobRepository, StoredImportJob};
 use crate::config::AppConfig;
 use crate::providers::{BackendRegistry, NavidromeClient, RegisteredProvider};
 use axum::{
@@ -294,11 +294,26 @@ pub(super) async fn import_fixture(
     )
 }
 
+struct PlaylistTimeoutRunner(u64);
+
+#[async_trait::async_trait]
+impl ProcessRunner for PlaylistTimeoutRunner {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        options: ProcessOptions,
+    ) -> Result<ProcessExecutionResult, ProcessError> {
+        assert_eq!(options.timeout_ms, Some(self.0));
+        SuccessfulProcessRunner.run(command, args, options).await
+    }
+}
+
 #[tokio::test]
 async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_every_track() {
-    for (case, status, imported) in [
-        (NavidromeResult::MissingTrack, "partial", 2),
-        (NavidromeResult::RejectPlaylist, "failed", 0),
+    for (case, status, imported, timeout, timeout_ms) in [
+        (NavidromeResult::MissingTrack, "partial", 2, PlaylistImportTimeout::Auto, 0),
+        (NavidromeResult::RejectPlaylist, "failed", 0, PlaylistImportTimeout::Manual { minutes: 90 }, 5_400_000),
     ] {
         let db = DbPool::connect_memory().await.unwrap();
         run_migrations(&db, None).await.unwrap();
@@ -309,7 +324,8 @@ async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_ev
         let mut record: StoredImportJob = serde_json::from_value(json!({
             "job": {"id":"spimp_fixture", "userId":"alice", "status":"queued", "stage":"queued"},
             "playlistUrl":"https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
-            "user":{"id":"alice", "disabled":false}
+            "user":{"id":"alice", "disabled":false},
+            "timeout": timeout
         }))
         .unwrap();
         record.job.playlist_description = Some("Original description".into());
@@ -328,7 +344,7 @@ async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_ev
                     imports.clone(),
                 )
                 .with_downloader(Arc::new(SpotDLDownloaderAdapter::with_runner(Arc::new(
-                    SuccessfulProcessRunner,
+                    PlaylistTimeoutRunner(timeout_ms),
                 ))))
                 .with_output_dir(stage.path()),
             ),

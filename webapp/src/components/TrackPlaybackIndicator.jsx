@@ -1,5 +1,5 @@
 function TrackPlaybackIndicator({
-  index,
+  index = 0,
   isCurrentTrack,
   isPlaying,
 }) {

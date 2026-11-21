@@ -1201,7 +1201,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const cdp = await context.newCDPSession(page);
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
       await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true });
-      await login(page, app); await openTracks(page, app, 80);
+      await login(page, app);
       const touch = (type: "touchStart" | "touchMove" | "touchEnd", x = 0, y = 0) => cdp.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y, id: 1 }] });
       const tap = async (target: Locator) => {
         await expect(target).toBeVisible();
@@ -1212,6 +1212,26 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await touch("touchEnd");
       };
       try {
+        const nav = page.getByRole("navigation", { name: "Mobile navigation" });
+        await expect(nav.getByRole("link")).toHaveText(["Home", "Discover", "Search", "Library"]);
+        const header = page.locator("header.topbar");
+        await expect(header.getByRole("button", { name: "Sleep timer", exact: true })).toBeVisible();
+        await expect(header.getByRole("button", { name: "Open menu" })).toHaveCount(0);
+        await expect(header.getByLabel("Search your music")).toHaveCount(0);
+        await tap(nav.getByRole("link", { name: "Search", exact: true }));
+        await expect(page.getByRole("main").getByRole("searchbox", { name: "Search your music" })).toBeVisible();
+        await expect(nav.getByRole("link", { name: "Search", exact: true })).toHaveAttribute("aria-current", "page");
+        await tap(nav.getByRole("link", { name: "Library", exact: true }));
+        const playlists = page.getByRole("list", { name: "Library playlists" });
+        await expect(playlists.getByRole("link").first()).toHaveAccessibleName("Liked Songs");
+        await expect(playlists.getByRole("link", { name: "Liked Songs", exact: true })).toHaveAttribute("href", "/liked");
+        await expect(playlists.getByRole("link", { name: "Downloads", exact: true })).toHaveCount(0);
+        await tap(header.locator(".profile-button"));
+        await tap(page.getByRole("menuitem", { name: "Downloads", exact: true }));
+        await expect(page).toHaveURL(/\/downloads$/);
+        await expect(nav.getByRole("link", { name: "Library", exact: true })).toHaveAttribute("aria-current", "page");
+        await openTracks(page, app, 80);
+
         const title = page.locator('.track[role="row"] .track-title-text').first();
         await title.scrollIntoViewIfNeeded();
         const bounds = await title.boundingBox();
@@ -1288,6 +1308,21 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         expect(visibleTitle).toBeGreaterThanOrEqual(0);
         await tap(titles.nth(visibleTitle));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(true);
+        const miniPlayer = page.getByRole("contentinfo", { name: "Mini player" });
+        const openPlayer = miniPlayer.getByRole("button", { name: /^Open Now Playing/ });
+        await tap(openPlayer);
+        const nowPlaying = page.getByRole("dialog", { name: "Now Playing", exact: true });
+        await expect(nowPlaying.getByRole("button", { name: "Close Now Playing" })).toBeFocused();
+        await expect(nowPlaying.getByRole("slider", { name: "Song progress" })).toBeEnabled();
+        await expect(nowPlaying.getByRole("button", { name: "Previous song" })).toBeVisible();
+        await expect(nowPlaying.getByRole("button", { name: "Choose playback device" })).toBeVisible();
+        await page.screenshot({ path: info.outputPath("now-playing-390.png"), animations: "disabled" });
+        await tap(nowPlaying.getByRole("button", { name: "Queue", exact: true }));
+        const queue = page.getByRole("complementary", { name: "Playback queue" });
+        await expect(queue.getByRole("button", { name: "Close queue sidebar" })).toBeFocused();
+        await page.keyboard.press("Escape");
+        await expect(openPlayer).toBeFocused();
+        await expect(miniPlayer.getByRole("button", { name: "Pause", exact: true })).toBeVisible();
         const before = await page.evaluate(() => window.__acceptance.player.currentTime);
         // Browser tab backgrounding exercises visibility/media-session integration;
         // it cannot certify iOS/Android OS process suspension or lock-screen hardware.

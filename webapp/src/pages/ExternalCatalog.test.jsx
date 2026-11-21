@@ -8,7 +8,6 @@ import { artistOverviewQueryClient } from "../api/artistOverviewQuery";
 import Explore from "./Explore";
 import {
   getAlbum,
-  getAlbums,
   getArtist,
   getArtistPortrait,
   getMusicBrainzArtistPortrait,
@@ -28,6 +27,7 @@ import {
   setMediaFavorite,
 } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { getWikipediaBiography } from "../services/biographyFallback";
 import { canStreamPreview, findItunesPreview } from "../utils/previewPlayback";
 
@@ -50,7 +50,6 @@ function render(ui, options) {
 jest.mock("../api/musicdeck", () => ({
   getAlbum: jest.fn(),
   getLikedAlbums: jest.fn(async () => []),
-  getAlbums: jest.fn(async () => []),
   getArtist: jest.fn(),
   getArtistPortrait: jest.fn(async () => null),
   getMusicBrainzArtistPortrait: jest.fn(async () => null),
@@ -83,6 +82,7 @@ jest.mock("../api/playlists", () => ({
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: jest.fn(),
 }));
+jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn() }));
 
 const playSong = jest.fn();
 const playQueue = jest.fn();
@@ -102,7 +102,6 @@ beforeEach(() => {
   canStreamPreview.mockImplementation(async url => Boolean(url));
   findItunesPreview.mockResolvedValue(null);
   getCoverUrl.mockImplementation((id) => (id ? typeof id === "object" ? id.url : `/artwork/${id}` : null));
-  getAlbums.mockResolvedValue([]);
   getArtist.mockResolvedValue({ album: [] });
   getArtistTracks.mockResolvedValue([]);
   getArtistPortrait.mockResolvedValue(null);
@@ -128,6 +127,7 @@ beforeEach(() => {
   hydrateExternalPreviews.mockResolvedValue([]);
   getRecommendations.mockResolvedValue({ sections: [], degraded: false });
   getPersonalizedDiscovery.mockResolvedValue({ tracks: [], artists: [], albums: [], personalized: true, degraded: false, message: null });
+  useMediaQuery.mockReturnValue(false);
   usePlayer.mockReturnValue({
     playSong,
     playQueue,
@@ -629,7 +629,6 @@ test("renders personalized Explore songs alongside Deezer charts", async () => {
     "Songs Popular Externally",
     "Discover Artists",
     "Discover Albums",
-    "Browse by Genre & Mood",
   ];
   expect(await screen.findByRole("button", { name: "Play Recommended Song" })).toBeInTheDocument();
   expect([...document.querySelectorAll(".explore-page section h2")].map((heading) => heading.textContent)).toEqual(headings);
@@ -643,6 +642,48 @@ test("renders personalized Explore songs alongside Deezer charts", async () => {
   expect(screen.getByRole("button", { name: "Play Chart Song" })).toBeInTheDocument();
   expect(screen.getByText("3:29")).toBeInTheDocument();
   expect(getExternalCharts).toHaveBeenCalledTimes(1);
+});
+
+test("uses the mobile Home layout for both Discover song feeds and album playback controls", async () => {
+  useMediaQuery.mockReturnValue(true);
+  const togglePlay = jest.fn();
+  const tracks = Array.from({ length: 6 }, (_, index) => ({ ...chartData.tracks[0], id: `chart-${index}`, title: `Chart Song ${index}`,
+    metadata: { albumId: "external_deezer_album_201", artistId: "external_deezer_artist_101", audioMetadata: { codec: "flac" } },
+    previewUrl: "https://cdns-preview-a.dzcdn.net/chart-song.mp3",
+  }));
+  getExternalCharts.mockResolvedValue({ ...chartData, tracks });
+  getPersonalizedDiscovery.mockResolvedValue({ ...chartData, tracks, personalized: true });
+  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: tracks[0], isPlaying: true, togglePlay });
+  const { rerender } = render(<MemoryRouter><Explore /></MemoryRouter>);
+
+  for (const name of ["Discover Songs", "Songs Popular Externally"]) {
+    const shelf = screen.getByRole("region", { name });
+    const rows = await within(shelf).findAllByRole("row");
+    expect(rows).toHaveLength(3);
+    expect(shelf.querySelectorAll(".track-cover-art img")).toHaveLength(3);
+    expect(shelf.querySelector(".track-number-text, .track-duration, .audio-quality-badge")).toBeNull();
+    expect(within(shelf).getByRole("button", { name: "More options for Chart Song 0" })).toBeInTheDocument();
+  }
+
+  for (const name of ["Trending Now / Featured", "Albums Popular Externally", "Discover Albums"]) {
+    const shelf = screen.getByRole("region", { name });
+    const pause = within(shelf).getByRole("button", { name: "Pause Chart Album" });
+    expect(pause.closest("article")).toHaveClass("is-current");
+    expect(pause).toHaveClass("explore-album-play-inline");
+    expect(shelf.querySelector(".explore-album-image button")).toBeNull();
+  }
+  const artist = within(screen.getByRole("region", { name: "Discover Artists" })).getByRole("link", { name: "Chart Artist" });
+  expect(artist).toHaveAccessibleDescription("Now playing");
+  expect(screen.queryByRole("region", { name: "Browse by Genre & Mood" })).not.toBeInTheDocument();
+  const popularAlbums = within(screen.getByRole("region", { name: "Albums Popular Externally" }));
+  fireEvent.click(popularAlbums.getByRole("button", { name: "Pause Chart Album" }));
+  expect(togglePlay).toHaveBeenCalledTimes(1);
+  expect(getAlbum).not.toHaveBeenCalled();
+
+  usePlayer.mockReturnValue({ ...usePlayer(), isPlaying: false });
+  rerender(<MemoryRouter><Explore /></MemoryRouter>);
+  expect(popularAlbums.getByRole("button", { name: "Resume Chart Album" })).toBeInTheDocument();
+  expect(artist).toHaveAccessibleDescription("Playback paused");
 });
 
 test("hydrates missing Explore chart previews after rendering the initial rows", async () => {

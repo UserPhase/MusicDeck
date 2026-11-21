@@ -41,6 +41,7 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthenticatedUser;
 use crate::catalog::{CatalogService, LibraryService, SourceResolver};
+use crate::catalog::track_dedup::TrackDedup;
 use crate::db::DbPool;
 use crate::error::ServerError;
 use crate::services::favorites::{
@@ -50,7 +51,7 @@ use crate::services::listening_activity::{
     ActivityPeriod, HistoryCursor, ListeningActivityError, PlaybackEventInput, listening_history,
     listening_statistics, listening_threshold, record_playback_with_scrobbles,
 };
-use crate::services::recently_played::{add_recently_played, list_recently_played_entries};
+use crate::services::recently_played::{RECENTLY_PLAYED_LIMIT, RecentlyPlayedEntry, add_recently_played, list_recently_played_entries};
 use crate::state::AppState;
 use crate::streaming::{proxy_upstream_stream, send_error_response};
 
@@ -1662,56 +1663,69 @@ async fn get_recently_played_handler(
     };
 
     let taste_only = params.get("tasteOnly").is_some_and(|v| v == "1");
-    let entries = match list_recently_played_entries(db, &auth.user.id, taste_only).await {
-        Ok(entries) => entries,
-        Err(err) => return ServerError::Database(err).into_response(),
-    };
     let catalog = CatalogService::from_pool(db.clone(), state.providers().clone());
-    let tracks = stream::iter(entries)
-        .map(|entry| {
-            let catalog = &catalog;
-            async move {
-                let snapshot = entry
-                    .track_json
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                    .filter(Value::is_object)
-                    .unwrap_or_else(|| json!({}));
-                let known_title = snapshot["title"].as_str().is_some_and(|title| {
-                    !matches!(title.trim(), "" | "Unknown title" | "Unavailable track")
-                });
-                let known_artist = snapshot["artist"]
-                    .as_str()
-                    .or_else(|| snapshot["artistName"].as_str())
-                    .is_some_and(|artist| !matches!(artist.trim(), "" | "Unknown artist"));
-                let mut track = if known_title && known_artist {
-                    snapshot
-                } else {
-                    catalog
-                        .get_track(&entry.track_id)
-                        .await
-                        .and_then(|track| serde_json::to_value(track).ok())
-                        .unwrap_or(snapshot)
-                };
-                if track["title"]
-                    .as_str()
-                    .is_none_or(|title| matches!(title.trim(), "" | "Unknown title"))
-                {
-                    track["title"] = json!("Unavailable track");
+    let mut offset = 0;
+    let mut seen = TrackDedup::default();
+    let mut tracks = Vec::with_capacity(RECENTLY_PLAYED_LIMIT as usize);
+    while tracks.len() < RECENTLY_PLAYED_LIMIT as usize {
+        let entries = match list_recently_played_entries(db, &auth.user.id, taste_only, offset).await {
+            Ok(entries) => entries,
+            Err(err) => return ServerError::Database(err).into_response(),
+        };
+        let count = entries.len() as i64;
+        let mut hydrated = stream::iter(entries).map(|entry| hydrate_recent_play(&catalog, entry)).buffered(4);
+        while let Some(track) = hydrated.next().await {
+            if seen.insert_history(&track) {
+                tracks.push(track);
+                if tracks.len() == RECENTLY_PLAYED_LIMIT as usize {
+                    break;
                 }
-                if track["duration"].is_null() && track["durationSeconds"].is_null() {
-                    track["duration"] = json!(entry.duration_seconds);
-                }
-                track["id"] = json!(entry.track_id);
-                track["trackId"] = json!(entry.track_id);
-                track["playedAt"] = json!(entry.played_at);
-                track
             }
-        })
-        .buffered(4)
-        .collect::<Vec<_>>()
-        .await;
+        }
+        if count < RECENTLY_PLAYED_LIMIT {
+            break;
+        }
+        offset += count;
+    }
     Json(json!({ "tracks": tracks })).into_response()
+}
+
+async fn hydrate_recent_play(catalog: &CatalogService, entry: RecentlyPlayedEntry) -> Value {
+    let snapshot = entry
+        .track_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let known_title = snapshot["title"].as_str().is_some_and(|title| {
+        !matches!(title.trim(), "" | "Unknown title" | "Unavailable track")
+    });
+    let known_artist = snapshot["artist"]
+        .as_str()
+        .or_else(|| snapshot["artistName"].as_str())
+        .is_some_and(|artist| !matches!(artist.trim(), "" | "Unknown artist"));
+    let mut track = if known_title && known_artist {
+        snapshot
+    } else {
+        catalog
+            .get_track(&entry.track_id)
+            .await
+            .and_then(|track| serde_json::to_value(track).ok())
+            .unwrap_or(snapshot)
+    };
+    if track["title"]
+        .as_str()
+        .is_none_or(|title| matches!(title.trim(), "" | "Unknown title"))
+    {
+        track["title"] = json!("Unavailable track");
+    }
+    if track["duration"].is_null() && track["durationSeconds"].is_null() {
+        track["duration"] = json!(entry.duration_seconds);
+    }
+    track["id"] = json!(entry.track_id);
+    track["trackId"] = json!(entry.track_id);
+    track["playedAt"] = json!(entry.played_at);
+    track
 }
 
 async fn post_recently_played_handler(
@@ -1944,21 +1958,23 @@ async fn list_tracks_handler(
         .unwrap_or(0);
 
     let snapshot = state.catalog_snapshots().tracks(&catalog).await;
+    let (unique, revision) = snapshot.unique_tracks();
+    let total = unique.len();
     let limit =
         limit
             .map(|limit| limit.clamp(1, 500))
             .unwrap_or(if params.contains_key("offset") {
                 200
             } else {
-                snapshot.items.len()
+                total
             });
-    let tracks: Vec<_> = snapshot.items.iter().skip(offset).take(limit).collect();
+    let tracks: Vec<_> = unique.skip(offset).take(limit).collect();
 
     Json(json!({
         "tracks": tracks,
-        "total": snapshot.items.len(),
+        "total": total,
         "offset": offset,
-        "revision": snapshot.revision,
+        "revision": revision,
         "degraded": snapshot.degraded,
     }))
     .into_response()
@@ -1982,7 +1998,8 @@ async fn list_recently_added_tracks_handler(
     let snapshot = state.catalog_snapshots().tracks(&catalog).await;
     let mut tracks: Vec<_> = snapshot.items.iter().collect();
     tracks.sort_by(|a, b| b.item.added_at.cmp(&a.item.added_at));
-    tracks.truncate(limit);
+    let mut seen = TrackDedup::default();
+    let tracks: Vec<_> = tracks.into_iter().filter(|track| seen.insert_track(&track.item)).take(limit).collect();
 
     Json(json!({
         "tracks": tracks,

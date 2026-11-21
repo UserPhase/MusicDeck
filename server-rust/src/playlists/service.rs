@@ -237,6 +237,16 @@ struct RawPlaylistRow {
     exclude_from_taste: bool,
 }
 
+/// Playlist metadata for the user's recently played shelf.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentlyPlayedPlaylist {
+    id: String,
+    name: String,
+    cover_art: Option<String>,
+    is_smart: bool,
+}
+
 #[derive(Debug, Clone)]
 struct RawPlaylistItemRow {
     id: String,
@@ -373,6 +383,52 @@ impl PlaylistService {
                 continue;
             }
             playlists.push(self.build_record(row, None, None, Some(perms)).await?);
+        }
+        Ok(playlists)
+    }
+
+    /// Lists each playlist played during the listening window, newest play first.
+    pub async fn list_recently_played(
+        &self,
+        user: &SessionUser,
+    ) -> Result<Vec<RecentlyPlayedPlaylist>, PlaylistError> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT context_playlist_id FROM taste_listening_events
+             WHERE user_id = ? AND created_at >= ? AND counted = 1 AND context_playlist_id IS NOT NULL
+             GROUP BY context_playlist_id
+             ORDER BY MAX(julianday(created_at)) DESC, context_playlist_id;",
+        )
+        .bind(&user.id)
+        .bind(crate::services::recently_played::listening_window_start_iso())
+        .fetch_all(self.db.inner())
+        .await?;
+        let mut playlists = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = self.fetch_playlist_row(&id).await? {
+                if self.permissions_for_row(&row, user).await?.can_read {
+                    let cover_art = self.artwork.describe(&id).await?.artwork_id;
+                    playlists.push(RecentlyPlayedPlaylist {
+                        id,
+                        name: row.name,
+                        cover_art,
+                        is_smart: false,
+                    });
+                }
+            } else if let Some(name) = sqlx::query_scalar::<_, String>(
+                "SELECT name FROM smart_playlists WHERE id = ? AND user_id = ?;",
+            )
+            .bind(&id)
+            .bind(&user.id)
+            .fetch_optional(self.db.inner())
+            .await?
+            {
+                playlists.push(RecentlyPlayedPlaylist {
+                    id,
+                    name,
+                    cover_art: None,
+                    is_smart: true,
+                });
+            }
         }
         Ok(playlists)
     }

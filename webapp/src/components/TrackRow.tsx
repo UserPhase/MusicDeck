@@ -55,11 +55,14 @@ export interface Track {
 export interface TrackRowProps {
   song: Track;
   index: number;
+  ariaRowIndex?: number;
   onPlay?: (song: Track, index: number) => void;
   showAlbum?: boolean;
   showDateAdded?: boolean;
   searchTokens?: readonly string[];
   showArtwork?: boolean;
+  showDuration?: boolean;
+  showQualityBadge?: boolean;
   showSourceIndicator?: boolean;
   dimWhenUnavailable?: boolean;
   isDownloaded?: boolean;
@@ -84,6 +87,7 @@ export interface TrackRowProps {
   onDownload?: (song: Track) => void;
   action?: ReactNode;
   showImportAction?: boolean;
+  compactTile?: boolean;
 }
 
 /** Links and controls keep their own click, text-editing and drag behavior. */
@@ -97,11 +101,14 @@ const addedDateFormat = new Intl.DateTimeFormat(undefined, { year: "numeric", mo
 function TrackRow({
   song,
   index,
+  ariaRowIndex = index + 2,
   onPlay,
   showAlbum = true,
   showDateAdded = false,
   searchTokens,
   showArtwork = false,
+  showDuration = true,
+  showQualityBadge = true,
   showSourceIndicator = false,
   dimWhenUnavailable = false,
   isDownloaded,
@@ -126,6 +133,7 @@ function TrackRow({
   onDownload,
   action,
   showImportAction = true,
+  compactTile = false,
 }: TrackRowProps) {
   const scope = useTrackActionScope();
   const editingDisabled = editingDisabledProp || Boolean(scope?.disabled);
@@ -141,6 +149,7 @@ function TrackRow({
     isPlaying,
     togglePlay,
   } = useTrackPlayer(song.id);
+  const rowRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const [contextPoint, setContextPoint] = useState<{ x: number; y: number } | null>(null);
   const [localMenuOpen, setLocalMenuOpen] = useState(false);
@@ -246,6 +255,7 @@ function TrackRow({
 
   function handleRowClick(event: MouseEvent) {
     if (!isTrackControl(event.target)) {
+      if (compactTile && menuOpen) closeMenu();
       if (onSelect && (selectionMode || event.ctrlKey || event.metaKey || event.shiftKey || (legacySelection && Date.now() - lastTouch.current > 800))) {
         if (!editingDisabled) onSelect(index, selectionMode && !event.shiftKey ? { ctrlKey: true } : event);
       } else activateTrack();
@@ -310,9 +320,11 @@ function TrackRow({
 
   return (
     <div
+      ref={rowRef}
       className={rowClassName}
       role="row"
-      aria-rowindex={index + 2}
+      aria-rowindex={ariaRowIndex}
+      aria-current={compactTile && isCurrentTrack ? "true" : undefined}
       aria-selected={selected}
       aria-keyshortcuts={reorderable ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
       tabIndex={0}
@@ -358,8 +370,11 @@ function TrackRow({
           isCurrentTrack={isCurrentTrack}
           isPlaying={isPlaying}
         />}
+        {compactTile && showArtwork && isCurrentTrack && (
+          <TrackPlaybackIndicator index={index} isCurrentTrack isPlaying={isPlaying} />
+        )}
 
-        <button
+        {!compactTile && <button
           type="button"
           className="track-play"
           onClick={(event) => {
@@ -369,23 +384,27 @@ function TrackRow({
           aria-label={playLabel}
         >
           {isCurrentTrack && isPlaying ? "⏸" : "▶"}
-        </button>
+        </button>}
       </div>
 
       <div className="track-info" role="cell">
         <div className={`track-title ${song.provider === "external" && song.inLibrary ? "track-title-with-library-badge" : ""}${isExternalTrack ? " track-title--bookmark" : ""}`}>
           <span className="track-title-text"><PlaylistSearchHighlight text={song.title || "Unknown title"} tokens={searchTokens} /></span>
-          {song.showContributor && song.addedBy && <ContributorAvatar user={song.addedBy} label={`Added by ${song.addedBy.displayName}`} />}
-          {offlineAudit.status === "verified" && <span className="offline-available-badge" title="Verified audio saved on this device">↓ Offline</span>}
-          <InLibraryBadge visible={song.provider === "external" && song.inLibrary} />
-          <AvailabilityHint availability={song.availability} />
-          {showSourceIndicator && <SourceIndicator source={song.source} />}
-          <EditionBadges item={song} formatOnly />
-          {isExternalTrack && <SaveDiscoveryButton compact kind="track" item={{ ...song, id: String(song.id) }} />}
+          {!compactTile && <>
+            {song.showContributor && song.addedBy && <ContributorAvatar user={song.addedBy} label={`Added by ${song.addedBy.displayName}`} />}
+            {offlineAudit.status === "verified" && <span className="offline-available-badge" title="Verified audio saved on this device">↓ Offline</span>}
+            <InLibraryBadge visible={song.provider === "external" && song.inLibrary} />
+            <AvailabilityHint availability={song.availability} />
+            {showSourceIndicator && <SourceIndicator source={song.source} />}
+            {showQualityBadge && <EditionBadges item={song} formatOnly />}
+            {isExternalTrack && <SaveDiscoveryButton compact kind="track" item={{ ...song, id: String(song.id) }} />}
+          </>}
         </div>
 
-        <TrackArtistLinks song={song} className="track-artist" artistId={artistId}
-          fallback={artistFallback} searchTokens={searchTokens} />
+        {compactTile ? <span className="track-artist">{resolvedArtist}</span> : (
+          <TrackArtistLinks song={song} className="track-artist" artistId={artistId}
+            fallback={artistFallback} searchTokens={searchTokens} />
+        )}
       </div>
 
       {showAlbum && (
@@ -416,66 +435,68 @@ function TrackRow({
         )}
       </div>}
 
-      <div className="track-duration" role="cell">
-        {formatDuration(resolvedDuration)}
-      </div>
+      {!compactTile && <>
+        {showDuration && <div className="track-duration" role="cell">
+          {formatDuration(resolvedDuration)}
+        </div>}
 
-      <div
-        className="track-row-actions"
-        role="cell"
-        ref={actionsRef}
-        onClick={(event) => event.stopPropagation()}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        {action}
-        {showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
-        {isExternalTrack && showImportAction && (
-          <TrackDownloadButton
-            song={song}
-            className="track-row-import"
-            completedPlaceholder
-          />
-        )}
-
-        <button
-          type="button"
-          className="track-menu"
-          ref={menuTriggerRef}
-          aria-label={`More options for ${song.title || "track"}`}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          onClick={(event) => {
-            event.stopPropagation();
-            if (menuOpen) closeMenu();
-            else openContextMenu();
-          }}
+        <div
+          className="track-row-actions"
+          role="cell"
+          ref={actionsRef}
+          onClick={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
         >
-          ⋯
-        </button>
+          {action}
+          {showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
+          {isExternalTrack && showImportAction && (
+            <TrackDownloadButton
+              song={song}
+              className="track-row-import"
+              completedPlaceholder
+            />
+          )}
 
-        {menuOpen && (
-          <UniversalTrackContextMenu
-            song={song}
-            targets={scope && selected ? scope.selectedPreview : undefined}
-            targetCount={scope && selected ? scope.selection.selectedCount : 1}
-            resolveTargets={scope && selected ? scope.resolveSelected : undefined}
-            downloadQuality={downloadQuality}
-            isServerSynced={isServerSynced}
-            offlineStatus={offlineStatus}
-            offlineError={offlineError}
-            onOfflineDownload={onDownload ? () => onDownload(song) : handleOfflineDownload}
-            onSpotdlDownload={onSpotdlDownload}
-            triggerRef={menuTriggerRef}
-            anchorPoint={contextPoint}
-            onAddToQueue={onQueue}
-            actionsDisabled={editingDisabled}
-            onRequestClose={closeMenu}
-            onActionError={scope?.reportActionError}
+          <button
+            type="button"
+            className="track-menu"
+            ref={menuTriggerRef}
+            aria-label={`More options for ${song.title || "track"}`}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (menuOpen) closeMenu();
+              else openContextMenu();
+            }}
           >
-            {legacyMenu ? supplementalMenuContent : null}
-          </UniversalTrackContextMenu>
-        )}
-      </div>
+            ⋯
+          </button>
+        </div>
+      </>}
+
+      {menuOpen && (
+        <UniversalTrackContextMenu
+          song={song}
+          targets={scope && selected ? scope.selectedPreview : undefined}
+          targetCount={scope && selected ? scope.selection.selectedCount : 1}
+          resolveTargets={scope && selected ? scope.resolveSelected : undefined}
+          downloadQuality={downloadQuality}
+          isServerSynced={isServerSynced}
+          offlineStatus={offlineStatus}
+          offlineError={offlineError}
+          onOfflineDownload={onDownload ? () => onDownload(song) : handleOfflineDownload}
+          onSpotdlDownload={onSpotdlDownload}
+          triggerRef={compactTile ? rowRef : menuTriggerRef}
+          anchorPoint={contextPoint}
+          onAddToQueue={onQueue}
+          actionsDisabled={editingDisabled}
+          onRequestClose={closeMenu}
+          onActionError={scope?.reportActionError}
+        >
+          {legacyMenu ? supplementalMenuContent : null}
+        </UniversalTrackContextMenu>
+      )}
     </div>
   );
 }

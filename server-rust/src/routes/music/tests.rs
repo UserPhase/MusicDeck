@@ -63,6 +63,76 @@ fn playback_event(seconds: f64, finished: bool) -> Value {
     })
 }
 
+#[tokio::test]
+async fn recently_played_playlists_are_distinct_ordered_and_visible_to_the_listener() {
+    let (db, state, session) = playback_state(false).await;
+    sqlx::raw_sql(
+        "
+        INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+        VALUES ('other', 'other', 'unused', 'Other', 'user', '2026-01-01', '2026-01-01');
+        INSERT INTO playlists (id, owner_user_id, name, sharing_mode, created_at, updated_at, deleted_at)
+        VALUES ('recent', 'listener', 'Recently played', 'PRIVATE', '2026-01-01', '2026-01-01', NULL),
+               ('shared', 'other', 'Shared', 'SHARED_READ', '2026-01-01', '2026-01-01', NULL),
+               ('not-shared', 'other', 'Private', 'PRIVATE', '2026-01-01', '2026-01-01', NULL),
+               ('deleted', 'listener', 'Deleted', 'PRIVATE', '2026-01-01', '2026-01-01', '2026-01-01'),
+               ('private-listen', 'listener', 'Hidden listen', 'PRIVATE', '2026-01-01', '2026-01-01', NULL),
+               ('old', 'listener', 'Old', 'PRIVATE', '2026-01-01', '2026-01-01', NULL),
+               ('unplayed', 'listener', 'Unplayed', 'PRIVATE', '2026-01-01', '2026-01-01', NULL);
+        INSERT INTO playlist_permissions (playlist_id, user_id, role, granted_at)
+        VALUES ('shared', 'listener', 'VIEWER', '2026-01-01');
+        INSERT INTO smart_playlists (id, user_id, name, rules_json, created_at, updated_at)
+        VALUES ('smart', 'listener', 'Smart', '{}', '2026-01-01', '2026-01-01'),
+               ('other-smart', 'other', 'Other Smart', '{}', '2026-01-01', '2026-01-01');
+        ",
+    )
+    .execute(db.inner())
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    for (index, (user, playlist, days_ago, counted, excluded)) in [
+        ("listener", "recent", 1, true, false),
+        ("listener", "recent", 5, true, false),
+        ("listener", "smart", 2, true, false),
+        ("listener", "shared", 3, true, false),
+        ("listener", "not-shared", 0, true, false),
+        ("listener", "other-smart", 0, true, false),
+        ("listener", "deleted", 0, true, false),
+        ("listener", "private-listen", 0, true, true),
+        ("listener", "old", 46, true, false),
+        ("listener", "unplayed", 0, false, false),
+        ("other", "unplayed", 0, true, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO listening_events
+                (id, user_id, track_id, event_type, created_at, counted, taste_excluded, context_playlist_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+        )
+        .bind(format!("listen-{index}"))
+        .bind(user)
+        .bind(format!("track-{index}"))
+        .bind(if counted { "complete" } else { "progress" })
+        .bind((now - Duration::days(days_ago)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .bind(counted)
+        .bind(excluded)
+        .bind(playlist)
+        .execute(db.inner())
+        .await
+        .unwrap();
+    }
+
+    let path = "/api/v1/playlists/recently-played";
+    let (status, data) = json_response(request(&state, &session, "GET", path, None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = data["playlists"].as_array().unwrap();
+    let ids = items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(ids, ["recent", "smart", "shared"]);
+    assert_eq!(items[1]["isSmart"], true);
+}
+
 async fn report(state: &AppState, session: &str, event: &Value) -> (StatusCode, Value) {
     json_response(request(state, session, "POST", "/api/listening-events", Some(event)).await).await
 }
@@ -1168,17 +1238,37 @@ async fn library_pages_cover_albums_past_500_and_revise_when_same_count_rows_shi
 #[tokio::test]
 async fn library_track_filters_apply_before_paging_and_revisions_are_user_scoped() {
     let (db, state, session) = playback_state(true).await;
-    set_catalog_fixture(
-        &state,
-        ["a", "b", "c", "d", "e"]
-            .into_iter()
-            .map(|id| catalog_test_track(id, "Shared title"))
-            .collect(),
-        vec![],
-    );
+    let mut tracks: Vec<_> = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let mut track = catalog_test_track(id, "Shared title");
+            track.identity_hints = Some(crate::providers::IdentityHints {
+                isrc: Some(format!("USABC26{index:05}")),
+                ..Default::default()
+            });
+            track
+        })
+        .collect();
+    let mut duplicate = tracks[2].clone();
+    duplicate.id = "copy-c".into();
+    duplicate.provider_id = duplicate.id.clone();
+    duplicate.added_at = Some("2026-01-01T00:00:00Z".into());
+    tracks.insert(3, duplicate);
+    set_catalog_fixture(&state, tracks, vec![]);
     let (_, listing) =
         json_response(request(&state, &session, "GET", "/api/tracks", None).await).await;
     let rows = listing["tracks"].as_array().unwrap();
+    assert_eq!(listing["total"], 5);
+    assert_eq!(rows[2]["providerId"], "c");
+    assert_eq!(rows[3]["providerId"], "d");
+    let (status, recent) = json_response(request(&state, &session, "GET", "/api/tracks/recently-added?limit=5", None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let recent = recent["tracks"].as_array().unwrap();
+    assert_eq!(recent.len(), 5);
+    assert_eq!(recent[0]["providerId"], "copy-c");
+    assert!(!recent.iter().any(|track| track["providerId"] == "c"));
+    let duplicate_id = recent[0]["id"].as_str().unwrap();
     let id = |index: usize| rows[index]["id"].as_str().unwrap();
     sqlx::query("INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
         VALUES ('other', 'other', 'unused', 'Other', 'user', '2026-01-01', '2026-01-01')")
@@ -1196,6 +1286,8 @@ async fn library_track_filters_apply_before_paging_and_revisions_are_user_scoped
     crate::services::favorites::set_media_favorite(&db, "listener", "track", id(4), true, None)
         .await
         .unwrap();
+    crate::services::favorites::set_track_favorite(&db, "listener", duplicate_id, true)
+        .await.unwrap();
     add_recently_played(&db, "listener", id(1), None, false, None, None)
         .await
         .unwrap();
@@ -1241,6 +1333,8 @@ async fn library_track_filters_apply_before_paging_and_revisions_are_user_scoped
     add_recently_played(&db, "listener", id(2), None, false, None, None)
         .await
         .unwrap();
+    add_recently_played(&db, "listener", duplicate_id, None, false, None, None)
+        .await.unwrap();
     crate::services::favorites::set_track_favorite(&db, "listener", id(0), true)
         .await
         .unwrap();
@@ -2722,6 +2816,33 @@ async fn recently_played_returns_track_details_for_recorded_and_legacy_plays() {
     assert!(tracks[1]["artworkId"].is_string());
     assert_eq!(tracks[1]["playedAt"], legacy_time);
     provider.abort();
+}
+
+#[tokio::test]
+async fn recently_played_keeps_the_newest_recording_and_fills_past_duplicate_ids() {
+    let (db, state, session) = playback_state(false).await;
+    let mut event = playback_event(180.0, true);
+    assert_eq!(report(&state, &session, &event).await.0, StatusCode::OK);
+    event["playbackSessionId"] = json!("other-playback");
+    event["trackId"] = json!("other-catalog-id");
+    event["track"]["title"] = json!("ROYGBIV");
+    assert_eq!(report(&state, &session, &event).await.0, StatusCode::OK);
+    let newest = (Utc::now() + Duration::seconds(1)).to_rfc3339();
+    add_recently_played(&db, "listener", "other-catalog-id", Some(&newest), false, None, None)
+        .await.unwrap();
+    let older = (Utc::now() - Duration::days(1)).to_rfc3339();
+    for index in 0..49 {
+        let id = format!("older-{index:02}");
+        add_recently_played(&db, "listener", &id, Some(&older), false, None, None).await.unwrap();
+    }
+    let (status, result) = json_response(request(&state, &session, "GET", "/api/recently-played?tasteOnly=1", None).await).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let tracks = result["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 50);
+    assert_eq!(tracks[0]["id"], "other-catalog-id");
+    assert_eq!(tracks[0]["playedAt"], newest);
+    assert_eq!(tracks[49]["id"], "older-48");
+    assert!(!tracks.iter().any(|track| track["id"] == "track-1"));
 }
 
 #[tokio::test]

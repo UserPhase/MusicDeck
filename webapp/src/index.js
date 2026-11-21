@@ -15,6 +15,7 @@ import './styles/hero.css';
 import './styles/glassmorphic.css';
 import './styles/tactile.css';
 import './styles/theme.css';
+import './styles/mobile.css';
 import App from './App';
 import { initDesktopRuntime, isDesktopRuntime } from './services/desktop/desktopRuntime';
 import { registerServiceWorker } from './services/serviceWorkerRegistration';

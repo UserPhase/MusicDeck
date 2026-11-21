@@ -1,15 +1,21 @@
-import TrackActionScope from "../components/TrackActionScope";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { DiscoveryArtistCard, DiscoveryAlbumCard } from "../components/DiscoveryCards";
+import DiscoveryTrackList, { MOBILE_DISCOVERY_TRACK_LIMIT } from "../components/DiscoveryTrackList";
 import LightHero from "../components/Layout/LightHero";
+import PlaylistCover from "../components/PlaylistCover";
 import { NewReleasesShelf } from "../views/NewReleasesView";
-import TrackRow from "../components/TrackRow";
-import { getAlbum, getAlbums, getArtists, getRecentlyAddedSongs, getRecommendations } from "../api/musicdeck";
+import { useDiscoveryPlayback } from "../hooks/useDiscoveryPlayback";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { getAlbum, getAlbums, getArtists, getRecentlyAddedSongs, getRecommendations, LISTENING_ACTIVITY_CHANGED_EVENT } from "../api/musicdeck";
+import { getRecentlyPlayedPlaylists } from "../api/playlists";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
+import { startVisualPolling } from "../services/visualActivity";
 import { toUnifiedTrack } from "../types/track";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
+import { uniqueTracks } from "../utils/uniqueTracks";
 
 
 const HERO_LIMIT = 6;
@@ -21,7 +27,7 @@ function displayName(session) {
 }
 
 function recommendationItems(result) {
-  return (result?.sections || []).flatMap((section) => section.items || []).slice(0, TRACK_LIMIT);
+  return uniqueTracks((result?.sections || []).flatMap((section) => section.items || []), TRACK_LIMIT);
 }
 
 function preferredEntities(tracks, entities, kind) {
@@ -54,31 +60,25 @@ function SectionSkeleton({ variant, count }) {
   );
 }
 
-function HomeTracks({ tracks, onPlay, listId, className = "", showArtwork = false }) {
+function HomeTracks({ tracks, className = "", ...props }) {
   const songs = useMemo(() => tracks.map((song) => toUnifiedTrack(song, "home")), [tracks]);
-  return <TrackActionScope tracks={songs} dataKey={listId}><div className={`home-track-list track-list--compact ${className}`} role="table" aria-label="Songs">
-    {songs.map((song, index) => {
-      return <TrackRow key={`${song.id}-${index}`} song={song} index={index} showAlbum={false} showArtwork={showArtwork}
-        onPlay={onPlay}
-         />;
-    })}
-  </div></TrackActionScope>;
+  return <DiscoveryTrackList tracks={songs} className={`home-track-list ${className}`} {...props} />;
 }
 
-function CompactTrackList({ title, id, tracks, loading, error, onPlay, to }) {
+function CompactTrackList({ title, id, tracks, loading, error, onPlay, to, mobile }) {
   return (
     <section className="home-track-panel" aria-labelledby={id}>
       <SectionHeader id={id} title={title} to={to} />
-      {loading ? <SectionSkeleton variant="tracks" count={TRACK_LIMIT} /> : error ? (
+      {loading ? <SectionSkeleton variant="tracks" count={mobile ? MOBILE_DISCOVERY_TRACK_LIMIT : TRACK_LIMIT} /> : error ? (
         <p className="home-section-state">{error}</p>
       ) : tracks.length ? (
-        <HomeTracks tracks={tracks} onPlay={onPlay}  listId={id} />
+        <HomeTracks tracks={tracks} onPlay={onPlay} listId={id} mobile={mobile} />
       ) : <p className="home-section-state">Nothing to show yet.</p>}
     </section>
   );
 }
 
-function ArtistShelf({ id, title, artists, loading, error, to }) {
+function ArtistShelf({ id, title, artists, loading, error, to, artistState }) {
   return (
     <section className="home-section" aria-labelledby={id}>
       <SectionHeader id={id} title={title} to={to} />
@@ -86,9 +86,57 @@ function ArtistShelf({ id, title, artists, loading, error, to }) {
         <p className="home-section-state">{error}</p>
       ) : artists.length ? (
         <div className="explore-artist-row">
-          {artists.map((artist) => <DiscoveryArtistCard key={artist.id} artist={artist} />)}
+          {artists.map((artist) => <DiscoveryArtistCard key={artist.id} artist={artist}
+            playbackState={artistState(artist)} />)}
         </div>
       ) : <p className="home-section-state">No artists to show yet.</p>}
+    </section>
+  );
+}
+
+function RecentlyPlayedPlaylists() {
+  const [playlists, setPlaylists] = useState([]);
+
+  useEffect(() => {
+    let pending;
+    function load() {
+      pending?.abort();
+      const controller = new AbortController();
+      pending = controller;
+      getRecentlyPlayedPlaylists(controller.signal).then((items) => {
+        if (!controller.signal.aborted) setPlaylists(items);
+      }).catch(() => {
+        if (!controller.signal.aborted) setPlaylists([]);
+      });
+    }
+
+    const events = [LISTENING_ACTIVITY_CHANGED_EVENT, "playlistsChanged", "smartPlaylistsChanged", "online"];
+    const stopPolling = startVisualPolling(load, 60_000, { refreshOnWindowFocus: true });
+    events.forEach((event) => window.addEventListener(event, load));
+    return () => {
+      stopPolling();
+      pending?.abort();
+      events.forEach((event) => window.removeEventListener(event, load));
+    };
+  }, []);
+
+  if (!playlists.length) return null;
+
+  return (
+    <section className="home-section" aria-labelledby="recent-playlists-title">
+      <SectionHeader id="recent-playlists-title" title="Recently Played Playlists" />
+      <ul className="explore-album-row home-playlist-row">
+        {playlists.map((playlist) => (
+          <li key={playlist.id}>
+            <Link className="home-playlist-card" to={`/${playlist.isSmart ? "smart-playlist" : "playlist"}/${encodeURIComponent(playlist.id)}`}>
+              <span className="home-playlist-cover" aria-hidden="true">
+                <PlaylistCover playlist={playlist} size={320} />
+              </span>
+              <span className="explore-card-name">{playlist.name}</span>
+            </Link>
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }
@@ -102,8 +150,10 @@ function Home() {
   const [unexploredArtists, setUnexploredArtists] = useState({ items: [], loading: true, error: null });
   const [deepCuts, setDeepCuts] = useState({ items: [], loading: true, error: null });
 
-  const { playSong, playQueue, recentlyPlayed } = usePlayer();
+  const { playSong, playQueue, recentlyPlayed, currentSong, isPlaying, togglePlay } = usePlayer();
   const { session } = useAuth();
+  const isMobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+  const { albumState, artistState } = useDiscoveryPlayback(currentSong, isPlaying, isMobile);
 
   async function playAlbum(album) {
     try {
@@ -132,10 +182,10 @@ function Home() {
     }
 
     load(setRecentAlbums, () => getAlbums(ALBUM_LIMIT), "Could not load recently added albums.");
-    load(setRecentTracks, () => getRecentlyAddedSongs(TRACK_LIMIT), "Could not load recently added songs.");
+    load(setRecentTracks, async () => uniqueTracks(await getRecentlyAddedSongs(TRACK_LIMIT), TRACK_LIMIT), "Could not load recently added songs.");
     const discovery = getRecommendations(["discover"], 30)
       .then((data) => (data.sections || []).flatMap((section) => section.items || []));
-    load(setDiscoverTracks, async () => (await discovery).slice(0, TRACK_LIMIT), "Could not load discovery tracks.");
+    load(setDiscoverTracks, async () => uniqueTracks(await discovery, TRACK_LIMIT), "Could not load discovery tracks.");
     const personalized = async (loader, kind) => {
       const [profile, catalog] = await Promise.allSettled([discovery, loader()]);
       if (catalog.status === "rejected") throw catalog.reason;
@@ -151,7 +201,7 @@ function Home() {
     };
   }, []);
 
-  const continueTracks = useMemo(() => recentlyPlayed.slice(0, HERO_LIMIT), [recentlyPlayed]);
+  const continueTracks = useMemo(() => uniqueTracks(recentlyPlayed, HERO_LIMIT), [recentlyPlayed]);
 
   return (
     <div className="home-page home-hero-gradient">
@@ -165,29 +215,34 @@ function Home() {
       <section className="home-section home-continue" aria-labelledby="continue-listening-title">
         <SectionHeader id="continue-listening-title" title="Continue Listening" />
         {continueTracks.length ? (
-          <HomeTracks tracks={continueTracks} onPlay={playSong} listId="continue" className="home-continue-grid" showArtwork />
+          <HomeTracks tracks={continueTracks} onPlay={playSong} listId="continue" className="home-continue-grid"
+            showArtwork compactTile={isMobile} />
         ) : <p className="home-section-state">Start listening and your recent music will appear here.</p>}
       </section>
 
       <NewReleasesShelf />
+      {isMobile && session?.id && <RecentlyPlayedPlaylists key={session.id} />}
       <section className="home-section" aria-labelledby="recent-albums-title">
         <SectionHeader id="recent-albums-title" title="Recently Added Albums" to="/library/albums" />
         {recentAlbums.loading ? <SectionSkeleton variant="albums" count={ALBUM_LIMIT} /> : recentAlbums.error ? (
           <p className="home-section-state">{recentAlbums.error}</p>
         ) : (
           <div className="explore-album-row">
-            {recentAlbums.items.map((album) => (
-              <DiscoveryAlbumCard key={album.id} album={album} onPlay={playAlbum} />
-            ))}
+            {recentAlbums.items.map((album) => {
+              const playbackState = albumState(album);
+              return <DiscoveryAlbumCard key={album.id} album={album} inlinePlay={isMobile}
+                playbackState={playbackState} onPlay={playbackState ? togglePlay : playAlbum} />;
+            })}
           </div>
         )}
       </section>
 
-      <ArtistShelf id="discover-artists-title" title="Discover Artists" artists={discoverArtists.items} loading={discoverArtists.loading} error={discoverArtists.error} to="/explore" />
+      <ArtistShelf id="discover-artists-title" title="Discover Artists" artists={discoverArtists.items} loading={discoverArtists.loading} error={discoverArtists.error} to="/explore"
+        artistState={artistState} />
 
       <section className="home-section home-discovery-split" aria-label="Track discovery">
-        <CompactTrackList id="recent-tracks-title" title="Recently Added Songs" tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error} onPlay={playSong} to="/library/tracks"  />
-        <CompactTrackList id="discover-tracks-title" title="Discover Tracks" tracks={discoverTracks.items} loading={discoverTracks.loading} error={discoverTracks.error} onPlay={playSong} to="/explore"  />
+        <CompactTrackList id="recent-tracks-title" title="Recently Added Songs" tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error} onPlay={playSong} to="/library/tracks" mobile={isMobile} />
+        <CompactTrackList id="discover-tracks-title" title="Discover Tracks" tracks={discoverTracks.items} loading={discoverTracks.loading} error={discoverTracks.error} onPlay={playSong} to="/explore" mobile={isMobile} />
       </section>
 
       <section className="home-section" aria-labelledby="discover-albums-title">
@@ -203,14 +258,15 @@ function Home() {
         )}
       </section>
 
-      <ArtistShelf id="unexplored-artists-title" title="Unexplored Artists" artists={unexploredArtists.items} loading={unexploredArtists.loading} error={unexploredArtists.error} to="/library/artists" />
+      <ArtistShelf id="unexplored-artists-title" title="Unexplored Artists" artists={unexploredArtists.items} loading={unexploredArtists.loading} error={unexploredArtists.error} to="/library/artists"
+        artistState={artistState} />
 
       <section className="home-section" aria-labelledby="deep-cuts-title">
         <SectionHeader id="deep-cuts-title" title="Try Something Different" to="/library/tracks" action="More tracks" />
-        {deepCuts.loading ? <SectionSkeleton variant="deep-cuts" count={TRACK_LIMIT} /> : deepCuts.error ? (
+        {deepCuts.loading ? <SectionSkeleton variant={isMobile ? "tracks" : "deep-cuts"} count={isMobile ? MOBILE_DISCOVERY_TRACK_LIMIT : TRACK_LIMIT} /> : deepCuts.error ? (
           <p className="home-section-state">{deepCuts.error}</p>
         ) : deepCuts.items.length ? (
-          <HomeTracks tracks={deepCuts.items} onPlay={playSong}  listId="deep-cuts" className="home-deep-cuts" />
+          <HomeTracks tracks={deepCuts.items} onPlay={playSong} listId="deep-cuts" className="home-deep-cuts" mobile={isMobile} />
         ) : <p className="home-section-state">Keep listening to uncover deep cuts from your library.</p>}
       </section>
     </div>

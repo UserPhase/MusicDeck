@@ -4,6 +4,7 @@
 //!
 //! ## Endpoints Mounted
 //! - `GET /api/playlists`: Lists all playlists visible to the authenticated user.
+//! - `GET /api/v1/playlists/recently-played`: Lists the authenticated user's recently played playlists.
 //! - `POST /api/playlists`: Creates a new playlist (`201 Created`).
 //! - `GET /api/playlists/:playlist_id`: Returns hydrated playlist details and `itemIds`.
 //! - `PATCH /api/playlists/:playlist_id`: Updates playlist `name` and/or `description`.
@@ -86,6 +87,10 @@ pub fn playlist_routes() -> Router<AppState> {
         .route(
             "/api/playlists",
             get(list_playlists_handler).post(create_playlist_handler),
+        )
+        .route(
+            "/api/v1/playlists/recently-played",
+            get(list_recently_played_playlists_handler),
         )
         .route(
             "/api/playlists/:playlist_id",
@@ -193,6 +198,24 @@ async fn list_playlists_handler(
     match service.list(&auth.user).await {
         Ok(playlists) => Json(json!({ "playlists": playlists })).into_response(),
         Err(err) => map_playlist_error(err),
+    }
+}
+
+async fn list_recently_played_playlists_handler(
+    State(state): State<AppState>,
+    auth: AuthenticatedUser,
+) -> Response {
+    let service = match build_playlist_service(&state) {
+        Ok(service) => service,
+        Err(response) => return response,
+    };
+    match service.list_recently_played(&auth.user).await {
+        Ok(playlists) => (
+            [(CACHE_CONTROL, "private, no-store")],
+            Json(json!({ "playlists": playlists })),
+        )
+            .into_response(),
+        Err(error) => map_playlist_error(error),
     }
 }
 

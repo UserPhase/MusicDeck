@@ -59,9 +59,9 @@ export function ImportProvider({ children }) {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  const startImport = useCallback(async (url) => {
+  const startImport = useCallback(async (url, timeout) => {
     assertBrowserIntegrationAllowed("imports");
-    const started = await startSpotifyPlaylistImport(url);
+    const started = await startSpotifyPlaylistImport(url, timeout);
     setJob(started);
     setIsMinimized(false);
     return started;

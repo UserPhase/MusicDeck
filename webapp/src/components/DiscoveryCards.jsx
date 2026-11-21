@@ -4,6 +4,7 @@ import { useAlbumArtwork } from "../hooks/useAlbumArtwork";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { toAlbumRouteIdFromApiId, toArtistRouteIdFromApiId } from "../utils/idResolver";
 import ArtistAvatar from "./ArtistAvatar";
+import TrackPlaybackIndicator from "./TrackPlaybackIndicator";
 import { EditionBadges } from "./common/EditionBadges";
 
 const nameOf = (item) => item?.name || item?.title || "Unknown";
@@ -28,24 +29,43 @@ export function DiscoveryArtwork({ item, className = "" }) {
   </span>;
 }
 
-export function DiscoveryArtistCard({ artist }) {
-  return <Link className="explore-artist" to={itemLink(artist, "artist")} title={artist.recommendationReason || undefined}>
+export function DiscoveryArtistCard({ artist, playbackState = null }) {
+  const name = nameOf(artist);
+  return <Link className={`explore-artist${playbackState ? " is-current" : ""}`} to={itemLink(artist, "artist")}
+    title={artist.recommendationReason || undefined}
+    aria-description={playbackState === "playing" ? "Now playing" : playbackState === "paused" ? "Playback paused" : undefined}>
     <ArtistAvatar artist={artist} className="explore-artist-image" allowAlbumTileFallback
       enableMusicBrainzFallback deferUntilVisible />
-    <span className="explore-card-name">{nameOf(artist)}</span>
+    {playbackState && <span className="explore-artist-status" aria-hidden="true">
+      <TrackPlaybackIndicator isCurrentTrack isPlaying={playbackState === "playing"} />
+    </span>}
+    <span className="explore-card-name">{name}</span>
   </Link>;
 }
 
-export function DiscoveryAlbumCard({ album, onPlay }) {
+export function DiscoveryAlbumCard({ album, onPlay, inlinePlay = false, playbackState = null }) {
   const deletion = useServerDeletion();
   if (album.id && deletion?.deletedAlbums.has(String(album.id))) return null;
-  return <article className="explore-album" title={album.recommendationReason || undefined}>
+  const name = nameOf(album);
+  const playing = playbackState === "playing";
+  const action = playing ? "Pause" : playbackState === "paused" ? "Resume" : "Play";
+  const playButton = (
+    <button type="button" onClick={() => onPlay(album)} aria-label={`${action} ${name}`}
+      className={inlinePlay ? "explore-album-play-inline" : "explore-album-play"}>
+      {playing ? <span aria-hidden="true"><TrackPlaybackIndicator isCurrentTrack isPlaying /></span> : "▶"}
+    </button>
+  );
+  return <article className={`explore-album${inlinePlay ? " explore-album--inline-play" : ""}${playbackState ? " is-current" : ""}`}
+    title={album.recommendationReason || undefined}>
     <div className="explore-album-image">
-      <Link to={itemLink(album, "album")} aria-label={`Open ${nameOf(album)}`}><DiscoveryArtwork item={album} /></Link>
-      <button type="button" onClick={() => onPlay(album)} aria-label={`Play ${nameOf(album)}`} className="explore-album-play">▶</button>
+      <Link to={itemLink(album, "album")} aria-label={`Open ${name}`}><DiscoveryArtwork item={album} /></Link>
+      {!inlinePlay && playButton}
     </div>
-    <Link className="explore-card-name" to={itemLink(album, "album")}>{nameOf(album)}</Link>
-    <span className="explore-card-subtitle">{album.artist || "Unknown artist"}</span>
-      <EditionBadges item={album} />
+    <div className="explore-album-caption">
+      <Link className="explore-card-name" to={itemLink(album, "album")}>{name}</Link>
+      <span className="explore-card-subtitle">{album.artist || "Unknown artist"}</span>
+      {inlinePlay && playButton}
+    </div>
+    <EditionBadges item={album} />
   </article>;
 }

@@ -7,10 +7,12 @@
 
 mod input;
 mod playlist_files;
+mod playlist_timeout;
 pub mod repository;
 pub mod service;
 pub mod spotdl;
 pub use input::{AcquisitionKind, AcquisitionResult};
+pub use playlist_timeout::PlaylistImportTimeout;
 
 pub use repository::{
     ImportEntry, ImportEntryStatus, ImportJob, PlaylistImportForbiddenError,
@@ -104,6 +106,8 @@ mod tests {
             user: json!({ "id": "alice", "role": "user", "disabled": false }),
             unreadable_manifest: None,
             playlist_intent: None,
+            timeout: PlaylistImportTimeout::Auto,
+            download_sample: None,
         };
 
         repo.save(&stored).await.expect("save import checkpoint");

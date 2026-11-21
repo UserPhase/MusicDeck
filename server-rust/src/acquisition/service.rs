@@ -812,7 +812,7 @@ impl AcquisitionService {
                 "Acquisition staging must be a regular directory".into(),
             ));
         }
-        let batch = download_manifest(context, downloader, &request, job_id).await?;
+        let batch = download_manifest(context, downloader, &request, job_id, None).await?;
         let (library, config) = self.library.as_ref().zip(config).ok_or_else(|| {
             TaskError::ExecutionFailed("Shared Navidrome library is not configured".into())
         })?;

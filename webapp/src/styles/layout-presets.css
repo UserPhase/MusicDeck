@@ -9,7 +9,7 @@
  * Every shell keeps the same routes, panels and controls.
  */
 
-:root { --mobile-nav-height: 60px; --mobile-player-height: 64px; --drawer-ease: cubic-bezier(.22, .8, .24, 1); }
+:root { --drawer-ease: cubic-bezier(.22, .8, .24, 1); }
 
 .topbar-brand-group { display: flex; align-items: center; gap: 14px; justify-self: start; min-width: 0; max-width: 100%; }
 
@@ -98,10 +98,8 @@
 :root[data-layout-shell="ytmusic"] .main { left: var(--frame); }
 :root[data-layout-shell="ytmusic"] .main.sidebar-open { right: var(--frame); }
 
-:root[data-layout-shell="ytmusic"] .sidebar,
-:root[data-layout-shell="mobile"] .sidebar { z-index: 40; visibility: hidden; transform: translateX(calc(-100% - var(--frame) * 2)); transition: transform 260ms var(--drawer-ease), visibility 0s linear 260ms; }
-:root[data-layout-shell="ytmusic"][data-nav-drawer="open"] .sidebar,
-:root[data-layout-shell="mobile"][data-nav-drawer="open"] .sidebar { visibility: visible; transform: none; box-shadow: 0 24px 60px rgb(0 0 0 / 38%); transition: transform 260ms var(--drawer-ease), visibility 0s; }
+:root[data-layout-shell="ytmusic"] .sidebar { z-index: 40; visibility: hidden; transform: translateX(calc(-100% - var(--frame) * 2)); transition: transform 260ms var(--drawer-ease), visibility 0s linear 260ms; }
+:root[data-layout-shell="ytmusic"][data-nav-drawer="open"] .sidebar { visibility: visible; transform: none; box-shadow: 0 24px 60px rgb(0 0 0 / 38%); transition: transform 260ms var(--drawer-ease), visibility 0s; }
 
 :root[data-layout-shell="ytmusic"] .player--drawer { left: var(--frame); right: var(--frame); bottom: var(--frame); height: calc(var(--player-height) - var(--frame) * 2); padding: 0 18px; grid-template-columns: auto minmax(0, 1fr) auto; gap: 22px; border: 1px solid var(--panel-border); border-radius: 18px; box-shadow: var(--panel-shadow); }
 :root[data-layout-shell="ytmusic"] .player--drawer .controls { order: -1; }
@@ -172,50 +170,11 @@
 /* Only the default shell shows the floating "Now Playing" reopen button. */
 :root[data-layout-shell]:not([data-layout-shell="spotify"]) .main-now-playing-toggle { display: none; }
 
-/* ---------- Unified mobile shell (< 768px) ---------- */
-:root[data-layout-shell="mobile"] .topbar { grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; padding: 0 10px; }
-:root[data-layout-shell="mobile"] .topbar-primary-nav { display: none; }
-:root[data-layout-shell="mobile"] .topbar-brand-group { gap: 6px; }
-:root[data-layout-shell="mobile"] .search { width: 100%; }
-:root[data-layout-shell="mobile"] .search-wrapper { max-width: none; }
-:root[data-layout-shell="mobile"] .sidebar { top: 80px; bottom: calc(var(--mobile-nav-height) + var(--frame)); width: min(300px, calc(100vw - 48px)); }
-:root[data-layout-shell="mobile"] .main,
-:root[data-layout-shell="mobile"] .main.sidebar-open { left: var(--frame); right: var(--frame); bottom: calc(var(--mobile-player-height) + var(--mobile-nav-height)); }
-
-:root[data-layout-shell="mobile"] .player { bottom: var(--mobile-nav-height); height: var(--mobile-player-height); padding: 0 12px; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; border-top: 1px solid var(--layout-divider); }
-:root[data-layout-shell="mobile"] .player-right { display: none; }
-:root[data-layout-shell="mobile"] .player .now-cover { width: 44px; height: 44px; }
-:root[data-layout-shell="mobile"] .player .heart { margin-left: 8px; }
-:root[data-layout-shell="mobile"] .player .control-buttons { gap: 12px; }
-:root[data-layout-shell="mobile"] .player .shuffle-control,
-:root[data-layout-shell="mobile"] .player .loop-control { display: none; }
-:root[data-layout-shell="mobile"] .player .progress-container { position: absolute; top: -1px; left: 0; right: 0; width: auto; }
-:root[data-layout-shell="mobile"] .player .progress-container .time { display: none; }
-:root[data-layout-shell="mobile"] .player .progress { height: 3px; }
-:root[data-layout-shell="mobile"] .player .now-preview-import,
-:root[data-layout-shell="mobile"] .player .now-audio-badge { display: none; }
-
-:root[data-layout-shell="mobile"] .right-sidebar,
-:root[data-layout-shell="mobile"] .queue-sidebar { display: flex; top: 80px; left: var(--frame); right: var(--frame); bottom: calc(var(--mobile-player-height) + var(--mobile-nav-height) + 4px); width: auto; z-index: 25; animation: shell-sheet-in 260ms var(--drawer-ease) both; }
-
-.mobile-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 21; height: var(--mobile-nav-height); display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); padding-bottom: env(safe-area-inset-bottom, 0px); box-sizing: content-box; border-top: 1px solid var(--layout-divider); background: var(--player-bg); }
-.mobile-nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 0; color: var(--nav-item-text); font-size: 10.5px; font-weight: 600; text-decoration: none; transition: color 150ms ease; }
-.mobile-nav-icon { width: 34px; height: 24px; display: grid; place-items: center; border-radius: var(--radius-pill); font-size: 16px; line-height: 1; transition: background 150ms ease; }
-.mobile-nav-label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-nav-item:hover { color: var(--nav-hover-text); }
-.mobile-nav-item.active { color: var(--nav-active-text); }
-.mobile-nav-item.active .mobile-nav-icon { background: var(--nav-active-fill); }
-.mobile-nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -4px; border-radius: 10px; }
-
-@media (max-width: 420px) {
-  :root[data-layout-shell="mobile"] .logo { display: none; }
-}
-
 @keyframes shell-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes shell-sheet-in { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .topbar-primary-link, .topbar-drawer-toggle, .header-player-button, .widget-track, .widget-playlist, .mobile-nav-item, .mobile-nav-icon, .player-expand-button, .player-expand-button svg { transition: none; }
+  .topbar-primary-link, .topbar-drawer-toggle, .header-player-button, .widget-track, .widget-playlist, .player-expand-button, .player-expand-button svg { transition: none; }
   :root[data-layout-shell] .sidebar { transition: none; }
   .nav-drawer-scrim,
   :root[data-layout-shell] .right-sidebar,

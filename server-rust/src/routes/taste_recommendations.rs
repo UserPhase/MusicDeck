@@ -492,9 +492,20 @@ async fn get_recommendations_handler(
         RecommendationKind::Discover,
         RecommendationKind::SimilarArtists,
     ];
+    let mut requested = Vec::new();
+    if let Some(kinds) = params.get("kinds").filter(|kinds| !kinds.trim().is_empty()) {
+        for raw in kinds.split(',') {
+            let kind = RecommendationKind::parse(raw)
+                .ok_or_else(|| ServerError::BadRequest("Invalid recommendation kind".into()))?;
+            if !requested.contains(&kind) {
+                requested.push(kind);
+            }
+        }
+    }
+    let kinds = if requested.is_empty() { &default_kinds[..] } else { &requested };
     let sections = state
         .recommendations()
-        .sections(&catalog, &auth.user.id, &default_kinds, limit)
+        .sections(&catalog, &auth.user.id, kinds, limit)
         .await;
 
     Ok((

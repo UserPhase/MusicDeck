@@ -46,19 +46,19 @@ export function formatTime(seconds) {
 }
 
 
-function paintProgress(input, percent) {
-  input.value = String(percent);
-  input.style.setProperty("--range-progress", `${percent}%`);
+function paintProgress(element, percent) {
+  if (element instanceof HTMLInputElement) element.value = String(percent);
+  element.style.setProperty("--range-progress", `${percent}%`);
 }
 
 function progressPercent(position, duration) {
   return duration > 0 && Number.isFinite(position) ? Math.min(100, Math.max(0, position / duration * 100)) : 0;
 }
 
-function PlayerProgress({ player }) {
+function PlayerProgress({ player, compact = false }) {
   const { currentSong, isPlaying, isBuffering, isRemotePlayback, duration, seek, readPlaybackPosition } = player;
   const currentTime = usePlaybackDisplayPosition(player);
-  const progressInput = useRef(null);
+  const progressRef = useRef(null);
   const visualActive = useVisualActivity();
   const desktop = isDesktopRuntime();
   const animateProgress = Boolean((!desktop || isRemotePlayback) && visualActive && currentSong && duration > 0 && isPlaying && !isBuffering && readPlaybackPosition);
@@ -66,17 +66,21 @@ function PlayerProgress({ player }) {
   useLayoutEffect(() => {
     if (!visualActive) return;
     const position = (!desktop || isRemotePlayback) && currentSong && readPlaybackPosition ? readPlaybackPosition() : currentTime;
-    paintProgress(progressInput.current, progressPercent(position, duration));
+    paintProgress(progressRef.current, progressPercent(position, duration));
   }, [currentSong, currentTime, duration, animateProgress, readPlaybackPosition, visualActive, desktop, isRemotePlayback]);
 
   // Repaint only the scrubber between media events so the rest of the UI stays idle.
   useLayoutEffect(() => {
     if (!animateProgress) return;
-    const input = progressInput.current;
+    const progress = progressRef.current;
+    let previousPercent;
     let frame;
     const draw = () => {
       const percent = progressPercent(readPlaybackPosition(), duration);
-      if (input.valueAsNumber !== percent) paintProgress(input, percent);
+      if (previousPercent !== percent) {
+        paintProgress(progress, percent);
+        previousPercent = percent;
+      }
       frame = requestAnimationFrame(draw);
     };
     frame = requestAnimationFrame(draw);
@@ -84,11 +88,13 @@ function PlayerProgress({ player }) {
   }, [animateProgress, duration, readPlaybackPosition]);
 
 
+  if (compact) return <div className="mobile-player-progress" ref={progressRef} aria-hidden="true" />;
+
   return (
     <div className="progress-container">
       <span className="time">{formatTime(currentTime)}</span>
       <input
-        ref={progressInput}
+        ref={progressRef}
         type="range"
         min="0"
         max="100"
@@ -108,46 +114,160 @@ function PlayerProgress({ player }) {
   );
 }
 
+function LikeButton({ player: { toggleLike, isCurrentSongLiked } }) {
+  return (
+    <button type="button" className={`heart${isCurrentSongLiked ? " liked" : ""}`}
+      onClick={toggleLike} aria-label={isCurrentSongLiked ? "Unlike song" : "Like song"}>
+      {isCurrentSongLiked ? "♥" : "♡"}
+    </button>
+  );
+}
+
+function PlaybackControls({ player, compact = false }) {
+  const { currentSong, isPlaying, isPreparingPlayback, togglePlay, nextSong, previousSong,
+    toggleShuffle, isShuffleEnabled, toggleLoop, isLooping, repeatMode } = player;
+  const playLabel = isPreparingPlayback ? "Cancel preparation" : isPlaying ? "Pause" : "Play";
+
+  return (
+    <div className="control-buttons">
+      {!compact && <>
+        <button type="button" className={`control shuffle-control${isShuffleEnabled ? " active" : ""}`}
+          onClick={toggleShuffle} disabled={!currentSong}
+          aria-label={isShuffleEnabled ? "Turn off shuffle" : "Turn on shuffle"} aria-pressed={isShuffleEnabled}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 7h3.2c1.3 0 2.5.6 3.3 1.6L17 17" />
+            <path d="m15 14 3 3-3 3" />
+            <path d="M3 17h3.2c1.3 0 2.5-.6 3.3-1.6L11 13" />
+            <path d="m15 4 3 3-3 3" />
+          </svg>
+        </button>
+        <button type="button" className="control skip-control" onClick={previousSong}
+          disabled={!currentSong} aria-label="Previous song">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h3v14H5zM19 5 8 12l11 7z" /></svg>
+        </button>
+      </>}
+      <button type="button" className="play-button" onClick={togglePlay} disabled={!currentSong}
+        aria-label={playLabel} aria-busy={isPreparingPlayback || undefined}>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          {isPreparingPlayback ? <path d="M7 7h10v10H7z" />
+            : isPlaying ? <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
+            : <path d="M8 4.5v15L20 12z" />}
+        </svg>
+      </button>
+      <button type="button" className="control skip-control" onClick={nextSong}
+        disabled={!currentSong} aria-label="Next song">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 5h3v14h-3zM5 5l11 7-11 7z" /></svg>
+      </button>
+      {!compact && (
+        <button type="button" className={`control loop-control${isLooping ? " active" : ""}`}
+          onClick={toggleLoop} disabled={!currentSong}
+          aria-label={repeatMode === "all" ? "Repeat queue. Switch to repeat one"
+            : repeatMode === "one" ? "Repeat one. Turn off repeat" : "Turn on repeat"}
+          aria-pressed={isLooping}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M17 3l4 4-4 4M3 7h18M7 21l-4-4 4-4M21 17H3" />
+            {repeatMode === "one" && <path d="M11 11l1-1v5m-1 0h2" />}
+          </svg>
+        </button>
+      )}
+    </div>
+  );
+}
+
+function MobilePlayer({ hidden = false, onOpenNowPlaying, nowPlayingButtonRef }) {
+  const player = usePlayer();
+  const { currentSong, isPlaying, playbackMessage, playbackUnavailable, isPreview } = player;
+  const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
+
+  return (
+    <footer className={`player mobile-player${currentSong ? " has-current-track" : ""}${currentSong && isPlaying ? " is-playing" : ""}`}
+      aria-label="Mini player" hidden={hidden}>
+      {playbackMessage && <div className="player-toast" role="status">{playbackMessage}</div>}
+      <button type="button" className="mobile-player-track" ref={nowPlayingButtonRef} onClick={onOpenNowPlaying}
+        aria-label={currentSong?.title ? `Open Now Playing: ${currentSong.title}` : "Open Now Playing"}
+        aria-haspopup="dialog">
+        <span className="now-cover" aria-hidden="true">
+          {coverUrl ? <img src={coverUrl} onError={onCoverError} alt="" width="56" height="56" /> : "♫"}
+        </span>
+        <span className="mobile-player-meta">
+          <span className="now-title-text">{currentSong?.title || "Nothing playing"}</span>
+          <span className="now-artist">
+            {playbackUnavailable ? "Unavailable" : currentSong?.artist || (currentSong ? "Unknown artist" : "Open player")}
+            {!playbackUnavailable && isPreview && currentSong && " · Preview"}
+          </span>
+        </span>
+        <svg className="mobile-player-expand" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m6 15 6-6 6 6" />
+        </svg>
+      </button>
+      <div className="player-audio-tools-mobile">
+        <DeviceSelectorButton compact />
+      </div>
+      <PlaybackControls player={player} compact />
+      {!hidden && <PlayerProgress player={player} compact />}
+    </footer>
+  );
+}
+
+export function MobilePlaybackControls({ player, onOpenQueue }) {
+  return (
+    <div className="mobile-playback">
+      {player.currentSong && <>
+        <PlayerProgress player={player} />
+        <PlaybackControls player={player} />
+      </>}
+      <div className="mobile-playback-actions" role="group" aria-label="Playback options">
+        <DeviceSelectorButton />
+        <PlayerAudioTools />
+        <button type="button" className="mobile-playback-queue" onClick={onOpenQueue}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
+          Queue
+        </button>
+      </div>
+      {player.playbackMessage && <p className="mobile-playback-message" role="status">{player.playbackMessage}</p>}
+    </div>
+  );
+}
+
+export function MobileTrackActions({ player }) {
+  const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(player.currentSong);
+  const { canImport } = usePrivacy();
+  return (
+    <>
+      <LikeButton player={player} />
+      {player.isPreview && canImport && (
+        <button type="button" className="now-preview-import" onClick={importPreviewTrack} disabled={isImportDisabled}>
+          {importLabel}
+        </button>
+      )}
+    </>
+  );
+}
+
 /**
  * Docked player bar. `variant="drawer"` restyles it as the floating,
  * expandable bar used by the YouTube Music layout; `actions` renders extra
  * buttons (such as the drawer expand toggle) beside the queue button.
  */
-function Player({
+function DesktopPlayer({
   isQueueSidebarOpen = false,
   onToggleQueueSidebar,
   variant = "bar",
   actions = null,
-  mobile = false,
 }) {
 
   const player = usePlayer();
   const {
     currentSong,
-    isPlaying,
     isRemotePlayback,
     isCasting,
-
-    togglePlay,
-
-    nextSong,
-    previousSong,
-    toggleShuffle,
-    isShuffleEnabled,
-    toggleLoop,
-    isLooping,
-    repeatMode,
 
     volume,
     changeVolume,
 
-    toggleLike,
-    isCurrentSongLiked,
-
     isPreview,
     playbackUnavailable,
     playbackMessage,
-    isPreparingPlayback,
 
   } = player;
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
@@ -257,42 +377,7 @@ function Player({
         </div>
 
 
-        {/* LIKE */}
-
-        {currentSong && (
-
-          <button
-            className={
-              `heart ${
-                isCurrentSongLiked
-                  ? "liked"
-                  : ""
-              }`
-            }
-
-            onClick={
-              toggleLike
-            }
-
-            aria-label={
-              isCurrentSongLiked
-                ? "Unlike song"
-                : "Like song"
-            }
-
-          >
-            {isCurrentSongLiked
-              ? "♥"
-              : "♡"}
-
-          </button>
-
-        )}
-        {mobile && <div className="player-audio-tools-mobile" role="group" aria-label="Playback devices">
-          <PlayerAudioTools />
-          <DeviceSelectorButton compact />
-        </div>}
-
+        {currentSong && <LikeButton player={player} />}
 
       </div>
 
@@ -304,158 +389,7 @@ function Player({
       <div className="controls">
 
 
-        <div className="control-buttons">
-
-
-          {/* SHUFFLE */}
-
-          <button
-            className={
-              `control shuffle-control ${
-                isShuffleEnabled
-                  ? "active"
-                  : ""
-              }`
-            }
-
-            onClick={
-              toggleShuffle
-            }
-
-            disabled={
-              !currentSong
-            }
-
-            aria-label={
-              isShuffleEnabled
-                ? "Turn off shuffle"
-                : "Turn on shuffle"
-            }
-
-            aria-pressed={
-              isShuffleEnabled
-            }
-          >
-            <svg
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path d="M3 7h3.2c1.3 0 2.5.6 3.3 1.6L17 17" />
-              <path d="m15 14 3 3-3 3" />
-              <path d="M3 17h3.2c1.3 0 2.5-.6 3.3-1.6L11 13" />
-              <path d="m15 4 3 3-3 3" />
-            </svg>
-          </button>
-
-
-          {/* PREVIOUS */}
-
-          <button
-            className="control"
-
-            onClick={
-              previousSong
-            }
-
-            disabled={
-              !currentSong
-            }
-
-            aria-label="Previous song"
-          >
-            ◀
-          </button>
-
-
-          {/* PLAY / PAUSE */}
-
-          <button
-            className="play-button"
-
-            onClick={
-              togglePlay
-            }
-
-            disabled={
-              !currentSong
-            }
-
-            aria-label={
-              isPreparingPlayback ? "Cancel preparation" : isPlaying
-                ? "Pause"
-                : "Play"
-            }
-            aria-busy={isPreparingPlayback || undefined}
-          >
-
-            {isPreparingPlayback ? "…" : isPlaying
-              ? "❚❚"
-              : "▶"}
-
-          </button>
-
-
-          {/* NEXT */}
-
-          <button
-            className="control"
-
-            onClick={
-              nextSong
-            }
-
-            disabled={
-              !currentSong
-            }
-
-            aria-label="Next song"
-          >
-            ▶
-          </button>
-
-
-          {/* LOOP */}
-
-          <button
-            className={
-              `control loop-control ${
-                isLooping
-                  ? "active"
-                  : ""
-              }`
-            }
-
-            onClick={
-              toggleLoop
-            }
-
-            disabled={
-              !currentSong
-            }
-
-            aria-label={
-              repeatMode === "all" ? "Repeat queue. Switch to repeat one"
-                : repeatMode === "one" ? "Repeat one. Turn off repeat" : "Turn on repeat"
-            }
-
-            aria-pressed={
-              isLooping
-            }
-          >
-            <svg
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path d="M17 3l4 4-4 4" />
-              <path d="M3 7h18" />
-              <path d="M7 21l-4-4 4-4" />
-              <path d="M21 17H3" />
-              {repeatMode === "one" && <path d="M11 11l1-1v5m-1 0h2" />}
-            </svg>
-          </button>
-
-        </div>
-
+        <PlaybackControls player={player} />
 
         {/* PROGRESS */}
 
@@ -493,10 +427,10 @@ function Player({
         </div>
 
 
-        {!mobile && <div className="player-streaming-controls" role="group" aria-label="Playback devices">
+        <div className="player-streaming-controls" role="group" aria-label="Playback devices">
           <PlayerAudioTools />
           <DeviceSelectorButton compact />
-        </div>}
+        </div>
 
         {/* =============================== */}
         {/* VOLUME */}
@@ -550,4 +484,6 @@ function Player({
 }
 
 
-export default Player;
+export default function Player({ mobile = false, ...props }) {
+  return mobile ? <MobilePlayer {...props} /> : <DesktopPlayer {...props} />;
+}

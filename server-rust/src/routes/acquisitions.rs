@@ -28,7 +28,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
 use crate::acquisition::{
-    AcquisitionCreateOptions, AcquisitionJobError, AcquisitionJobStatus, parse_spotify_playlist_url,
+    AcquisitionCreateOptions, AcquisitionJobError, AcquisitionJobStatus, PlaylistImportTimeout,
+    parse_spotify_playlist_url,
 };
 use crate::auth::AuthenticatedUser;
 use crate::error::ServerError;
@@ -37,6 +38,8 @@ use crate::error::ServerError;
 #[serde(rename_all = "camelCase")]
 struct StartSpotifyImportBody {
     pub playlist_url: String,
+    #[serde(default)]
+    pub timeout: PlaylistImportTimeout,
 }
 
 /// Builds the router for `/api/acquisitions/*` and `/api/v1/playlists/import-spotify*`.
@@ -267,7 +270,12 @@ async fn start_spotify_playlist_import_handler(
 
     let job = state
         .spotify_imports()
-        .start(&body.playlist_url, &auth.user, Some(state.tasks()))
+        .start_with_timeout(
+            &body.playlist_url,
+            body.timeout,
+            &auth.user,
+            Some(state.tasks()),
+        )
         .await
         .map_err(ServerError::BadRequest)?;
 
@@ -301,6 +309,20 @@ mod tests {
     use crate::tasks::{TaskDefinition, TaskError, TaskRunContext, TaskType};
 
     struct FakeDownloader;
+
+    #[test]
+    fn parses_playlist_import_timeout_and_defaults_older_requests_to_auto() {
+        let url = "https://open.spotify.com/playlist/abc123";
+        let legacy: StartSpotifyImportBody = serde_json::from_value(json!({ "playlistUrl": url })).unwrap();
+        assert_eq!(legacy.timeout, PlaylistImportTimeout::Auto);
+        let manual: StartSpotifyImportBody = serde_json::from_value(json!({
+            "playlistUrl": url, "timeout": { "mode": "manual", "minutes": 90 }
+        })).unwrap();
+        assert_eq!(manual.timeout, PlaylistImportTimeout::Manual { minutes: 90 });
+        for timeout in [json!({ "mode": "manual" }), json!({ "mode": "manual", "minutes": 1.5 }), json!({ "mode": "unexpected" })] {
+            assert!(serde_json::from_value::<StartSpotifyImportBody>(json!({ "playlistUrl": url, "timeout": timeout })).is_err());
+        }
+    }
 
     #[async_trait::async_trait]
     impl TaskDefinition for FakeDownloader {

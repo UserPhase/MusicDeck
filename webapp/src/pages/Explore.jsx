@@ -1,8 +1,7 @@
-import TrackActionScope from "../components/TrackActionScope";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { getAlbum, getAlbums, getCoverUrl, getPersonalizedDiscovery } from "../api/musicdeck";
+import { getAlbum, getCoverUrl, getPersonalizedDiscovery } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
 import { usePrivacy } from "../context/PrivacyContext";
 import { externalDiscoveryService } from "../services/externalDiscovery";
@@ -11,15 +10,19 @@ import { canStreamPreview, trustedPreviewUrl } from "../utils/previewPlayback";
 import { extractArtworkColor } from "../utils/extractArtworkColor";
 import { toUnifiedTrack } from "../types/track";
 import { DiscoveryArtistCard, DiscoveryAlbumCard, DiscoveryArtwork as Artwork, itemLink } from "../components/DiscoveryCards";
+import DiscoveryTrackList, { MOBILE_DISCOVERY_TRACK_LIMIT } from "../components/DiscoveryTrackList";
 import ExternalAlbumCard from "../components/ExternalAlbumCard";
 import LightHero from "../components/Layout/LightHero";
-import TrackRow from "../components/TrackRow";
+import { useDiscoveryPlayback } from "../hooks/useDiscoveryPlayback";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 
 import { toAlbumRouteIdFromApiId } from "../utils/idResolver";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
+import { uniqueTracks } from "../utils/uniqueTracks";
 
 const SHELF_SIZE = 7;
 const TRACK_SIZE = 6;
-const feedKeys = ["featured", "popularArtists", "popularAlbums", "popularTracks", "discoverTracks", "discoverArtists", "discoverAlbums", "genres"];
+const feedKeys = ["featured", "popularArtists", "popularAlbums", "popularTracks", "discoverTracks", "discoverArtists", "discoverAlbums"];
 const initialFeeds = () => Object.fromEntries(feedKeys.map((key) => [key, { items: [], loading: true, error: null }]));
 const nameOf = (item) => item?.name || item?.title || "Unknown";
 
@@ -40,12 +43,12 @@ function FeedBody({ feed, shape, count, empty, children }) {
   return <>{feed.notice && <p className="explore-feed-message" role="status">{feed.notice}</p>}{children}</>;
 }
 
-function ArtistShelf({ id, title, subtitle, feed }) {
+function ArtistShelf({ id, title, subtitle, feed, artistState }) {
   return <section className="explore-section" aria-labelledby={id}>
     <Header id={id} title={title} subtitle={subtitle} />
     <FeedBody feed={feed} shape="circles" count={SHELF_SIZE} empty="No artists to show yet.">
       <div className="explore-artist-row">{feed.items.slice(0, SHELF_SIZE).map((artist) =>
-        <DiscoveryArtistCard key={artist.id} artist={artist} />
+        <DiscoveryArtistCard key={artist.id} artist={artist} playbackState={artistState(artist)} />
       )}</div>
     </FeedBody>
   </section>;
@@ -56,53 +59,28 @@ function isExternalAlbum(album) {
   return Boolean(album?.id && !album.sample && (album.external || album.source?.kind === "external"));
 }
 
-function AlbumShelf({ id, title, subtitle, feed, onPlay }) {
+function AlbumShelf({ id, title, subtitle, feed, limit = SHELF_SIZE, empty = "No albums to show yet.", mobile, albumState, onPlay, onToggle }) {
   return <section className="explore-section" aria-labelledby={id}>
     <Header id={id} title={title} subtitle={subtitle} />
-    <FeedBody feed={feed} shape="squares" count={SHELF_SIZE} empty="No albums to show yet.">
-      <div className="explore-album-row">{feed.items.slice(0, SHELF_SIZE).map((album) => isExternalAlbum(album)
-        ? <ExternalAlbumCard key={album.id} album={album} onPlay={onPlay} />
-        : <DiscoveryAlbumCard key={album.id} album={album} onPlay={onPlay} />
-      )}</div>
+    <FeedBody feed={feed} shape="squares" count={limit} empty={empty}>
+      <div className="explore-album-row">{feed.items.slice(0, limit).map((album) => {
+        if (!mobile && isExternalAlbum(album)) return <ExternalAlbumCard key={album.id} album={album} onPlay={onPlay} />;
+        const playbackState = albumState(album);
+        return <DiscoveryAlbumCard key={album.id} album={album} inlinePlay={mobile}
+          playbackState={playbackState} onPlay={playbackState ? onToggle : onPlay} />;
+      })}</div>
     </FeedBody>
   </section>;
 }
 
-function TrackPanel({ id, title, subtitle, feed, onPlay }) {
+function TrackPanel({ id, title, subtitle, feed, onPlay, mobile }) {
+  const tracks = useMemo(() => uniqueTracks(feed.items.map((song) => toUnifiedTrack(song, "explore")), TRACK_SIZE), [feed.items]);
   return <section className="explore-track-panel" aria-labelledby={id}>
     <Header id={id} title={title} subtitle={subtitle} />
-    <FeedBody feed={feed} shape="tracks" count={TRACK_SIZE} empty="No songs to show yet.">
-      <TrackActionScope tracks={feed.items.slice(0, TRACK_SIZE).map((song) => toUnifiedTrack(song, "explore"))} dataKey={id}>
-      <div className="explore-track-list track-list--compact" role="table">{feed.items.slice(0, TRACK_SIZE).map((rawSong, index) => {
-        const song = toUnifiedTrack(rawSong, "explore");
-        return <TrackRow
-          className="explore-track-row"
-          key={`${song.id}-${index}`}
-          song={song}
-          index={index}
-          showAlbum={false}
-          onPlay={onPlay}
-
-
-        />;
-      })}</div></TrackActionScope>
+    <FeedBody feed={feed} shape="tracks" count={mobile ? MOBILE_DISCOVERY_TRACK_LIMIT : TRACK_SIZE} empty="No songs to show yet.">
+      <DiscoveryTrackList tracks={tracks} listId={id} className="explore-track-list" onPlay={onPlay} mobile={mobile} />
     </FeedBody>
   </section>;
-}
-
-const genreTones = ["#593092", "#187477", "#a34645", "#476395", "#915b2f", "#456b3c", "#743e77", "#2c6b82"];
-const genreSymbols = ["◈", "✦", "♫", "◒", "✳", "◆", "◎", "✺"];
-
-function genreCards(albums = [], moods = []) {
-  const counts = new Map();
-  albums.forEach((album) => {
-    if (album.genre?.trim()) {
-      const genre = album.genre.trim();
-      counts.set(genre, (counts.get(genre) || 0) + 1);
-    }
-  });
-  const genres = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name]) => ({ name }));
-  return [...genres, ...moods].slice(0, 12).map((item, index) => ({ ...item, tone: item.tone || genreTones[index % genreTones.length], symbol: item.symbol || genreSymbols[index % genreSymbols.length] }));
 }
 
 function ExploreContent() {
@@ -112,7 +90,9 @@ function ExploreContent() {
   const [personalizedDiscovery, setPersonalizedDiscovery] = useState(true);
   const discoverySubtitle = personalizedDiscovery ? "Favourite artists and new connections" : "Popular picks to get started";
 
-  const { playSong, playQueue, audioEngine } = usePlayer();
+  const { playSong, playQueue, audioEngine, currentSong, isPlaying, togglePlay } = usePlayer();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+  const { albumState, artistState } = useDiscoveryPlayback(currentSong, isPlaying, mobile);
   const playbackRequest = useRef(0);
   useEffect(() => () => { playbackRequest.current += 1; }, []);
 
@@ -165,15 +145,10 @@ function ExploreContent() {
         items: [], loading: false, error: error.message || "Personalised discovery is temporarily unavailable.",
       }])) }));
     });
-    load("genres", async () => {
-      const [albums, moods] = await Promise.allSettled([getAlbums(100), externalDiscoveryService.getMoods()]);
-      if (albums.status === "rejected" && moods.status === "rejected") throw albums.reason;
-      return genreCards(albums.status === "fulfilled" ? albums.value : [], moods.status === "fulfilled" ? moods.value : []);
-    });
     return () => { active = false; };
   }, []);
 
-  const leadArtwork = getCoverUrl(feeds.featured.items[0]?.coverArt, 640);
+  const leadArtwork = mobile ? null : getCoverUrl(feeds.featured.items[0]?.coverArt, 640);
   useEffect(() => {
     let active = true;
     extractArtworkColor(leadArtwork).then((color) => { if (active) setHeroColor(color); });
@@ -249,6 +224,14 @@ function ExploreContent() {
     }
   }
 
+  function toggleAlbumPlayback() {
+    playbackRequest.current += 1;
+    setActionMessage("");
+    togglePlay();
+  }
+
+  const albumShelfProps = { mobile, albumState, onPlay: playAlbum, onToggle: toggleAlbumPlayback };
+
   return <div className="explore-page" data-view-loading={Object.values(feeds).some((feed) => feed.loading)}>
     <div className="page-hero-gradient">
       <LightHero
@@ -260,6 +243,8 @@ function ExploreContent() {
     </div>
     {actionMessage && <p className="explore-action-message" role="status">{actionMessage}</p>}
 
+    {mobile ? <AlbumShelf id="explore-featured-title" title="Trending Now / Featured" subtitle="Current chart picks from Deezer"
+      feed={feeds.featured} limit={3} empty="Featured albums are unavailable." {...albumShelfProps} /> : (
     <section className="explore-section" aria-labelledby="explore-featured-title">
       <Header id="explore-featured-title" title="Trending Now / Featured" subtitle="Current chart picks from Deezer" featured />
       <FeedBody feed={feeds.featured} shape="hero" count={3} empty="Featured albums are unavailable.">
@@ -277,26 +262,16 @@ function ExploreContent() {
           </article>)}
         </div>
       </FeedBody>
-    </section>
+    </section>)}
 
-    <ArtistShelf id="explore-popular-artists" title="Artists Popular Externally" subtitle="Deezer charts" feed={feeds.popularArtists} />
-    <AlbumShelf id="explore-popular-albums" title="Albums Popular Externally" subtitle="Deezer charts" feed={feeds.popularAlbums} onPlay={playAlbum} />
+    <ArtistShelf id="explore-popular-artists" title="Artists Popular Externally" subtitle="Deezer charts" feed={feeds.popularArtists} artistState={artistState} />
+    <AlbumShelf id="explore-popular-albums" title="Albums Popular Externally" subtitle="Deezer charts" feed={feeds.popularAlbums} {...albumShelfProps} />
     <div className="explore-pulse" aria-label="The Pulse: track discovery">
-      <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle={discoverySubtitle} feed={feeds.discoverTracks} onPlay={playTrack}    />
-      <TrackPanel id="explore-popular-songs" title="Songs Popular Externally" subtitle="Deezer charts" feed={feeds.popularTracks} onPlay={playTrack}    />
+      <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle={discoverySubtitle} feed={feeds.discoverTracks} onPlay={playTrack} mobile={mobile} />
+      <TrackPanel id="explore-popular-songs" title="Songs Popular Externally" subtitle="Deezer charts" feed={feeds.popularTracks} onPlay={playTrack} mobile={mobile} />
     </div>
-    <ArtistShelf id="explore-discover-artists" title="Discover Artists" subtitle={personalizedDiscovery ? "New artists connected to your favourites" : "New artists to explore"} feed={feeds.discoverArtists} />
-    <AlbumShelf id="explore-discover-albums" title="Discover Albums" subtitle={discoverySubtitle} feed={feeds.discoverAlbums} onPlay={playAlbum} />
-    <section className="explore-section" aria-labelledby="explore-genres">
-      <Header id="explore-genres" title="Browse by Genre & Mood" subtitle="Library genres and moods" />
-      <FeedBody feed={feeds.genres} shape="genres" count={8} empty="No genres to show yet.">
-        <div className="explore-genres">{feeds.genres.items.map((genre) =>
-          <Link className="explore-genre" key={genre.name} to={`/search?q=${encodeURIComponent(genre.name)}`} style={{ "--genre-tone": genre.tone }}>
-            <strong>{genre.name}</strong><span aria-hidden="true">{genre.symbol}</span>
-          </Link>
-        )}</div>
-      </FeedBody>
-    </section>
+    <ArtistShelf id="explore-discover-artists" title="Discover Artists" subtitle={personalizedDiscovery ? "New artists connected to your favourites" : "New artists to explore"} feed={feeds.discoverArtists} artistState={artistState} />
+    <AlbumShelf id="explore-discover-albums" title="Discover Albums" subtitle={discoverySubtitle} feed={feeds.discoverAlbums} {...albumShelfProps} />
   </div>;
 }
 

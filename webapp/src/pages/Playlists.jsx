@@ -1,26 +1,20 @@
-import {
-  useEffect,
-  useState,
-} from "react";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
-import {
-  Link,
-} from "react-router-dom";
-
-import {
-  getPlaylists,
-} from "../api/playlists";
-
-import PlaylistCover from "../components/PlaylistCover";
+import { getPlaylists } from "../api/playlists";
+import PlaylistCover, { LikedSongsCover } from "../components/PlaylistCover";
 import LibraryBrowseControls from "../components/LibraryBrowseControls";
-import { normalizePlaylistSearch } from "../utils/playlistSearch";
 import LikedAlbumsSection from "../components/LikedAlbumsSection";
 import SmartPlaylistShelf from "../components/SmartPlaylistShelf";
+import { usePlayer } from "../context/PlayerContext";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useSmartPlaylists } from "../hooks/useSmartPlaylists";
-
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
+import { normalizePlaylistSearch } from "../utils/playlistSearch";
+import MobilePlaylists from "./MobilePlaylists";
 
 const playlistFilters = { all: "All playlists", regular: "Regular playlists", smart: "Smart playlists" };
-const playlistSorts = { az: "A–Z", za: "Z–A", newest: "Newest", oldest: "Oldest" };
+const playlistSorts = { az: "A\u2013Z", za: "Z\u2013A", newest: "Newest", oldest: "Oldest" };
 const compareNames = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
 
 function comparePlaylists(left, right, sort) {
@@ -33,230 +27,80 @@ function comparePlaylists(left, right, sort) {
   return (sort === "newest" ? rightDate - leftDate : leftDate - rightDate) || byName;
 }
 
-function PlaylistGrid() {
+function DesktopPlaylists({ playlists, loading, error, smart, likedCount }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState("az");
-  const smart = useSmartPlaylists();
-
-  const [playlists, setPlaylists] =
-    useState([]);
-
-  const [loading, setLoading] =
-    useState(true);
-
-  const [error, setError] =
-    useState(null);
   const search = normalizePlaylistSearch(query.trim());
   const matches = playlist => normalizePlaylistSearch(playlist.name).includes(search);
   const ordered = items => items.filter(matches).sort((left, right) => comparePlaylists(left, right, sort));
   const visible = filter === "smart" ? [] : ordered(playlists);
   const smartItems = filter === "regular" ? [] : ordered(smart.items);
   const total = visible.length + smartItems.length;
+  const ready = !loading && !error;
 
+  return <section className="library-section">
+    <div className="library-section-header">
+      <h2>Playlists</h2>
+      {ready && <>
+        <span>{total + 1} {total === 0 ? "playlist" : "playlists"}</span>
+        <LibraryBrowseControls label="playlists" query={query} onQueryChange={setQuery} filter={filter}
+          onFilterChange={setFilter} choices={playlistFilters} sort={sort} onSortChange={setSort} sortChoices={playlistSorts} />
+      </>}
+    </div>
+    <div className="playlist-grid">
+      <Link to="/liked" className="playlist-card" aria-label="Liked Songs">
+        <LikedSongsCover className="playlist-cover playlist-cover--liked" />
+        <div className="playlist-title">Liked Songs</div>
+        <div className="playlist-meta">Pinned {"\u00b7"} {likedCount} {likedCount === 1 ? "song" : "songs"}</div>
+      </Link>
+      {ready && visible.map((playlist) => <Link key={playlist.id} to={`/playlist/${encodeURIComponent(playlist.id)}`} className="playlist-card">
+        <div className="playlist-cover"><PlaylistCover playlist={playlist} size={300} /></div>
+        <div className="playlist-title">{playlist.name}</div>
+        <div className="playlist-meta">{playlist.songCount || 0} {playlist.songCount === 1 ? "song" : "songs"}</div>
+      </Link>)}
+      {ready && total === 0 && (filter === "regular" || (!smart.loading && !smart.error)) && (
+        <div className="playlist-empty">{search || filter !== "all" ? "No other playlists match these filters." : "No other playlists yet."}</div>
+      )}
+    </div>
+    {loading && <div className="loading">Loading playlists...</div>}
+    {error && <div className="error">{error}</div>}
+    {ready && filter !== "regular" && <SmartPlaylistShelf {...smart} items={smartItems} />}
+  </section>;
+}
 
-  /*
-   * Load playlists
-   */
+export default function Playlists() {
+  const [playlists, setPlaylists] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+  const smart = useSmartPlaylists();
+  const player = usePlayer();
 
   useEffect(() => {
     let mounted = true, sequence = 0;
-
-    async function loadPlaylists(quiet = false) {
+    async function loadPlaylists() {
       const request = ++sequence;
-
       try {
-
-        if (!quiet) setLoading(true);
-
-        setError(null);
-
-
-        const data =
-          await getPlaylists();
-
-
-        if (mounted && request === sequence) setPlaylists(data);
-
+        const data = await getPlaylists();
+        if (mounted && request === sequence) {
+          setPlaylists(data);
+          setError(null);
+        }
       } catch (err) {
-
-        console.error(
-          "Could not load playlists:",
-          err
-        );
-
-
-        if (mounted && request === sequence) setError(
-          err.message ||
-          "Could not load playlists."
-        );
-
+        if (mounted && request === sequence) setError(err.message || "Could not load playlists.");
       } finally {
-
         if (mounted && request === sequence) setLoading(false);
-
       }
-
     }
-
-
-    loadPlaylists();
-    const changed = () => { void loadPlaylists(true); };
-    window.addEventListener("playlistsChanged", changed);
-    return () => { mounted = false; window.removeEventListener("playlistsChanged", changed); };
+    void loadPlaylists();
+    window.addEventListener("playlistsChanged", loadPlaylists);
+    return () => { mounted = false; window.removeEventListener("playlistsChanged", loadPlaylists); };
   }, []);
 
-
-  /*
-   * Loading
-   */
-
-  if (loading) {
-
-    return (
-
-      <section className="library-section">
-
-        <div className="library-section-header">
-
-          <h2>
-            Playlists
-          </h2>
-
-        </div>
-
-
-        <div className="loading">
-          Loading playlists...
-        </div>
-
-      </section>
-
-    );
-
-  }
-
-
-  /*
-   * Error
-   */
-
-  if (error) {
-
-    return (
-
-      <section className="library-section">
-
-        <div className="library-section-header">
-
-          <h2>
-            Playlists
-          </h2>
-
-        </div>
-
-
-        <div className="error">
-          {error}
-        </div>
-
-      </section>
-
-    );
-
-  }
-
-
-  return (
-
-    <section className="library-section">
-
-
-      {/* HEADER */}
-
-      <div className="library-section-header">
-
-        <h2>
-          Playlists
-        </h2>
-
-
-        <span>
-          {total} playlists
-        </span>
-        <LibraryBrowseControls label="playlists" query={query} onQueryChange={setQuery} filter={filter}
-          onFilterChange={setFilter} choices={playlistFilters} sort={sort} onSortChange={setSort} sortChoices={playlistSorts} />
-
-      </div>
-
-
-      {/* PLAYLIST GRID */}
-
-      <div className="playlist-grid">
-
-        {visible.map(
-          (playlist) => (
-
-          <Link
-            key={playlist.id}
-            to={`/playlist/${playlist.id}`}
-            className="playlist-card"
-          >
-
-
-            {/* COVER */}
-
-            <div className="playlist-cover">
-
-              <PlaylistCover playlist={playlist} size={300} />
-
-            </div>
-
-
-            {/* INFO */}
-
-            <div className="playlist-title">
-              {playlist.name}
-            </div>
-
-
-            <div className="playlist-meta">
-
-              {playlist.songCount || 0}{" "}
-
-              {playlist.songCount === 1
-                ? "song"
-                : "songs"}
-
-            </div>
-
-          </Link>
-
-        ))}
-
-
-        {/* EMPTY */}
-
-        {total === 0 && (filter === "regular" || (!smart.loading && !smart.error)) && (
-
-          <div className="playlist-empty">
-
-            {search || filter !== "all" ? "No playlists match these filters." : "No playlists yet."}
-
-          </div>
-
-        )}
-
-      </div>
-      {filter !== "regular" && <SmartPlaylistShelf {...smart} items={smartItems} />}
-
-    </section>
-
-  );
-
-}
-
-
-export default function Playlists() {
-  return <><PlaylistGrid /><LikedAlbumsSection /></>;
+  return <>
+    {mobile ? <MobilePlaylists playlists={playlists} loading={loading} error={error} smart={smart} player={player} />
+      : <DesktopPlaylists playlists={playlists} loading={loading} error={error} smart={smart} likedCount={player?.likedSongIds?.size ?? 0} />}
+    <LikedAlbumsSection />
+  </>;
 }

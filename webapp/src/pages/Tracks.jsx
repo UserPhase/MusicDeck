@@ -9,6 +9,7 @@ import { useCollectorLibrary } from "../hooks/useCollectorLibrary";
 import CollectorFilterBar from "../components/CollectorFilterBar";
 import { useViewStateValue } from "../hooks/useViewStateStore";
 import { useServerDeletion } from "../context/ServerDeletionContext";
+import { uniqueTracks } from "../utils/uniqueTracks";
 import { EmptyState, ErrorState, LoadingState } from "../components/ui/PageState";
 
 const compareText = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
@@ -50,9 +51,9 @@ function Tracks() {
   })), []);
   const collector = useCollectorLibrary("track", { ...filters, exclude: excludeTrack, sortActive });
   const collectorActive = collector.showSnapshot;
-  const collectorItems = useMemo(() => sortActive
+  const collectorItems = useMemo(() => uniqueTracks(sortActive
     ? [...collector.items].sort((left, right) => compareTracks(left, right, sort.field, sort.descending))
-    : collector.items, [collector.items, sort, sortActive]);
+    : collector.items), [collector.items, sort, sortActive]);
   const total = collectorActive ? collectorItems.length : library.total;
   const getCollectorItem = useCallback(index => collectorItems[index], [collectorItems]);
   const selectionIdentity = useMemo(() => ({ filters: activeFilters, revision: library.collectionRevision, deletedTracks }), [activeFilters, library.collectionRevision, deletedTracks]);

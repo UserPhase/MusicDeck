@@ -17,6 +17,7 @@ import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
 import SourceIndicator from "../components/SourceIndicator";
 import LightHero from "../components/Layout/LightHero";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useViewStateValue } from "../hooks/useViewStateStore";
 import InLibraryBadge from "../components/InLibraryBadge";
 import TrackListHeader from "../components/TrackListHeader";
@@ -24,6 +25,7 @@ import TrackRow from "../components/TrackRow";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { usePrivacy } from "../context/PrivacyContext";
 import { toAlbumRouteIdFromApiId, toArtistRouteIdFromApiId } from "../utils/idResolver";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 import TrackArtistLinks from "../components/TrackArtistLinks";
 import {
   EmptyState,
@@ -36,10 +38,25 @@ import {
   usePlayer,
 } from "../context/PlayerContext";
 
-function SearchHero({ title }) {
+function SearchHero({ title, query, onSearch }) {
+  const isMobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    onSearch(new FormData(event.currentTarget).get("q").trim());
+  }
+
   return (
     <div className="page-hero-gradient">
-      <LightHero className="search-page-hero" title={title} />
+      <LightHero className="search-page-hero" title={title}>
+        {isMobile && (
+          <form className="search-page-form" role="search" aria-label="Music search" onSubmit={handleSubmit}>
+            <input key={query} type="search" name="q" defaultValue={query} enterKeyHint="search"
+              placeholder="Search your music" aria-label="Search your music" autoComplete="off" />
+            <button type="submit">Search</button>
+          </form>
+        )}
+      </LightHero>
     </div>
   );
 }
@@ -49,12 +66,17 @@ function Search() {
 
   const [
     searchParams,
+    setSearchParams,
   ] = useSearchParams();
 
 
   const [savedQuery, setSavedQuery] = useViewStateValue("/search", "query", "");
   const query = searchParams.has("q") ? searchParams.get("q") || "" : savedQuery;
   useEffect(() => { setSavedQuery(query); }, [query, setSavedQuery]);
+
+  function searchFor(term) {
+    if (term !== query) setSearchParams({ q: term });
+  }
 
 
   const [
@@ -218,7 +240,7 @@ function Search() {
 
       <div className="search-page">
 
-        <SearchHero title="Search" />
+        <SearchHero title="Search" query={query} onSearch={searchFor} />
 
 
         <EmptyState>
@@ -242,7 +264,7 @@ function Search() {
 
       <div className="search-page" data-view-loading="true">
 
-        <SearchHero title="Search" />
+        <SearchHero title="Search" query={query} onSearch={searchFor} />
 
 
         <LoadingState>
@@ -266,7 +288,7 @@ function Search() {
 
       <div className="search-page">
 
-        <SearchHero title="Search" />
+        <SearchHero title="Search" query={query} onSearch={searchFor} />
 
         <ErrorState>
           {error}
@@ -293,7 +315,7 @@ function Search() {
 
       {/* HEADER */}
 
-      <SearchHero title="Search results" />
+      <SearchHero title="Search results" query={query} onSearch={searchFor} />
 
 
       <div className="search-mode" role="group" aria-label="Search source">

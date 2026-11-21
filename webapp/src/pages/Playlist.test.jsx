@@ -20,6 +20,7 @@ import {
 } from "../api/musicdeck";
 
 import { usePlayer } from "../context/PlayerContext";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { downloadToDevice } from "../utils/downloadManager";
 import { offlineAuditor } from "../services/storage/OfflineAuditor";
 
@@ -46,6 +47,7 @@ jest.mock("../api/musicdeck", () => ({
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: jest.fn(),
 }));
+jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn() }));
 jest.mock("../context/AuthContext", () => ({ useAuth: () => ({ session: { id: "playlist-user", role: "user" } }) }));
 
 
@@ -436,6 +438,54 @@ test("renders the playlist description in the hero and saves edited details", as
   }));
   expect(await screen.findByRole("heading", { name: "Updated playlist" })).toBeInTheDocument();
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+});
+
+test("keeps mobile playlist controls, search and virtual row labels compact", async () => {
+  useMediaQuery.mockReturnValue(true);
+  const playlist = {
+    ...editablePlaylist,
+    name: "We Do What We Want - Edit",
+    description: "Imported from Spotify: https://open.spotify.com/playlist/0W0OZUkLt1234567890",
+    entry: editablePlaylist.entry.map((track) => ({ ...track, duration: 99 })),
+  };
+  renderPlaylist(playlist);
+
+  expect(await screen.findByRole("heading", { name: playlist.name })).toBeInTheDocument();
+  expect(screen.getByText("Imported from Spotify")).toBeInTheDocument();
+  expect(screen.queryByText(/open\.spotify\.com/)).not.toBeInTheDocument();
+  const seeMore = screen.getByRole("button", { name: "See more" });
+  expect(seeMore).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(seeMore);
+  const fullDescription = screen.getByText(playlist.description);
+  const seeLess = screen.getByRole("button", { name: "See less" });
+  expect(seeLess).toHaveAttribute("aria-expanded", "true");
+  expect(seeLess).toHaveAttribute("aria-controls", fullDescription.id);
+  fireEvent.click(seeLess);
+  expect(screen.getByText("Imported from Spotify")).toBeInTheDocument();
+  expect(fullDescription).toHaveTextContent(/^Imported from Spotify$/);
+  const grid = screen.getByRole("grid", { name: "Playlist tracks" });
+  expect(grid).toHaveAttribute("aria-rowcount", "3");
+  expect(within(grid).getByRole("row", { name: "First by Artist" })).toHaveAttribute("aria-rowindex", "1");
+  expect(within(grid).queryByRole("columnheader")).not.toBeInTheDocument();
+  expect(within(grid).queryByText("1:39")).not.toBeInTheDocument();
+  expect(within(grid).getByRole("button", { name: "More options for First" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Share playlist" }).querySelector("svg")).toBeInTheDocument();
+
+  const search = screen.getByRole("button", { name: "Search this playlist" });
+  const tools = search.closest(".playlist-track-tools");
+  expect(tools.nextElementSibling).toBe(grid);
+  expect(within(tools).getByRole("button", { name: "Sort tracks: Custom order" })).toBeInTheDocument();
+  fireEvent.click(search);
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search this playlist" }), { target: { value: "First" } });
+  await waitFor(() => expect(grid).toHaveAttribute("aria-rowcount", "1"));
+  expect(screen.getByText("3 songs")).toBeInTheDocument();
+});
+
+test("shows a short mobile playlist description without a disclosure button", async () => {
+  useMediaQuery.mockReturnValue(true);
+  renderPlaylist({ ...collagePlaylist, description: "A late night mix." });
+  expect(await screen.findByText("A late night mix.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "See more" })).not.toBeInTheDocument();
 });
 
 

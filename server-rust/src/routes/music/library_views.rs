@@ -12,6 +12,7 @@ use crate::AppState;
 use crate::auth::AuthenticatedUser;
 use crate::catalog::merge::{strong_recording_ids, title_key};
 use crate::catalog::snapshot::catalog_revision;
+use crate::catalog::track_dedup::TrackDedup;
 use crate::catalog::{
     Available, CatalogEntityType, UnifiedCatalogItem, normalize_music_text, recordings_match,
 };
@@ -180,6 +181,7 @@ pub(super) async fn post_filter_tracks_handler(
     let activity = user_track_activity(require_db(&state)?, &auth.user.id).await?;
     let mut ids = Vec::new();
     let mut page = Vec::with_capacity(limit);
+    let mut seen = TrackDedup::default();
 
     for track in &snapshot.items {
         let (favorite, play_count, last_played_at) = activity
@@ -208,6 +210,7 @@ pub(super) async fn post_filter_tracks_handler(
         if annotated
             .matches(&body.filters)
             .map_err(|error| ServerError::Internal(error.to_string()))?
+            && seen.insert_track(&track.item)
         {
             if ids.len() >= body.offset && page.len() < limit {
                 page.push(

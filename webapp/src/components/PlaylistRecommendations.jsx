@@ -7,14 +7,11 @@ import { usePrivacy } from "../context/PrivacyContext";
 import { useExternalAction } from "../services/externalActions";
 import { resolveTrackPreview } from "../services/resolveTrackPreview";
 import { toUnifiedTrack } from "../types/track";
+import { createTrackDeduplicator, normalizeRecordingText } from "../utils/uniqueTracks";
 
 import TrackRow from "./TrackRow";
 import TrackActionScope from "./TrackActionScope";
 import "../styles/playlist-recommendations.css";
-
-const normalize = (value) => String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
-  .replace(/&/g, " and ").replace(/[^\p{L}\p{N}]+/gu, " ").trim().toLowerCase();
-const recording = (track) => `${normalize(track.artist || track.artistName)}:${normalize(track.title)}`;
 
 const Recommendation = memo(function Recommendation({ song, playlistId, editable, disabled, canImport, onAdded, onImported,
   onPlay, index }) {
@@ -85,20 +82,16 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
   const local = useQuery(load("library"));
   const external = useQuery({ ...load("external"), enabled: songs.length > 0 && externalEnabled });
   const items = useMemo(() => {
-    const existingIds = new Set(songs.map((song) => String(song.id)));
-    const seen = new Set(songs.map(recording));
-    const seenIsrc = new Set(songs.map((song) => song.identityHints?.isrc || song.metadata?.isrc).filter(Boolean));
+    const keep = createTrackDeduplicator();
+    songs.forEach(keep);
     const owned = (local.data?.items || []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
     const discovered = (externalEnabled ? external.data?.items || [] : []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
     const byArtist = new Map();
     let count = 0;
     for (let index = 0; index < Math.max(owned.length, discovered.length); index++) {
       for (const item of [owned[index], discovered[index]]) {
-        if (!item || existingIds.has(String(item.id)) || seen.has(recording(item))) continue;
-        const isrc = item.identityHints?.isrc || item.metadata?.isrc;
-        if (isrc && seenIsrc.has(isrc)) continue;
-        seen.add(recording(item)); if (isrc) seenIsrc.add(isrc);
-        const artist = normalize(item.artist || item.artistName);
+        if (!keep(item)) continue;
+        const artist = normalizeRecordingText(item.artist || item.artistName);
         if (!byArtist.has(artist)) byArtist.set(artist, []);
         byArtist.get(artist).push(item);
         count++;

@@ -46,6 +46,11 @@ export async function getPlaylists() {
   return fetchPlaylists();
 }
 
+export async function getRecentlyPlayedPlaylists(signal) {
+  const result = await request("/api/v1/playlists/recently-played", { signal, cache: "no-store" });
+  return result.playlists || [];
+}
+
 
 export async function getPlaylist(playlistId) {
   return fetchPlaylist(playlistId);
@@ -60,10 +65,10 @@ export async function createPlaylist(name, description = "") {
   return requestCreatePlaylist(name, description);
 }
 
-export async function startSpotifyPlaylistImport(playlistUrl) {
+export async function startSpotifyPlaylistImport(playlistUrl, timeout) {
   const data = await request("/api/v1/playlists/import-spotify", {
     method: "POST",
-    body: JSON.stringify({ playlistUrl }),
+    body: JSON.stringify({ playlistUrl, timeout }),
   });
   return data.job;
 }

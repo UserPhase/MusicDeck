@@ -80,7 +80,7 @@ export default function SmartPlaylists() {
       }
       if (!tracks.length) { setNotice("No tracks currently match this playlist."); return; }
       if (!player) throw new Error("The player is unavailable. Reload MusicDeck and try again.");
-      player.playQueue(tracks, 0);
+      player.playQueue(tracks.map((track) => ({ ...track, tastePlaylistId: selected.id })), 0);
     } catch (failure) {
       if (alive.current && version === operation.current) setError(failure instanceof TypeError
         ? "Can't reach MusicDeck. Your current playback has not been changed."

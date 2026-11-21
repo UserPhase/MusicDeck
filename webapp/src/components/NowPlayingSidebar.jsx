@@ -24,9 +24,21 @@ import ArtistBiography from "./ArtistBiography";
 import TrackArtistLinks from "./TrackArtistLinks";
 import LyricsView from "./player/LyricsView";
 import PrivateListeningBadge from "./player/PrivateListeningBadge";
+import { MobilePlaybackControls, MobileTrackActions } from "./Player";
 
+function cycleDialogFocus(event) {
+  const dialog = event.currentTarget;
+  if (event.key !== "Tab" || event.defaultPrevented || !dialog.contains(event.target)) return;
+  const controls = [...dialog.querySelectorAll("a[href], button:enabled, input:enabled, [tabindex='0']")]
+    .filter((control) => control.tabIndex >= 0 && control.getClientRects().length);
+  const first = controls[0];
+  const last = controls.at(-1);
+  if (event.target !== (event.shiftKey ? first : last)) return;
+  event.preventDefault();
+  (event.shiftKey ? last : first)?.focus();
+}
 
-function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
+function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, closeButtonRef }) {
   const [lyricsResult, setLyricsResult] = useState(null);
   const player = usePlayer();
   const { currentSong, currentTime = 0, duration = 0, queue = [], queueIndex = -1,
@@ -65,31 +77,71 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
 
   if (!isOpen) return null;
 
+  const trackInfo = currentSong ? (
+    <section className="right-sidebar-song-info" aria-labelledby="now-playing-title">
+      <div className="right-sidebar-now-cover">
+        {coverUrl ? <img src={coverUrl} onError={onCoverError} alt="" width="512" height="512" /> : <span aria-hidden="true">♫</span>}
+      </div>
+      <div className="now-playing-track-summary">
+        <div className="now-playing-track-copy">
+          {!mobile && <div className="right-sidebar-song-kicker">Playing now</div>}
+          <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>
+          <p><TrackArtistLinks song={currentSong} /></p>
+          {mobile && player.isPreview ? <span className="audio-badge audio-badge-preview">Preview</span>
+            : <AudioQualityBadge className="right-sidebar-audio-badge" />}
+        </div>
+        {mobile && <div className="mobile-track-actions"><MobileTrackActions player={player} /></div>}
+      </div>
+    </section>
+  ) : (
+    <div className="right-sidebar-empty">{mobile ? "Choose a track to start listening." : "Choose a track to see its story and lyrics."}</div>
+  );
+
+  const nextQueue = (
+    <section className="now-playing-next-queue" aria-labelledby="next-in-queue-title">
+      <header className="now-playing-next-header">
+        <h3 id="next-in-queue-title">Next in queue</h3>
+        {!mobile && <button type="button" onClick={onOpenQueue}>Open queue</button>}
+      </header>
+      {nextTrack ? (
+        <div className="now-playing-next-track">
+          <span className="now-playing-next-index" aria-hidden="true">→</span>
+          <span className="queue-sidebar-track-info">
+            <span className="queue-sidebar-track-title">{nextTrack.title || "Unknown title"}</span>
+            <span className="queue-sidebar-track-artist">{nextTrack.artist || "Unknown artist"}</span>
+          </span>
+          <span className="queue-sidebar-track-duration">
+            {formatDuration(nextTrack.duration ?? nextTrack.metadata?.durationSeconds)}
+          </span>
+        </div>
+      ) : (
+        <p className="queue-sidebar-empty">Nothing queued next.</p>
+      )}
+    </section>
+  );
+
   return (
-    <aside className="right-sidebar now-playing-sidebar sidebar-panel" aria-label="Now Playing">
+    <aside className="right-sidebar now-playing-sidebar sidebar-panel" role={mobile ? "dialog" : undefined}
+      aria-label="Now Playing" aria-modal={mobile || undefined} onKeyDown={mobile ? cycleDialogFocus : undefined}>
       <header className="sidebar-panel-header">
         <h2>Now Playing</h2>
         <div className="now-playing-header-actions">
           <PrivateListeningBadge />
-          <button className="queue-sidebar-close" type="button" onClick={onClose} aria-label="Close Now Playing sidebar">×</button>
+          <button className="queue-sidebar-close" type="button" ref={closeButtonRef}
+            onClick={onClose} aria-label={mobile ? "Close Now Playing" : "Close Now Playing sidebar"}>×</button>
         </div>
       </header>
 
       <div className="right-sidebar-now-playing">
-        {!currentSong ? (
-          <div className="right-sidebar-empty">Choose a track to see its story and lyrics.</div>
-        ) : (
-          <>
-            <section className="right-sidebar-song-info" aria-labelledby="now-playing-title">
-              <div className="right-sidebar-now-cover">
-                {coverUrl ? <img src={coverUrl} onError={onCoverError} alt="" width="512" height="512" /> : <span aria-hidden="true">♫</span>}
-              </div>
-              <div className="right-sidebar-song-kicker">Playing now</div>
-              <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>
-              <p><TrackArtistLinks song={currentSong} /></p>
-              <AudioQualityBadge className="right-sidebar-audio-badge" />
-            </section>
+        {mobile ? (
+          <div className="mobile-now-playing-deck">
+            {trackInfo}
+            <MobilePlaybackControls player={player} onOpenQueue={onOpenQueue} />
+          </div>
+        ) : trackInfo}
 
+        {currentSong && (
+          <>
             <LyricsView trackId={String(trackId ?? "")} title={songTitle || "Unknown title"} artist={songArtist}
               artwork={coverUrl} lyrics={result?.lyrics ?? null} loading={Boolean(trackId && !result)}
               error={result?.error} currentTime={Number(currentTime)} positionSource={player} seekToSeconds={seekToSeconds}
@@ -103,28 +155,9 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue }) {
             </section>
           </>
         )}
+        {mobile && nextQueue}
       </div>
-
-      <section className="now-playing-next-queue" aria-labelledby="next-in-queue-title">
-        <header className="now-playing-next-header">
-          <h3 id="next-in-queue-title">Next in queue</h3>
-          <button type="button" onClick={onOpenQueue}>Open queue</button>
-        </header>
-        {nextTrack ? (
-          <div className="now-playing-next-track">
-            <span className="now-playing-next-index" aria-hidden="true">→</span>
-            <span className="queue-sidebar-track-info">
-              <span className="queue-sidebar-track-title">{nextTrack.title || "Unknown title"}</span>
-              <span className="queue-sidebar-track-artist">{nextTrack.artist || "Unknown artist"}</span>
-            </span>
-            <span className="queue-sidebar-track-duration">
-              {formatDuration(nextTrack.duration ?? nextTrack.metadata?.durationSeconds)}
-            </span>
-          </div>
-        ) : (
-          <p className="queue-sidebar-empty">Nothing queued next.</p>
-        )}
-      </section>
+      {!mobile && nextQueue}
     </aside>
   );
 }

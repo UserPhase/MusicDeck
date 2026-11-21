@@ -131,6 +131,9 @@ function Sidebar({ id }) {
   const [playlistName, setPlaylistName] = useState("");
   const [description, setDescription] = useState("");
   const [playlistUrl, setPlaylistUrl] = useState("");
+  const [timeoutMode, setTimeoutMode] = useState("auto");
+  const [timeoutMinutes, setTimeoutMinutes] = useState("60");
+  const [timeoutError, setTimeoutError] = useState("");
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -273,14 +276,23 @@ function Sidebar({ id }) {
    * Create playlist
    */
 
-  function handleAddPlaylist(trigger) {
+  const handleAddPlaylist = useCallback((trigger) => {
     triggerRef.current = trigger;
     setModalStep(importJob && (importJob.status === "queued" || importJob.status === "running") ? "progress" : "choose");
     setPlaylistName("");
     setDescription("");
     setPlaylistUrl("");
+    setTimeoutMode("auto");
+    setTimeoutMinutes("60");
+    setTimeoutError("");
     setFormError("");
-  }
+  }, [importJob]);
+
+  useEffect(() => {
+    const open = (event) => handleAddPlaylist(event.detail);
+    window.addEventListener("musicdeck:open-playlist-creator", open);
+    return () => window.removeEventListener("musicdeck:open-playlist-creator", open);
+  }, [handleAddPlaylist]);
 
   function closeModal() {
     if (busy) return;
@@ -307,6 +319,7 @@ function Sidebar({ id }) {
       }
       window.dispatchEvent(new Event("playlistsChanged"));
       setModalStep(null);
+      triggerRef.current?.focus();
       setNotice({ type: "success", text: `Created '${trimmedName}'.` });
     } catch (error) {
       setNotice({ type: "error", text: error.message || "Could not create playlist." });
@@ -322,9 +335,16 @@ function Sidebar({ id }) {
       return;
     }
     setFormError("");
+    const minutes = Number(timeoutMinutes);
+    if (timeoutMode === "manual" && (!Number.isInteger(minutes) || minutes < 1 || minutes > 120)) {
+      setTimeoutError("Enter a maximum download time between 1 and 120 minutes.");
+      return;
+    }
+    setTimeoutError("");
     setBusy(true);
     try {
-      await startImport(playlistUrl.trim());
+      const timeout = timeoutMode === "manual" ? { mode: "manual", minutes } : { mode: "auto" };
+      await startImport(playlistUrl.trim(), timeout);
       setModalStep("progress");
     } catch (error) {
       setNotice({ type: "error", text: error.message || "Could not import the Spotify playlist." });
@@ -467,6 +487,22 @@ function Sidebar({ id }) {
                 <label htmlFor="spotify-playlist-url">Spotify playlist URL</label>
                 <input id="spotify-playlist-url" type="url" value={playlistUrl} onChange={(event) => { setPlaylistUrl(event.target.value); setFormError(""); }} placeholder="https://open.spotify.com/playlist/..." aria-invalid={Boolean(formError)} aria-describedby={formError ? "spotify-url-error" : undefined} autoFocus disabled={busy} />
                 {formError && <p id="spotify-url-error" className="playlist-modal-error" role="alert">{formError}</p>}
+                <label htmlFor="spotify-import-timeout-mode">Download timeout</label>
+                <select id="spotify-import-timeout-mode" value={timeoutMode} onChange={(event) => { setTimeoutMode(event.target.value); setTimeoutError(""); }} aria-describedby="spotify-import-timeout-help" disabled={busy}>
+                  <option value="auto">Auto</option>
+                  <option value="manual">Manual</option>
+                </select>
+                <p id="spotify-import-timeout-help" className="playlist-modal-help">
+                  {timeoutMode === "auto"
+                    ? "Adapts to playlist size, past imports, and download progress. No fixed time limit."
+                    : "Choose a limit from 1 to 120 minutes."}
+                  {" A stalled download stops within 15 minutes."}
+                </p>
+                {timeoutMode === "manual" && <>
+                  <label htmlFor="spotify-import-timeout-minutes">Maximum download time (minutes)</label>
+                  <input id="spotify-import-timeout-minutes" type="number" min="1" max="120" step="1" required value={timeoutMinutes} onChange={(event) => { setTimeoutMinutes(event.target.value); setTimeoutError(""); }} aria-invalid={Boolean(timeoutError)} aria-describedby={timeoutError ? "spotify-import-timeout-error" : undefined} disabled={busy} />
+                  {timeoutError && <p id="spotify-import-timeout-error" className="playlist-modal-error" role="alert">{timeoutError}</p>}
+                </>}
                 {busy && <p className="playlist-modal-progress" role="status"><span className="playlist-modal-spinner" aria-hidden="true" />Fetching playlist details and queueing download...</p>}
                 <div className="playlist-modal-actions">
                   <button type="button" className="playlist-modal-back" onClick={() => setModalStep("choose")} disabled={busy}>Back</button>

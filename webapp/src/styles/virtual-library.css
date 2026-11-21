@@ -3,10 +3,39 @@
 .virtual-track-skeleton { height: 100%; }
 .virtual-track-skeleton span { height: .75rem; width: 70%; border-radius: .25rem; background: var(--card-hover); }
 .virtual-album-window { width: 100%; }
-.virtual-album-row { display: grid; gap: 20px; padding-bottom: 20px; box-sizing: border-box; }
+.virtual-album-row { display: grid; box-sizing: border-box; }
 .virtual-album-row .album-cover { aspect-ratio: 1; }
 .virtual-album-row .album-title { line-height: 20px; }
 .virtual-album-row .album-artist { line-height: 18px; }
 .virtual-album-row img { width: 100%; height: 100%; object-fit: cover; }
 .virtual-album-skeleton .album-cover { background: var(--card-hover); }
 .virtual-album-skeleton .album-title { height: 1rem; margin-top: .75rem; width: 70%; background: var(--card-hover); }
+
+.virtual-album-window--mobile .album { min-width: 0; padding: 6px; }
+.virtual-album-window--mobile .album:is(:hover, :focus-visible) { transform: none; }
+.virtual-album-window--mobile .album-cover { margin-bottom: 8px; }
+.virtual-album-window--mobile :is(.album-grid-title, .album-artist) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.virtual-album-window--mobile .album-grid-title { margin-bottom: 2px; }
+.virtual-album-window--mobile .album-title { flex: 1; margin: 0; }
+.virtual-album-window--mobile :is(.album-title, .album-grid-artist-name) {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.virtual-album-window--mobile .offline-available-badge { flex: none; margin-left: 0; }
+.virtual-album-window--mobile .collector-editions { display: flex; margin-top: 2px; }
+.virtual-album-window--mobile .collector-editions .audio-quality-badge { min-height: 18px; padding: 1px 4px; }
+.virtual-album-window--mobile .album.is-current {
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.virtual-album-window--mobile .album.is-current .album-title { color: var(--accent-text); }
+.album-grid-indicator { display: flex; flex: none; }
+.virtual-album-window--mobile .album-admin-actions { top: auto; right: 7px; bottom: 27px; }
+.virtual-album-window--mobile .album-admin-menu-toggle { width: 44px; height: 44px; background: transparent; border-color: transparent; }
+.virtual-album-window--mobile .album-card-shell:has(> .album-admin-actions) :is(.album-grid-title, .album-artist) { padding-inline-end: 44px; }

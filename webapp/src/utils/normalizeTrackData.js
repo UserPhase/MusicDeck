@@ -177,6 +177,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
     object(metadata.replayGain) ||
     null;
   const artistCredits = normalizeArtistCredits(track.artistCredits ?? wrapper.artistCredits);
+  const identityHints = object(track.identityHints) || object(wrapper.identityHints);
 
   return {
     id: id === null ? null : String(id),
@@ -190,6 +191,7 @@ export function normalizeTrackData(rawTrack, origin = "unknown") {
       wrapper.ArtistItems?.[0]?.Id
     ),
     ...(artistCredits.length ? { artistCredits } : {}),
+    ...(identityHints ? { identityHints } : {}),
     artist: String(first(
       typeof track.artist === "string" ? track.artist : null,
       deezerArtist,

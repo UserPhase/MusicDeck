@@ -1,13 +1,14 @@
 //! Shared, immutable catalog windows for the paged library endpoints.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::{Available, CatalogListResult, CatalogService};
+use super::track_dedup::TrackDedup;
 use crate::providers::{Album, ProviderError, Track};
 
 const WINDOW_TTL: Duration = Duration::from_secs(30);
@@ -18,6 +19,7 @@ pub(crate) struct CatalogSnapshot<T> {
     pub revision: String,
     pub degraded: bool,
     expires_at: Instant,
+    track_grid: OnceLock<(Vec<usize>, String)>,
 }
 
 impl<T> CatalogSnapshot<T> {
@@ -35,7 +37,22 @@ impl<T> CatalogSnapshot<T> {
             revision,
             degraded: result.degraded,
             expires_at: Instant::now() + WINDOW_TTL,
+            track_grid: OnceLock::new(),
         }
+    }
+}
+
+impl CatalogSnapshot<Track> {
+    pub(crate) fn unique_tracks(&self) -> (impl ExactSizeIterator<Item = &Available<Track>>, &str) {
+        let (indices, revision) = self.track_grid.get_or_init(|| {
+            let mut seen = TrackDedup::default();
+            let indices: Vec<_> = self.items.iter().enumerate()
+                .filter_map(|(index, track)| seen.insert_track(&track.item).then_some(index))
+                .collect();
+            let revision = catalog_revision(indices.iter().map(|&index| self.items[index].item.id.as_str()), self.degraded);
+            (indices, revision)
+        });
+        (indices.iter().map(|&index| &self.items[index]), revision)
     }
 }
 

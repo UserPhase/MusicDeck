@@ -10,7 +10,7 @@ import RecommendationMenuItems from "./RecommendationMenuItems";
 
 export interface UniversalTrackContextMenuProps {
   song: Track; targets?: readonly Track[]; targetCount?: number; resolveTargets?(): Promise<Track[]>;
-  triggerRef?: RefObject<HTMLButtonElement | null>; anchorPoint?: { x: number; y: number } | null;
+  triggerRef?: RefObject<HTMLElement | null>; anchorPoint?: { x: number; y: number } | null;
   onRequestClose?(): void; actionsDisabled?: boolean; children?: ReactNode;
   onActionError?(message: string): void;
   downloadQuality?: string; isServerSynced?: boolean; offlineStatus?: string; offlineError?: string | null;

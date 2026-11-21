@@ -1,4 +1,4 @@
-import { fireEvent, render as renderWithOptions, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render as renderWithOptions, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import NowPlayingSidebar from "./NowPlayingSidebar";
@@ -147,4 +147,34 @@ test("fetches silently with the panel closed and shows a settled unavailable sta
   rerender(<NowPlayingSidebar isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
   expect(await screen.findByText("Lyrics not available for this track.")).toBeInTheDocument();
   expect(await screen.findByText("No artist biography is available yet.")).toBeInTheDocument();
+});
+
+test("keeps the mobile playback deck together while lyrics load and settle", async () => {
+  let finishLyrics;
+  getTrackLyrics.mockReturnValue(new Promise((resolve) => { finishLyrics = resolve; }));
+  const onOpenQueue = jest.fn();
+  usePlayer.mockReturnValue({
+    currentSong: { id: "mobile-track", title: "Track title", artist: "Artist", duration: 180 },
+    duration: 180,
+    isPreview: true,
+    playbackMessage: "Preparing playback.",
+  });
+  render(<NowPlayingSidebar mobile isOpen onClose={jest.fn()} onOpenQueue={onOpenQueue} />);
+
+  const dialog = screen.getByRole("dialog", { name: "Now Playing" });
+  const deck = dialog.querySelector(".mobile-now-playing-deck");
+  const lyrics = within(dialog).getByRole("region", { name: "Lyrics" });
+  const playbackOptions = within(deck).getByRole("group", { name: "Playback options" });
+  expect(within(deck).getByText("Preview")).toBeInTheDocument();
+  expect(within(deck).getByRole("button", { name: "Like song" })).toBeInTheDocument();
+  expect(within(deck).getByRole("slider", { name: "Song progress" })).toBeEnabled();
+  expect(within(deck).getByRole("button", { name: "Turn on repeat" }).parentElement.nextElementSibling).toBe(playbackOptions);
+  expect(playbackOptions.nextElementSibling).toHaveTextContent("Preparing playback.");
+  expect(deck.nextElementSibling).toBe(lyrics);
+  expect(within(lyrics).getByRole("status")).toHaveTextContent(/Finding lyrics/);
+
+  finishLyrics(null);
+  expect(await within(lyrics).findByText("Lyrics not available for this track.")).toBeInTheDocument();
+  fireEvent.click(within(playbackOptions).getByRole("button", { name: "Queue" }));
+  expect(onOpenQueue).toHaveBeenCalledTimes(1);
 });

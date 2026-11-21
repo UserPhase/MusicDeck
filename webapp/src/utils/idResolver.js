@@ -10,6 +10,11 @@ export function toAlbumRouteIdFromApiId(rawId) {
   return value;
 }
 
+export function toTrackAlbumRouteId(track) {
+  return toAlbumRouteIdFromApiId(track?.albumId || track?.metadata?.albumId || track?.albumPlaybackId ||
+    (track?.mediaResume?.type === "album" ? track.mediaResume.mediaId : ""));
+}
+
 function decodeExternalId(value) {
   try {
     return decodeURIComponent(value);

@@ -3,6 +3,9 @@ import { MemoryRouter } from "react-router-dom";
 
 import Search from "./Search";
 import { searchNavidrome, startRadio } from "../api/musicdeck";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+
+jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn(() => false) }));
 
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn((id) => (id ? `/api/artwork/${id}` : null)),
@@ -45,6 +48,27 @@ test("uses shared empty state for an empty query", () => {
   renderSearch("");
 
   expect(screen.getByText(/search for an artist, album or song/i)).toHaveClass("library-empty");
+});
+
+test("submits and clears queries from the mobile search page", async () => {
+  useMediaQuery.mockReturnValue(true);
+  searchNavidrome.mockResolvedValue({ results: {} });
+  try {
+    renderSearch("");
+    const form = screen.getByRole("search", { name: "Music search" });
+    fireEvent.change(within(form).getByRole("searchbox"), { target: { value: "  Digital Love  " } });
+    fireEvent.submit(form);
+
+    await screen.findByText(/no results found/i);
+    expect(searchNavidrome).toHaveBeenCalledWith("Digital Love", { mode: expect.any(String), phase: "local" });
+    expect(within(form).getByRole("searchbox")).toHaveValue("Digital Love");
+
+    fireEvent.change(within(form).getByRole("searchbox"), { target: { value: "" } });
+    fireEvent.submit(form);
+    expect(screen.getByText(/search for an artist, album or song/i)).toBeInTheDocument();
+  } finally {
+    useMediaQuery.mockReturnValue(false);
+  }
 });
 
 test("renders songs, albums, artists, playlists, and availability from universal results", async () => {

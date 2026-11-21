@@ -1017,6 +1017,9 @@ impl RecommendationService {
                 .then_with(|| a.0.item.title.cmp(&b.0.item.title))
         });
 
+        let mut seen = crate::catalog::track_dedup::TrackDedup::default();
+        candidates.retain(|(avail, _, _)| seen.insert_track(&avail.item));
+
         if context.kind == RecommendationKind::SimilarArtists {
             let mut seen_artists = HashSet::new();
             candidates.retain(|(avail, _, _)| {

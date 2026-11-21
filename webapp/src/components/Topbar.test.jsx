@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import Topbar from "./Topbar";
 import { useAuth } from "../context/AuthContext";
+import { usePlayer } from "../context/PlayerContext";
 import { searchNavidrome } from "../api/musicdeck";
 import { useImport } from "../context/ImportContext";
 
@@ -12,11 +13,7 @@ jest.mock("../context/AuthContext", () => ({
 }));
 jest.mock("../context/ImportContext", () => ({ useImport: jest.fn() }));
 
-jest.mock("../context/PlayerContext", () => ({
-  usePlayer: () => ({
-    playSong: jest.fn(),
-  }),
-}));
+jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
 
 jest.mock("../api/musicdeck", () => ({
   getCoverUrl: jest.fn(() => null),
@@ -24,7 +21,11 @@ jest.mock("../api/musicdeck", () => ({
 }));
 
 
-function renderTopbar(user) {
+beforeEach(() => {
+  usePlayer.mockReturnValue({ playSong: jest.fn() });
+});
+
+function renderTopbar(user, props) {
   useImport.mockReturnValue({ job: null, isMinimized: false, openProgress: jest.fn() });
   useAuth.mockReturnValue({
     session: user,
@@ -33,7 +34,7 @@ function renderTopbar(user) {
 
   return render(
     <MemoryRouter>
-      <Topbar />
+      <Topbar {...props} />
     </MemoryRouter>
   );
 }
@@ -142,4 +143,22 @@ test("links to Downloads from the top bar", () => {
   renderTopbar({ username: "sam", displayName: "Sam", role: "user" });
 
   expect(screen.getByRole("link", { name: "Downloads" })).toHaveAttribute("href", "/downloads");
+  expect(screen.getByRole("link", { name: "Listening Activity" })).toHaveAttribute("href", "/listening-activity");
+});
+
+test("puts the shared sleep timer next to the mobile profile badge", () => {
+  const timer = { status: "armed" };
+  usePlayer.mockReturnValue({ audioEngine: { sleepTimer: { subscribe: () => () => {}, getSnapshot: () => timer } } });
+  renderTopbar({ username: "sam", displayName: "Sam", role: "user" }, { mobile: true });
+
+  expect(screen.getByRole("button", { name: "Sleep timer, timer active" })).toHaveAttribute("aria-haspopup", "dialog");
+  expect(screen.queryByLabelText("Search your music")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Listening Activity" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Downloads" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Sam" }));
+  expect(screen.getByRole("menuitem", { name: "Listening Activity" })).toHaveAttribute("href", "/listening-activity");
+  const downloads = screen.getByRole("menuitem", { name: "Downloads" });
+  expect(downloads).toHaveAttribute("href", "/downloads");
+  fireEvent.click(downloads);
+  expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 });

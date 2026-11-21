@@ -10,6 +10,7 @@ import {
 } from "../api/musicdeck";
 
 import TrackListHeader from "../components/TrackListHeader";
+import { LikedSongsCover } from "../components/PlaylistCover";
 import TrackRow from "../components/TrackRow";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
 import FloatingPanel from "../components/ui/FloatingPanel";
@@ -197,9 +198,7 @@ function Liked() {
 
       <div className="playlist-header">
 
-        <div className="playlist-page-cover liked-cover">
-          ♥
-        </div>
+        <LikedSongsCover className="playlist-page-cover" />
 
 
         <div className="playlist-page-info">

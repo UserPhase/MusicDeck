@@ -1,8 +1,8 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { startVisualPolling } from "../services/visualActivity";
 import { normalizePlaylistSearch, playlistTrackSearchText } from "../utils/playlistSearch";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useParams, Link, useNavigate } from "react-router-dom";
+import { useParams, Link, useLocation, useNavigate } from "react-router-dom";
 
 import PlaylistCover from "../components/PlaylistCover";
 import PlaylistSearchBox from "../components/playlists/PlaylistSearchBox";
@@ -17,6 +17,8 @@ import VirtualizedTrackList from "../components/VirtualizedTrackList";
 import PlaylistRecommendations from "../components/PlaylistRecommendations";
 import { useTrackSelection } from "../hooks/useTrackSelection";
 import { usePlaylistUndo } from "../hooks/usePlaylistUndo";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 import { reorderPlaylistEntries } from "../utils/playlistEditing";
 
 import PlaylistDetailsDialog from "../components/PlaylistDetailsDialog";
@@ -39,9 +41,44 @@ import "../styles/playlist-organization.css";
 const trackSortLabels = { custom: "Custom order", added: "Date added", title: "Title", artist: "Artist", album: "Album", duration: "Duration" };
 const trackSortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
+function PlaylistDescription({ description, mobile }) {
+  const id = useId();
+  const textRef = useRef(null);
+  const [expanded, setExpanded] = useState(false);
+  const [clipped, setClipped] = useState(false);
+  const trimmed = description.trim();
+  const preview = trimmed.replace(/(^|\n)Imported from Spotify: https:\/\/open\.spotify\.com\/playlist\/\S+$/i, "$1Imported from Spotify");
+  const hasHiddenContent = preview !== trimmed || /[\r\n]/.test(preview);
+
+  useLayoutEffect(() => {
+    const text = textRef.current;
+    const container = text?.parentElement;
+    if (!mobile || expanded || hasHiddenContent || !container) return undefined;
+    // Measure against the full row so the toggle's own width cannot keep it visible.
+    const measure = () => setClipped(text.scrollWidth > container.clientWidth);
+    measure();
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(measure);
+      observer.observe(container);
+      return () => observer.disconnect();
+    }
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [mobile, expanded, hasHiddenContent, preview]);
+
+  return <div className={`playlist-description-block${expanded ? " is-expanded" : ""}`}>
+    <p id={id} ref={textRef} className="playlist-description">{mobile && !expanded ? preview : description}</p>
+    {mobile && (expanded || hasHiddenContent || clipped) && <button type="button" className="playlist-description-toggle"
+      aria-controls={id} aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+      {expanded ? "See less" : "See more"}
+    </button>}
+  </div>;
+}
+
 function Playlist() {
 
   const { id } = useParams();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
 
 
   const [playlist, setPlaylist] =
@@ -62,8 +99,11 @@ function Playlist() {
   const optionsTriggerRef = useRef(null);
   const coverInputRef = useRef(null);
   const navigate = useNavigate();
+  const { state } = useLocation();
   const queryClient = useQueryClient();
   const [editDetailsOpen, setEditDetailsOpen] = useState(false);
+  const editFromOverview = state?.editPlaylistDetails === true;
+  useEffect(() => { setEditDetailsOpen(editFromOverview); }, [id, editFromOverview]);
   const [sharingOpen, setSharingOpen] = useState(false);
   const [editingBusy, setEditingBusy] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
@@ -672,6 +712,23 @@ async function handleRemoveSong(
 
   }
 
+  const songCount = mobile ? playlist.entry?.length ?? 0 : songs.length;
+  const trackMatches = trackQuery && <p className="playlist-edit-message" role="status">{songs.length} of {playlist.entry?.length || 0} tracks</p>;
+  const trackTools = <div className="playlist-track-tools">
+    <PlaylistSearchBox key={id} label="Search this playlist" value={trackQuery} onChange={setTrackQuery} />
+    <button type="button" className="folder-sort-trigger" ref={trackSortTrigger} aria-label={`Sort tracks: ${trackSortLabels[trackSort]}`}
+      aria-haspopup="menu" aria-expanded={trackSortOpen} onClick={() => setTrackSortOpen(!trackSortOpen)}>
+      {trackSortLabels[trackSort]} <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h12M8 12h8M8 18h4M4 5v2m0 4v2m0 4v2" /></svg>
+    </button>
+    {trackSortOpen && <FloatingPanel anchorRef={trackSortTrigger} className="folder-sort-menu" aria-label="Sort playlist tracks" onClose={() => setTrackSortOpen(false)}>
+      <span className="folder-sort-caption" aria-hidden="true">Sort by</span>
+      {Object.entries(trackSortLabels).map(([value, label]) => <button key={value} type="button" role="menuitemradio" aria-checked={trackSort === value}
+        onClick={() => { sortBy(value); setTrackSortOpen(false); trackSortTrigger.current?.focus(); }}>
+        {label}{trackSort === value && <span aria-hidden="true">{value === "custom" ? "\u2713" : sortDescending ? "\u2193" : "\u2191"}</span>}
+      </button>)}
+    </FloatingPanel>}
+  </div>;
+
   return (
 
     <div
@@ -762,24 +819,8 @@ async function handleRemoveSong(
           </h1>
 
 
-          {playlist.description && (
-
-            <p className="playlist-description">
-              {playlist.description}
-            </p>
-
-          )}
-
-
-          <div className="playlist-meta">
-
-            {songs.length}{" "}
-
-            {songs.length === 1
-              ? "song"
-              : "songs"}
-
-          </div>
+          {playlist.description && <PlaylistDescription key={id} description={playlist.description} mobile={mobile} />}
+          <div className="playlist-meta">{songCount} {songCount === 1 ? "song" : "songs"}</div>
 
         </div>
 
@@ -790,14 +831,16 @@ async function handleRemoveSong(
 
 
             <button
+              type="button"
               className="playlist-play"
+              aria-label="Play playlist"
               onClick={playPlaylist}
               disabled={
                 songs.length === 0
               }
             >
               ▶
-              <span>
+              <span className="playlist-play-label">
                 Play
               </span>
 
@@ -831,7 +874,12 @@ async function handleRemoveSong(
               collectionName={playlist.name}
             />
             {canManage && <button type="button" className="detail-secondary-action playlist-share-action" aria-label="Share playlist"
-              onClick={() => setSharingOpen(true)}><span>Share<br />playlist</span></button>}
+              onClick={() => setSharingOpen(true)}>
+              {mobile ? <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 15V3m-4 4 4-4 4 4M7 10H5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-2" />
+              </svg> : <span>Share<br />playlist</span>}
+            </button>}
 
 <div className="playlist-options">
 
@@ -982,27 +1030,14 @@ async function handleRemoveSong(
 
 </div>
 
-        <div className="playlist-track-tools">
-          <PlaylistSearchBox key={id} label="Search this playlist" value={trackQuery} onChange={setTrackQuery} />
-          <button type="button" className="folder-sort-trigger" ref={trackSortTrigger} aria-label={`Sort tracks: ${trackSortLabels[trackSort]}`}
-            aria-haspopup="menu" aria-expanded={trackSortOpen} onClick={() => setTrackSortOpen(!trackSortOpen)}>
-            {trackSortLabels[trackSort]} <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 6h12M8 12h8M8 18h4M4 5v2m0 4v2m0 4v2" /></svg>
-          </button>
-          {trackSortOpen && <FloatingPanel anchorRef={trackSortTrigger} className="folder-sort-menu" aria-label="Sort playlist tracks" onClose={() => setTrackSortOpen(false)}>
-            <span className="folder-sort-caption" aria-hidden="true">Sort by</span>
-            {Object.entries(trackSortLabels).map(([value, label]) => <button key={value} type="button" role="menuitemradio" aria-checked={trackSort === value}
-              onClick={() => { sortBy(value); setTrackSortOpen(false); trackSortTrigger.current?.focus(); }}>
-              {label}{trackSort === value && <span aria-hidden="true">{value === "custom" ? "✓" : sortDescending ? "↓" : "↑"}</span>}
-            </button>)}
-          </FloatingPanel>}
-        </div>
+        {!mobile && trackTools}
 
       </div>
 
 
       {/* SONG LIST */}
 
-      {trackQuery && <p className="playlist-edit-message" role="status">{songs.length} of {playlist.entry?.length || 0} tracks</p>}
+      {!mobile && trackMatches}
 
       {!canEditTracks && songs.length > 0 && <p className="playlist-edit-message">Viewer access · You can listen and add tracks to your own queue.</p>}
       {canEditTracks && !canEditEntries && songs.length > 0 && <p className="playlist-edit-message">Reload to enable batch removal and reordering.</p>}
@@ -1013,9 +1048,12 @@ async function handleRemoveSong(
       </div>}
       {editStatus && <p className="playlist-edit-message" role="status">{editStatus}</p>}
       {editingBusy && <p className="playlist-edit-message" role="status">Saving playlist changes...</p>}
-      <div className="track-list playlist-track-list" role="grid" aria-label="Playlist tracks" aria-multiselectable="true" aria-rowcount={songs.length + 1}>
+      {mobile && trackTools}
+      {mobile && trackMatches}
+      <div className="track-list playlist-track-list" role="grid" aria-label="Playlist tracks" aria-multiselectable="true"
+        aria-rowcount={mobile ? songs.length || undefined : songs.length + 1}>
 
-        <TrackListHeader sort={{ field: trackSort, descending: sortDescending, onChange: sortBy }} />
+        {!mobile && <TrackListHeader sort={{ field: trackSort, descending: sortDescending, onChange: sortBy }} />}
 
         {songs.length === 0 ? (
 
@@ -1032,6 +1070,9 @@ async function handleRemoveSong(
               dataKey={id}
               onPlay={handleTrackPlayback}
               showDateAdded
+              showDuration={!mobile}
+              hasColumnHeader={!mobile}
+              estimateRowHeight={mobile ? 52 : undefined}
               searchTokens={searchTokens}
 
 
@@ -1069,7 +1110,7 @@ async function handleRemoveSong(
           setPlaylist((current) => current?.id === updated.id ? updated : current);
           notifyPlaylistChange();
         }} />
-      {editDetailsOpen && (
+      {editDetailsOpen && canManage && (
         <PlaylistDetailsDialog
           playlist={playlist}
           busy={updatePlaylistMutation.isPending}

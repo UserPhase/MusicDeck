@@ -105,3 +105,7 @@ function PlaylistCover({
 
 
 export default PlaylistCover;
+
+export function LikedSongsCover({ className }) {
+  return <div className={`liked-cover ${className}`} aria-hidden="true">{"\u2665"}</div>;
+}
