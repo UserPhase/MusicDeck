@@ -1,0 +1,20 @@
+[package]
+name = "musicdeck-android"
+version = "0.2.1"
+description = "MusicDeck Android Client"
+authors = ["MusicDeck"]
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "musicdeck_android_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+serde_json = "1"

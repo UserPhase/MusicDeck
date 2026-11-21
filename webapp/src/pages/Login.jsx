@@ -3,9 +3,11 @@ import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import DesktopWindowControls from "../components/desktop/DesktopWindowControls";
 import {
+  ANDROID_CONNECTION_URL,
   DESKTOP_CONFIG_CHANGED_EVENT,
   DESKTOP_OPEN_SERVER_MODAL_EVENT,
   getDesktopServerUrl,
+  isAndroidTauriRuntime,
   isDesktopRuntime,
 } from "../services/desktop/desktopRuntime";
 
@@ -160,6 +162,8 @@ function Login({ redirectTo } = {}) {
         >
           {loading ? "Signing in..." : "Sign in"}
         </button>
+
+        {isAndroidTauriRuntime() && <a className="login-change-server" href={ANDROID_CONNECTION_URL}>Change server</a>}
 
         {isDesktop && (
           <div

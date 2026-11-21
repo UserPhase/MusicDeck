@@ -3,6 +3,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { setDesktopForeground } from "../visualActivity";
 
 export const DEFAULT_DESKTOP_SERVER_URL = "http://localhost:4534";
+export const ANDROID_CONNECTION_URL = "https://tauri.localhost/";
 export const DESKTOP_SERVER_URL_KEY = "musicdeck.desktop.serverUrl";
 export const DESKTOP_CLOSE_TO_TRAY_KEY = "musicdeck.desktop.closeToTray";
 export const DESKTOP_AUTO_UPDATE_KEY = "musicdeck.desktop.autoCheckUpdates";
@@ -41,11 +42,19 @@ function isBinaryOrStreamApiPath(path) {
 
 export function isDesktopRuntime(win = typeof window !== "undefined" ? window : undefined) {
   if (!win) return false;
-  return Boolean(
-    win.__TAURI_INTERNALS__ ||
-      win.__TAURI__ ||
-      win.__MUSICDECK_DESKTOP__
-  );
+  if (win.__MUSICDECK_DESKTOP__) return true;
+  // Android WebView exposes Tauri IPC too, while using the web app's API path.
+  return Boolean(win.__TAURI_INTERNALS__ || win.__TAURI__) && !isAndroidTauriRuntime(win);
+}
+
+export function isAndroidTauriRuntime(win = typeof window !== "undefined" ? window : undefined) {
+  const userAgent = win?.navigator?.userAgent ?? "";
+  return /\bMusicDeckAndroid\b/.test(userAgent)
+    || (Boolean(win?.__TAURI_INTERNALS__ || win?.__TAURI__) && /\bAndroid\b/i.test(userAgent));
+}
+
+export function isAndroidConnectionScreen(win = typeof window !== "undefined" ? window : undefined) {
+  return isAndroidTauriRuntime(win) && win.location?.origin === new URL(ANDROID_CONNECTION_URL).origin;
 }
 
 export function normalizeDesktopServerUrl(raw) {
@@ -337,11 +346,13 @@ export function resolveDesktopApiUrl(pathOrUrl) {
   return `${serverUrl}${pathOrUrl}`;
 }
 
-export function resolveRemoteSocketUrl() {
-  const desktop = isDesktopRuntime();
-  const base = desktop ? remoteProxyUrl : window.location.href;
+export function resolveRemoteSocketUrl(win = window) {
+  if (isAndroidConnectionScreen(win)) return null;
+  const desktop = isDesktopRuntime(win);
+  const base = desktop ? remoteProxyUrl : win.location.href;
   if (!base) return null;
   const url = desktop ? new URL("api/v1/remote", `${base}/`) : new URL("/api/v1/remote", base);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 }

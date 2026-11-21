@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registers_authenticated_cra_websocket_and_rejects_other_origins() {
+    async fn registers_authenticated_cra_and_lan_websocket_clients() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::{TcpListener, TcpStream};
 
@@ -486,18 +486,23 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
-        for (origin, signed_in, expected) in [
-            ("http://localhost:3000", true, "101"),
-            ("http://127.0.0.1:3000", true, "101"),
-            ("http://localhost:3000", false, "401"),
-            ("http://unrelated.test:3000", true, "403"),
-            ("http://localhost:3001", true, "403"),
-            ("http://localhost:8080", true, "101"),
+        let backend_host = addr.to_string();
+        let lan_host = "192.168.1.50:8080";
+        for (origin, host, signed_in, expected) in [
+            ("http://localhost:3000", backend_host.as_str(), true, "101"),
+            ("http://127.0.0.1:3000", backend_host.as_str(), true, "101"),
+            ("http://localhost:3000", backend_host.as_str(), false, "401"),
+            ("http://unrelated.test:3000", backend_host.as_str(), true, "403"),
+            ("http://localhost:3001", backend_host.as_str(), true, "403"),
+            ("http://localhost:8080", backend_host.as_str(), true, "101"),
+            ("http://192.168.1.50:8080", lan_host, true, "101"),
+            ("http://192.168.1.50:8080", lan_host, false, "401"),
+            ("https://tauri.localhost", lan_host, true, "403"),
         ] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
             let cookie = if signed_in { format!("Cookie: {}={}\r\n", crate::auth::SESSION_COOKIE, session.id) } else { String::new() };
             let request = format!(
-                "GET {REMOTE_WS_PATH} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\n{cookie}Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                "GET {REMOTE_WS_PATH} HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n{cookie}Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
             );
             stream.write_all(request.as_bytes()).await.unwrap();
             let mut stream = BufReader::new(stream);

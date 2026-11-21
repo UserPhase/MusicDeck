@@ -32,8 +32,10 @@ import { useImport } from "../context/ImportContext";
 import { BrandWordmark } from "../context/BrandingContext";
 import { useViewStateValue } from "../hooks/useViewStateStore";
 import {
+  ANDROID_CONNECTION_URL,
   handleDesktopTitlebarDoubleClick,
   handleDesktopTitlebarMouseDown,
+  isAndroidTauriRuntime,
 } from "../services/desktop/desktopRuntime";
 
 // Primary destinations for header-navigation layouts (YouTube Music, SoundCloud).
@@ -721,6 +723,10 @@ function Topbar({ leading = null, showPrimaryNav = false, playerSlot = null, mob
                     Listening Activity
                   </Link>
                 </>}
+
+                {isAndroidTauriRuntime() && <a href={ANDROID_CONNECTION_URL} className="account-menu-item" role="menuitem">
+                  Change server
+                </a>}
 
                 {user.role === "admin" && (
 

@@ -218,6 +218,36 @@ test("a pending Web Audio resume keeps the active element audible at the same po
   }
 });
 
+test("foreground return resumes a suspended audio context only for active playback", async () => {
+  const ctx = new FakeAudioContext();
+  const { engine, audios } = setup({ audioContext: ctx as unknown as AudioContext });
+  const visibility = jest.spyOn(document, "visibilityState", "get");
+  const resume = jest.spyOn(ctx, "resume");
+  try {
+    await engine.load(track("foreground"), { startAt: 24 });
+    audios[0].loaded(120);
+    ctx.state = "suspended";
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resume).not.toHaveBeenCalled();
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(engine.getPosition()).toBe(24);
+    expect(audios[0].load).toHaveBeenCalledTimes(1);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    engine.pause();
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(audios[0].paused).toBe(true);
+  } finally {
+    engine.destroy();
+    visibility.mockRestore();
+  }
+});
+
 test.each([
   ["rejects", () => Promise.reject(new Error("Audio context blocked"))],
   ["throws", () => { throw new Error("Audio context blocked"); }],

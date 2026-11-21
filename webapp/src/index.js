@@ -17,7 +17,7 @@ import './styles/tactile.css';
 import './styles/theme.css';
 import './styles/mobile.css';
 import App from './App';
-import { initDesktopRuntime, isDesktopRuntime } from './services/desktop/desktopRuntime';
+import { initDesktopRuntime, isAndroidConnectionScreen, isDesktopRuntime } from './services/desktop/desktopRuntime';
 import { registerServiceWorker } from './services/serviceWorkerRegistration';
 
 function mountApp() {
@@ -30,7 +30,11 @@ function mountApp() {
   void registerServiceWorker();
 }
 
-if (isDesktopRuntime()) {
+if (isAndroidConnectionScreen()) {
+  void import('./pages/AndroidConnection').then(({ default: AndroidConnection }) => {
+    ReactDOM.createRoot(document.getElementById('root')).render(<AndroidConnection />);
+  });
+} else if (isDesktopRuntime()) {
   void initDesktopRuntime().finally(mountApp);
 } else {
   mountApp();

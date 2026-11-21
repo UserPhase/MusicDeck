@@ -66,3 +66,4 @@
 	.profile-button > span:last-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 	.topbar-import-status span:last-child { display: none; }
 }
+.login-form .login-change-server { display: grid; min-height: 44px; place-items: center; color: var(--accent-text); }

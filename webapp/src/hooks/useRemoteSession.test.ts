@@ -110,6 +110,58 @@ test.each([4001, 4002, 4009])("close code %i cannot pause local playback", (code
   }
 });
 
+test.each(["online", "musicdeck:android-network-available"])("%s expedites one retry and respects an ended session", async (event) => {
+  const player = adapter();
+  renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  await receive(ws, { type: "DEVICES", devices: [] });
+  act(() => {
+    ws.close(1006);
+    window.dispatchEvent(new Event(event));
+    window.dispatchEvent(new Event(event));
+  });
+  expect(FakeSocket.instances).toHaveLength(2);
+  const replacement = FakeSocket.instances[1];
+  act(() => replacement.open());
+  expect(replacement.sent.filter(frame => frame.type === "REGISTER")).toHaveLength(1);
+  act(() => {
+    replacement.close(4001);
+    window.dispatchEvent(new Event(event));
+    jest.advanceTimersByTime(1000);
+  });
+  expect(FakeSocket.instances).toHaveLength(2);
+  expect(player.pause).not.toHaveBeenCalled();
+});
+
+test("replaces an expired socket on foreground return when background timers were suspended", async () => {
+  const player = adapter();
+  const { result, unmount } = renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  try {
+    act(() => ws.open());
+    const now = Date.now();
+    await receive(ws, { type: "INITIAL_STATE", controlTimeoutMs: 25_000, server_time: now, state: {
+      device_id: result.current.deviceId, track: initial.current_track, position_ms: initial.position_ms,
+      duration_ms: initial.duration_ms, volume: initial.volume, updated_at: now, is_playing: false, revision: 1,
+    } });
+    act(() => setDesktopForeground(false));
+    jest.setSystemTime(now + 15_000);
+    act(() => setDesktopForeground(true));
+    expect(FakeSocket.instances).toHaveLength(1);
+
+    act(() => setDesktopForeground(false));
+    jest.setSystemTime(now + 30_000);
+    act(() => setDesktopForeground(true));
+    expect(ws.readyState).toBe(3);
+    expect(FakeSocket.instances).toHaveLength(2);
+    expect(player.pause).not.toHaveBeenCalled();
+  } finally {
+    unmount();
+    setDesktopForeground(null);
+  }
+});
+
 test("registers same-origin cookies-only control, publishes explicit playback claims and reconnects cleanly", async () => {
   const player = adapter();
   const { result, rerender, unmount } = renderHook(() => useRemoteSession("user", player));

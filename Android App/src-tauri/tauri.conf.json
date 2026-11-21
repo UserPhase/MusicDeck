@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MusicDeck",
+  "version": "0.2.1",
+  "identifier": "app.musicdeck.android",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../webapp run build",
+    "beforeBuildCommand": "npm --prefix ../webapp run build",
+    "frontendDist": "../../webapp/build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "MusicDeck",
+        "create": false,
+        "useHttpsScheme": true
+      }
+    ],
+    "security": {
+      "capabilities": ["server-connection"],
+      "csp": "default-src 'self'; base-uri 'self'; object-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' ipc: https://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "android": {
+      "minSdkVersion": 24
+    }
+  }
+}

@@ -205,6 +205,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     let reconnect: number | undefined;
     let handshake: number | undefined;
     let watchdog: number | undefined;
+    let heartbeatDeadline: number | undefined;
     let controlTimeout = 0;
     let leaseDuration: number | undefined;
     let leaseRenewal: number | undefined;
@@ -256,6 +257,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       liveSync = false;
       window.clearTimeout(handshake);
       window.clearTimeout(watchdog);
+      heartbeatDeadline = undefined;
       controlTimeout = 0;
       clockOffset.current = null;
       clockSamples = [];
@@ -323,6 +325,7 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       window.clearTimeout(watchdog);
       const ws = socket.current;
       if (!controlTimeout || !ws) return;
+      heartbeatDeadline = Date.now() + controlTimeout;
       watchdog = window.setTimeout(() => {
         disconnect(ws, 4003, "Device control heartbeat timed out");
       }, controlTimeout);
@@ -708,6 +711,18 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     };
     window.addEventListener("pagehide", pageHidden);
     window.addEventListener("pageshow", pageShown);
+    const recoverTransport = () => {
+      if (closed || pageSuspended) return;
+      const ws = socket.current;
+      // WebView can suspend timers while the device is locked.
+      if (ws && heartbeatDeadline !== undefined && Date.now() >= heartbeatDeadline) {
+        disconnect(ws, 4003, "Device control heartbeat timed out");
+      }
+      // Expedite transient retries without reopening an ended session.
+      if (!socket.current && reconnect !== undefined) connect();
+    };
+    window.addEventListener("online", recoverTransport);
+    window.addEventListener("musicdeck:android-network-available", recoverTransport);
     const publishState = () => {
       if (socket.current?.readyState !== WebSocket.OPEN) return;
       const state = adapterRef.current.state();
@@ -755,7 +770,9 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
     };
     // Server WebSocket pings and remote commands are independent of position samples.
     const unsubscribeVisibility = subscribeVisualActivity(() => {
-      if (getVisualActivity() && ownsPlayingOutput()) publishState();
+      const visible = getVisualActivity();
+      if (visible) recoverTransport();
+      if (visible && ownsPlayingOutput()) publishState();
       else schedulePositionSample();
     });
     // Let an immediately cleaned-up effect cancel startup before opening a socket.
@@ -767,6 +784,8 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       window.removeEventListener(DESKTOP_CONFIG_CHANGED_EVENT, reconnectForServerChange);
       window.removeEventListener("pagehide", pageHidden);
       window.removeEventListener("pageshow", pageShown);
+      window.removeEventListener("online", recoverTransport);
+      window.removeEventListener("musicdeck:android-network-available", recoverTransport);
       releaseSocketOwnership();
       clearOwnershipLease();
       const ws = socket.current;

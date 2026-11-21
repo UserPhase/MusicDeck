@@ -20,6 +20,8 @@ import {
   getDesktopServerUrl,
   initDesktopRuntime,
   installDesktopRuntime,
+  isAndroidTauriRuntime,
+  isAndroidConnectionScreen,
   isDesktopRuntime,
   normalizeDesktopServerUrl,
   resolveDesktopApiUrl,
@@ -60,6 +62,23 @@ describe("desktopRuntime", () => {
 
     window.__TAURI_INTERNALS__ = {};
     expect(isDesktopRuntime()).toBe(true);
+    const android = { navigator: { userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel; wv)" } };
+    expect(isAndroidTauriRuntime(android)).toBe(false);
+    const androidWebView = { ...android, __TAURI_INTERNALS__: {} };
+    expect(isAndroidTauriRuntime(androidWebView)).toBe(true);
+    expect(isDesktopRuntime(androidWebView)).toBe(false);
+  });
+
+  test("uses the Android gateway origin for remote control without connecting from the launcher", () => {
+    const android = { navigator: { userAgent: "Mozilla/5.0 MusicDeckAndroid" }, __TAURI_INTERNALS__: {} };
+    const at = (url) => ({ ...android, location: new URL(url) });
+    const launcher = at("https://tauri.localhost/");
+    expect(isAndroidConnectionScreen(launcher)).toBe(true);
+    expect(resolveRemoteSocketUrl(launcher)).toBeNull();
+    expect(resolveRemoteSocketUrl(at("http://192.168.1.50:8080/playlist/123")).href)
+      .toBe("ws://192.168.1.50:8080/api/v1/remote");
+    expect(resolveRemoteSocketUrl(at("https://music.example.com/album/123")).href)
+      .toBe("wss://music.example.com/api/v1/remote");
   });
 
   test("keeps the previous settings and surfaces a native save failure", async () => {

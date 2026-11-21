@@ -1,0 +1,6 @@
+{
+  "identifier": "server-connection",
+  "description": "Allow the bundled launcher to select a MusicDeck server.",
+  "windows": ["main"],
+  "permissions": ["allow-connect-musicdeck-server", "allow-open-musicdeck-android-releases"]
+}

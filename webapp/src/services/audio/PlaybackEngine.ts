@@ -283,11 +283,19 @@ export class PlaybackEngine implements QueuePlaybackEngine {
       },
     });
     if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", this.realignSleepClock);
-      this.detachers.push(() => document.removeEventListener("visibilitychange", this.realignSleepClock));
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+      this.detachers.push(() => document.removeEventListener("visibilitychange", this.onVisibilityChange));
     }
     if (this.pendingAudioContext?.state === "running") this.initializeAudioGraph();
   }
+
+  private readonly onVisibilityChange = () => {
+    this.realignSleepClock();
+    const context = this.graph?.ctx;
+    if (document.visibilityState === "visible" && this.wantsPlayback && !this.remoteOutput && context) {
+      this.requestContextResume(context);
+    }
+  };
 
   private readonly realignSleepClock = () => {
     this.sleepTimer.realignClock();
