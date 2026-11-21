@@ -90,8 +90,15 @@ mod tests {
             "http://[::1]:8080",
             "http://[::ffff:127.0.0.1]:8080",
         ] {
-            assert!(parse_server_url(url, true).unwrap_err().contains("this phone"));
+            assert!(parse_server_url(url, true)
+                .unwrap_err()
+                .contains("this phone"));
         }
-        assert_eq!(parse_server_url("http://10.0.2.2:3000", true).unwrap().port(), Some(3000));
+        assert_eq!(
+            parse_server_url("http://10.0.2.2:3000", true)
+                .unwrap()
+                .port(),
+            Some(3000)
+        );
     }
 }

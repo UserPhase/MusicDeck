@@ -1,4 +1,4 @@
-import { createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import AndroidConnection from "./AndroidConnection";
 
@@ -53,5 +53,5 @@ test("reports a native connection failure and opens releases through Android", a
 
   fireEvent.click(screen.getByRole("button", { name: "Android APK releases" }));
   expect(invoke).toHaveBeenLastCalledWith("open_musicdeck_android_releases");
-  expect(await screen.findByRole("button", { name: "Connect", enabled: true })).toBeEnabled();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled());
 });
