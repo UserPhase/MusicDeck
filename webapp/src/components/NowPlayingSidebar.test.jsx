@@ -178,3 +178,30 @@ test("keeps the mobile playback deck together while lyrics load and settle", asy
   fireEvent.click(within(playbackOptions).getByRole("button", { name: "Queue" }));
   expect(onOpenQueue).toHaveBeenCalledTimes(1);
 });
+
+test("mobile lyrics show a short preview and share playback controls with the full reader", async () => {
+  const togglePlay = jest.fn();
+  const seek = jest.fn();
+  getTrackLyrics.mockResolvedValue({ syncedLyrics: Array.from({ length: 10 }, (_, i) => ({
+    timestampMs: i * 1000, text: `Line ${i + 1}`,
+  })) });
+  usePlayer.mockReturnValue({ currentSong: { id: "lyrics", title: "Lyrics track" }, currentTime: 2,
+    duration: 100, isPlaying: true, togglePlay, seek });
+  render(<NowPlayingSidebar mobile isOpen onClose={jest.fn()} onOpenQueue={jest.fn()} />);
+  const card = screen.getByRole("region", { name: "Lyrics" });
+  await within(card).findByText("Line 3");
+  expect(card.querySelectorAll(".lyrics-preview-line")).toHaveLength(3);
+  expect(card.querySelector(".lyrics-scroll")).toBeNull();
+
+  fireEvent.click(within(card).getByRole("button", { name: "Full screen" }));
+  const reader = screen.getByRole("dialog", { name: "Lyrics track" });
+  expect(reader.querySelectorAll(".lyrics-scroll")).toHaveLength(1);
+  expect(reader.querySelectorAll(".right-sidebar-lyric-line")).toHaveLength(10);
+  const controls = within(reader).getByRole("group", { name: "Lyrics playback" });
+  fireEvent.click(within(controls).getByRole("button", { name: "Pause" }));
+  fireEvent.change(within(controls).getByRole("slider", { name: "Song progress" }), { target: { value: "73" } });
+  expect(togglePlay).toHaveBeenCalledTimes(1);
+  expect(seek).toHaveBeenCalledWith(73);
+  fireEvent.click(within(reader).getByRole("button", { name: "Close full-screen lyrics" }));
+  expect(screen.queryByRole("dialog", { name: "Lyrics track" })).not.toBeInTheDocument();
+});

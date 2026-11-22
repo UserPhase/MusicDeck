@@ -55,6 +55,7 @@ export interface Track {
 export interface TrackRowProps {
   song: Track;
   index: number;
+  mobile?: boolean;
   ariaRowIndex?: number;
   onPlay?: (song: Track, index: number) => void;
   showAlbum?: boolean;
@@ -72,6 +73,7 @@ export interface TrackRowProps {
   albumFallback?: string;
   duration?: number | null;
   onToggleMenu?: (song: Track, event?: MouseEvent) => void;
+  onToggleEntryMenu?: (song: Track, index: number, event?: MouseEvent) => void;
   menu?: ReactNode;
   actionsRef?: Ref<HTMLDivElement>;
   onSpotdlDownload?: (song: Track) => void;
@@ -86,6 +88,7 @@ export interface TrackRowProps {
   onQueue?: (song: Track) => void;
   onDownload?: (song: Track) => void;
   action?: ReactNode;
+  menuAction?: (close: () => void) => ReactNode;
   showImportAction?: boolean;
   compactTile?: boolean;
 }
@@ -101,14 +104,15 @@ const addedDateFormat = new Intl.DateTimeFormat(undefined, { year: "numeric", mo
 function TrackRow({
   song,
   index,
-  ariaRowIndex = index + 2,
+  mobile = false,
+  ariaRowIndex = index + (mobile ? 1 : 2),
   onPlay,
   showAlbum = true,
   showDateAdded = false,
   searchTokens,
-  showArtwork = false,
-  showDuration = true,
-  showQualityBadge = true,
+  showArtwork = mobile,
+  showDuration = !mobile,
+  showQualityBadge = !mobile,
   showSourceIndicator = false,
   dimWhenUnavailable = false,
   isDownloaded,
@@ -118,6 +122,7 @@ function TrackRow({
   albumFallback,
   duration,
   onToggleMenu,
+  onToggleEntryMenu,
   menu,
   actionsRef,
   onSpotdlDownload,
@@ -132,9 +137,11 @@ function TrackRow({
   onQueue,
   onDownload,
   action,
+  menuAction,
   showImportAction = true,
   compactTile = false,
 }: TrackRowProps) {
+  const mobileRow = mobile || compactTile;
   const scope = useTrackActionScope();
   const editingDisabled = editingDisabledProp || Boolean(scope?.disabled);
   const selected = selectedProp ?? (scope ? scope.selection.selectedIds.has(scope.keyAt(index)) : undefined);
@@ -280,17 +287,23 @@ function TrackRow({
   }
 
   function openContextMenu(event?: MouseEvent) {
-    if (onSelect && !selected && !editingDisabled) onSelect(index, {});
+    if ((!mobileRow || selectionMode) && onSelect && !selected && !editingDisabled) onSelect(index, {});
     setContextPoint(event ? { x: event.clientX, y: event.clientY } : null);
-    if (legacyMenu && onToggleMenu) {
-      if (!menu) onToggleMenu(song, event);
+    if (legacyMenu && (onToggleMenu || onToggleEntryMenu)) {
+      if (!menu) {
+        if (onToggleEntryMenu) onToggleEntryMenu(song, index, event);
+        else onToggleMenu?.(song, event);
+      }
     } else setLocalMenuOpen(true);
   }
 
   function closeMenu() {
     setLocalMenuOpen(false);
     setContextPoint(null);
-    if (legacyMenu && menu) onToggleMenu?.(song);
+    if (legacyMenu && menu) {
+      if (onToggleEntryMenu) onToggleEntryMenu(song, index);
+      else onToggleMenu?.(song);
+    }
   }
 
   const playLabel = isCurrentTrack
@@ -303,6 +316,7 @@ function TrackRow({
 
   const rowClassName = [
     "track",
+    mobileRow && "track-mobile-row",
     showArtwork && "track-with-artwork",
     !showAlbum && "track-album-page",
     dimWhenUnavailable && !resolvedDownloaded && "track-not-downloaded",
@@ -370,11 +384,11 @@ function TrackRow({
           isCurrentTrack={isCurrentTrack}
           isPlaying={isPlaying}
         />}
-        {compactTile && showArtwork && isCurrentTrack && (
+        {mobileRow && showArtwork && isCurrentTrack && (
           <TrackPlaybackIndicator index={index} isCurrentTrack isPlaying={isPlaying} />
         )}
 
-        {!compactTile && <button
+        {!mobileRow && <button
           type="button"
           className="track-play"
           onClick={(event) => {
@@ -397,17 +411,17 @@ function TrackRow({
             <AvailabilityHint availability={song.availability} />
             {showSourceIndicator && <SourceIndicator source={song.source} />}
             {showQualityBadge && <EditionBadges item={song} formatOnly />}
-            {isExternalTrack && <SaveDiscoveryButton compact kind="track" item={{ ...song, id: String(song.id) }} />}
+            {isExternalTrack && !mobile && <SaveDiscoveryButton compact kind="track" item={{ ...song, id: String(song.id) }} />}
           </>}
         </div>
 
-        {compactTile ? <span className="track-artist">{resolvedArtist}</span> : (
+        {mobileRow ? <span className="track-artist"><PlaylistSearchHighlight text={resolvedArtist} tokens={searchTokens} /></span> : (
           <TrackArtistLinks song={song} className="track-artist" artistId={artistId}
             fallback={artistFallback} searchTokens={searchTokens} />
         )}
       </div>
 
-      {showAlbum && (
+      {!mobileRow && showAlbum && (
         resolvedAlbumId ? (
           <div className="track-album" role="cell">
             <Link to={`/album/${encodeURIComponent(toAlbumRouteIdFromApiId(resolvedAlbumId))}`} className="track-album-link" onClick={(event) => event.stopPropagation()}>
@@ -419,9 +433,9 @@ function TrackRow({
         )
       )}
 
-      {!showAlbum && <div className="track-album" role="cell" aria-hidden="true" />}
+      {!mobileRow && !showAlbum && <div className="track-album" role="cell" aria-hidden="true" />}
 
-      {showDateAdded ? <div className="track-date-added" role="cell">
+      {!mobileRow && (showDateAdded ? <div className="track-date-added" role="cell">
         {song.playlistAddedAt && Number.isFinite(Date.parse(song.playlistAddedAt))
           ? <time dateTime={song.playlistAddedAt}>{addedDateFormat.format(new Date(song.playlistAddedAt))}</time>
           : <span aria-label="Date unavailable">—</span>}
@@ -433,7 +447,7 @@ function TrackRow({
         ) : (
           <TrackDownloadButton song={song} completedPlaceholder />
         )}
-      </div>}
+      </div>)}
 
       {!compactTile && <>
         {showDuration && <div className="track-duration" role="cell">
@@ -448,8 +462,8 @@ function TrackRow({
           onMouseDown={(event) => event.stopPropagation()}
         >
           {action}
-          {showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
-          {isExternalTrack && showImportAction && (
+          {!mobile && showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
+          {!mobile && isExternalTrack && showImportAction && (
             <TrackDownloadButton
               song={song}
               className="track-row-import"
@@ -462,7 +476,7 @@ function TrackRow({
             className="track-menu"
             ref={menuTriggerRef}
             aria-label={`More options for ${song.title || "track"}`}
-            aria-haspopup="menu"
+            aria-haspopup={mobile ? "dialog" : "menu"}
             aria-expanded={menuOpen}
             onClick={(event) => {
               event.stopPropagation();
@@ -494,6 +508,7 @@ function TrackRow({
           onRequestClose={closeMenu}
           onActionError={scope?.reportActionError}
         >
+          {menuAction?.(closeMenu)}
           {legacyMenu ? supplementalMenuContent : null}
         </UniversalTrackContextMenu>
       )}

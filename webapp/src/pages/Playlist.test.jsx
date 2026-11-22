@@ -364,6 +364,59 @@ test("clicking a playlist row starts its full playback context", async () => {
   );
 });
 
+test("a large playlist passes every occurrence to playback and delays offscreen recommendations", async () => {
+  const observer = window.IntersectionObserver;
+  let showRecommendations;
+  window.IntersectionObserver = class {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe(node) {
+      if (node.hasAttribute("data-playlist-recommendations-sentinel")) {
+        showRecommendations = () => this.callback([{ isIntersecting: true }]);
+      }
+    }
+    disconnect() {}
+  };
+  const entry = Array.from({ length: 1201 }, (_, index) => ({
+    id: `track-${index % 1200}`, playlistItemId: `entry-${index}`, title: `Track ${index}`, artist: "Artist",
+  }));
+  const playQueue = jest.fn();
+  try {
+    renderPlaylist({ ...collagePlaylist, entry, itemIds: entry.map(track => track.playlistItemId), editRevision: 7 }, { playQueue });
+    const grid = await screen.findByRole("grid", { name: "Playlist tracks" });
+    expect(within(grid).getAllByRole("row").length).toBeLessThan(100);
+    expect(grid).toHaveAttribute("aria-rowcount", "1202");
+    expect(getPlaylistRecommendations).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Play playlist" }));
+    expect(playQueue).toHaveBeenCalledWith(entry, 0, expect.objectContaining({ id: "mdpl_1", type: "playlist" }));
+    fireEvent.click(within(grid).getByRole("button", { name: "Play Track 1" }));
+    expect(playContext).toHaveBeenCalledWith(entry, 1, expect.objectContaining({ id: "mdpl_1", type: "playlist" }));
+
+    act(() => showRecommendations());
+    expect(await screen.findByRole("heading", { name: "Recommended" })).toBeInTheDocument();
+    expect(getPlaylistRecommendations).toHaveBeenCalledTimes(1);
+  } finally {
+    window.IntersectionObserver = observer;
+  }
+});
+
+test("leaving a loading playlist aborts its request", async () => {
+  let olderSignal;
+  getPlaylist.mockImplementationOnce((_id, signal) => {
+    olderSignal = signal;
+    return new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  });
+  renderPlaylist(collagePlaylist, {}, true);
+  await waitFor(() => expect(olderSignal).toBeDefined());
+  getPlaylist.mockResolvedValueOnce({ ...collagePlaylist, id: "mdpl_other", name: "Other Playlist" });
+  fireEvent.click(screen.getByRole("link", { name: "Open another playlist" }));
+  expect(await screen.findByRole("heading", { name: "Other Playlist" })).toBeInTheDocument();
+  expect(olderSignal.aborted).toBe(true);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
 
 test("clicking the active playlist track toggles playback without rebuilding its queue", async () => {
   const playlist = {

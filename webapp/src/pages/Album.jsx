@@ -15,6 +15,7 @@ import {
   getAlbum,
 } from "../api/musicdeck";
 import { HeroArtwork } from "../components/Layout/FullHero";
+import { DetailBackLink } from "../components/Layout/MobileNavigation";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
@@ -24,7 +25,9 @@ import AlbumLikeButton from "../components/AlbumLikeButton";
 import AlbumEditionPicker from "../components/AlbumEditionPicker";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { usePrivacy } from "../context/PrivacyContext";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { toAlbumRouteIdFromApiId, toArtistRouteIdFromApiId } from "../utils/idResolver";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 
 
 import {
@@ -33,6 +36,7 @@ import {
 
 function Album({ albumId, backTo = "/library" } = {}) {
   const deletion = useServerDeletion();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
 
   const params = useParams();
   const id = toAlbumRouteIdFromApiId(albumId ?? params.id);
@@ -147,7 +151,7 @@ function Album({ albumId, backTo = "/library" } = {}) {
    */
 
   if (external && !canMetadata) return <div className="privacy-banner" role="status">
-    External releases are disabled by server privacy policy. <Link to={backTo}>Back to your library</Link>
+    External releases are disabled by server privacy policy. <DetailBackLink fallback={backTo}>{mobile ? "Back" : "Back to your library"}</DetailBackLink>
   </div>;
 
   if (loading || (album && String(album.id) !== id)) {
@@ -180,12 +184,12 @@ function Album({ albumId, backTo = "/library" } = {}) {
 
       <div className="album-page">
 
-        <Link
-          to={backTo}
+        <DetailBackLink
+          fallback={backTo}
           className="album-back"
         >
           ← Back
-        </Link>
+        </DetailBackLink>
 
 
         <div className="error">
@@ -240,12 +244,12 @@ function Album({ albumId, backTo = "/library" } = {}) {
 
       {/* BACK */}
 
-      <Link
-        to={backTo}
+      <DetailBackLink
+        fallback={backTo}
         className="album-back"
       >
         ← Back
-      </Link>
+      </DetailBackLink>
 
 
       {/* ALBUM HEADER */}
@@ -410,9 +414,9 @@ function Album({ albumId, backTo = "/library" } = {}) {
 
       {/* TRACK LIST */}
 
-      <div className="track-list" role="table" aria-label="Album tracks">
+      <div className="track-list track-list--mobile" role="table" aria-label="Album tracks">
 
-        <TrackListHeader showAlbum={false} />
+        {!mobile && <TrackListHeader showAlbum={false} />}
 
 
         <TrackActionScope tracks={songs} dataKey={album?.id}>
@@ -430,6 +434,7 @@ function Album({ albumId, backTo = "/library" } = {}) {
             key={`${song.id}-${index}`}
             song={song}
             index={index}
+            mobile={mobile}
             showAlbum={false}
             showSourceIndicator
             dimWhenUnavailable

@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { Link, MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { useEffect } from "react";
 
 import AppLayout from "./AppLayout";
+import { DetailBackLink } from "./MobileNavigation";
 import { usePlayer } from "../../context/PlayerContext";
 import { getPlaylists } from "../../api/playlists";
 
@@ -11,8 +12,14 @@ jest.mock("../../api/playlists", () => ({
   getPlaylists: jest.fn(),
 }));
 jest.mock("../Sidebar", () => ({ id }) => <aside data-testid="library-sidebar" id={id} />);
-jest.mock("../QueueSidebar", () => ({ isOpen }) => (isOpen ? <aside data-testid="queue-panel" /> : null));
-jest.mock("../NowPlayingSidebar", () => ({ isOpen }) => (isOpen ? <aside data-testid="now-playing-panel" /> : null));
+jest.mock("../QueueSidebar", () => ({ isOpen, onClose, closeButtonRef }) => isOpen && (
+  <aside data-testid="queue-panel"><button ref={closeButtonRef} onClick={onClose}>Close queue</button></aside>
+));
+jest.mock("../NowPlayingSidebar", () => ({ isOpen, covered, onOpenQueue, queueButtonRef }) => isOpen && (
+  <aside data-testid="now-playing-panel" hidden={covered}>
+    <button ref={queueButtonRef} onClick={onOpenQueue}>Queue</button>
+  </aside>
+));
 jest.mock("../PlaylistCover", () => () => <span />);
 jest.mock("../Topbar", () => ({ leading, showPrimaryNav, playerSlot }) => (
   <header data-testid="topbar">
@@ -22,8 +29,11 @@ jest.mock("../Topbar", () => ({ leading, showPrimaryNav, playerSlot }) => (
   </header>
 ));
 jest.mock("../Player", () => {
-  const Player = ({ variant = "bar", actions }) => (
-    <footer data-testid={`player-${variant}`}>{actions}</footer>
+  const Player = ({ variant = "bar", actions, hidden, onOpenNowPlaying, nowPlayingButtonRef }) => (
+    <footer data-testid={`player-${variant}`} hidden={hidden}>
+      {actions}
+      {onOpenNowPlaying && <button ref={nowPlayingButtonRef} onClick={onOpenNowPlaying}>Open Now Playing</button>}
+    </footer>
   );
   return { __esModule: true, default: Player, formatTime: () => "0:00" };
 });
@@ -176,6 +186,59 @@ test("every preset falls back to the unified mobile shell below 768px", () => {
   expect(screen.getByRole("link", { name: "Discover" })).toHaveAttribute("aria-current", "page");
   expect(screen.getByRole("link", { name: "Search" })).toHaveAttribute("href", "/search");
   expect(screen.queryByRole("button", { name: "Open menu" })).not.toBeInTheDocument();
+});
+
+test("closing mobile Queue restores the mounted Now Playing view and its Queue button", () => {
+  mockMatchMedia(true);
+  renderLayout("spotify", "/library/albums");
+  fireEvent.click(screen.getByRole("button", { name: "Open Now Playing" }));
+  const deck = screen.getByTestId("now-playing-panel");
+  const queueButton = screen.getByRole("button", { name: "Queue" });
+  deck.scrollTop = 137;
+  fireEvent.click(queueButton);
+  expect(deck).not.toBeVisible();
+  const close = screen.getByRole("button", { name: "Close queue" });
+  expect(close).toHaveFocus();
+  fireEvent.click(close);
+  expect(screen.getByTestId("now-playing-panel")).toBe(deck);
+  expect(deck).toBeVisible();
+  expect(deck.scrollTop).toBe(137);
+  expect(queueButton).toHaveFocus();
+});
+
+test("detail pages retain their mobile tab and exact return route through nested links", () => {
+  mockMatchMedia(true);
+
+  function NavigationFixture() {
+    const { pathname, search } = useLocation();
+    const navigate = useNavigate();
+    return (
+      <>
+        <output>{pathname + search}</output>
+        <button onClick={() => navigate(-1)}>History back</button>
+        <AppLayout>
+          <Link to="/artist/one">Artist result</Link>
+          <Link to="/album/one">Album result</Link>
+          <Link to="/library/artists">Browse library artists</Link>
+          <DetailBackLink fallback="/library/playlists">Back from detail</DetailBackLink>
+        </AppLayout>
+      </>
+    );
+  }
+
+  render(<MemoryRouter initialEntries={["/search?q=road"]}><NavigationFixture /></MemoryRouter>);
+  fireEvent.click(screen.getByRole("link", { name: "Artist result" }));
+  expect(screen.getByRole("link", { name: "Search" })).toHaveAttribute("aria-current", "page");
+  fireEvent.click(screen.getByRole("link", { name: "Album result" }));
+  expect(screen.getByRole("link", { name: "Search" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("link", { name: "Back from detail" })).toHaveAttribute("href", "/artist/one");
+  fireEvent.click(screen.getByRole("link", { name: "Back from detail" }));
+  expect(screen.getByRole("link", { name: "Back from detail" })).toHaveAttribute("href", "/search?q=road");
+  fireEvent.click(screen.getByRole("button", { name: "History back" }));
+  expect(screen.getByText("/search?q=road")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("link", { name: "Browse library artists" }));
+  fireEvent.click(screen.getByRole("link", { name: "Home" }));
+  expect(screen.getByRole("link", { name: "Library" })).toHaveAttribute("href", "/library/artists");
 });
 
 test("auto-opens Now Playing on a new track only in docked-panel shells", () => {

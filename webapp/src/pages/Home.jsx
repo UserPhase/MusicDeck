@@ -202,6 +202,9 @@ function Home() {
   }, []);
 
   const continueTracks = useMemo(() => uniqueTracks(recentlyPlayed, HERO_LIMIT), [recentlyPlayed]);
+  const recentSongs = <CompactTrackList id="recent-tracks-title" title="Recently Added Songs"
+    tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error}
+    onPlay={playSong} to="/library/tracks" mobile={isMobile} />;
 
   return (
     <div className="home-page home-hero-gradient">
@@ -237,11 +240,12 @@ function Home() {
         )}
       </section>
 
+      {isMobile && recentSongs}
       <ArtistShelf id="discover-artists-title" title="Discover Artists" artists={discoverArtists.items} loading={discoverArtists.loading} error={discoverArtists.error} to="/explore"
         artistState={artistState} />
 
       <section className="home-section home-discovery-split" aria-label="Track discovery">
-        <CompactTrackList id="recent-tracks-title" title="Recently Added Songs" tracks={recentTracks.items} loading={recentTracks.loading} error={recentTracks.error} onPlay={playSong} to="/library/tracks" mobile={isMobile} />
+        {!isMobile && recentSongs}
         <CompactTrackList id="discover-tracks-title" title="Discover Tracks" tracks={discoverTracks.items} loading={discoverTracks.loading} error={discoverTracks.error} onPlay={playSong} to="/explore" mobile={isMobile} />
       </section>
 

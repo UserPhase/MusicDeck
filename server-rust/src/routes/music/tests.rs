@@ -181,6 +181,113 @@ async fn json_response(response: Response) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn large_playlist_load_preserves_occurrences_and_playable_ids() {
+    let (db, state, session) = playback_state(true).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = NavidromeClient::new(NavidromeConfig {
+        url: format!("http://{}", listener.local_addr().unwrap()),
+        username: "fixture".into(),
+        password: "fixture".into(),
+    })
+    .unwrap();
+    let upstream = tokio::spawn(async move {
+        let router = Router::new().route(
+            "/rest/getSong.view",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                tokio::time::sleep(Timeout::from_millis(3)).await;
+                Json(json!({ "subsonic-response": { "status": "ok", "song": {
+                "id": params["id"], "title": params["id"], "albumId": "album", "artistId": "artist",
+                "coverArt": "art", "duration": 180
+            } } }))
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    state.providers().replace_all(vec![RegisteredProvider {
+        connection_id: "fixture".into(),
+        provider_type: "navidrome".into(),
+        name: "Fixture".into(),
+        enabled: true,
+        provider: Arc::new(provider),
+    }]);
+    sqlx::raw_sql(
+        "INSERT INTO backend_connections (id, type, name, config_json, enabled, created_at, updated_at)
+          VALUES ('fixture', 'navidrome', 'Fixture', '{}', 1, '2026-01-01', '2026-01-01');
+         INSERT INTO playlists (id, name, owner_user_id, created_at, updated_at)
+          VALUES ('large', 'Large playlist', 'listener', '2026-01-01', '2026-01-01');
+         WITH RECURSIVE tracks(n) AS (VALUES (0) UNION ALL SELECT n + 1 FROM tracks WHERE n < 1199)
+         INSERT INTO library_items (id, type, created_at, updated_at)
+          SELECT 'md_' || n, 'track', '2026-01-01', '2026-01-01' FROM tracks;
+         INSERT INTO library_item_sources (library_item_id, item_type, connection_id, provider_item_id, created_at)
+          SELECT id, 'track', 'fixture', 'song-' || substr(id, 4), '2026-01-01' FROM library_items;
+         INSERT INTO playlist_items (id, playlist_id, position, connection_id, provider_track_id, library_track_id, created_at)
+          SELECT 'entry-' || substr(id, 4), 'large', substr(id, 4), 'fixture', 'song-' || substr(id, 4), id, '2026-01-01'
+          FROM library_items;
+         INSERT INTO playlist_items (id, playlist_id, position, connection_id, provider_track_id, library_track_id, created_at)
+          VALUES ('repeat', 'large', 1200, 'fixture', 'song-0', 'md_0', '2026-01-01');"
+    ).execute(db.inner()).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let response = request(&state, &session, "GET", "/api/playlists/large", None).await;
+    let elapsed = started.elapsed();
+    let timing = response.headers().get("server-timing").cloned();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    eprintln!(
+        "1201 occurrences: {elapsed:?}, {} JSON bytes, {timing:?}",
+        bytes.len()
+    );
+    let timing = timing.unwrap();
+    for phase in ["playlist_db", "playlist_hydrate", "playlist_json"] {
+        assert!(timing.to_str().unwrap().contains(phase));
+    }
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let playlist = &body["playlist"];
+    let tracks = playlist["tracks"].as_array().unwrap();
+    let ids = playlist["itemIds"].as_array().unwrap();
+    assert_eq!(playlist["songCount"], 1201);
+    assert_eq!(ids.len(), tracks.len());
+    for (index, track) in tracks.iter().enumerate() {
+        let track_index = index % 1200;
+        assert_eq!(track["id"], format!("md_{track_index}"));
+        assert_eq!(
+            track["streamUrl"],
+            format!("/api/tracks/md_{track_index}/stream")
+        );
+        assert_eq!(track["playlistItemId"], ids[index]);
+        for field in ["albumId", "artistId", "artworkId"] {
+            assert!(track[field].is_string());
+            assert_eq!(track[field], tracks[0][field]);
+        }
+    }
+    assert_eq!(ids[1200], "repeat");
+
+    let compressed = playlist_routes()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/playlists/large")
+                .header("cookie", format!("{SESSION_COOKIE}={session}"))
+                .header(http::header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compressed.status(), StatusCode::OK);
+    assert_eq!(compressed.headers()[http::header::CONTENT_ENCODING], "gzip");
+    let compressed_bytes = compressed.into_body().collect().await.unwrap().to_bytes();
+    use std::io::Read as _;
+    let mut uncompressed = Vec::new();
+    flate2::read::GzDecoder::new(compressed_bytes.as_ref())
+        .read_to_end(&mut uncompressed)
+        .unwrap();
+    assert_eq!(uncompressed.as_slice(), bytes.as_ref());
+    eprintln!("1201 occurrences: {} gzip bytes", compressed_bytes.len());
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn silence_analysis_routes_reject_invalid_profiles_and_explain_missing_audio() {
     let (db, state, session) = playback_state(true).await;
     let track = LibraryService::new(db, None)

@@ -8,7 +8,9 @@ import { useMediaQuery } from "../hooks/useMediaQuery";
 jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn(() => false) }));
 
 jest.mock("../api/musicdeck", () => ({
-  getCoverUrl: jest.fn((id) => (id ? `/api/artwork/${id}` : null)),
+  getCoverUrl: (id) => (id ? `/api/artwork/${id.startsWith("extart_") ? "external/" : ""}${id}` : null),
+  getArtistPortrait: async () => null,
+  getMusicBrainzArtistPortrait: async () => null,
   getUserSettings: jest.fn(async () => []),
   startRadio: jest.fn(async () => []),
   updateUserSettings: jest.fn(async () => []),
@@ -23,12 +25,14 @@ jest.mock("../api/playlists", () => ({
 const mockPlaySong = jest.fn();
 const mockPlaySongFromSource = jest.fn();
 const mockPlayQueue = jest.fn();
+const mockPlayContext = jest.fn();
 
 jest.mock("../context/PlayerContext", () => ({
   usePlayer: () => ({
     playSong: mockPlaySong,
     playSongFromSource: mockPlaySongFromSource,
     playQueue: mockPlayQueue,
+    playContext: mockPlayContext,
   }),
 }));
 
@@ -66,6 +70,96 @@ test("submits and clears queries from the mobile search page", async () => {
     fireEvent.change(within(form).getByRole("searchbox"), { target: { value: "" } });
     fireEvent.submit(form);
     expect(screen.getByText(/search for an artist, album or song/i)).toBeInTheDocument();
+  } finally {
+    useMediaQuery.mockReturnValue(false);
+  }
+});
+
+test("mobile song results use compact artwork rows and desktop keeps duration", async () => {
+  searchNavidrome.mockResolvedValue({ results: { track: [{
+    id: "track-1", title: "Song", artist: "Artist", album: "Album", coverArt: "mdart_album",
+    metadata: { durationSeconds: 120, format: "FLAC" },
+    source: { kind: "library", count: 1 },
+  }] } });
+  useMediaQuery.mockReturnValue(true);
+  try {
+    const renderView = () => <MemoryRouter initialEntries={["/search?q=love"]}><Search /></MemoryRouter>;
+    const { rerender } = render(renderView());
+    const table = await screen.findByRole("table", { name: "Search tracks" });
+    expect(within(table).getByRole("row", { name: "Song by Artist" })).toHaveClass("track-with-artwork");
+    expect(within(table).queryByText("2:00")).not.toBeInTheDocument();
+    expect(within(table).queryByText("FLAC")).not.toBeInTheDocument();
+    expect(within(table).queryByRole("columnheader", { name: "Duration" })).not.toBeInTheDocument();
+
+    useMediaQuery.mockReturnValue(false);
+    rerender(renderView());
+    expect(within(table).getByText("2:00")).toBeInTheDocument();
+    expect(within(table).getByRole("columnheader", { name: "Duration" })).toBeInTheDocument();
+  } finally {
+    useMediaQuery.mockReturnValue(false);
+  }
+});
+
+test("mobile previews lead to full categories without refetching or trimming the playback queue", async () => {
+  useMediaQuery.mockReturnValue(true);
+  const track = Array.from({ length: 6 }, (_, index) => ({
+    id: `song-${index}`, title: `Song ${index + 1}`, artist: "Artist", source: { kind: "library" },
+  }));
+  const album = Array.from({ length: 4 }, (_, index) => ({ id: `album-${index}`, title: `Album ${index + 1}` }));
+  searchNavidrome.mockResolvedValue({ results: {
+    track, album, artist: [{ id: "artist", title: "Artist match" }],
+  } });
+  try {
+    renderSearch();
+    await screen.findByRole("heading", { name: "Songs" });
+    expect(screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent))
+      .toEqual(["Songs", "Albums", "Artists"]);
+    expect(within(screen.getByRole("table", { name: "Search tracks" })).getAllByRole("row")).toHaveLength(3);
+    expect(within(screen.getByRole("region", { name: "Albums" })).getAllByRole("link")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("row", { name: "Song 2 by Artist" }).querySelector(".track-artist"));
+    expect(mockPlayContext).toHaveBeenCalledWith(track, 1, expect.objectContaining({ type: "search", id: "love" }));
+
+    const requestCount = searchNavidrome.mock.calls.length;
+    const types = within(screen.getByRole("group", { name: "Result type" }));
+    fireEvent.click(screen.getByRole("button", { name: "See all albums" }));
+    expect(types.getByRole("button", { name: "Albums" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(1);
+    expect(within(screen.getByRole("region", { name: "Albums" })).getAllByRole("link")).toHaveLength(4);
+    fireEvent.click(types.getByRole("button", { name: "Songs" }));
+    expect(within(screen.getByRole("table", { name: "Search tracks" })).getAllByRole("row")).toHaveLength(6);
+    fireEvent.click(types.getByRole("button", { name: "Playlists" }));
+    expect(screen.getByText("No playlists found.")).toBeInTheDocument();
+    expect(searchNavidrome).toHaveBeenCalledTimes(requestCount);
+  } finally {
+    useMediaQuery.mockReturnValue(false);
+  }
+});
+
+test("mobile artist results show portraits and initials in both the preview and Artists filter", async () => {
+  useMediaQuery.mockReturnValue(true);
+  searchNavidrome.mockResolvedValue({ results: { artist: [
+    { id: "external_deezer_artist_7", title: "Queen", coverArt: "extart_queen", source: { kind: "external" } },
+    { id: "external_itunes_artist_8", title: "Queen(Ares)", source: { kind: "external" } },
+    { id: "local-artist", title: "Another Artist", source: { kind: "library" } },
+  ] } });
+
+  try {
+    renderSearch();
+    const region = within(await screen.findByRole("region", { name: "Artists" }));
+    expect(region.getAllByRole("link")).toHaveLength(2);
+    const queen = region.getByRole("link", { name: "Queen", exact: true });
+    expect(queen.parentElement).toHaveClass("artist-grid");
+    expect(queen).toHaveAttribute("href", "/artist/ext%3Adeezer%3A7");
+    expect(queen.firstElementChild).toHaveClass("artist-cover");
+    expect(queen.lastElementChild).toHaveClass("artist-name");
+    await waitFor(() => expect(queen.querySelector("img")).toHaveAttribute("src", "/api/artwork/external/extart_queen"));
+    const otherQueen = region.getByRole("link", { name: "Queen(Ares)", exact: true });
+    expect(otherQueen.querySelector(".artist-avatar-fallback")).toBeInTheDocument();
+    expect(otherQueen.querySelector("img")).not.toBeInTheDocument();
+
+    fireEvent.click(region.getByRole("button", { name: "See all artists" }));
+    expect(region.getAllByRole("link")).toHaveLength(3);
+    expect(region.getByRole("link", { name: "Another Artist" }).parentElement).toHaveClass("artist-grid");
   } finally {
     useMediaQuery.mockReturnValue(false);
   }

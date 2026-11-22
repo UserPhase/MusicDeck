@@ -14,6 +14,8 @@ import { LikedSongsCover } from "../components/PlaylistCover";
 import TrackRow from "../components/TrackRow";
 import CollectionDownloadButton from "../components/CollectionDownloadButton";
 import FloatingPanel from "../components/ui/FloatingPanel";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 
 
 import {
@@ -21,6 +23,7 @@ import {
 } from "../context/PlayerContext";
 
 function Liked() {
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
 
   const [
     songs,
@@ -309,9 +312,9 @@ function Liked() {
 
       {/* TRACK LIST */}
 
-      <TrackActionScope tracks={songs} dataKey="liked-tracks"><div className="track-list" role="table" aria-label="Liked tracks">
+      <TrackActionScope tracks={songs} dataKey="liked-tracks"><div className="track-list track-list--mobile" role="table" aria-label="Liked tracks">
 
-        <TrackListHeader />
+        {!mobile && <TrackListHeader />}
 
         {songs.length === 0 ? (
 
@@ -327,6 +330,7 @@ function Liked() {
               key={`${song.id}-${index}`}
               song={song}
               index={index}
+              mobile={mobile}
               onPlay={handleTrackPlayback}
               onSelectSource={playSongFromSource}
 

@@ -1,7 +1,7 @@
 import { ComponentProps, memo, ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useVisualActivity } from "../hooks/useVisualActivity";
 import { createPortal } from "react-dom";
-import type { CSSProperties, DragEvent, MouseEvent } from "react";
+import type { CSSProperties, DragEvent } from "react";
 import TrackRow, { isTrackControl } from "./TrackRow";
 import TrackActionScope, { useTrackActionScope } from "./TrackActionScope";
 import { findScrollParent, indexAtOffset, useVirtualWindow } from "../hooks/useVirtualWindow";
@@ -14,6 +14,7 @@ type RowProps = ComponentProps<typeof TrackRow>;
 
 export interface VirtualizedTrackListProps {
   itemCount: number;
+  mobile?: boolean;
   getItem(index: number): LibraryTrack | undefined;
   onPlay: RowProps["onPlay"];
   onToggleMenu?: RowProps["onToggleMenu"];
@@ -26,7 +27,7 @@ export interface VirtualizedTrackListProps {
   renderMenu?(song: LibraryTrack, index: number): ReactNode;
   getItemKey?(index: number): string;
   selection?: TrackSelection;
-  onToggleEntryMenu?(song: LibraryTrack, index: number, event?: MouseEvent): void;
+  onToggleEntryMenu?: RowProps["onToggleEntryMenu"];
   /** Target is a boundary in the original visible order, from 0 through itemCount. */
   onReorder?(ids: readonly string[], targetIndex: number): void;
   editingDisabled?: boolean;
@@ -66,10 +67,10 @@ const MeasuredSlot = memo(function MeasuredSlot({
 /** Rows receive stable data/actions only. Player state is selected inside the
  * row; neither playback ticks nor favorites remap the virtual window. */
 function VirtualizedTrackList({
-  itemCount, getItem, onPlay, onToggleMenu, renderMenu, onRangeChange,
-  estimateRowHeight = 64, dynamicHeight = false, dataKey, getItemKey,
+  itemCount, mobile = false, getItem, onPlay, onToggleMenu, renderMenu, onRangeChange,
+  estimateRowHeight = mobile ? 52 : 64, dynamicHeight = false, dataKey, getItemKey,
   selection: suppliedSelection, onReorder, editingDisabled: editingDisabledProp = false, onToggleEntryMenu,
-  onQueue, onDownload, showDateAdded, showDuration, hasColumnHeader = true, searchTokens,
+  onQueue, onDownload, showDateAdded, showDuration, hasColumnHeader = !mobile, searchTokens,
 }: VirtualizedTrackListProps) {
   const scope = useTrackActionScope();
   const visualActive = useVisualActivity();
@@ -172,11 +173,11 @@ function VirtualizedTrackList({
     slots.push(<MeasuredSlot key={keyAt(index)} index={index}
       height={estimateRowHeight} dynamic={dynamicHeight} measure={windowed.measure}
       style={pinned ? { position: "absolute", top: windowed.offsets[index], left: 0, right: 0 } : undefined}>
-      {song ? <TrackRow song={song} index={index} ariaRowIndex={ariaRowIndex} onPlay={onPlay}
+      {song ? <TrackRow song={song} index={index} mobile={mobile} ariaRowIndex={ariaRowIndex} onPlay={onPlay}
         showDateAdded={showDateAdded} showDuration={showDuration}
         searchTokens={searchTokens}
         onQueue={onQueue} onDownload={onDownload}
-        onToggleMenu={onToggleEntryMenu ? (track, event) => onToggleEntryMenu(track, index, event) : onToggleMenu}
+        onToggleMenu={onToggleMenu} onToggleEntryMenu={onToggleEntryMenu}
         selected={selection ? selection.selectedIds.has(scope?.keyAt(index) ?? keyAt(index)) : undefined} onSelect={scope?.select || selection?.select}
         reorderable={Boolean(onReorder)} editingDisabled={editingDisabled}
         menu={renderMenu?.(song, index)} />

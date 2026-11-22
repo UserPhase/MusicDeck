@@ -67,6 +67,11 @@
   --queue-tab-text: var(--text-muted);
   --queue-tab-hover-bg: var(--secondary-button-bg);
   --queue-tab-hover-text: var(--nav-hover-text);
+  --queue-history-surface: #1b1b22;
+  --queue-history-text: #a9adb8;
+  --player-gradient-control-bg: #1b1228;
+  --player-gradient-control-text: #faf6ff;
+  --player-gradient-control-border: #a18ab8;
   --avatar-fallback-bg: #1c1626;
   --artwork-fallback-base: var(--bg-card);
   --ambient-blob: #000000;
@@ -95,6 +100,8 @@
 }
 
 :root[data-theme="light"] {
+  --queue-history-surface: #edf0f5;
+  --queue-history-text: #465061;
   --bg-app: #e9ecf1;
   --bg-panel: rgba(255, 255, 255, 0.88);
   --bg-chrome: rgba(255, 255, 255, 0.94);

@@ -1,12 +1,18 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent, ReactNode, RefObject } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 import TrackTasteOption from "./settings/TrackTasteOption";
 import { getPlaylists } from "../api/playlists";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { isLibraryActionTrack, useTrackActions, type TrackActionName } from "../hooks/useTrackActions";
 import type { Track } from "./TrackRow";
 import RecommendationMenuItems from "./RecommendationMenuItems";
+import MobileTrackActionSheet from "./MobileTrackActionSheet";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
+import { toArtistRouteIdFromApiId, toTrackAlbumRouteId } from "../utils/idResolver";
+import "../styles/track-actions.css";
 
 export interface UniversalTrackContextMenuProps {
   song: Track; targets?: readonly Track[]; targetCount?: number; resolveTargets?(): Promise<Track[]>;
@@ -22,6 +28,7 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
   onRequestClose, actionsDisabled = false, children, downloadQuality = "320kbps", offlineStatus, offlineError,
   onOfflineDownload, onAddToQueue, onSpotdlDownload, onActionError }: UniversalTrackContextMenuProps) {
   const actions = useTrackActions(targets || song);
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
   const menuId = useId();
   const count = targetCount ?? targets?.length ?? 1;
   const batch = count > 1;
@@ -34,13 +41,14 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
   const operation = useRef(false);
   const [position, setPosition] = useState<CSSProperties>({ top: 12, left: 12, visibility: "hidden" });
   const [choosing, setChoosing] = useState(false);
-  const [destinations, setDestinations] = useState<Array<{ id: string; name: string }>>([]);
+  const [destinations, setDestinations] = useState<Array<{ id: string; name: string; permissions?: { canEditTracks?: boolean } }>>([]);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [attempt, setAttempt] = useState(0);
   useLayoutEffect(() => {
+    if (mobile) return;
     const update = () => {
       const rect = triggerRef?.current?.getBoundingClientRect();
       if (!rect && !anchorPoint) return;
@@ -60,10 +68,10 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
     window.visualViewport?.addEventListener("resize", update); window.visualViewport?.addEventListener("scroll", update);
     return () => { observer?.disconnect(); window.removeEventListener("resize", update); window.removeEventListener("scroll", update, true);
       window.visualViewport?.removeEventListener("resize", update); window.visualViewport?.removeEventListener("scroll", update); };
-  }, [triggerRef, anchorPoint]);
+  }, [triggerRef, anchorPoint, mobile]);
   useEffect(() => {
     active.current = true;
-    menu.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]:not(:disabled)')?.focus({ preventScroll: true });
+    if (!mobile) menu.current?.querySelector<HTMLElement>('[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]:not(:disabled)')?.focus({ preventScroll: true });
     const outside = (event: Event) => {
       if (event.target instanceof Node && !menu.current?.contains(event.target) && !triggerRef?.current?.contains(event.target)) close.current?.();
     };
@@ -71,13 +79,14 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
     const anotherMenu = (event: Event) => { if ((event as CustomEvent).detail !== menuId) close.current?.(); };
     window.dispatchEvent(new CustomEvent("musicdeck:track-menu-open", { detail: menuId }));
     window.addEventListener("musicdeck:track-menu-open", anotherMenu);
-    document.addEventListener("pointerdown", outside, true); window.addEventListener("musicdeck:navigation", navigate);
+    if (!mobile) document.addEventListener("pointerdown", outside, true);
+    window.addEventListener("musicdeck:navigation", navigate);
     return () => {
       active.current = false;
       if (lastFailure.current) report.current?.(lastFailure.current);
       document.removeEventListener("pointerdown", outside, true); window.removeEventListener("musicdeck:navigation", navigate); window.removeEventListener("musicdeck:track-menu-open", anotherMenu);
     };
-  }, [triggerRef, menuId]);
+  }, [triggerRef, menuId, mobile]);
   useEffect(() => {
     if (!choosing) return;
     let cancelled = false; setLoading(true); setError("");
@@ -87,12 +96,12 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
     return () => { cancelled = true; };
   }, [choosing, attempt]);
   function keyDown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
+    if (!mobile && event.key === "Escape") {
       event.preventDefault(); event.stopPropagation(); close.current?.(); triggerRef?.current?.focus({ preventScroll: true }); return;
     }
-    if (event.key === "Tab") { close.current?.(); return; }
+    if (!mobile && event.key === "Tab") { close.current?.(); return; }
     if (event.target instanceof Element && event.target.closest("input,select,textarea")) return;
-    const items = [...(menu.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"], [role="menuitemcheckbox"]') || [])]
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"], [role="menuitemcheckbox"]'))
       .filter((item) => !item.disabled && item.getAttribute("aria-disabled") !== "true");
     if (!items.length || !["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
@@ -140,8 +149,58 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
       <span className="track-context-menu-icon" aria-hidden="true">{icon}</span><span className="track-context-menu-copy"><span>{label}</span><small id={`${menuId}-${name}-hint`}>{hint}</small></span>
     </button>;
   }
+  const actionLabel = batch ? `Actions for ${count} selected tracks` : `Actions for ${song.title || "track"}`;
+  const messages = <>
+    {(error || actions.error) && <p role="alert" className="track-context-menu-error">{error || actions.error}</p>}
+    {notice && <p role="status" className="track-action-notice">{notice}</p>}
+  </>;
+  const secondary = <>
+    {item("hideFromRecommendations", "Hide from recommendations", "⊘", "Stop suggesting these tracks")}
+    {item("downloadSelected", downloadLabel, "↓", offlineError || (offlineStatus === "needs-redownload" ? "Offline copy is missing or damaged"
+      : actions.allLibrary ? `${quality}${offlineStatus === "downloaded" ? " • Downloaded" : ""}` : "External tracks import to your server; library tracks save on this device"),
+      (!actions.canDownload && !mayBeLibrary) || (!batch && ["downloaded", "downloading"].includes(offlineStatus || "")))}
+    {!batch && actions.allLibrary && item("startRadio", "Start radio", "◉", "Play a station based on this track")}
+    {!batch && <RecommendationMenuItems song={song} onRequestClose={onRequestClose} excludeHide disabled={disabled} allowRadio={actions.allLibrary} />}
+    {!batch && !unresolved && <TrackTasteOption tracks={[song]} disabled={disabled} />}
+    {children && <><div className="track-context-menu-divider" aria-hidden="true" />{children}</>}
+    {!batch && deletion?.canDelete && actions.allLibrary && <button type="button" role="menuitem" disabled={disabled} className="playlist-menu-item server-delete-menu-item"
+      onClick={() => { deletion.openTrack(song); close.current?.(); }}>Delete from Server</button>}
+  </>;
+  const saveForLater = item("saveForLater", "Save for Later", "◷", "Library tracks go to Saved for Later; discoveries stay in Saved");
+
+  if (mobile) {
+    const artist = toArtistRouteIdFromApiId(song.artistCredits?.find(({ id }) => id)?.id || song.artistId || song.metadata?.artistId);
+    const album = toTrackAlbumRouteId(song);
+    return <MobileTrackActionSheet label={actionLabel} title={batch ? `${count} selected tracks` : "Track actions"}
+      subtitle={batch ? undefined : song.title} triggerRef={triggerRef}
+      onClose={() => close.current?.()} choosing={choosing} onChoose={(open) => { setChoosing(open); setError(""); }}
+      destinations={destinations} loading={loading} error={error} disabled={disabled}
+      onRetry={() => setAttempt((value) => value + 1)} onAdd={(id) => { void run("addToPlaylist", id); }}
+      messages={messages}>
+      <button type="button" className="track-sheet-action" disabled={disabled} onClick={() => { void run("playNext"); }}>Play next</button>
+      <button type="button" className="track-sheet-action" disabled={disabled} onClick={() => { void run("addToQueue"); }}>Add to queue</button>
+      <button type="button" className="track-sheet-action" data-open-playlist-picker="" disabled={disabled || !libraryOnly}
+        onClick={() => setChoosing(true)}>Add to playlist</button>
+      <button type="button" className="track-sheet-action" disabled={disabled || !libraryOnly}
+        onClick={() => { void run("toggleFavorite"); }}>
+        {batch || unresolved ? "Toggle favorites" : actions.allFavorite ? "Unlike" : "Like"}
+      </button>
+      {!batch && artist && <Link className="track-sheet-action" onClick={onRequestClose}
+        to={`/artist/${encodeURIComponent(artist)}`}>Go to artist</Link>}
+      {!batch && album && <Link className="track-sheet-action" onClick={onRequestClose}
+        to={`/album/${encodeURIComponent(album)}`}>Go to album</Link>}
+      <details className="track-sheet-more">
+        <summary>More actions</summary>
+        <div role="menu" aria-label="More track actions" onKeyDown={keyDown}>
+          {saveForLater}
+          {secondary}
+        </div>
+      </details>
+    </MobileTrackActionSheet>;
+  }
+
   return createPortal(<div ref={menu} role="menu" className="glass-dropdown playlist-menu track-context-menu track-context-menu-portal universal-track-context-menu"
-    data-track-selection-menu="" aria-label={batch ? `Actions for ${count} selected tracks` : `Actions for ${song.title || "track"}`}
+    data-track-selection-menu="" aria-label={actionLabel}
     aria-busy={disabled || undefined} style={position} onKeyDown={keyDown}
     onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}
     onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}>
@@ -165,17 +224,7 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
       disabled={disabled || !libraryOnly} onClick={() => { void run("toggleFavorite"); }}>
       <span className="track-context-menu-icon" aria-hidden="true">{actions.allFavorite ? "♥" : "♡"}</span>
       <span className="track-context-menu-copy"><span>{batch || unresolved ? "Toggle Favorites" : actions.allFavorite ? "Remove from Liked Songs" : "Save to Liked Songs"}</span><small>{libraryOnly ? "Like tracks" : "Available after the track is in your library"}</small></span></button>
-    {item("hideFromRecommendations", "Hide from recommendations", "⊘", "Stop suggesting these tracks")}
-    {item("downloadSelected", downloadLabel, "↓", offlineError || (offlineStatus === "needs-redownload" ? "Offline copy is missing or damaged"
-      : actions.allLibrary ? `${quality}${offlineStatus === "downloaded" ? " • Downloaded" : ""}` : "External tracks import to your server; library tracks save on this device"),
-      (!actions.canDownload && !mayBeLibrary) || (!batch && ["downloaded", "downloading"].includes(offlineStatus || "")))}
-    {!batch && actions.allLibrary && item("startRadio", "Start radio", "◉", "Play a station based on this track")}
-    {!batch && <RecommendationMenuItems song={song} onRequestClose={onRequestClose} excludeHide disabled={disabled} allowRadio={actions.allLibrary} />}
-    {!batch && !unresolved && <TrackTasteOption tracks={[song]} disabled={disabled} />}
-    {children && <><div className="track-context-menu-divider" aria-hidden="true" />{children}</>}
-    {!batch && deletion?.canDelete && actions.allLibrary && <button type="button" role="menuitem" disabled={disabled} className="playlist-menu-item server-delete-menu-item"
-      onClick={() => { deletion.openTrack(song); close.current?.(); }}>Delete from Server</button>}
-    {(error || actions.error) && <p role="alert" className="track-context-menu-error">{error || actions.error}</p>}
-    {notice && <p role="status" className="track-action-notice">{notice}</p>}
+    {secondary}
+    {messages}
   </div>, document.body);
 }

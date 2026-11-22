@@ -1,26 +1,24 @@
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, type ReactNode } from "react";
 
-export default function FullScreenLyricsModal({ title, artist, artwork, onClose, children }: {
+export default function FullScreenLyricsModal({ title, artist, artwork, onClose, children, mobile, controls }: {
   title: string;
   artist?: string;
   artwork?: string | null;
   onClose(): void;
   children: ReactNode;
+  mobile?: boolean;
+  controls?: ReactNode;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useId();
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = dialog.current;
     if (!element) return;
     element.showModal();
     return () => { if (element.open) element.close(); };
   }, []);
-  function close() {
-    dialog.current?.close();
-    onClose();
-  }
-  return <dialog ref={dialog} className="lyrics-reader" aria-labelledby={heading}
-    onCancel={event => { event.preventDefault(); close(); }}
+  return <dialog ref={dialog} className={`lyrics-reader${mobile ? " lyrics-reader--mobile" : ""}`} aria-labelledby={heading}
+    onCancel={event => { event.preventDefault(); onClose(); }}
     onKeyDown={event => event.stopPropagation()}>
     {artwork && <img className="lyrics-reader-backdrop" alt="" aria-hidden="true" src={artwork} />}
     <div className="lyrics-reader-surface">
@@ -30,9 +28,10 @@ export default function FullScreenLyricsModal({ title, artist, artwork, onClose,
           <h2 id={heading}>{title}</h2>
           {artist && <p>{artist}</p>}
         </div>
-        <button type="button" aria-label="Close full-screen lyrics" onClick={close}>×</button>
+        <button type="button" aria-label="Close full-screen lyrics" onClick={onClose}>×</button>
       </header>
       {children}
+      {controls}
     </div>
   </dialog>;
 }

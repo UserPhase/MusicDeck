@@ -60,7 +60,7 @@ const Recommendation = memo(function Recommendation({ song, playlistId, editable
   </div>;
 });
 
-export default function PlaylistRecommendations({ playlistId, songs, disabled = false, onPlaylistChange }) {
+const PlaylistRecommendations = memo(function PlaylistRecommendations({ playlistId, songs, editRevision, disabled = false, onPlaylistChange }) {
   const { session } = useAuth() || {};
   const { canMetadata, canImport } = usePrivacy();
   const player = usePlayer();
@@ -74,7 +74,7 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
   useEffect(() => () => { previewRequest.current += 1; }, [playlistId]);
   useEffect(() => () => { if (importRefresh.current) clearTimeout(importRefresh.current); }, []);
   
-  const signature = useMemo(() => songs.map((song) => String(song.id)).sort().join("|"), [songs]);
+  const signature = useMemo(() => editRevision ?? songs.map((song) => String(song.id)).sort().join("|"), [editRevision, songs]);
   const baseKey = useMemo(() => ["playlist-recommendations", session?.id || "current", playlistId], [session?.id, playlistId]);
   const externalEnabled = canMetadata && (session?.role === "admin" || session?.externalSearchEnabled === true);
   const load = (source) => ({ queryKey: [...baseKey, source, signature], enabled: songs.length > 0,
@@ -82,10 +82,13 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
   const local = useQuery(load("library"));
   const external = useQuery({ ...load("external"), enabled: songs.length > 0 && externalEnabled });
   const items = useMemo(() => {
+    const libraryItems = local.data?.items || [];
+    const externalItems = externalEnabled ? external.data?.items || [] : [];
+    if (!libraryItems.length && !externalItems.length) return [];
     const keep = createTrackDeduplicator();
     songs.forEach(keep);
-    const owned = (local.data?.items || []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
-    const discovered = (externalEnabled ? external.data?.items || [] : []).map((item) => toUnifiedTrack(item, "playlist-recommendations"));
+    const owned = libraryItems.map((item) => toUnifiedTrack(item, "playlist-recommendations"));
+    const discovered = externalItems.map((item) => toUnifiedTrack(item, "playlist-recommendations"));
     const byArtist = new Map();
     let count = 0;
     for (let index = 0; index < Math.max(owned.length, discovered.length); index++) {
@@ -170,4 +173,24 @@ export default function PlaylistRecommendations({ playlistId, songs, disabled = 
     {(local.data?.message || (externalEnabled && external.data?.message)) && <p className="playlist-recommendations-status">{local.data?.message || external.data?.message}</p>}
     {notice && <p className="playlist-recommendations-status" role="status">{notice}</p>}
   </section>;
+});
+
+export default function DeferredPlaylistRecommendations(props) {
+  const sentinel = useRef(null);
+  const [ready, setReady] = useState(() => typeof IntersectionObserver !== "function");
+  const hasSongs = props.songs.length > 0;
+  useEffect(() => {
+    if (ready || !sentinel.current) return undefined;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) return;
+      observer.disconnect();
+      setReady(true);
+    }, { rootMargin: "400px 0px" });
+    observer.observe(sentinel.current);
+    return () => observer.disconnect();
+  }, [ready, hasSongs]);
+
+  if (!hasSongs) return null;
+  return ready ? <PlaylistRecommendations {...props} />
+    : <div ref={sentinel} data-playlist-recommendations-sentinel="" aria-hidden="true" />;
 }

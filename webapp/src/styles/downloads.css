@@ -65,6 +65,8 @@
 .downloads-confirm button { margin-right: 8px; }
 .downloads-tracks.track-list { --track-grid-columns: 2.5rem minmax(0, 4fr) minmax(0, 3fr) 1.5rem 3rem 7.5rem; --track-grid-gap: .65rem; }
 .downloads-tracks .downloads-remove { padding: 7px 9px; font-size: 11px; }
+:root[data-layout-shell="mobile"] .downloads-confirm { bottom: calc(var(--mobile-dock) + 8px); }
+:root[data-layout-shell="mobile"] .downloads-view :is(button, .downloads-toolbar input) { min-width: 44px; min-height: 44px; }
 .offline-available-badge { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 10px; line-height: 1.5; white-space: nowrap; border: 1px solid var(--panel-border); border-radius: 4px; padding: 1px 5px; margin-left: 8px; vertical-align: middle; }
 @media (max-width: 640px) { .downloads-hero { align-items: start; flex-direction: column; }.downloads-boundary { padding: 16px; }.downloads-toolbar input { width: 100%; min-width: 0; }.downloads-queue article { flex-wrap: wrap; }.downloads-queue article > div:first-child { flex-basis: 100%; } }
 @media (max-width: 1024px) { .downloads-tracks.track-list { --track-grid-columns: 2.5rem minmax(0, 4fr) minmax(0, 3fr) 3rem 7.5rem; } }

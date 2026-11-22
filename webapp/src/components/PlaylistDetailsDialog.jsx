@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import PlaylistCover from "./PlaylistCover";
+import { useVisualViewportBounds } from "../hooks/useVisualViewportBounds";
 
 function PlaylistDetailsDialog({ playlist, busy, error, onClose, onSave, prepareCover }) {
   const [name, setName] = useState(playlist.name);
@@ -10,7 +11,9 @@ function PlaylistDetailsDialog({ playlist, busy, error, onClose, onSave, prepare
   const [readingCover, setReadingCover] = useState(false);
   const coverInput = useRef(null);
   const dialogRef = useRef(null);
+  const backdrop = useRef(null);
   const nameRef = useRef(null);
+  useVisualViewportBounds(backdrop);
   const busyRef = useRef(busy);
   const onCloseRef = useRef(onClose);
   busyRef.current = busy;
@@ -77,6 +80,7 @@ function PlaylistDetailsDialog({ playlist, busy, error, onClose, onSave, prepare
 
   return createPortal(
     <div
+      ref={backdrop}
       className="playlist-details-backdrop"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !busy) onClose();
@@ -107,40 +111,43 @@ function PlaylistDetailsDialog({ playlist, busy, error, onClose, onSave, prepare
           </button>
         </div>
 
-        <div className="playlist-details-body">
-          <div className="playlist-details-artwork">
-            <button type="button" className="playlist-details-cover" aria-label="Choose playlist cover"
-              onClick={() => coverInput.current?.click()} disabled={busy || readingCover}>
-              {cover ? <img src={cover} alt="New cover preview" /> : <PlaylistCover
-                playlist={cover === null ? { ...playlist, coverArt: null } : playlist} size={384} />}
-              <span className="playlist-details-cover-pencil" aria-hidden="true">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="m15 5 4 4M4 20l4-.8L20 7l-4-4L4.8 15Z" /></svg>
-              </span>
-            </button>
-            <input ref={coverInput} type="file" hidden aria-label="Playlist cover image"
-              accept="image/png,image/jpeg,image/webp,image/gif" disabled={busy || readingCover} onChange={chooseCover} />
-            {(cover || (cover === undefined && playlist.coverMode === "custom")) && <button type="button"
-              className="playlist-details-remove-cover" aria-label="Use automatic cover" disabled={busy || readingCover} onClick={() => {
-                setCover(playlist.coverMode === "custom" ? null : undefined); setCoverError("");
-              }}>
-              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg>
-              <span className="playlist-details-cover-tooltip" aria-hidden="true">Use automatic cover</span>
-            </button>}
+        <div className="playlist-details-content">
+          <div className="playlist-details-body">
+            <div className="playlist-details-artwork">
+              <button type="button" className="playlist-details-cover" aria-label="Choose playlist cover"
+                onClick={() => coverInput.current?.click()} disabled={busy || readingCover}>
+                {cover ? <img src={cover} alt="New cover preview" /> : <PlaylistCover
+                  playlist={cover === null ? { ...playlist, coverArt: null } : playlist} size={384} />}
+                <span className="playlist-details-cover-pencil" aria-hidden="true">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="m15 5 4 4M4 20l4-.8L20 7l-4-4L4.8 15Z" /></svg>
+                </span>
+              </button>
+              <input ref={coverInput} type="file" hidden aria-label="Playlist cover image"
+                accept="image/png,image/jpeg,image/webp,image/gif" disabled={busy || readingCover} onChange={chooseCover} />
+              {(cover || (cover === undefined && playlist.coverMode === "custom")) && <button type="button"
+                className="playlist-details-remove-cover" aria-label="Use automatic cover" disabled={busy || readingCover} onClick={() => {
+                  setCover(playlist.coverMode === "custom" ? null : undefined); setCoverError("");
+                }}>
+                <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" /></svg>
+                <span className="playlist-details-cover-tooltip" aria-hidden="true">Use automatic cover</span>
+              </button>}
+            </div>
+            <label htmlFor="playlist-details-name">Name</label>
+            <input ref={nameRef} id="playlist-details-name" value={name}
+              onChange={(event) => setName(event.target.value)} maxLength={200} required autoComplete="off" />
+            <label htmlFor="playlist-details-description">Description</label>
+            <textarea id="playlist-details-description" value={description}
+              onChange={(event) => setDescription(event.target.value)} maxLength={1000} rows={5} />
           </div>
-          <label htmlFor="playlist-details-name">Name</label>
-          <input ref={nameRef} id="playlist-details-name" value={name}
-            onChange={(event) => setName(event.target.value)} maxLength={200} required autoComplete="off" />
-          <label htmlFor="playlist-details-description">Description</label>
-          <textarea id="playlist-details-description" value={description}
-            onChange={(event) => setDescription(event.target.value)} maxLength={1000} rows={5} />
-        </div>
 
-        {readingCover && <p className="playlist-details-shortcut" role="status">Reading image…</p>}
-        {coverError && <p className="playlist-details-error" role="alert">{coverError}</p>}
-        {error && <p className="playlist-details-error" role="alert">{error}</p>}
-        <p className="playlist-details-shortcut" id="playlist-details-shortcut">
-          Press Ctrl+Enter or ⌘+Enter to save.
-        </p>
+          {readingCover && <p className="playlist-details-shortcut" role="status">Reading image…</p>}
+          {coverError && <p className="playlist-details-error" role="alert">{coverError}</p>}
+          {error && <p className="playlist-details-error" role="alert">{error}</p>}
+          <p className="playlist-details-shortcut" id="playlist-details-shortcut">
+            Press Ctrl+Enter or ⌘+Enter to save.
+          </p>
+
+        </div>
 
         <div className="playlist-details-actions">
           <button type="button" className="playlist-modal-back" onClick={onClose} disabled={busy}>

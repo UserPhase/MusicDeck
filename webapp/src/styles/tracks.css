@@ -12,6 +12,22 @@
 .track-with-artwork .track-cover-art .explore-artwork-fallback { font-size: .875rem; }
 .track-with-artwork:hover .track-cover-art, .track-with-artwork:focus-within .track-cover-art, .track-with-artwork.is-current-track .track-cover-art { filter: brightness(.55); }
 .track-with-artwork.is-current-track .track-play { opacity: 1; pointer-events: auto; transform: scale(1); }
+.track.track-mobile-row .track-cover-art { filter: none; }
+.track.track-mobile-row .track-number > .track-equalizer {
+  position: absolute;
+  inset: auto 0 0 auto;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--control-surface);
+  opacity: 1;
+  transform: none;
+  pointer-events: none;
+}
+.track.track-mobile-row .track-equalizer i { width: 2px; height: 6px; }
+:root[data-layout-shell="mobile"] .track-mobile-row.track-selection-mode { grid-template-columns: 44px minmax(0, 1fr) auto; }
+:root[data-layout-shell="mobile"] .track-mobile-row .track-selection-checkbox { width: 44px; height: 44px; }
 .track-list-header-sentinel { height: 1px; margin-bottom: -1px; pointer-events: none; }
 .track-list-header { position: sticky; top: 0; z-index: 5; display: grid; grid-template-columns: var(--track-grid-columns); gap: var(--track-grid-gap); align-items: center; min-height: 2.375rem; margin-bottom: .25rem; padding: 0 1rem .5rem; border-bottom: 1px solid var(--layout-divider); background: transparent; color: var(--text-muted); font-size: .75rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; }
 .track-list-header.is-stuck { background: var(--main-surface-solid); }
@@ -45,7 +61,7 @@
 .track.is-current-track .track-artist,
 .track.is-current-track .track-album,
 .track.is-current-track .track-duration { color: var(--text-soft); }
-.track.is-current-track:hover .track-equalizer { opacity: 0; transform: scale(0.82); }
+.track:not(.track-mobile-row).is-current-track:hover .track-equalizer { opacity: 0; transform: scale(0.82); }
 .track.is-current-track.is-playing:hover .track-play { font-size: 0; }
 .track.is-current-track.is-playing:hover .track-play::before { content: "⏸"; font-size: 14px; line-height: 1; }
 .track-play { position: absolute; display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%; background: var(--accent); color: var(--bg-app); font-size: 12px; opacity: 0; pointer-events: none; cursor: pointer; transform: scale(0.82); transition: opacity 150ms ease, background 0.15s ease, transform 150ms ease; }
@@ -156,13 +172,13 @@
 @media (max-width: 64rem) {
   .track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) 5rem 4.5rem; --track-grid-gap: .875rem; }
   .track-list-header > :nth-child(4),
-  .track > :nth-child(4) { display: none; }
+  .track:not(.track-mobile-row) > :nth-child(4) { display: none; }
 }
 
 @media (max-width: 48rem) {
   .track-list { --track-grid-columns: 3.125rem minmax(0, 1fr) 5rem 4.5rem; --track-grid-gap: .75rem; }
   .track-list-header > :nth-child(3),
-  .track > :nth-child(3) { display: none; }
+  .track:not(.track-mobile-row) > :nth-child(3) { display: none; }
 }
 @keyframes track-download-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 @keyframes track-equalizer-pulse { from { transform: scaleY(0.45); } to { transform: scaleY(1.45); } }

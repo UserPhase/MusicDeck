@@ -11,6 +11,8 @@ import { countLegacyDownloads, importLegacyDownloads } from "../services/storage
 import { formatStorageSize } from "../utils/browserCache";
 import ServerDownloads from "./ServerDownloads";
 import "../styles/downloads.css";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 
 type PlaylistChoice = { id: string; name: string };
 export default function DownloadsView() {
@@ -18,6 +20,7 @@ export default function DownloadsView() {
   const { isAuthenticated, session } = useAuth()!;
   const { playContext } = usePlayer()!;
   const online = useOnlineStatus();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
   const [verified, setVerified] = useState<Set<string>>(new Set());
   const [checking, setChecking] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -155,8 +158,14 @@ export default function DownloadsView() {
       <input type="search" aria-label="Filter downloads" placeholder="Find saved music" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
     {checking && <p role="status">Verifying audio on this device…</p>}
     {!checking && tab === "tracks" && !shown.length && <div className="downloads-empty"><span aria-hidden="true">↓</span><h2>{filter ? "No matching downloads" : "Take your music with you"}</h2><p>{filter ? "Try another title, artist, or album." : "Choose Download to device from a track menu, or download a whole album or playlist. Verified audio will appear here."}</p></div>}
-    {tab === "tracks" && <div className="downloads-tracks track-list" role="table" aria-label="Verified offline tracks">{shown.map((item, index) => <TrackRow key={item.key} song={item.track} index={index} onPlay={() => play(shown, index)} preserveDeleted showImportAction={false}
-      action={<button type="button" className="downloads-remove" disabled={busy} aria-label={`Remove ${item.track.title || "track"} from downloads`} onClick={() => setConfirmRemove(item.track_id)}>Remove</button>} />)}</div>}
+    {tab === "tracks" && <div className={`downloads-tracks track-list${mobile ? " track-list--mobile" : ""}`} role="table" aria-label="Verified offline tracks">
+      {shown.map((item, index) => <TrackRow key={item.key} song={item.track} index={index} mobile={mobile}
+        onPlay={() => play(shown, index)} preserveDeleted showImportAction={false}
+        action={mobile ? undefined : <button type="button" className="downloads-remove" disabled={busy}
+          aria-label={`Remove ${item.track.title || "track"} from downloads`} onClick={() => setConfirmRemove(item.track_id)}>Remove</button>}
+        menuAction={mobile ? (close) => <button type="button" role="menuitem" className="playlist-menu-item" disabled={busy}
+          onClick={() => { close(); setConfirmRemove(item.track_id); }}>Remove download</button> : undefined} />)}
+    </div>}
     {tab !== "tracks" && <div className="downloads-collections">{collections.filter((collection) => collection.name.toLowerCase().includes(filter.toLowerCase())).map((collection) => {
       const available = collection.trackIds.map((id) => byId.get(id)).filter((item): item is OfflineManifest => Boolean(item));
       return <article key={collection.key}><span className="downloads-eyebrow">{collection.kind.toUpperCase()}</span><h2>{collection.name}</h2>

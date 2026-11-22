@@ -162,7 +162,20 @@ impl CatalogService {
         track: Track,
         connection_id: &str,
     ) -> Result<Available<Track>, ProviderError> {
-        self.resolve_track_ids(track, connection_id, true)
+        self.resolve_track_ids(track, connection_id, true, None)
+            .await?
+            .ok_or_else(|| ProviderError::Configuration("Track identity is missing".into()))
+    }
+
+    /// Stamps metadata for a track with a stable ID and sources already read in bulk.
+    pub(crate) async fn stamp_mapped_track(
+        &self,
+        track: Track,
+        connection_id: &str,
+        library_id: &str,
+        sources: &[SourceRef],
+    ) -> Result<Available<Track>, ProviderError> {
+        self.resolve_track_ids(track, connection_id, true, Some((library_id, sources)))
             .await?
             .ok_or_else(|| ProviderError::Configuration("Track identity is missing".into()))
     }
@@ -172,6 +185,7 @@ impl CatalogService {
         mut track: Track,
         connection_id: &str,
         register_missing: bool,
+        mapped: Option<(&str, &[SourceRef])>,
     ) -> Result<Option<Available<Track>>, ProviderError> {
         let resolve_id = async |item_type, provider_item_id: &str| {
             let source = SourceRef {
@@ -188,8 +202,13 @@ impl CatalogService {
             };
             result.map_err(|err| ProviderError::Configuration(err.to_string()))
         };
-        let Some(md_id) = resolve_id(LibraryItemType::Track, &track.provider_id).await? else {
-            return Ok(None);
+        let md_id = if let Some((id, _)) = mapped {
+            id.to_owned()
+        } else {
+            let Some(id) = resolve_id(LibraryItemType::Track, &track.provider_id).await? else {
+                return Ok(None);
+            };
+            id
         };
 
         if let Some(ref artist_id) = track.artist_id {
@@ -221,7 +240,11 @@ impl CatalogService {
         track.stream_url = format_stream_url(&md_id);
         track.id = md_id.clone();
 
-        let (availability, sources) = self.availability_for_item(&md_id, connection_id).await;
+        let (availability, sources) = if let Some((_, sources)) = mapped {
+            self.availability_for_sources(sources, connection_id)
+        } else {
+            self.availability_for_item(&md_id, connection_id).await
+        };
         Ok(Some(Available {
             item: track,
             availability,
@@ -512,10 +535,18 @@ impl CatalogService {
             .get_sources(library_item_id)
             .await
             .unwrap_or_default();
+        self.availability_for_sources(&sources, connection_id)
+    }
+
+    fn availability_for_sources(
+        &self,
+        sources: &[SourceRef],
+        connection_id: &str,
+    ) -> (Availability, Option<Vec<SourceOption>>) {
         let total = sources.len().max(1);
         let mut options = Vec::new();
 
-        for src in &sources {
+        for src in sources {
             if let Some(entry) = self.registry.get_by_connection_id(&src.connection_id)
                 && entry.enabled
             {
@@ -555,7 +586,7 @@ impl CatalogService {
                 Ok(tracks) => {
                     for track in tracks {
                         match self
-                            .resolve_track_ids(track, &entry.connection_id, register_missing)
+                            .resolve_track_ids(track, &entry.connection_id, register_missing, None)
                             .await
                         {
                             Ok(Some(stamped)) => items.push(stamped),

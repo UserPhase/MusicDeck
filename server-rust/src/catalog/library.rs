@@ -131,10 +131,17 @@ impl LibraryService {
         let mut conn = self.db.inner().acquire().await?;
         let mut tx = conn.begin().await?;
 
-        sqlx::query(
+        // Take the writer lock before checking again. Another request may have
+        // discovered this artist, album, or artwork after the initial lookup.
+        let inserted = sqlx::query_scalar::<_, String>(
             r"
             INSERT INTO library_items (id, type, created_at, updated_at, content_revision)
-            VALUES (?, ?, ?, ?, ?);
+            SELECT ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM library_item_sources
+                WHERE connection_id = ? AND provider_item_id = ? AND item_type = ?
+            )
+            RETURNING id;
             ",
         )
         .bind(&id)
@@ -142,25 +149,42 @@ impl LibraryService {
         .bind(&now_iso)
         .bind(&now_iso)
         .bind(&revision)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            r"
-            INSERT INTO library_item_sources
-              (library_item_id, item_type, connection_id, provider_item_id, created_at)
-            VALUES (?, ?, ?, ?, ?);
-            ",
-        )
-        .bind(&id)
-        .bind(item_type.as_str())
         .bind(&ref_item.connection_id)
         .bind(&ref_item.provider_item_id)
-        .bind(&now_iso)
-        .execute(&mut *tx)
+        .bind(item_type.as_str())
+        .fetch_optional(&mut *tx)
         .await?;
 
+        let id = if let Some(id) = inserted {
+            sqlx::query(
+                r"
+                INSERT INTO library_item_sources
+                  (library_item_id, item_type, connection_id, provider_item_id, created_at)
+                VALUES (?, ?, ?, ?, ?);
+                ",
+            )
+            .bind(&id)
+            .bind(item_type.as_str())
+            .bind(&ref_item.connection_id)
+            .bind(&ref_item.provider_item_id)
+            .bind(&now_iso)
+            .execute(&mut *tx)
+            .await?;
+            id
+        } else {
+            sqlx::query_scalar(
+                "SELECT library_item_id FROM library_item_sources
+                 WHERE connection_id = ? AND provider_item_id = ? AND item_type = ?;",
+            )
+            .bind(&ref_item.connection_id)
+            .bind(&ref_item.provider_item_id)
+            .bind(item_type.as_str())
+            .fetch_one(&mut *tx)
+            .await?
+        };
+
         tx.commit().await?;
+        drop(conn);
 
         if item_type == LibraryItemType::Track
             && let Some(hint) = content

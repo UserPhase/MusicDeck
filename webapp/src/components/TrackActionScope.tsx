@@ -5,6 +5,8 @@ import { useAuth } from "../context/AuthContext";
 import { useTrackSelection, type SelectionModifiers, type TrackSelection } from "../hooks/useTrackSelection";
 import type { Track } from "./TrackRow";
 import UniversalTrackContextMenu from "./UniversalTrackContextMenu";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 import "../styles/track-actions.css";
 
 interface Scope {
@@ -33,6 +35,7 @@ export default function TrackActionScope(props: TrackActionScopeProps) {
 function CollectionScope({ tracks, itemCount = tracks?.length || 0, getItem, getItemKey, selection: supplied,
   dataKey, loadSelection, disabled = false, children }: TrackActionScopeProps) {
   const instance = useId();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
   const ids = useMemo(() => {
     const occurrences = new Map<string, number>();
     return Array.from({ length: itemCount }, (_, index) => {
@@ -121,13 +124,13 @@ function CollectionScope({ tracks, itemCount = tracks?.length || 0, getItem, get
         <strong aria-live="polite">{selection.selectedCount.toLocaleString()} selected</strong>
         <button type="button" disabled={disabled || resolving} onClick={selectAll}>Select all</button>
         <button type="button" disabled={disabled || resolving} onClick={exit}>Clear selection</button>
-        <button type="button" ref={trigger} disabled={disabled || resolving} aria-haspopup="menu" aria-expanded={menuOpen}
+        <button type="button" ref={trigger} disabled={disabled || resolving} aria-haspopup={mobile ? "dialog" : "menu"} aria-expanded={menuOpen}
           onClick={() => setMenuOpen(!menuOpen)}>{resolving ? "Loading selected tracks…" : "Actions for selected tracks"}</button>
         {menuOpen && <UniversalTrackContextMenu song={preview || { id: "selection", title: "selected tracks" }}
           targets={scope.selectedPreview} targetCount={selection.selectedCount} resolveTargets={resolveSelected}
           triggerRef={trigger} actionsDisabled={disabled} onActionError={reportActionError} onRequestClose={() => setMenuOpen(false)} />}
       </> : <>
-        <span className="track-selection-hint">Tap tracks to select. Artist and album links still open normally.</span>
+        <span className="track-selection-hint">{mobile ? "Tap tracks to select." : "Tap tracks to select. Artist and album links still open normally."}</span>
         <button type="button" disabled={locked} onClick={exit}>Done selecting</button>
       </>}
     </aside>, document.body)}

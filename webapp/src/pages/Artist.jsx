@@ -16,12 +16,15 @@ import {
 import ArtistAvatar from "../components/ArtistAvatar";
 import ArtistFollowButton from "../components/ArtistFollowButton";
 import FullHero from "../components/Layout/FullHero";
+import { DetailBackLink } from "../components/Layout/MobileNavigation";
 import ArtistBiography from "../components/ArtistBiography";
 import InLibraryBadge from "../components/InLibraryBadge";
 import { useArtistBiography } from "../hooks/useArtistBiography";
 import { useMergedAlbums } from "../hooks/useMergedAlbums";
 import { useArtistTopTracks } from "../hooks/useArtistTopTracks";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useUniversalArtist } from "../hooks/useUniversalArtist";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 
 import TrackListHeader from "../components/TrackListHeader";
 import TrackRow from "../components/TrackRow";
@@ -79,6 +82,7 @@ function ArtistBiographySection({ artist, songs }) {
 function Artist() {
 
   const { id } = useParams();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
   const userId = useAuth()?.session?.id;
   const universalArtist = useUniversalArtist(id, userId);
   const topTracksQuery = useArtistTopTracks(universalArtist.apiId, userId);
@@ -244,12 +248,12 @@ function Artist() {
 
       <div className="artist-page">
 
-        <Link
-          to="/library/artists"
+        <DetailBackLink
+          fallback="/library/artists"
           className="artist-back"
         >
           ← Back
-        </Link>
+        </DetailBackLink>
 
 
         <div className="error">
@@ -265,6 +269,30 @@ function Artist() {
 
   }
 
+  const popularTracks = (
+    <section className="artist-tracks">
+      <div className="artist-section-header">
+        <h2>Top 10 Popular Tracks</h2>
+      </div>
+      <div className="track-list track-list--mobile" role="table" aria-label="Artist tracks">
+        {!mobile && <TrackListHeader />}
+        {topTracks.length === 0 && !topTracksQuery.isFetching && (
+          <div className="artist-tracks-empty" role="row">
+            <span role="cell">No tracks yet.</span>
+          </div>
+        )}
+        <TrackActionScope tracks={topTracks} dataKey={id}>
+          {topTracks.map((song, index) => (
+            <TrackRow key={`${song.id}-${index}`} song={song} index={index}
+              mobile={mobile} showDownloadStatus={false} showSourceIndicator
+              onPlay={handleTopTrack} onSelectSource={playSongFromSource} />
+          ))}
+        </TrackActionScope>
+      </div>
+    </section>
+  );
+  const biography = <ArtistBiographySection artist={artist} songs={songs} />;
+
   return (
 
     <div
@@ -274,12 +302,12 @@ function Artist() {
 
       {/* BACK */}
 
-      <Link
-        to="/library/artists"
+      <DetailBackLink
+        fallback="/library/artists"
         className="artist-back"
       >
         ← Back
-      </Link>
+      </DetailBackLink>
 
 
       {/* ARTIST HEADER */}
@@ -325,7 +353,7 @@ function Artist() {
       />
 
 
-      <ArtistBiographySection artist={artist} songs={songs} />
+      {mobile ? popularTracks : biography}
 
 
       {/* ALBUMS */}
@@ -356,50 +384,7 @@ function Artist() {
 
       )}
 
-      {/* TRACKS */}
-
-      <section className="artist-tracks">
-
-        <div className="artist-section-header">
-
-          <h2>Top 10 Popular Tracks</h2>
-
-        </div>
-
-
-        <div className="track-list" role="table" aria-label="Artist tracks">
-
-          <TrackListHeader />
-
-          {topTracks.length === 0 && !topTracksQuery.isFetching && (
-
-            <div className="artist-tracks-empty" role="row">
-              <span role="cell">No tracks yet.</span>
-            </div>
-
-          )}
-
-          <TrackActionScope tracks={topTracks} dataKey={id}>
-                {topTracks.map(
-            (song, index) => (
-            <TrackRow
-              key={`${song.id}-${index}`}
-              song={song}
-              index={index}
-              showDownloadStatus={false}
-              showSourceIndicator
-              onPlay={handleTopTrack}
-              onSelectSource={playSongFromSource}
-
-
-            />
-
-          ))}
-        </TrackActionScope>
-
-        </div>
-
-      </section>
+      {mobile ? biography : popularTracks}
 
     </div>
 

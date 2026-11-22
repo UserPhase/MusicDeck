@@ -2,7 +2,8 @@ import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMe
 import { startVisualPolling } from "../services/visualActivity";
 import { normalizePlaylistSearch, playlistTrackSearchText } from "../utils/playlistSearch";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useParams, Link, useLocation, useNavigate } from "react-router-dom";
+import { useParams, useLocation, useNavigate } from "react-router-dom";
+import { DetailBackLink } from "../components/Layout/MobileNavigation";
 
 import PlaylistCover from "../components/PlaylistCover";
 import PlaylistSearchBox from "../components/playlists/PlaylistSearchBox";
@@ -40,6 +41,13 @@ import "../styles/playlist-organization.css";
 
 const trackSortLabels = { custom: "Custom order", added: "Date added", title: "Title", artist: "Artist", album: "Album", duration: "Duration" };
 const trackSortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const EMPTY_TRACKS = [];
+
+function compareTrackNumbers(left, right, direction) {
+  if (!Number.isFinite(left)) return Number(Number.isFinite(right));
+  if (!Number.isFinite(right)) return -1;
+  return (left - right) * direction;
+}
 
 function PlaylistDescription({ description, mobile }) {
   const id = useId();
@@ -127,33 +135,41 @@ function Playlist() {
   const trackSortTrigger = useRef(null);
   const deferredQuery = useDeferredValue(trackQuery);
   const searchTokens = useMemo(() => normalizePlaylistSearch(deferredQuery).trim().split(/\s+/).filter(Boolean), [deferredQuery]);
-  const searchIndex = useMemo(() => (playlist?.entry || []).map(song => ({
-    song, text: playlistTrackSearchText(song), added: Date.parse(song.playlistAddedAt),
-  })), [playlist?.entry]);
+  const entries = playlist?.entry ?? EMPTY_TRACKS;
+  const searching = searchTokens.length > 0;
+  const searchIndex = useMemo(() => searching ? entries.map(playlistTrackSearchText) : null, [entries, searching]);
   const songs = useMemo(() => {
-    const matches = searchIndex.filter(item => searchTokens.every(token => item.text.includes(token)));
+    if (!searchIndex && trackSort === "custom") return entries;
+    const matches = searchIndex
+      ? entries.filter((_song, index) => searchTokens.every(token => searchIndex[index].includes(token)))
+      : entries.slice();
     const direction = sortDescending ? -1 : 1;
-    if (trackSort === "added" || trackSort === "duration") {
-      const value = (entry) => trackSort === "added" ? entry.added : entry.song.duration;
-      matches.sort((a, b) => {
-        const left = value(a), right = value(b);
-        if (!Number.isFinite(left)) return Number(Number.isFinite(right));
-        if (!Number.isFinite(right)) return -1;
-        return (left - right) * direction;
-      });
+    if (trackSort === "added") {
+      return matches.map(song => ({ song, added: Date.parse(song.playlistAddedAt) }))
+        .sort((a, b) => compareTrackNumbers(a.added, b.added, direction)).map(item => item.song);
+    } else if (trackSort === "duration") {
+      matches.sort((a, b) => compareTrackNumbers(a.duration, b.duration, direction));
     } else if (trackSort !== "custom") {
-      matches.sort((a, b) => direction * trackSortCollator.compare(a.song[trackSort] || "", b.song[trackSort] || ""));
+      matches.sort((a, b) => direction * trackSortCollator.compare(a[trackSort] || "", b[trackSort] || ""));
     }
-    return matches.map(item => item.song);
-  }, [searchIndex, searchTokens, trackSort, sortDescending]);
+    return matches;
+  }, [entries, searchIndex, searchTokens, trackSort, sortDescending]);
   const occurrenceIds = useMemo(() => songs.map((song, index) => song.playlistItemId || `${index}:${song.id}`), [songs]);
+  const getTrack = useCallback((index) => songs[index], [songs]);
+  const getOccurrenceId = useCallback((index) => occurrenceIds[index], [occurrenceIds]);
+  const toggleTrackMenu = useCallback((_song, index) => {
+    const key = occurrenceIds[index];
+    setMenuSongId(previous => previous === key ? null : key);
+  }, [occurrenceIds]);
   const selection = useTrackSelection(occurrenceIds, `${id}:${deferredQuery}`);
   const { selectAll: selectAllTracks, clear: clearTrackSelection, selectedCount: trackSelectionCount } = selection;
-  const selectedSongs = useMemo(() => songs.filter((_song, index) => selection.selectedIds.has(occurrenceIds[index])),
+  const selectedSongs = useMemo(() => selection.selectedIds.size
+    ? songs.filter((_song, index) => selection.selectedIds.has(occurrenceIds[index])) : EMPTY_TRACKS,
     [songs, occurrenceIds, selection.selectedIds]);
   const canManage = playlist?.permissions?.canManage === true;
   const canEditTracks = playlist?.permissions?.canEditTracks === true;
-  const canEditEntries = Boolean(canEditTracks && Array.isArray(playlist?.itemIds) && songs.every((song) => song.playlistItemId));
+  const canEditEntries = useMemo(() => Boolean(canEditTracks && Array.isArray(playlist?.itemIds) && songs.every((song) => song.playlistItemId)),
+    [canEditTracks, playlist?.itemIds, songs]);
   useEffect(() => {
     const updated = (event) => {
       if (String(event.detail?.playlistId) === String(id) && event.detail?.deletedAt) { navigate("/library/playlists"); return; }
@@ -166,7 +182,7 @@ function Playlist() {
   useEffect(() => {
     let active = true, controller;
     const check = async () => {
-      if (editLock.current || batchLock.current || document.visibilityState !== "visible") return;
+      if (playlistRef.current?.id !== id || editLock.current || batchLock.current || document.visibilityState !== "visible") return;
       controller?.abort(); const polling = new AbortController(); controller = polling;
       try {
         const state = await request(`/api/v1/playlists/${encodeURIComponent(id)}/access-state`, { signal: polling.signal });
@@ -174,9 +190,16 @@ function Playlist() {
         const current = playlistRef.current;
         if (!current) return;
         if (current.editRevision !== state.editRevision || current.sharingRevision !== state.sharingRevision) {
-          const updated = await getPlaylist(id);
+          const updated = await getPlaylist(id, polling.signal);
           if (active && !polling.signal.aborted && !editLock.current && !batchLock.current) setPlaylist(updated);
-        } else setPlaylist(previous => previous ? { ...previous, permissions: state.permissions } : previous);
+        } else if (state.permissions) {
+          const { canRead, canEditTracks, canManage } = state.permissions;
+          setPlaylist(previous => {
+            if (previous !== current || (previous.permissions?.canRead === canRead &&
+              previous.permissions?.canEditTracks === canEditTracks && previous.permissions?.canManage === canManage)) return previous;
+            return { ...previous, permissions: state.permissions };
+          });
+        }
       } catch (failure) {
         if (active && !polling.signal.aborted && /permission|access denied/i.test(failure.message)) { setError("Playlist access changed. Ask the owner to share it again."); setPlaylist(null); }
       }
@@ -250,19 +273,19 @@ function Playlist() {
     setEditDetailsOpen(true);
   };
 
-  function handleTrackPlayback(song, index) {
+  const handleTrackPlayback = useCallback((_song, index) => {
     playContext(
       songs,
       index,
       {
         type: deferredQuery.trim() || trackSort !== "custom" ? "collection" : "playlist",
-        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist.id) } : {}),
-        id: playlist.id,
-        name: playlist.name,
-        coverArt: playlist.coverArt,
+        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist?.id) } : {}),
+        id: playlist?.id,
+        name: playlist?.name,
+        coverArt: playlist?.coverArt,
       }
     );
-  }
+  }, [playContext, songs, deferredQuery, trackSort, playlist?.id, playlist?.name, playlist?.coverArt]);
 
   useEffect(() => {
     function selectAllSongs(event) {
@@ -292,11 +315,11 @@ function Playlist() {
   }, [loading, editingBusy, batchBusy, songs.length, selectAllTracks, clearTrackSelection, trackSelectionCount]);
 
   /*
-   * Load playlist from Navidrome
+   * Cancel requests when navigating or replacing a playlist load.
    */
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     const generation = pageGeneration.current + 1;
     pageGeneration.current = generation;
     editLock.current = false;
@@ -316,14 +339,15 @@ function Playlist() {
 
 
         const data =
-          await getPlaylist(id);
+          await getPlaylist(id, controller.signal);
 
 
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setPlaylist(data);
         }
 
       } catch (err) {
+        if (controller.signal.aborted) return;
 
         console.error(
           "Could not load playlist:",
@@ -331,7 +355,7 @@ function Playlist() {
         );
 
 
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setError(
             err.message ||
             "Could not load playlist."
@@ -340,7 +364,7 @@ function Playlist() {
 
       } finally {
 
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setLoading(false);
         }
 
@@ -352,7 +376,7 @@ function Playlist() {
     loadPlaylist();
 
     return () => {
-      cancelled = true;
+      controller.abort();
       pageGeneration.current = generation + 1;
     };
   }, [id, reloadToken]);
@@ -520,6 +544,7 @@ function Playlist() {
       if (generation !== pageGeneration.current) return;
       setPlaylist((current) => ({
         ...current, entry: updated.entry, itemIds: updated.itemIds, songCount: updated.songCount,
+        editRevision: updated.editRevision ?? current.editRevision,
       }));
       notifyPlaylistChange();
     } catch (failure) {
@@ -650,7 +675,7 @@ async function handleRemoveSong(
 
   }
 
-  if (loading) {
+  if (loading || (playlist && playlist.id !== id && !error)) {
 
     return (
 
@@ -672,12 +697,12 @@ async function handleRemoveSong(
 
       <div className="playlist-page">
 
-        <Link
-          to="/library/playlists"
+        <DetailBackLink
+          fallback="/library/playlists"
           className="playlist-back"
         >
           ← Back
-        </Link>
+        </DetailBackLink>
 
 
         <div className="error">
@@ -739,19 +764,28 @@ async function handleRemoveSong(
 
       {/* BACK */}
 
-      <Link
-        to="/library/playlists"
+      <DetailBackLink
+        fallback="/library/playlists"
         className="playlist-back"
       >
         ← Back
-      </Link>
+      </DetailBackLink>
 
       <div className="playlist-header">
 
 
         <div className="playlist-cover-column">
 
-          <button
+          {mobile ? <div className="playlist-page-cover playlist-cover-mobile">
+            <PlaylistCover playlist={playlist} placeholderClassName="playlist-placeholder" />
+            {canManage && <button type="button" className="playlist-cover-camera"
+              aria-label={`Choose photo for ${playlist.name}`} aria-busy={artworkBusy} disabled={artworkBusy}
+              onClick={() => coverInputRef.current?.click()}>
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round">
+                <path d="M3 7h4l2-3h6l2 3h4v13H3z" /><circle cx="12" cy="13" r="3" />
+              </svg>
+            </button>}
+          </div> : <button
             type="button"
             className="playlist-page-cover playlist-cover-editable"
             aria-label={`Choose photo for ${playlist.name}`}
@@ -783,7 +817,7 @@ async function handleRemoveSong(
               </span>
             </span>}
 
-          </button>
+          </button>}
 
           <input
             ref={coverInputRef}
@@ -1050,7 +1084,7 @@ async function handleRemoveSong(
       {editingBusy && <p className="playlist-edit-message" role="status">Saving playlist changes...</p>}
       {mobile && trackTools}
       {mobile && trackMatches}
-      <div className="track-list playlist-track-list" role="grid" aria-label="Playlist tracks" aria-multiselectable="true"
+      <div className="track-list track-list--mobile playlist-track-list" role="grid" aria-label="Playlist tracks" aria-multiselectable="true"
         aria-rowcount={mobile ? songs.length || undefined : songs.length + 1}>
 
         {!mobile && <TrackListHeader sort={{ field: trackSort, descending: sortDescending, onChange: sortBy }} />}
@@ -1065,14 +1099,12 @@ async function handleRemoveSong(
 
             <VirtualizedTrackList
               itemCount={songs.length}
-              getItem={(index) => songs[index]}
-              getItemKey={(index) => occurrenceIds[index]}
+              getItem={getTrack}
+              getItemKey={getOccurrenceId}
               dataKey={id}
               onPlay={handleTrackPlayback}
               showDateAdded
-              showDuration={!mobile}
-              hasColumnHeader={!mobile}
-              estimateRowHeight={mobile ? 52 : undefined}
+              mobile={mobile}
               searchTokens={searchTokens}
 
 
@@ -1086,9 +1118,7 @@ async function handleRemoveSong(
                   if (generation === pageGeneration.current) setEditError(failure.message || "Could not reorder playlist tracks.");
                 });
               } : undefined}
-              onToggleEntryMenu={(_song, index) => {
-                setMenuSongId(menuSongId === occurrenceIds[index] ? null : occurrenceIds[index]);
-              }}
+              onToggleEntryMenu={toggleTrackMenu}
               renderMenu={(song, index) => canEditTracks && menuSongId === occurrenceIds[index] ? (
                 <div className="playlist-menu">
                   <button type="button" role="menuitem" className="playlist-menu-item playlist-track-remove" disabled={editingBusy || batchBusy} onClick={() => { void runTrackAction(async () => {
@@ -1105,7 +1135,7 @@ async function handleRemoveSong(
 
       </div>
 
-      <PlaylistRecommendations key={id} playlistId={id} songs={songs} disabled={editingBusy || batchBusy}
+      <PlaylistRecommendations key={id} playlistId={id} songs={entries} editRevision={playlist.editRevision} disabled={editingBusy || batchBusy}
         onPlaylistChange={(updated) => {
           setPlaylist((current) => current?.id === updated.id ? updated : current);
           notifyPlaylistChange();

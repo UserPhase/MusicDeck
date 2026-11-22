@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useVisualActivity } from "../hooks/useVisualActivity";
 import { usePlaybackDisplayPosition } from "../hooks/usePlaybackDisplayPosition";
 import { isDesktopRuntime } from "../services/desktop/desktopRuntime";
@@ -15,6 +15,7 @@ import { usePrivacy } from "../context/PrivacyContext";
 
 import AudioQualityBadge from "./player/AudioQualityBadge";
 import DeviceSelectorButton from "./player/DeviceSelectorButton";
+import UniversalTrackContextMenu from "./UniversalTrackContextMenu";
 
 
 export function formatTime(seconds) {
@@ -123,10 +124,30 @@ function LikeButton({ player: { toggleLike, isCurrentSongLiked } }) {
   );
 }
 
-function PlaybackControls({ player, compact = false }) {
-  const { currentSong, isPlaying, isPreparingPlayback, togglePlay, nextSong, previousSong,
-    toggleShuffle, isShuffleEnabled, toggleLoop, isLooping, repeatMode } = player;
+function PlayPauseButton({ player: { currentSong, isPlaying, isPreparingPlayback, togglePlay } }) {
   const playLabel = isPreparingPlayback ? "Cancel preparation" : isPlaying ? "Pause" : "Play";
+  return (
+    <button type="button" className="play-button" onClick={togglePlay} disabled={!currentSong}
+      aria-label={playLabel} aria-busy={isPreparingPlayback || undefined}>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        {isPreparingPlayback ? <path d="M7 7h10v10H7z" />
+          : isPlaying ? <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
+          : <path d="M8 4.5v15L20 12z" />}
+      </svg>
+    </button>
+  );
+}
+
+export function LyricsPlaybackControls({ player }) {
+  return <div className="lyrics-reader-controls" role="group" aria-label="Lyrics playback">
+    <PlayPauseButton player={player} />
+    <PlayerProgress player={player} />
+  </div>;
+}
+
+function PlaybackControls({ player, compact = false }) {
+  const { currentSong, nextSong, previousSong,
+    toggleShuffle, isShuffleEnabled, toggleLoop, isLooping, repeatMode } = player;
 
   return (
     <div className="control-buttons">
@@ -146,14 +167,7 @@ function PlaybackControls({ player, compact = false }) {
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h3v14H5zM19 5 8 12l11 7z" /></svg>
         </button>
       </>}
-      <button type="button" className="play-button" onClick={togglePlay} disabled={!currentSong}
-        aria-label={playLabel} aria-busy={isPreparingPlayback || undefined}>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          {isPreparingPlayback ? <path d="M7 7h10v10H7z" />
-            : isPlaying ? <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
-            : <path d="M8 4.5v15L20 12z" />}
-        </svg>
-      </button>
+      <PlayPauseButton player={player} />
       <button type="button" className="control skip-control" onClick={nextSong}
         disabled={!currentSong} aria-label="Next song">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 5h3v14h-3zM5 5l11 7-11 7z" /></svg>
@@ -179,8 +193,12 @@ function MobilePlayer({ hidden = false, onOpenNowPlaying, nowPlayingButtonRef })
   const { currentSong, isPlaying, playbackMessage, playbackUnavailable, isPreview } = player;
   const { url: coverUrl, onError: onCoverError } = useAlbumArtwork(currentSong, 56);
 
+  if (!currentSong) {
+    return !hidden && playbackMessage ? <div className="player-toast mobile-player-toast" role="status">{playbackMessage}</div> : null;
+  }
+
   return (
-    <footer className={`player mobile-player${currentSong ? " has-current-track" : ""}${currentSong && isPlaying ? " is-playing" : ""}`}
+    <footer className={`player mobile-player has-current-track${isPlaying ? " is-playing" : ""}`}
       aria-label="Mini player" hidden={hidden}>
       {playbackMessage && <div className="player-toast" role="status">{playbackMessage}</div>}
       <button type="button" className="mobile-player-track" ref={nowPlayingButtonRef} onClick={onOpenNowPlaying}
@@ -190,10 +208,10 @@ function MobilePlayer({ hidden = false, onOpenNowPlaying, nowPlayingButtonRef })
           {coverUrl ? <img src={coverUrl} onError={onCoverError} alt="" width="56" height="56" /> : "♫"}
         </span>
         <span className="mobile-player-meta">
-          <span className="now-title-text">{currentSong?.title || "Nothing playing"}</span>
+          <span className="now-title-text">{currentSong.title || "Unknown title"}</span>
           <span className="now-artist">
-            {playbackUnavailable ? "Unavailable" : currentSong?.artist || (currentSong ? "Unknown artist" : "Open player")}
-            {!playbackUnavailable && isPreview && currentSong && " · Preview"}
+            {playbackUnavailable ? "Unavailable" : currentSong.artist || "Unknown artist"}
+            {!playbackUnavailable && isPreview && " · Preview"}
           </span>
         </span>
         <svg className="mobile-player-expand" viewBox="0 0 24 24" aria-hidden="true">
@@ -209,7 +227,7 @@ function MobilePlayer({ hidden = false, onOpenNowPlaying, nowPlayingButtonRef })
   );
 }
 
-export function MobilePlaybackControls({ player, onOpenQueue }) {
+export function MobilePlaybackControls({ player, onOpenQueue, queueButtonRef }) {
   return (
     <div className="mobile-playback">
       {player.currentSong && <>
@@ -219,7 +237,7 @@ export function MobilePlaybackControls({ player, onOpenQueue }) {
       <div className="mobile-playback-actions" role="group" aria-label="Playback options">
         <DeviceSelectorButton />
         <PlayerAudioTools />
-        <button type="button" className="mobile-playback-queue" onClick={onOpenQueue}>
+        <button type="button" className="mobile-playback-queue" ref={queueButtonRef} onClick={onOpenQueue}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
           Queue
         </button>
@@ -232,9 +250,15 @@ export function MobilePlaybackControls({ player, onOpenQueue }) {
 export function MobileTrackActions({ player }) {
   const { importLabel, isImportDisabled, importPreviewTrack } = usePreviewImport(player.currentSong);
   const { canImport } = usePrivacy();
+  const trigger = useRef(null);
+  const [menuTrack, setMenuTrack] = useState(null);
   return (
     <>
       <LikeButton player={player} />
+      <button ref={trigger} type="button" className="now-track-menu" aria-label={`More options for ${player.currentSong?.title || "track"}`}
+        aria-haspopup="dialog" aria-expanded={Boolean(menuTrack)} onClick={() => setMenuTrack(player.currentSong)}>⋯</button>
+      {menuTrack && <UniversalTrackContextMenu song={menuTrack} triggerRef={trigger}
+        downloadQuality={player.downloadQuality} onRequestClose={() => setMenuTrack(null)} />}
       {player.isPreview && canImport && (
         <button type="button" className="now-preview-import" onClick={importPreviewTrack} disabled={isImportDisabled}>
           {importLabel}

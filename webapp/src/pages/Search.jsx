@@ -13,6 +13,7 @@ import {
 
 import { searchNavidrome, getCoverUrl, getUserSettings, updateUserSettings } from "../api/musicdeck";
 
+import ArtistAvatar from "../components/ArtistAvatar";
 import AvailabilityHint from "../components/AvailabilityHint";
 import PlaylistCover from "../components/PlaylistCover";
 import SourceIndicator from "../components/SourceIndicator";
@@ -38,9 +39,17 @@ import {
   usePlayer,
 } from "../context/PlayerContext";
 
-function SearchHero({ title, query, onSearch }) {
-  const isMobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+const CATEGORIES = [
+  { id: "songs", type: "track", label: "Songs", preview: 3 },
+  { id: "albums", type: "album", label: "Albums", preview: 2 },
+  { id: "artists", type: "artist", label: "Artists", preview: 2 },
+  { id: "playlists", type: "playlist", label: "Playlists", preview: 2 },
+];
 
+function SearchHero({ title, query, onSearch, isMobile, category, chooseCategory, categoryControls }) {
+  const [draft, setDraft] = useState(query);
+  const input = useRef(null);
+  useEffect(() => { setDraft(query); }, [query]);
   function handleSubmit(event) {
     event.preventDefault();
     onSearch(new FormData(event.currentTarget).get("q").trim());
@@ -50,11 +59,24 @@ function SearchHero({ title, query, onSearch }) {
     <div className="page-hero-gradient">
       <LightHero className="search-page-hero" title={title}>
         {isMobile && (
-          <form className="search-page-form" role="search" aria-label="Music search" onSubmit={handleSubmit}>
-            <input key={query} type="search" name="q" defaultValue={query} enterKeyHint="search"
-              placeholder="Search your music" aria-label="Search your music" autoComplete="off" />
-            <button type="submit">Search</button>
-          </form>
+          <>
+            <form className="search-page-form" role="search" aria-label="Music search" onSubmit={handleSubmit}>
+              <div className="search-input-field">
+                <input ref={input} type="search" name="q" value={draft} onChange={(event) => setDraft(event.target.value)}
+                  enterKeyHint="search" placeholder="Search your music" aria-label="Search your music" autoComplete="off" />
+                {draft && <button type="button" className="search-clear" aria-label="Clear search" onClick={() => {
+                  setDraft(""); onSearch(""); input.current?.focus();
+                }}>×</button>}
+              </div>
+              <button type="submit">Search</button>
+            </form>
+            <div className="search-categories" role="group" aria-label="Result type" ref={categoryControls}>
+              {[{ id: "all", label: "All" }, ...CATEGORIES].map(({ id, label }) => (
+                <button key={id} type="button" data-category={id} aria-pressed={category === id}
+                  onClick={() => chooseCategory(id)}>{label}</button>
+              ))}
+            </div>
+          </>
         )}
       </LightHero>
     </div>
@@ -63,6 +85,7 @@ function SearchHero({ title, query, onSearch }) {
 
 function Search() {
   const deletion = useServerDeletion();
+  const isMobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
 
   const [
     searchParams,
@@ -73,9 +96,22 @@ function Search() {
   const [savedQuery, setSavedQuery] = useViewStateValue("/search", "query", "");
   const query = searchParams.has("q") ? searchParams.get("q") || "" : savedQuery;
   useEffect(() => { setSavedQuery(query); }, [query, setSavedQuery]);
+  const categoryControls = useRef(null);
+  const chosenCategory = isMobile && CATEGORIES.find(({ id }) => id === searchParams.get("category"));
+  const category = chosenCategory?.id ?? "all";
+  const shownCategories = chosenCategory ? [chosenCategory] : CATEGORIES;
+
+  function chooseCategory(next) {
+    if (next === category) return;
+    const params = new URLSearchParams(searchParams);
+    if (query && !params.has("q")) params.set("q", query);
+    if (next === "all") params.delete("category");
+    else params.set("category", next);
+    setSearchParams(params);
+  }
 
   function searchFor(term) {
-    if (term !== query) setSearchParams({ q: term });
+    if (term !== query) setSearchParams(chosenCategory ? { q: term, category } : { q: term });
   }
 
 
@@ -116,8 +152,11 @@ function Search() {
     playSongFromSource,
   } = usePlayer();
 
+  const playableResults = isMobile && deletion?.deletedTracks?.size
+    ? results.track.filter((song) => !deletion.deletedTracks.has(String(song.id))) : results.track;
+
   function handleTrackPlayback(song, index) {
-    playContext(results.track, index, {
+    playContext(playableResults, index, {
       type: "search",
       id: query,
       name: `Search: ${query}`,
@@ -229,6 +268,8 @@ function Search() {
     updateUserSettings({ "catalog.sourceMode": mode }).catch(() => {});
   }
 
+  const searchHeroProps = { query, onSearch: searchFor, isMobile, category, chooseCategory, categoryControls };
+
 
   /*
    * EMPTY SEARCH
@@ -240,7 +281,7 @@ function Search() {
 
       <div className="search-page">
 
-        <SearchHero title="Search" query={query} onSearch={searchFor} />
+        <SearchHero title="Search" {...searchHeroProps} />
 
 
         <EmptyState>
@@ -264,7 +305,7 @@ function Search() {
 
       <div className="search-page" data-view-loading="true">
 
-        <SearchHero title="Search" query={query} onSearch={searchFor} />
+        <SearchHero title="Search" {...searchHeroProps} />
 
 
         <LoadingState>
@@ -288,7 +329,7 @@ function Search() {
 
       <div className="search-page">
 
-        <SearchHero title="Search" query={query} onSearch={searchFor} />
+        <SearchHero title="Search" {...searchHeroProps} />
 
         <ErrorState>
           {error}
@@ -301,11 +342,13 @@ function Search() {
   }
 
 
-  const hasResults =
-    results.artist.length > 0 ||
-    results.album.length > 0 ||
-    results.track.length > 0 ||
-    results.playlist.length > 0;
+  const availableResults = {
+    ...results,
+    track: playableResults,
+    album: deletion?.deletedAlbums?.size
+      ? results.album.filter((album) => !deletion.deletedAlbums.has(String(album.id))) : results.album,
+  };
+  const hasResults = shownCategories.some(({ type }) => availableResults[type].length > 0);
 
 
   return (
@@ -315,7 +358,7 @@ function Search() {
 
       {/* HEADER */}
 
-      <SearchHero title="Search results" query={query} onSearch={searchFor} />
+      <SearchHero title="Search results" {...searchHeroProps} />
 
 
       <div className="search-mode" role="group" aria-label="Search source">
@@ -346,223 +389,91 @@ function Search() {
       {!hasResults && !externalLoading ? (
 
         <EmptyState>
-          No results found.
+          {chosenCategory ? `No ${chosenCategory.label.toLowerCase()} found.` : "No results found."}
         </EmptyState>
 
       ) : hasResults ? (
 
         <div className="search-groups">
+          {shownCategories.filter(({ type }) => availableResults[type].length > 0).map(({ id, type, label, preview }) => {
+            const matches = availableResults[type];
+            const items = isMobile && category === "all" ? matches.slice(0, preview) : matches;
+            const headingId = `search-results-${id}`;
 
-
-          {/* ================================
-              ARTISTS
-          ================================= */}
-
-          {results.artist.length > 0 && (
-
-            <section className="section search-group search-group-artists">
-
-              <div className="section-header">
-
-                <h2>
-                  Artists
-                </h2>
-
+            return <section key={id} className={`${type === "track" ? "library-section" : "section"} search-group search-group-${id}`}
+              aria-labelledby={headingId}>
+              <div className={type === "track" ? "library-section-header" : "section-header"}>
+                <h2 id={headingId}>{label}</h2>
+                {items.length < matches.length && <button className="search-category-more" type="button"
+                  aria-label={`See all ${label.toLowerCase()}`} onClick={() => {
+                    categoryControls.current?.querySelector(`[data-category="${id}"]`)?.focus({ preventScroll: true });
+                    chooseCategory(id);
+                  }}>See all</button>}
               </div>
 
+              {type === "track" && <div className="track-list track-list--mobile" role="table" aria-label="Search tracks">
+                {!isMobile && <TrackListHeader />}
+                <TrackActionScope tracks={items} dataKey={`${query}:${sourceMode}:${category}`}>
+                  {items.map((song, index) => <TrackRow key={song.id} song={song} index={index}
+                    mobile={isMobile} showDownloadStatus={false} showSourceIndicator
+                    duration={song.metadata?.durationSeconds} sources={song.source?.options}
+                    onPlay={handleTrackPlayback} onSelectSource={playSongFromSource} />)}
+                </TrackActionScope>
+              </div>}
 
-              <div className="search-results">
-
-                {results.artist.map(
-                  (artist) => (
-
-                    <Link
-                      key={artist.id}
-                      to={`/artist/${encodeURIComponent(toArtistRouteIdFromApiId(artist.id))}`}
-                      className="search-result"
-                    >
-
-                      <div className="search-result-info">
-
-                        <div className="search-result-title">
-                          {artist.title}
-                        </div>
-
-                        <div className="search-result-type">
-                          Artist
-                          <AvailabilityHint availability={artist.availability} />
-                          <SourceIndicator source={artist.source} />
-                        </div>
-
-                      </div>
-
-                    </Link>
-
-                  )
-                )}
-
-              </div>
-
-            </section>
-
-          )}
-
-
-          {/* ================================
-              ALBUMS
-          ================================= */}
-
-          {results.album.length > 0 && (
-
-            <section className="section search-group search-group-albums">
-
-              <div className="section-header">
-
-                <h2>
-                  Albums
-                </h2>
-
-              </div>
-
-
-              <div className="album-grid">
-
-                {results.album.map(
-                  (album) => deletion?.deletedAlbums.has(String(album.id)) ? null : (
-
-                    <div key={album.id} className="album-card-shell">
-                      <Link className="see-all"
-                        to={`/album/${encodeURIComponent(toAlbumRouteIdFromApiId(album.localAlbumId || album.id))}`}>
-                        <div className="album-cover">
-                          {album.coverArt && <img src={getCoverUrl(album.coverArt)} alt={`${album.title} cover`} />}
-                        </div>
-                        <div className="album-title search-album-title">
-                          <span className="search-album-title-text">{album.title}</span>
-                          <InLibraryBadge visible={album.provider === "external" && album.inLibrary} />
-                        </div>
-                      </Link>
-                      <div className="album-artist">
-                        <TrackArtistLinks song={album} />
-                        <AvailabilityHint availability={album.availability} />
-                        <SourceIndicator source={album.source} />
-                        <EditionBadges item={album} />
-                      </div>
-
+              {type === "album" && <div className="album-grid">
+                {items.map((album) => <div key={album.id} className="album-card-shell search-album-card">
+                  <Link className="see-all"
+                    to={`/album/${encodeURIComponent(toAlbumRouteIdFromApiId(album.localAlbumId || album.id))}`}>
+                    <div className="album-cover">
+                      {album.coverArt && <img src={getCoverUrl(album.coverArt, isMobile ? 300 : undefined)}
+                        alt={`${album.title} cover`} loading="lazy" decoding="async" />}
                     </div>
+                    <div className="album-title search-album-title">
+                      <span className="search-album-title-text">{album.title}</span>
+                      <InLibraryBadge visible={album.provider === "external" && album.inLibrary} />
+                    </div>
+                  </Link>
+                  <div className="album-artist">
+                    <TrackArtistLinks song={album} />
+                    <AvailabilityHint availability={album.availability} />
+                    <SourceIndicator source={album.source} />
+                    <EditionBadges item={album} />
+                  </div>
+                </div>)}
+              </div>}
 
-                  )
-                )}
+              {type === "artist" && <div className={isMobile ? "artist-grid" : "search-results"}>
+                {items.map((artist) => <Link key={artist.id}
+                  to={`/artist/${encodeURIComponent(toArtistRouteIdFromApiId(artist.id))}`}
+                  className={isMobile ? "artist" : "search-result"}>
+                  {isMobile ? <>
+                    <ArtistAvatar artist={artist} className="artist-cover" enableMusicBrainzFallback deferUntilVisible />
+                    <div className="artist-name">{artist.title}</div>
+                  </> : <div className="search-result-info">
+                    <div className="search-result-title">{artist.title}</div>
+                    <div className="search-result-type">
+                      Artist
+                      <AvailabilityHint availability={artist.availability} />
+                      <SourceIndicator source={artist.source} />
+                    </div>
+                  </div>}
+                </Link>)}
+              </div>}
 
-              </div>
-
-            </section>
-
-          )}
-
-
-          {/* ================================
-              SONGS
-          ================================= */}
-
-          {results.track.length > 0 && (
-
-            <section className="library-section search-group search-group-songs">
-
-              <div className="library-section-header">
-
-                <h2>
-                  Songs
-                </h2>
-
-              </div>
-
-
-              <div className="track-list" role="table" aria-label="Search tracks">
-
-                <TrackListHeader />
-
-                <TrackActionScope tracks={results.track} dataKey={`${query}:${sourceMode}`}>
-                {results.track.map(
-                  (song, index) => (
-                    <TrackRow
-                      key={song.id}
-                      song={song}
-                      index={index}
-                      showDownloadStatus={false}
-                      showSourceIndicator
-                      duration={song.metadata?.durationSeconds}
-                      sources={song.source?.options}
-                      onPlay={handleTrackPlayback}
-                      onSelectSource={playSongFromSource}
-
-
-                    />
-
-                  )
-                )}
-        </TrackActionScope>
-
-              </div>
-
-            </section>
-
-          )}
-
-
-          {results.playlist.length > 0 && (
-
-            <section className="section search-group search-group-playlists">
-
-              <div className="section-header">
-
-                <h2>
-                  Playlists
-                </h2>
-
-              </div>
-
-
-              <div className="search-results">
-
-                {results.playlist.map(
-                  (playlist) => (
-
-                    <Link
-                      key={playlist.id}
-                      to={`/playlist/${playlist.id}`}
-                      className="search-result"
-                    >
-
-                      <div className="search-result-cover">
-
-                        <PlaylistCover playlist={playlist} size={160} />
-
-                      </div>
-
-
-                      <div className="search-result-info">
-
-                        <div className="search-result-title">
-                          {playlist.title}
-                        </div>
-
-                        <div className="search-result-type">
-                          Playlist
-                        </div>
-
-                      </div>
-
-                    </Link>
-
-                  )
-                )}
-
-              </div>
-
-            </section>
-
-          )}
-
+              {type === "playlist" && <div className="search-results">
+                {items.map((playlist) => <Link key={playlist.id} to={`/playlist/${playlist.id}`} className="search-result">
+                  <div className="search-result-cover">
+                    <PlaylistCover playlist={playlist} size={160} />
+                  </div>
+                  <div className="search-result-info">
+                    <div className="search-result-title">{playlist.title}</div>
+                    <div className="search-result-type">Playlist</div>
+                  </div>
+                </Link>)}
+              </div>}
+            </section>;
+          })}
         </div>
 
       ) : null}

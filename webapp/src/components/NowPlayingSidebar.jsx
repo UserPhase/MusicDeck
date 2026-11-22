@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
@@ -24,7 +25,7 @@ import ArtistBiography from "./ArtistBiography";
 import TrackArtistLinks from "./TrackArtistLinks";
 import LyricsView from "./player/LyricsView";
 import PrivateListeningBadge from "./player/PrivateListeningBadge";
-import { MobilePlaybackControls, MobileTrackActions } from "./Player";
+import { LyricsPlaybackControls, MobilePlaybackControls, MobileTrackActions } from "./Player";
 
 function cycleDialogFocus(event) {
   const dialog = event.currentTarget;
@@ -38,8 +39,12 @@ function cycleDialogFocus(event) {
   (event.shiftKey ? last : first)?.focus();
 }
 
-function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, closeButtonRef }) {
+function NowPlayingSidebar({
+  isOpen, onClose, onOpenQueue, mobile = false, closeButtonRef, covered,
+  queueButtonRef, fullScreenLyrics, onOpenLyrics, lyricsButtonRef,
+}) {
   const [lyricsResult, setLyricsResult] = useState(null);
+  const headerDrag = useRef(null);
   const player = usePlayer();
   const { currentSong, currentTime = 0, duration = 0, queue = [], queueIndex = -1,
     audioEngine, isRemotePlayback, playbackStatus, seekToSeconds } = player;
@@ -77,6 +82,31 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, close
 
   if (!isOpen) return null;
 
+  function startSwipe(event) {
+    if (event.pointerType !== "touch" || !event.isPrimary ||
+      event.target.closest("button, a, input, select, textarea")) return;
+    headerDrag.current = { id: event.pointerId, x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveSwipe(event) {
+    const drag = headerDrag.current;
+    if (drag?.id !== event.pointerId) return;
+    const down = event.clientY - drag.y;
+    const sideways = Math.abs(event.clientX - drag.x);
+    const offset = down > sideways * 1.25 ? Math.max(0, down - 12) : 0;
+    event.currentTarget.parentElement.style.setProperty("--now-playing-swipe-offset", `${offset}px`);
+  }
+
+  function finishSwipe(event) {
+    const drag = headerDrag.current;
+    if (drag?.id !== event.pointerId) return;
+    headerDrag.current = null;
+    event.currentTarget.parentElement.style.removeProperty("--now-playing-swipe-offset");
+    const down = event.clientY - drag.y;
+    if (event.type === "pointerup" && down >= 72 && down > Math.abs(event.clientX - drag.x) * 1.25) onClose();
+  }
+
   const trackInfo = currentSong ? (
     <section className="right-sidebar-song-info" aria-labelledby="now-playing-title">
       <div className="right-sidebar-now-cover">
@@ -86,7 +116,7 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, close
         <div className="now-playing-track-copy">
           {!mobile && <div className="right-sidebar-song-kicker">Playing now</div>}
           <h2 id="now-playing-title">{currentSong.title || "Unknown title"}</h2>
-          <p><TrackArtistLinks song={currentSong} /></p>
+          <p>{mobile ? currentSong.artist || "Unknown artist" : <TrackArtistLinks song={currentSong} />}</p>
           {mobile && player.isPreview ? <span className="audio-badge audio-badge-preview">Preview</span>
             : <AudioQualityBadge className="right-sidebar-audio-badge" />}
         </div>
@@ -121,9 +151,16 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, close
   );
 
   return (
-    <aside className="right-sidebar now-playing-sidebar sidebar-panel" role={mobile ? "dialog" : undefined}
-      aria-label="Now Playing" aria-modal={mobile || undefined} onKeyDown={mobile ? cycleDialogFocus : undefined}>
-      <header className="sidebar-panel-header">
+    <aside className={`right-sidebar now-playing-sidebar sidebar-panel${covered ? " is-covered" : ""}`}
+      role={mobile ? "dialog" : undefined} inert={covered || undefined}
+      aria-label="Now Playing" aria-modal={(mobile && !covered) || undefined}
+      onKeyDown={mobile ? cycleDialogFocus : undefined}>
+      <header className="sidebar-panel-header"
+        onPointerDown={mobile ? startSwipe : undefined}
+        onPointerMove={mobile ? moveSwipe : undefined}
+        onPointerUp={mobile ? finishSwipe : undefined}
+        onPointerCancel={mobile ? finishSwipe : undefined}
+        onLostPointerCapture={mobile ? finishSwipe : undefined}>
         <h2>Now Playing</h2>
         <div className="now-playing-header-actions">
           <PrivateListeningBadge />
@@ -136,7 +173,7 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, close
         {mobile ? (
           <div className="mobile-now-playing-deck">
             {trackInfo}
-            <MobilePlaybackControls player={player} onOpenQueue={onOpenQueue} />
+            <MobilePlaybackControls player={player} onOpenQueue={onOpenQueue} queueButtonRef={queueButtonRef} />
           </div>
         ) : trackInfo}
 
@@ -144,6 +181,9 @@ function NowPlayingSidebar({ isOpen, onClose, onOpenQueue, mobile = false, close
           <>
             <LyricsView trackId={String(trackId ?? "")} title={songTitle || "Unknown title"} artist={songArtist}
               artwork={coverUrl} lyrics={result?.lyrics ?? null} loading={Boolean(trackId && !result)}
+              mobile={mobile} readerControls={mobile ? <LyricsPlaybackControls player={player} /> : undefined}
+              fullScreen={fullScreenLyrics} onOpenFullScreen={onOpenLyrics} onCloseFullScreen={onOpenLyrics ? onClose : undefined}
+              fullScreenButtonRef={lyricsButtonRef}
               error={result?.error} currentTime={Number(currentTime)} positionSource={player} seekToSeconds={seekToSeconds}
               readPosition={interpolateLyrics && audioEngine && !isRemotePlayback && ["PLAYING", "TRANSITIONING"].includes(playbackStatus)
                 ? readPosition : undefined} />

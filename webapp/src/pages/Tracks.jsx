@@ -5,11 +5,13 @@ import { getAllSongs, getTrackPage } from "../api/musicdeck";
 import TrackListHeader from "../components/TrackListHeader";
 import VirtualizedTrackList from "../components/VirtualizedTrackList";
 import { usePagedLibrary } from "../hooks/usePagedLibrary";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useCollectorLibrary } from "../hooks/useCollectorLibrary";
 import CollectorFilterBar from "../components/CollectorFilterBar";
 import { useViewStateValue } from "../hooks/useViewStateStore";
 import { useServerDeletion } from "../context/ServerDeletionContext";
 import { uniqueTracks } from "../utils/uniqueTracks";
+import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 import { EmptyState, ErrorState, LoadingState } from "../components/ui/PageState";
 
 const compareText = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
@@ -33,6 +35,7 @@ function compareTracks(left, right, field, descending) {
 }
 
 function Tracks() {
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
   const { playContext } = usePlayerActions();
   const deletion = useServerDeletion();
   const deletedTracks = deletion?.deletedTracks;
@@ -139,10 +142,11 @@ function Tracks() {
     {preparingQueue && <div role="status">Preparing playback...</div>}
     {actionError && <ErrorState>{actionError}</ErrorState>}
     {library.error && <ErrorState>{library.error} <button type="button" onClick={library.retry}>Retry</button></ErrorState>}
-    {!library.loading && <div className="track-list" role="table" aria-label="Tracks" aria-rowcount={total + 1}>
-      <TrackListHeader sort={{ ...sort, onChange: sortBy }} showDateAdded={false} />
+    {!library.loading && <div className="track-list track-list--mobile" role="table" aria-label="Tracks"
+      aria-rowcount={mobile ? total || undefined : total + 1}>
+      {!mobile && <TrackListHeader sort={{ ...sort, onChange: sortBy }} showDateAdded={false} />}
       {!total && !library.error && !collector.bar.busy && <EmptyState>{collectorActive ? "No songs match these filters." : "No songs yet."}</EmptyState>}
-      <VirtualizedTrackList itemCount={total} getItem={collectorActive ? getCollectorItem : library.getItem}
+      <VirtualizedTrackList itemCount={total} mobile={mobile} getItem={collectorActive ? getCollectorItem : library.getItem}
         searchTokens={collector.searchTokens}
         loadSelection={collectorActive ? undefined : library.loadSelection}
         onRangeChange={collectorActive ? undefined : onRangeChange} dataKey={collectorActive ? collectorItems : selectionIdentity} dynamicHeight

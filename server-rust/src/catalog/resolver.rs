@@ -348,20 +348,26 @@ impl SourceResolver {
                 return Err(SourceUnavailableError::database_unavailable());
             }
         };
-        if sources.is_empty() {
-            return Ok(Vec::new());
-        }
+        Ok(self.candidates_for_sources(sources, preferred_connection_id))
+    }
 
+    pub(crate) fn candidates_for_sources(
+        &self,
+        sources: impl IntoIterator<Item = SourceRef>,
+        preferred_connection_id: Option<&str>,
+    ) -> Vec<CandidateSource> {
+        let mut candidates: Vec<CandidateSource> = sources
+            .into_iter()
+            .filter_map(|source| self.candidate_for_source(source))
+            .collect();
+        if candidates.len() <= 1 {
+            return candidates;
+        }
         let registered = self.registry.list();
         let order_map: HashMap<String, usize> = registered
             .iter()
             .enumerate()
             .map(|(idx, entry)| (entry.connection_id.clone(), idx))
-            .collect();
-
-        let mut candidates: Vec<CandidateSource> = sources
-            .into_iter()
-            .filter_map(|source| self.candidate_for_source(source))
             .collect();
 
         candidates.sort_by_key(|c| {
@@ -376,7 +382,7 @@ impl SourceResolver {
             (preferred_rank, registry_rank)
         });
 
-        Ok(candidates)
+        candidates
     }
 
     /// Resolves a provider-native source without requiring a library mapping.

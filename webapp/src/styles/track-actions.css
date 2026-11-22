@@ -28,3 +28,90 @@
 .track-action-scope-error { color: var(--danger-text, #fda4af); border-left: 2px solid currentColor; padding: 10px 14px; line-height: 1.5; }
 .track-action-scope-error button { margin-left: 12px; border: 1px solid currentColor; padding: 6px 10px; background: transparent; color: inherit; border-radius: 5px; cursor: pointer; }
 .track-action-scope { display: contents; }
+
+.track-action-sheet {
+  position: fixed;
+  inset: auto auto max(0px, calc(100% - var(--visible-viewport-top, 0px) - var(--visible-viewport-height, 100dvh)))
+    calc(var(--visible-viewport-left, 0px) + var(--visible-viewport-width, 100%) / 2);
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 0;
+  width: min(var(--visible-viewport-width, 100%), 32rem);
+  max-width: none;
+  max-height: none;
+  border: 0;
+  border-radius: 20px 20px 0 0;
+  background: var(--panel-chrome);
+  color: var(--text);
+  overflow: hidden;
+}
+.track-action-sheet::backdrop { background: rgb(0 0 0 / 60%); }
+.track-action-sheet-surface {
+  display: flex;
+  flex-direction: column;
+  max-height: min(32rem, calc(var(--visible-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top))));
+  padding: 8px max(12px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+}
+.track-action-sheet-header { display: flex; align-items: center; gap: 8px; padding-bottom: 8px; }
+.track-action-sheet-header > div { flex: 1; min-width: 0; }
+.track-action-sheet-header h2 { font-size: 17px; }
+.track-action-sheet-header p { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-secondary); font-size: 13px; }
+.track-action-sheet-header button, .track-sheet-filter button {
+  flex: 0 0 44px;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 8px;
+  background: var(--control-surface);
+  color: var(--text);
+  font-size: 22px;
+}
+.track-action-sheet-list { min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; }
+.track-action-sheet-list button { min-width: 44px; min-height: 44px; }
+.track-action-sheet-list button:disabled { opacity: .5; }
+.track-sheet-action, .track-sheet-more > summary, .track-sheet-more .playlist-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  text-align: start;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.track-sheet-more .track-context-menu-item { display: grid; }
+.track-sheet-more > summary { gap: 8px; color: var(--text-secondary); cursor: pointer; }
+.track-sheet-more > summary::before { content: "+"; }
+.track-sheet-more[open] > summary::before { content: "−"; }
+.track-action-sheet-list p { padding: 10px 12px; font-size: 13px; }
+.track-action-sheet-list [role="alert"] { color: var(--danger-text); }
+.track-sheet-action:active, .track-sheet-more > summary:active { background: var(--nav-hover); }
+.track-action-sheet :focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.track-sheet-filter { display: flex; gap: 4px; align-items: center; margin-bottom: 6px; }
+.track-sheet-filter input {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding-inline: 12px;
+  border: 1px solid var(--layout-divider);
+  border-radius: 8px;
+  background: var(--control-surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+}
+.track-sheet-filter input::-webkit-search-cancel-button { appearance: none; }
+:root[data-layout-shell="mobile"] .universal-track-toolbar {
+  inset: auto var(--mobile-right) calc(var(--mobile-dock) + 8px) var(--mobile-left);
+  width: auto;
+  max-width: 36rem;
+  max-height: calc(100dvh - var(--mobile-header) - var(--mobile-dock) - 16px);
+  margin-inline: auto;
+  transform: none;
+  flex-wrap: wrap;
+  overflow-y: auto;
+}
+:root[data-layout-shell="mobile"]:has(.now-playing-sidebar, .mobile-queue-scrim) .universal-track-toolbar { display: none; }

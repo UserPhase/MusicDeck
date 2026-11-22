@@ -207,6 +207,7 @@ test("audio quality sits beside the song title and devices sit beside Queue with
 });
 
 test("the mobile player exposes the device picker beside Now Playing", () => {
+  usePlayer.mockReturnValue({ ...usePlayer(), currentSong: { id: "one", title: "Song" } });
   const cast = { supported: true, allowed: true, available: false, connected: false, device: "", loading: false, error: "", volume: null,
     connect: jest.fn(), disconnect: jest.fn() };
   const { container } = render(<MemoryRouter><CastContext.Provider value={cast}>
@@ -216,4 +217,18 @@ test("the mobile player exposes the device picker beside Now Playing", () => {
   expect(container.querySelector(".player-audio-tools-mobile")).toContainElement(picker);
   fireEvent.click(picker);
   expect(screen.getByRole("dialog", { name: "Choose where it plays." })).toBeInTheDocument();
+});
+
+test("the mobile player collapses only when there is no selected track and still shows playback errors", () => {
+  const idle = usePlayer();
+  usePlayer.mockReturnValue({ ...idle, playbackMessage: "Playback failed" });
+  const { rerender } = render(<MemoryRouter><Player mobile /></MemoryRouter>);
+  expect(screen.queryByRole("contentinfo", { name: "Mini player" })).not.toBeInTheDocument();
+  expect(screen.getByRole("status")).toHaveTextContent("Playback failed");
+
+  usePlayer.mockReturnValue({ ...idle, currentSong: { id: "one", title: "Song to resume" } });
+  rerender(<MemoryRouter><Player mobile /></MemoryRouter>);
+  const player = screen.getByRole("contentinfo", { name: "Mini player" });
+  expect(within(player).getByRole("button", { name: "Open Now Playing: Song to resume" })).toBeInTheDocument();
+  expect(within(player).getByRole("button", { name: "Play", exact: true })).toBeEnabled();
 });

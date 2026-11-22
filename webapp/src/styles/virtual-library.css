@@ -11,9 +11,7 @@
 .virtual-album-skeleton .album-cover { background: var(--card-hover); }
 .virtual-album-skeleton .album-title { height: 1rem; margin-top: .75rem; width: 70%; background: var(--card-hover); }
 
-.virtual-album-window--mobile .album { min-width: 0; padding: 6px; }
 .virtual-album-window--mobile .album:is(:hover, :focus-visible) { transform: none; }
-.virtual-album-window--mobile .album-cover { margin-bottom: 8px; }
 .virtual-album-window--mobile :is(.album-grid-title, .album-artist) {
   display: flex;
   align-items: center;

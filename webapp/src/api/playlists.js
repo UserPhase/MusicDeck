@@ -52,8 +52,8 @@ export async function getRecentlyPlayedPlaylists(signal) {
 }
 
 
-export async function getPlaylist(playlistId) {
-  return fetchPlaylist(playlistId);
+export async function getPlaylist(playlistId, signal) {
+  return fetchPlaylist(playlistId, signal);
 }
 
 export async function updatePlaylist(playlistId, updates) {

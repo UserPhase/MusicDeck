@@ -9,7 +9,7 @@ export default function DiscoveryTrackList({ tracks, listId, onPlay, className, 
   return <TrackActionScope tracks={visible} dataKey={listId}>
     <div className={`${className} track-list--compact${mobile ? " track-list--mobile-discovery" : ""}`} role="table" aria-label="Songs">
       {visible.map((song, index) => <TrackRow key={`${song.id}-${index}`} song={song} index={index}
-        showAlbum={false} showArtwork={showArtwork || mobile} showDuration={!mobile} showQualityBadge={!mobile}
+        mobile={mobile} showAlbum={false} showArtwork={showArtwork || mobile}
         onPlay={onPlay} compactTile={compactTile} />)}
     </div>
   </TrackActionScope>;

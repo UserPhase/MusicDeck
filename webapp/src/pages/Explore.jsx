@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { getAlbum, getCoverUrl, getPersonalizedDiscovery } from "../api/musicdeck";
+import { getAlbum, getAlbums, getArtists, getCoverUrl, getPersonalizedDiscovery, getRecentlyAddedSongs } from "../api/musicdeck";
 import { usePlayer } from "../context/PlayerContext";
 import { usePrivacy } from "../context/PrivacyContext";
 import { externalDiscoveryService } from "../services/externalDiscovery";
@@ -23,6 +23,7 @@ import { uniqueTracks } from "../utils/uniqueTracks";
 const SHELF_SIZE = 7;
 const TRACK_SIZE = 6;
 const feedKeys = ["featured", "popularArtists", "popularAlbums", "popularTracks", "discoverTracks", "discoverArtists", "discoverAlbums"];
+const localFeedKeys = ["discoverTracks", "discoverAlbums", "discoverArtists"];
 const initialFeeds = () => Object.fromEntries(feedKeys.map((key) => [key, { items: [], loading: true, error: null }]));
 const nameOf = (item) => item?.name || item?.title || "Unknown";
 
@@ -83,7 +84,7 @@ function TrackPanel({ id, title, subtitle, feed, onPlay, mobile }) {
   </section>;
 }
 
-function ExploreContent() {
+function ExploreContent({ local = false }) {
   const [feeds, setFeeds] = useState(initialFeeds);
   const [heroColor, setHeroColor] = useState(null);
   const [actionMessage, setActionMessage] = useState("");
@@ -105,6 +106,13 @@ function ExploreContent() {
         if (active) setFeeds((previous) => ({ ...previous, [key]: { items: [], loading: false, error: error.message || "Could not load this section." } }));
       });
     };
+    if (local) {
+      load("discoverTracks", () => getRecentlyAddedSongs(MOBILE_DISCOVERY_TRACK_LIMIT));
+      load("discoverAlbums", () => getAlbums(SHELF_SIZE));
+      load("discoverArtists", async () => (await getArtists()).slice()
+        .sort((left, right) => (left.playCount ?? 0) - (right.playCount ?? 0)).slice(0, SHELF_SIZE));
+      return () => { active = false; };
+    }
     load("featured", externalDiscoveryService.getFeatured);
     load("popularArtists", externalDiscoveryService.getPopularArtists);
     load("popularAlbums", externalDiscoveryService.getPopularAlbums);
@@ -146,7 +154,7 @@ function ExploreContent() {
       }])) }));
     });
     return () => { active = false; };
-  }, []);
+  }, [local]);
 
   const leadArtwork = mobile ? null : getCoverUrl(feeds.featured.items[0]?.coverArt, 640);
   useEffect(() => {
@@ -232,16 +240,31 @@ function ExploreContent() {
 
   const albumShelfProps = { mobile, albumState, onPlay: playAlbum, onToggle: toggleAlbumPlayback };
 
+  if (local) return <div className="explore-page" data-view-loading={localFeedKeys.some((key) => feeds[key].loading)}>
+    <div className="page-hero-gradient">
+      <LightHero className="explore-page-heading" title="Discover" />
+    </div>
+    <p className="explore-local-note">From your library · External discovery is off</p>
+    {actionMessage && <p className="explore-action-message" role="status">{actionMessage}</p>}
+    <TrackPanel id="explore-local-songs" title="Recently Added Songs" feed={feeds.discoverTracks} onPlay={playTrack} mobile={mobile} />
+    <AlbumShelf id="explore-local-albums" title="Recently Added Albums" feed={feeds.discoverAlbums} {...albumShelfProps} />
+    <ArtistShelf id="explore-local-artists" title="Unexplored Artists" feed={feeds.discoverArtists} artistState={artistState} />
+  </div>;
+
+  const discoverSongs = <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle={discoverySubtitle}
+    feed={feeds.discoverTracks} onPlay={playTrack} mobile={mobile} />;
+
   return <div className="explore-page" data-view-loading={Object.values(feeds).some((feed) => feed.loading)}>
     <div className="page-hero-gradient">
       <LightHero
         className="explore-page-heading"
-        eyebrow="MusicDeck / Discover"
-        title="Find your next favorite"
-        subtitle="New music from favourite artists and new connections, alongside Deezer's current charts."
+        eyebrow={mobile ? undefined : "MusicDeck / Discover"}
+        title={mobile ? "Discover" : "Find your next favorite"}
+        subtitle={mobile ? undefined : "New music from favourite artists and new connections, alongside Deezer's current charts."}
       />
     </div>
     {actionMessage && <p className="explore-action-message" role="status">{actionMessage}</p>}
+    {mobile && discoverSongs}
 
     {mobile ? <AlbumShelf id="explore-featured-title" title="Trending Now / Featured" subtitle="Current chart picks from Deezer"
       feed={feeds.featured} limit={3} empty="Featured albums are unavailable." {...albumShelfProps} /> : (
@@ -267,7 +290,7 @@ function ExploreContent() {
     <ArtistShelf id="explore-popular-artists" title="Artists Popular Externally" subtitle="Deezer charts" feed={feeds.popularArtists} artistState={artistState} />
     <AlbumShelf id="explore-popular-albums" title="Albums Popular Externally" subtitle="Deezer charts" feed={feeds.popularAlbums} {...albumShelfProps} />
     <div className="explore-pulse" aria-label="The Pulse: track discovery">
-      <TrackPanel id="explore-discover-songs" title="Discover Songs" subtitle={discoverySubtitle} feed={feeds.discoverTracks} onPlay={playTrack} mobile={mobile} />
+      {!mobile && discoverSongs}
       <TrackPanel id="explore-popular-songs" title="Songs Popular Externally" subtitle="Deezer charts" feed={feeds.popularTracks} onPlay={playTrack} mobile={mobile} />
     </div>
     <ArtistShelf id="explore-discover-artists" title="Discover Artists" subtitle={personalizedDiscovery ? "New artists connected to your favourites" : "New artists to explore"} feed={feeds.discoverArtists} artistState={artistState} />
@@ -277,10 +300,12 @@ function ExploreContent() {
 
 export default function Explore() {
   const { canMetadata, policy } = usePrivacy();
+  const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+  if (!canMetadata && mobile) return <ExploreContent key="local" local />;
   if (!canMetadata) return <section className="privacy-banner" role="status">
     <h1>{policy?.localOnly || policy?.enforcedByEnvironment ? "Local-Only Mode Enabled" : "External Discovery Disabled"}</h1>
     <p>{policy?.localOnly || policy?.enforcedByEnvironment ? "Local-Only Mode Enabled. Outbound metadata services are offline." : "Outbound metadata services are disabled by your administrator."}</p>
     <Link to="/albums">Browse your local albums</Link>
   </section>;
-  return <ExploreContent />;
+  return <ExploreContent key="external" />;
 }

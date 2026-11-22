@@ -50,6 +50,7 @@
   min-height: 36px;
   padding: 6px 10px;
 }
+:root[data-layout-shell="mobile"] .audio-tools-dialog :is(button, select) { min-width: 44px; min-height: 44px; }
 .audio-tools-launch:focus-visible,
 :is(.audio-tools-dialog, .settings-equalizer) :is(button, input, select, a):focus-visible,
 .eq-heading .settings-switch input:focus-visible + span {

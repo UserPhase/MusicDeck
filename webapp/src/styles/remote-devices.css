@@ -14,6 +14,7 @@
 .remote-device-dialog p { color: var(--text-secondary); line-height: 1.7; font-size: 12px; }
 .remote-device-dialog button { border: 1px solid var(--panel-border); border-radius: 6px; background: rgb(var(--tint-rgb) / 5%); color: var(--text); padding: 8px 10px; font: inherit; font-size: 11px; cursor: pointer; }
 .remote-device-dialog button:disabled { opacity: .45; cursor: default; }
+:root[data-layout-shell="mobile"] .remote-device-dialog :is(button, input) { min-width: 44px; min-height: 44px; }
 .remote-device-dialog :focus-visible, .device-selector-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .remote-connection { display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--text-muted); padding: 14px 0; border-bottom: 1px solid var(--panel-border); }
 .remote-connection > span { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; }

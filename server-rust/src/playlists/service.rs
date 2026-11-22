@@ -21,12 +21,14 @@
 //!      and compacts remaining item positions to `0..M` inside the same transaction.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures_util::future::join_all;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{Acquire, Row};
+use sqlx::{Acquire, Executor, Row, Sqlite, SqliteConnection};
 use thiserror::Error;
 
 use crate::auth::SessionUser;
@@ -34,9 +36,17 @@ use crate::avatars::avatar_url_for;
 use crate::catalog::{CatalogService, LibraryService, SourceRef, SourceResolver};
 use crate::db::{DbError, DbPool, create_id};
 use crate::playlists::artwork::{
-    COLLAGE_TILE_COUNT, PlaylistArtworkMode, PlaylistArtworkService, RenderedArtwork,
-    load_svg_tile, resolve_artwork_size,
+    COLLAGE_TILE_COUNT, PlaylistArtworkDescriptor, PlaylistArtworkMode, PlaylistArtworkService,
+    RenderedArtwork, describe_on_conn, load_svg_tile, resolve_artwork_size,
 };
+
+const PLAYLIST_LOOKUPS_PER_REQUEST: usize = 12;
+static PLAYLIST_LOOKUP_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+
+pub(crate) struct PlaylistReadTiming {
+    pub database: Duration,
+    pub hydration: Duration,
+}
 
 /// Sharing visibility mode on `playlists.sharing_mode` (Migration 45).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +330,14 @@ impl PlaylistService {
         row: &RawPlaylistRow,
         user: &SessionUser,
     ) -> Result<PlaylistPermissions, PlaylistError> {
+        Self::read_permissions(self.db.inner(), row, user).await
+    }
+
+    async fn read_permissions<'e>(
+        executor: impl Executor<'e, Database = Sqlite>,
+        row: &RawPlaylistRow,
+        user: &SessionUser,
+    ) -> Result<PlaylistPermissions, PlaylistError> {
         let is_owner = row.owner_user_id.as_deref() == Some(user.id.as_str());
         let is_public_legacy = row.owner_user_id.is_none();
 
@@ -344,7 +362,7 @@ impl PlaylistService {
         )
         .bind(&row.id)
         .bind(&user.id)
-        .fetch_optional(self.db.inner())
+        .fetch_optional(executor)
         .await?
         .and_then(|r| r.try_get("role").ok());
 
@@ -439,22 +457,54 @@ impl PlaylistService {
         playlist_id: &str,
         user: &SessionUser,
     ) -> Result<Option<PlaylistRecord>, PlaylistError> {
-        let Some(row) = self.fetch_playlist_row(playlist_id).await? else {
+        Ok(self
+            .get_with_timing(playlist_id, user)
+            .await?
+            .map(|(record, _)| record))
+    }
+
+    pub(crate) async fn get_with_timing(
+        &self,
+        playlist_id: &str,
+        user: &SessionUser,
+    ) -> Result<Option<(PlaylistRecord, PlaylistReadTiming)>, PlaylistError> {
+        let started = Instant::now();
+        let mut tx = self.db.inner().begin().await?;
+        let Some(row) = Self::read_playlist_row(&mut *tx, playlist_id).await? else {
             return Ok(None);
         };
-        let perms = self.permissions_for_row(&row, user).await?;
+        let perms = Self::read_permissions(&mut *tx, &row, user).await?;
         if !perms.can_read {
             return Ok(None);
         }
 
-        let items = self.fetch_item_rows(playlist_id, -1).await?;
-        let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        let tracks = self.hydrate_items(&items).await;
+        let items = Self::read_item_rows(&mut *tx, playlist_id, -1).await?;
+        let sources = Self::read_item_sources(&mut tx, playlist_id).await?;
+        let artwork = describe_on_conn(&mut tx, playlist_id).await?;
+        tx.commit().await?;
+        let database = started.elapsed();
 
-        Ok(Some(
-            self.build_record(row, Some(tracks), Some(item_ids), Some(perms))
-                .await?,
-        ))
+        // The metadata, permissions and occurrence order came from one snapshot.
+        // Let other requests use SQLite while this request waits for providers.
+        let hydration_started = Instant::now();
+        let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let tracks = self.hydrate_items(items, sources).await;
+        let hydration = hydration_started.elapsed();
+
+        Ok(Some((
+            Self::make_record(
+                row,
+                artwork,
+                item_ids.len(),
+                Some(tracks),
+                Some(item_ids),
+                Some(perms),
+            ),
+            PlaylistReadTiming {
+                database,
+                hydration,
+            },
+        )))
     }
 
     /// Creates a new MusicDeck-owned playlist in SQLite.
@@ -1168,9 +1218,16 @@ impl PlaylistService {
         &self,
         playlist_id: &str,
     ) -> Result<Option<RawPlaylistRow>, PlaylistError> {
+        Self::read_playlist_row(self.db.inner(), playlist_id).await
+    }
+
+    async fn read_playlist_row<'e>(
+        executor: impl Executor<'e, Database = Sqlite>,
+        playlist_id: &str,
+    ) -> Result<Option<RawPlaylistRow>, PlaylistError> {
         let row = sqlx::query("SELECT * FROM playlists WHERE id = ? AND deleted_at IS NULL;")
             .bind(playlist_id)
-            .fetch_optional(self.db.inner())
+            .fetch_optional(executor)
             .await?;
 
         row.as_ref().map(map_playlist_row).transpose()
@@ -1178,6 +1235,14 @@ impl PlaylistService {
 
     async fn fetch_item_rows(
         &self,
+        playlist_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RawPlaylistItemRow>, PlaylistError> {
+        Self::read_item_rows(self.db.inner(), playlist_id, limit).await
+    }
+
+    async fn read_item_rows<'e>(
+        executor: impl Executor<'e, Database = Sqlite>,
         playlist_id: &str,
         limit: i64,
     ) -> Result<Vec<RawPlaylistItemRow>, PlaylistError> {
@@ -1193,7 +1258,7 @@ impl PlaylistService {
         )
         .bind(playlist_id)
         .bind(limit)
-        .fetch_all(self.db.inner())
+        .fetch_all(executor)
         .await?;
 
         let mut items = Vec::with_capacity(rows.len());
@@ -1214,95 +1279,123 @@ impl PlaylistService {
         Ok(items)
     }
 
-    async fn hydrate_items(&self, items: &[RawPlaylistItemRow]) -> Vec<PlaylistTrack> {
+    async fn read_item_sources(
+        conn: &mut SqliteConnection,
+        playlist_id: &str,
+    ) -> Result<HashMap<String, Vec<SourceRef>>, PlaylistError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            r"
+            SELECT s.library_item_id, s.connection_id, s.provider_item_id
+            FROM library_item_sources s
+            WHERE s.library_item_id IN (
+                SELECT library_track_id FROM playlist_items
+                WHERE playlist_id = ? AND library_track_id IS NOT NULL
+                  AND CASE WHEN json_valid(external_track_json) THEN json_type(external_track_json) <> 'object' ELSE 1 END
+            )
+            ORDER BY s.created_at ASC;
+            ",
+        )
+        .bind(playlist_id)
+        .fetch_all(conn)
+        .await?;
+        let mut sources = HashMap::<String, Vec<SourceRef>>::new();
+        for (id, connection_id, provider_item_id) in rows {
+            sources.entry(id).or_default().push(SourceRef {
+                connection_id,
+                provider_item_id,
+            });
+        }
+        Ok(sources)
+    }
+
+    async fn hydrate_items(
+        &self,
+        items: Vec<RawPlaylistItemRow>,
+        sources: HashMap<String, Vec<SourceRef>>,
+    ) -> Vec<PlaylistTrack> {
+        let resolved = stream::iter(sources)
+            .map(|(id, mappings)| async move {
+                self.hydrate_library_track(&id, &mappings)
+                    .await
+                    .map(|track| (id, track))
+            })
+            .buffer_unordered(PLAYLIST_LOOKUPS_PER_REQUEST)
+            .filter_map(std::future::ready)
+            .collect::<HashMap<_, _>>()
+            .await;
         let mut hydrated = Vec::with_capacity(items.len());
-        let mut resolved_cache: HashMap<String, Value> = HashMap::new();
 
         for item in items {
+            let external = item
+                .external_track_json
+                .as_deref()
+                .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+                .filter(Value::is_object);
+            let track = if let Some(external) = external {
+                external
+            } else if let Some(id) = item.library_track_id.as_deref() {
+                let Some(track) = resolved.get(id) else {
+                    continue;
+                };
+                track.clone()
+            } else {
+                json!({
+                    "id": item.provider_track_id,
+                    "providerId": item.provider_track_id,
+                    "connectionId": item.connection_id,
+                })
+            };
             let added_by = item.added_by_user_id.as_ref().map(|uid| TrackAddedByUser {
                 id: uid.clone(),
                 display_name: item
                     .added_by_name
-                    .clone()
                     .unwrap_or_else(|| String::from("Former member")),
                 avatar_url: avatar_url_for(uid, item.added_by_avatar.as_deref()),
             });
-
-            if let Some(ref ext_json) = item.external_track_json
-                && let Ok(parsed) = serde_json::from_str::<Value>(ext_json)
-            {
-                hydrated.push(PlaylistTrack {
-                    playlist_item_id: item.id.clone(),
-                    playlist_added_at: item.created_at.clone(),
-                    added_by_user_id: item.added_by_user_id.clone(),
-                    added_by,
-                    track: parsed,
-                });
-                continue;
-            }
-
-            let cache_key = item.library_track_id.clone().unwrap_or_else(|| {
-                format!("{}:{}", item.connection_id, item.provider_track_id)
+            hydrated.push(PlaylistTrack {
+                playlist_item_id: item.id,
+                playlist_added_at: item.created_at,
+                added_by_user_id: item.added_by_user_id,
+                added_by,
+                track,
             });
-
-            if let Some(cached_val) = resolved_cache.get(&cache_key) {
-                hydrated.push(PlaylistTrack {
-                    playlist_item_id: item.id.clone(),
-                    playlist_added_at: item.created_at.clone(),
-                    added_by_user_id: item.added_by_user_id.clone(),
-                    added_by,
-                    track: cached_val.clone(),
-                });
-                continue;
-            }
-
-            if let Some(ref lib_id) = item.library_track_id {
-                let candidates = self.resolver.candidate_sources(lib_id, None).await;
-                let mut found_val = None;
-                for candidate in candidates {
-                    if let Ok(Some(track)) = candidate
-                        .provider
-                        .provider
-                        .get_track(&candidate.source.provider_item_id)
-                        .await
-                        && let Ok(stamped) = self
-                            .catalog
-                            .stamp_track(track, &candidate.source.connection_id)
-                            .await
-                        && let Ok(val) = serde_json::to_value(&stamped)
-                    {
-                        found_val = Some(val);
-                        break;
-                    }
-                }
-                if let Some(val) = found_val {
-                    resolved_cache.insert(cache_key, val.clone());
-                    hydrated.push(PlaylistTrack {
-                        playlist_item_id: item.id.clone(),
-                        playlist_added_at: item.created_at.clone(),
-                        added_by_user_id: item.added_by_user_id.clone(),
-                        added_by,
-                        track: val,
-                    });
-                }
-            } else {
-                let fallback = json!({
-                    "id": item.provider_track_id,
-                    "providerId": item.provider_track_id,
-                    "connectionId": item.connection_id,
-                });
-                resolved_cache.insert(cache_key, fallback.clone());
-                hydrated.push(PlaylistTrack {
-                    playlist_item_id: item.id.clone(),
-                    playlist_added_at: item.created_at.clone(),
-                    added_by_user_id: item.added_by_user_id.clone(),
-                    added_by,
-                    track: fallback,
-                });
-            }
         }
 
         hydrated
+    }
+
+    async fn hydrate_library_track(&self, id: &str, mappings: &[SourceRef]) -> Option<Value> {
+        let candidates = self
+            .resolver
+            .candidates_for_sources(mappings.iter().cloned(), None);
+        if candidates.is_empty() {
+            return None;
+        }
+        let _slot = PLAYLIST_LOOKUP_SLOTS.acquire().await.ok()?;
+        for candidate in candidates {
+            let source = candidate.source;
+            let Ok(Some(track)) = candidate
+                .provider
+                .provider
+                .get_track(&source.provider_item_id)
+                .await
+            else {
+                continue;
+            };
+            let stamped = if track.provider_id == source.provider_item_id {
+                self.catalog
+                    .stamp_mapped_track(track, &source.connection_id, id, mappings)
+                    .await
+            } else {
+                self.catalog.stamp_track(track, &source.connection_id).await
+            };
+            if let Ok(stamped) = stamped
+                && let Ok(track) = serde_json::to_value(stamped)
+            {
+                return Some(track);
+            }
+        }
+        None
     }
 
     async fn build_record(
@@ -1328,7 +1421,25 @@ impl PlaylistService {
             usize::try_from(n).unwrap_or(0)
         };
 
-        Ok(PlaylistRecord {
+        Ok(Self::make_record(
+            row,
+            art_desc,
+            song_count,
+            tracks,
+            item_ids,
+            permissions,
+        ))
+    }
+
+    fn make_record(
+        row: RawPlaylistRow,
+        art_desc: PlaylistArtworkDescriptor,
+        song_count: usize,
+        tracks: Option<Vec<PlaylistTrack>>,
+        item_ids: Option<Vec<String>>,
+        permissions: Option<PlaylistPermissions>,
+    ) -> PlaylistRecord {
+        PlaylistRecord {
             provider_id: row
                 .source_playlist_id
                 .clone()
@@ -1349,7 +1460,7 @@ impl PlaylistService {
             permissions,
             item_ids,
             tracks,
-        })
+        }
     }
 
     async fn primary_connection_id(&self) -> Result<Option<String>, PlaylistError> {

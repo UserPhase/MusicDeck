@@ -6,12 +6,16 @@ import { autoDownloadPolicies } from "../services/storage/AutoDownloadPolicyMana
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
 import { getAcquisitions } from "../api/musicdeck";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 
 jest.mock("../context/AuthContext", () => ({ useAuth: jest.fn() }));
 jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
 jest.mock("../api/playlists", () => ({ getPlaylists: async () => [{ id: "p", name: "Road trip" }] }));
 jest.mock("../api/musicdeck", () => ({ getAcquisitions: jest.fn() }));
-jest.mock("../components/TrackRow", () => ({ __esModule: true, default: ({ song, onPlay, action }: any) => <div><button onClick={onPlay}>Play {song.title}</button>{action}</div> }));
+jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn(() => false) }));
+jest.mock("../components/TrackRow", () => ({ __esModule: true, default: ({ song, onPlay, action, menuAction }: any) =>
+  <div><button onClick={onPlay}>Play {song.title}</button>{action}
+    {menuAction && <div data-testid="track-actions">{menuAction(jest.fn())}</div>}</div> }));
 jest.mock("../services/storage/OfflineDownloadEngine", () => ({
   messageOf: (error: Error) => error.message, storageBoundary: jest.fn(),
   offlineDownloadEngine: { subscribe: () => () => {}, getSnapshot: jest.fn(), readVerifiedTrack: jest.fn(), verifyIntegrity: jest.fn(), purgeDownloadedTrack: jest.fn() },
@@ -68,6 +72,23 @@ test("does not make an unreadable manifest entry playable", async () => {
   await screen.findByText("Take your music with you");
   expect(screen.getByRole("button", { name: "Play downloads" })).toBeDisabled();
   expect(screen.queryByRole("button", { name: "Play Saved song" })).not.toBeInTheDocument();
+});
+test("mobile downloads remove a verified track through its track actions and confirmation", async () => {
+  (useMediaQuery as jest.Mock).mockReturnValue(true);
+  try {
+    mount();
+    await screen.findByRole("button", { name: "Play Saved song" });
+    expect(screen.getByRole("table", { name: "Verified offline tracks" })).toHaveClass("track-list--mobile");
+    const remove = screen.getByRole("menuitem", { name: "Remove download" });
+    expect(screen.getByTestId("track-actions")).toContainElement(remove);
+    fireEvent.click(remove);
+    expect(engine.purgeDownloadedTrack).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Remove download" }));
+    expect(engine.purgeDownloadedTrack).toHaveBeenCalledWith("one");
+    await screen.findByText("Offline audio removed.");
+  } finally {
+    (useMediaQuery as jest.Mock).mockReturnValue(false);
+  }
 });
 test("keeps partial saved playlist membership visible without a server request", async () => {
   mount(); await screen.findByRole("button", { name: "Play Saved song" });

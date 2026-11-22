@@ -17,6 +17,7 @@ import { usePrivacy } from "../context/PrivacyContext";
 import { useLikedAlbums } from "../hooks/useLikedAlbums";
 import { DiscoveryArtwork } from "./DiscoveryCards";
 import { useSmartPlaylists } from "../hooks/useSmartPlaylists";
+import { useVisualViewportBounds } from "../hooks/useVisualViewportBounds";
 import SmartPlaylistBuilder from "./SmartPlaylistBuilder";
 
 const navigation = [
@@ -139,6 +140,8 @@ function Sidebar({ id }) {
   const [notice, setNotice] = useState(null);
   const triggerRef = useRef(null);
   const modalRef = useRef(null);
+  const modalBackdropRef = useRef(null);
+  useVisualViewportBounds(modalBackdropRef, Boolean(modalStep && modalStep !== "advanced-mix"));
   const handledImportRef = useRef(null);
   const lastOpenTokenRef = useRef(openProgressToken);
 
@@ -408,7 +411,7 @@ function Sidebar({ id }) {
       </section>
       {modalStep === "advanced-mix" && <MixBuilderModal open onClose={closeModal} />}
       {modalStep && modalStep !== "advanced-mix" && createPortal(
-        <div className="playlist-modal-backdrop" onMouseDown={(event) => {
+        <div ref={modalBackdropRef} className="playlist-modal-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) closeModal();
         }}>
           <section className={`playlist-modal${modalStep === "smart" ? " playlist-modal--smart" : ""}`} role="dialog" aria-modal="true" aria-labelledby="playlist-modal-title" ref={modalRef} tabIndex={-1}>
@@ -421,7 +424,7 @@ function Sidebar({ id }) {
             </div>
 
             {modalStep === "choose" ? (
-              <>
+              <div className="playlist-modal-body">
                 <p className="playlist-modal-intro">Choose how you'd like to get started.</p>
                 <div className="playlist-modal-options">
                   <button type="button" className="playlist-modal-option" onClick={() => setModalStep("blank")} autoFocus>
@@ -442,23 +445,25 @@ function Sidebar({ id }) {
                     <span className="playlist-modal-option-arrow" aria-hidden="true">↗</span>
                   </button>}
                 </div>
-              </>
-            ) : modalStep === "smart" ? <>
+              </div>
+            ) : modalStep === "smart" ? <div className="playlist-modal-body">
               <button type="button" className="playlist-modal-back" disabled={busy} onClick={() => setModalStep("choose")}>Back</button>
               <button type="button" className="playlist-modal-back" disabled={busy} onClick={() => setModalStep("advanced-mix")}>Advanced mix</button>
               <SmartPlaylistBuilder onBusyChange={setBusy} onSaved={(playlist, kind) => {
                 setModalStep(null); setBusy(false); triggerRef.current?.focus();
                 navigate(`/${kind === "playlist" ? "playlist" : "smart-playlist"}/${encodeURIComponent(playlist.id)}`);
               }} />
-            </> : modalStep === "import" && !canImport ? (
-              <p className="playlist-modal-intro" role="status">Spotify imports are disabled by server privacy policy.</p>
+            </div> : modalStep === "import" && !canImport ? (
+              <div className="playlist-modal-body"><p className="playlist-modal-intro" role="status">Spotify imports are disabled by server privacy policy.</p></div>
             ) : modalStep === "blank" ? (
               <form className="playlist-modal-form" onSubmit={handleCreatePlaylist}>
-                <label htmlFor="new-playlist-name">Playlist name <span aria-hidden="true">*</span></label>
-                <input id="new-playlist-name" value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="Give it a name" maxLength={200} autoFocus required />
-                <label htmlFor="new-playlist-description">Description <span className="playlist-modal-optional">Optional</span></label>
-                <textarea id="new-playlist-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What belongs in this playlist?" rows={3} maxLength={1000} />
-                {formError && <p className="playlist-modal-error" role="alert">{formError}</p>}
+                <div className="playlist-modal-fields">
+                  <label htmlFor="new-playlist-name">Playlist name <span aria-hidden="true">*</span></label>
+                  <input id="new-playlist-name" value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="Give it a name" maxLength={200} autoFocus required />
+                  <label htmlFor="new-playlist-description">Description <span className="playlist-modal-optional">Optional</span></label>
+                  <textarea id="new-playlist-description" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What belongs in this playlist?" rows={3} maxLength={1000} />
+                  {formError && <p className="playlist-modal-error" role="alert">{formError}</p>}
+                </div>
                 <div className="playlist-modal-actions">
                   <button type="button" className="playlist-modal-back" onClick={() => setModalStep("choose")} disabled={busy}>Back</button>
                   <button type="submit" className="playlist-modal-submit" disabled={busy}>{busy ? "Creating…" : "Create"}</button>
@@ -466,16 +471,18 @@ function Sidebar({ id }) {
               </form>
             ) : modalStep === "progress" ? (
               <div className="playlist-import-progress" role="status" aria-live="polite">
-                <p className="playlist-modal-intro">{importJob?.playlistName || "Your Spotify playlist"}</p>
-                <div className="playlist-import-counter">
-                  {importJob?.stage === "scanning" ? "Scanning and adding tracks to your library..." : importJob?.expectedCount
-                    ? `Downloading track ${importJob.currentTrack || Math.min((importJob.downloadedCount || 0) + 1, importJob.expectedCount)} of ${importJob.expectedCount}`
-                    : importJob?.downloadedCount ? `Downloading track ${importJob.currentTrack || importJob.downloadedCount + 1}`
-                    : importJob?.stage === "queued" ? "Waiting to start download..." : "Fetching playlist details and queueing download..."}
-                </div>
-                <div className="playlist-import-track">{importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}` : importJob?.stage === "scanning" ? "Adding downloaded tracks to your library..." : "Preparing tracks..."}</div>
-                <div className={`playlist-import-bar${!importJob?.expectedCount ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={importJob?.expectedCount || undefined} aria-valuenow={importJob?.expectedCount ? Math.min(importJob.downloadedCount || 0, importJob.expectedCount) : undefined}>
-                  <span style={{ width: importJob?.expectedCount ? `${Math.min(100, 100 * (importJob.downloadedCount || 0) / importJob.expectedCount)}%` : "35%" }} />
+                <div className="playlist-modal-fields">
+                  <p className="playlist-modal-intro">{importJob?.playlistName || "Your Spotify playlist"}</p>
+                  <div className="playlist-import-counter">
+                    {importJob?.stage === "scanning" ? "Scanning and adding tracks to your library..." : importJob?.expectedCount
+                      ? `Downloading track ${importJob.currentTrack || Math.min((importJob.downloadedCount || 0) + 1, importJob.expectedCount)} of ${importJob.expectedCount}`
+                      : importJob?.downloadedCount ? `Downloading track ${importJob.currentTrack || importJob.downloadedCount + 1}`
+                      : importJob?.stage === "queued" ? "Waiting to start download..." : "Fetching playlist details and queueing download..."}
+                  </div>
+                  <div className="playlist-import-track">{importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}` : importJob?.stage === "scanning" ? "Adding downloaded tracks to your library..." : "Preparing tracks..."}</div>
+                  <div className={`playlist-import-bar${!importJob?.expectedCount ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={importJob?.expectedCount || undefined} aria-valuenow={importJob?.expectedCount ? Math.min(importJob.downloadedCount || 0, importJob.expectedCount) : undefined}>
+                    <span style={{ width: importJob?.expectedCount ? `${Math.min(100, 100 * (importJob.downloadedCount || 0) / importJob.expectedCount)}%` : "35%" }} />
+                  </div>
                 </div>
                 <div className="playlist-modal-actions">
                   <button type="button" className="playlist-modal-submit" onClick={closeModal}>Run in Background</button>
@@ -483,27 +490,29 @@ function Sidebar({ id }) {
               </div>
             ) : (
               <form className="playlist-modal-form" onSubmit={handleImportPlaylist} noValidate>
-                <p className="playlist-modal-intro">Paste a public Spotify playlist link. MusicDeck will download its songs and add the playlist to your library.</p>
-                <label htmlFor="spotify-playlist-url">Spotify playlist URL</label>
-                <input id="spotify-playlist-url" type="url" value={playlistUrl} onChange={(event) => { setPlaylistUrl(event.target.value); setFormError(""); }} placeholder="https://open.spotify.com/playlist/..." aria-invalid={Boolean(formError)} aria-describedby={formError ? "spotify-url-error" : undefined} autoFocus disabled={busy} />
-                {formError && <p id="spotify-url-error" className="playlist-modal-error" role="alert">{formError}</p>}
-                <label htmlFor="spotify-import-timeout-mode">Download timeout</label>
-                <select id="spotify-import-timeout-mode" value={timeoutMode} onChange={(event) => { setTimeoutMode(event.target.value); setTimeoutError(""); }} aria-describedby="spotify-import-timeout-help" disabled={busy}>
-                  <option value="auto">Auto</option>
-                  <option value="manual">Manual</option>
-                </select>
-                <p id="spotify-import-timeout-help" className="playlist-modal-help">
-                  {timeoutMode === "auto"
-                    ? "Adapts to playlist size, past imports, and download progress. No fixed time limit."
-                    : "Choose a limit from 1 to 120 minutes."}
-                  {" A stalled download stops within 15 minutes."}
-                </p>
-                {timeoutMode === "manual" && <>
-                  <label htmlFor="spotify-import-timeout-minutes">Maximum download time (minutes)</label>
-                  <input id="spotify-import-timeout-minutes" type="number" min="1" max="120" step="1" required value={timeoutMinutes} onChange={(event) => { setTimeoutMinutes(event.target.value); setTimeoutError(""); }} aria-invalid={Boolean(timeoutError)} aria-describedby={timeoutError ? "spotify-import-timeout-error" : undefined} disabled={busy} />
-                  {timeoutError && <p id="spotify-import-timeout-error" className="playlist-modal-error" role="alert">{timeoutError}</p>}
-                </>}
-                {busy && <p className="playlist-modal-progress" role="status"><span className="playlist-modal-spinner" aria-hidden="true" />Fetching playlist details and queueing download...</p>}
+                <div className="playlist-modal-fields">
+                  <p className="playlist-modal-intro">Paste a public Spotify playlist link. MusicDeck will download its songs and add the playlist to your library.</p>
+                  <label htmlFor="spotify-playlist-url">Spotify playlist URL</label>
+                  <input id="spotify-playlist-url" type="url" value={playlistUrl} onChange={(event) => { setPlaylistUrl(event.target.value); setFormError(""); }} placeholder="https://open.spotify.com/playlist/..." aria-invalid={Boolean(formError)} aria-describedby={formError ? "spotify-url-error" : undefined} autoFocus disabled={busy} />
+                  {formError && <p id="spotify-url-error" className="playlist-modal-error" role="alert">{formError}</p>}
+                  <label htmlFor="spotify-import-timeout-mode">Download timeout</label>
+                  <select id="spotify-import-timeout-mode" value={timeoutMode} onChange={(event) => { setTimeoutMode(event.target.value); setTimeoutError(""); }} aria-describedby="spotify-import-timeout-help" disabled={busy}>
+                    <option value="auto">Auto</option>
+                    <option value="manual">Manual</option>
+                  </select>
+                  <p id="spotify-import-timeout-help" className="playlist-modal-help">
+                    {timeoutMode === "auto"
+                      ? "Adapts to playlist size, past imports, and download progress. No fixed time limit."
+                      : "Choose a limit from 1 to 120 minutes."}
+                    {" A stalled download stops within 15 minutes."}
+                  </p>
+                  {timeoutMode === "manual" && <>
+                    <label htmlFor="spotify-import-timeout-minutes">Maximum download time (minutes)</label>
+                    <input id="spotify-import-timeout-minutes" type="number" min="1" max="120" step="1" required value={timeoutMinutes} onChange={(event) => { setTimeoutMinutes(event.target.value); setTimeoutError(""); }} aria-invalid={Boolean(timeoutError)} aria-describedby={timeoutError ? "spotify-import-timeout-error" : undefined} disabled={busy} />
+                    {timeoutError && <p id="spotify-import-timeout-error" className="playlist-modal-error" role="alert">{timeoutError}</p>}
+                  </>}
+                  {busy && <p className="playlist-modal-progress" role="status"><span className="playlist-modal-spinner" aria-hidden="true" />Fetching playlist details and queueing download...</p>}
+                </div>
                 <div className="playlist-modal-actions">
                   <button type="button" className="playlist-modal-back" onClick={() => setModalStep("choose")} disabled={busy}>Back</button>
                   <button type="submit" className="playlist-modal-submit" disabled={busy}>{busy ? "Importing…" : "Import & Download"}</button>

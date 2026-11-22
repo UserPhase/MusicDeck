@@ -19,6 +19,7 @@
 //! - `DELETE /api/playlists/:playlist_id/artwork`: Clears custom artwork (`reverts to collage`).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::error::ApiJson;
 use axum::Json;
@@ -29,14 +30,16 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, X_CONTENT_TYPE_OPTIO
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::CompressionLevel;
+use tower_http::compression::CompressionLayer;
 
 use crate::auth::AuthenticatedUser;
 use crate::catalog::{CatalogService, LibraryService, SourceResolver};
 use crate::error::{ApiErrorBody, ApiErrorEnvelope};
 use crate::playlists::{
-    MAX_ARTWORK_REQUEST_BYTES, PlaylistBatchEdit, PlaylistError, PlaylistService,
+    MAX_ARTWORK_REQUEST_BYTES, PlaylistBatchEdit, PlaylistError, PlaylistRecord, PlaylistService,
     PlaylistUpdatePayload, parse_image_data_url,
 };
 use crate::state::AppState;
@@ -74,6 +77,11 @@ struct ArtworkUploadBody {
     image: String,
 }
 
+#[derive(Serialize)]
+struct PlaylistDetailResponse {
+    playlist: PlaylistRecord,
+}
+
 /// Mounts all `/api/playlists` and `/api/v1/playlists` routes.
 pub fn playlist_routes() -> Router<AppState> {
     let artwork_upload_route = Router::new()
@@ -95,6 +103,7 @@ pub fn playlist_routes() -> Router<AppState> {
         .route(
             "/api/playlists/:playlist_id",
             get(get_playlist_handler)
+                .layer(CompressionLayer::new().quality(CompressionLevel::Fastest))
                 .patch(patch_playlist_handler)
                 .delete(delete_playlist_handler),
         )
@@ -258,8 +267,22 @@ async fn get_playlist_handler(
         Err(res) => return res,
     };
 
-    match service.get(&playlist_id, &auth.user).await {
-        Ok(Some(playlist)) => Json(json!({ "playlist": playlist })).into_response(),
+    match service.get_with_timing(&playlist_id, &auth.user).await {
+        Ok(Some((playlist, timing))) => {
+            let started = Instant::now();
+            let mut response = Json(PlaylistDetailResponse { playlist }).into_response();
+            let millis = |elapsed: Duration| elapsed.as_secs_f64() * 1000.0;
+            let header = format!(
+                "playlist_db;dur={:.2}, playlist_hydrate;dur={:.2}, playlist_json;dur={:.2}",
+                millis(timing.database),
+                millis(timing.hydration),
+                millis(started.elapsed())
+            );
+            if let Ok(value) = HeaderValue::from_str(&header) {
+                response.headers_mut().insert("server-timing", value);
+            }
+            response
+        }
         Ok(None) => send_error_response(StatusCode::NOT_FOUND, "Playlist not found", "NOT_FOUND"),
         Err(err) => map_playlist_error(err),
     }

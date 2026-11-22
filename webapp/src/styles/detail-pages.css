@@ -86,6 +86,24 @@
 .playlist-cover-editable:hover .playlist-cover-overlay,
 .playlist-cover-editable:focus-visible .playlist-cover-overlay,
 .playlist-cover-editable[aria-busy="true"] .playlist-cover-overlay { opacity: 1; }
+.playlist-cover-mobile { position: relative; }
+.playlist-cover-camera {
+  position: absolute;
+  inset: auto 4px 4px auto;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid #ffffff40;
+  border-radius: 10px;
+  background: rgb(18 15 25 / 92%);
+  color: #fff;
+}
+.playlist-cover-camera:focus-visible { outline: var(--focus-ring); outline-offset: -3px; }
+:root[data-layout-shell="mobile"] :is(.playlist-details-dialog, .playlist-share-dialog, .playlist-options-menu) button {
+  min-width: 44px;
+  min-height: 44px;
+}
 .playlist-cover-input, .visually-hidden-input { position: absolute; width: 1px; height: 1px; padding: 0; margin: calc(-1 * var(--space-1)); overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .playlist-cover-error { max-width: 230px; margin-top: var(--space-2); font-size: 12px; }
 .album-page-info, .playlist-page-info, .artist-page-info { min-width: 0; }
@@ -120,6 +138,7 @@
 .playlist-description { max-width: 500px; margin: var(--space-3) 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
 .playlist-details-backdrop { position: fixed; z-index: 5000; inset: 0; display: grid; place-items: center; padding: var(--space-5); background: rgb(0 0 0 / 68%); backdrop-filter: blur(8px); }
 .playlist-details-dialog { display: grid; gap: var(--space-2); width: min(42rem, 100%); max-height: calc(100vh - 2.5rem); overflow-y: auto; padding: var(--space-6); border: 1px solid rgb(168 85 247 / 22%); border-radius: 1rem; background: rgb(var(--dialog-rgb) / 96%); color: var(--text); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 55%); }
+.playlist-details-content { display: contents; }
 .playlist-details-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-3); }
 .playlist-details-eyebrow { margin: 0; color: var(--accent-text); font-size: .65rem; font-weight: 800; letter-spacing: .13em; }
 .playlist-details-heading h2 { margin: var(--space-2) 0 0; font-size: 1.45rem; font-weight: var(--weight-bold); line-height: 1.2; }

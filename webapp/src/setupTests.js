@@ -14,3 +14,8 @@ global.TextEncoder = TextEncoder;
 
 HTMLMediaElement.prototype.pause = jest.fn();
 HTMLMediaElement.prototype.load = jest.fn();
+
+if (!HTMLDialogElement.prototype.showModal) {
+	HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
+	HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
+}

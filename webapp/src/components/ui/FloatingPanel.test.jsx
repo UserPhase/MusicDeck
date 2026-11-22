@@ -59,3 +59,27 @@ test("clamps a panel anchored beyond the viewport and cleans up positioning list
   rect.mockRestore();
   remove.mockRestore();
 });
+
+test("recalculates anchored menu bounds when the visual viewport shrinks and pans", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(window, "visualViewport");
+  const viewport = Object.assign(new EventTarget(), { width: 400, height: 500, offsetLeft: 20, offsetTop: 80 });
+  Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+  const rect = jest.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+    left: 500, right: 540, top: 650, bottom: 694, width: 40, height: 44,
+  });
+  try {
+    render(<Example />);
+    fireEvent.click(screen.getByText("Open"));
+    const menu = screen.getByRole("menu");
+    expect(menu.style.top).toBe("568px");
+    expect(menu.style.left).toBe("408px");
+    Object.assign(viewport, { height: 255, offsetTop: 110 });
+    fireEvent(viewport, new Event("resize"));
+    expect(menu.style.top).toBe("353px");
+    expect(menu.style.maxHeight).toBe("231px");
+  } finally {
+    rect.mockRestore();
+    if (descriptor) Object.defineProperty(window, "visualViewport", descriptor);
+    else delete window.visualViewport;
+  }
+});

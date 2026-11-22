@@ -96,6 +96,68 @@
   padding-inline: .65rem;
 }
 .lyrics-reader .right-sidebar-lyrics-plain { padding-block: 1.3rem; text-align: center; }
+.lyrics-preview {
+  display: grid;
+  align-content: start;
+  min-height: 66px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 22px;
+  overflow-wrap: anywhere;
+}
+.lyrics-preview-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lyrics-preview-line[aria-current] { color: var(--text); font-weight: 700; }
+.lyrics-preview-excerpt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: pre-line;
+  overflow: hidden;
+}
+.lyrics-reader--mobile .lyrics-reader-surface { grid-template-rows: auto minmax(0, 1fr) auto; gap: 8px; }
+.lyrics-reader--mobile .lyrics-reader-heading > div { min-width: 0; }
+.lyrics-reader--mobile .lyrics-reader-heading :is(h2, p) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lyrics-reader--mobile .lyrics-reader-heading button {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  background: var(--player-gradient-control-bg);
+  color: var(--player-gradient-control-text);
+}
+.lyrics-reader--mobile .lyrics-scroll { overflow-y: auto; overscroll-behavior: contain; }
+.lyrics-reader--mobile .right-sidebar-lyric-line.is-active { transform: none; }
+.lyrics-reader-notice { padding: 8px; }
+.lyrics-reader-controls {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  color: var(--player-gradient-control-text);
+}
+.lyrics-reader-controls .play-button {
+  width: 44px;
+  height: 44px;
+  background: var(--player-gradient-control-text);
+  color: var(--player-gradient-control-bg);
+}
+.lyrics-reader-controls .play-button svg { width: 20px; height: 20px; }
+.lyrics-reader-controls .progress {
+  height: 44px;
+  accent-color: #faf6ff;
+  background: transparent;
+  touch-action: pan-y;
+}
+.lyrics-reader-controls .progress::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 4px;
+  background: linear-gradient(to right, #faf6ff var(--range-progress, 0%), #b6a8c7 0);
+}
+.lyrics-reader-controls .progress::-webkit-slider-thumb { margin-top: -5px; }
+.lyrics-reader-controls .time { width: auto; color: inherit; font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) {
   .lyrics-scroll .right-sidebar-lyric-line { transition: none; }
 }
