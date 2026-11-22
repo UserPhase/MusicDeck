@@ -29,7 +29,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{ConnectOptions, Connection, Row, SqlitePool};
 use thiserror::Error;
 
 pub use migrations::{
@@ -343,21 +343,32 @@ impl DbPool {
         Ok(row.try_get(0)?)
     }
 
-    /// Performs a `PRAGMA wal_checkpoint(TRUNCATE);` and closes all pooled connections,
-    /// matching `closeRuntimeDatabase()` in `server/src/main.ts`.
+    /// Drains the pool, then truncates the WAL on a dedicated connection for file-backed databases.
+    /// The pool stays closed if the checkpoint fails.
     pub async fn checkpoint_and_close(&self) -> Result<(), DbError> {
-        if self.database_path.is_some() {
-            let rows = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
-                .fetch_all(&self.pool)
-                .await?;
-            for row in rows {
-                let busy: i64 = row.try_get(0).unwrap_or(0);
-                if busy != 0 {
-                    return Err(DbError::CheckpointBusy);
-                }
-            }
-        }
         self.pool.close().await;
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+
+        // Reuse the pool's connection pragmas and busy timeout without creating a new database.
+        protect_database_file(path)?;
+        let mut connection = self
+            .pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .create_if_missing(false)
+            .connect()
+            .await?;
+        let checkpoint = sqlx::query_scalar::<_, i64>("PRAGMA main.wal_checkpoint(TRUNCATE);")
+            .fetch_one(&mut connection)
+            .await;
+        let close = connection.close().await;
+        if checkpoint? != 0 {
+            return Err(DbError::CheckpointBusy);
+        }
+        close?;
         Ok(())
     }
 
@@ -428,6 +439,78 @@ mod tests {
         reopened.close().await;
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_close_drains_a_checked_out_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DbPool::connect_with_options(
+            &temp.path().join("data/musicdeck.sqlite"),
+            DbPoolOptions {
+                max_connections: 1,
+                ..DbPoolOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let reader = db.inner().begin().await.unwrap();
+        let release = async {
+            db.inner().close_event().await;
+            reader.rollback().await.map_err(DbError::from)
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(db.checkpoint_and_close(), release)
+        })
+        .await
+        .expect("shutdown must start before waiting for a free connection")
+        .expect("checkpoint after draining the pool");
+        assert!(db.inner().is_closed());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_close_reports_busy_for_a_reader_outside_the_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data/musicdeck.sqlite");
+        let db = DbPool::connect_with_options(
+            &path,
+            DbPoolOptions {
+                busy_timeout_ms: 50,
+                ..DbPoolOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE fixture (value INTEGER);")
+            .execute(db.inner())
+            .await
+            .unwrap();
+
+        let mut connection = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .unwrap();
+        let mut reader = connection.begin().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture;")
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("INSERT INTO fixture VALUES (1);")
+            .execute(db.inner())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.checkpoint_and_close().await,
+            Err(DbError::CheckpointBusy)
+        ));
+        assert!(db.inner().is_closed());
+
+        reader.rollback().await.unwrap();
+        connection.close().await.unwrap();
+        db.checkpoint_and_close().await.unwrap();
     }
 
     #[tokio::test]
