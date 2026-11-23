@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useId } from "react";
 import { createAcquisition, getAcquisition, retryAcquisition } from "../api/musicdeck";
 import { acquisitionPayload } from "../services/externalActions";
 import { usePrivacy } from "../context/PrivacyContext";
 import { startVisualPolling } from "../services/visualActivity";
+import { downloadPhaseLabels } from "../services/downloadStatus";
 
 function ServerIcon() {
   return (
@@ -32,7 +33,10 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
   const { canImport } = usePrivacy();
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(null);
+  const [phase, setPhase] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
+  const errorId = useId();
+  const [statusRetrying, setStatusRetrying] = useState(false);
   const stopPollingRef = useRef(null);
   const jobRef = useRef(null);
   const isMountedRef = useRef(true);
@@ -50,7 +54,9 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
     stopPollingRef.current?.();
     setStatus("idle");
     setProgress(null);
+    setPhase(null);
     setErrorMessage(null);
+    setStatusRetrying(false);
   }, [song?.id]);
 
   if (!song) {
@@ -96,8 +102,10 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
       setStatus("queued");
       setErrorMessage(null);
       setProgress(null);
+      setPhase(null);
+      setStatusRetrying(false);
 
-      const res = status === "failed" && jobRef.current
+      const res = (status === "failed" || status === "partial") && jobRef.current
         ? await retryAcquisition(jobRef.current)
         : await createAcquisition(acquisitionPayload("track", {
           ...song,
@@ -114,41 +122,61 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
       setStatus(res.job?.status || res.status || "downloading");
 
       const jobId = res.jobId || res.job?.id;
-      if (!jobId) return;
+      if (!jobId) throw new Error("The server did not confirm the download. Check Server downloads before trying again.");
       jobRef.current = jobId;
 
       stopPollingRef.current?.();
       let inFlight = false;
-      const stopPolling = startVisualPolling(async () => {
-        if (inFlight) return;
+      let failures = 0;
+      let retryAt = 0;
+      const controller = new AbortController();
+      const stopPolling = () => {
+        controller.abort();
+        stopVisualPolling();
+      };
+      const stopVisualPolling = startVisualPolling(async () => {
+        if (inFlight || Date.now() < retryAt) return;
         inFlight = true;
         try {
-          const job = await getAcquisition(jobId);
-          if (!isMountedRef.current || stopPollingRef.current !== stopPolling) return;
+          const job = await getAcquisition(jobId, controller.signal);
+          if (controller.signal.aborted || !isMountedRef.current || stopPollingRef.current !== stopPolling) return;
+          if (!job?.status) throw new Error("Missing download status");
 
-          if (job) {
-            setStatus(job.status);
-            if (job.progress?.percent !== undefined) {
-              setProgress(job.progress.percent);
-            }
-
-            if (job.status === "completed") {
-              stopPolling();
-              setStatus("completed");
-            } else if (job.status === "partial") {
-              stopPolling();
-              setErrorMessage(job.errorMessage || "Part of the download was imported");
-            } else if (job.status === "failed") {
-              stopPolling();
-              setStatus("failed");
-              setErrorMessage(job.errorMessage || "Download failed");
-            } else if (job.status === "cancelled") {
-              stopPolling();
-              setStatus("idle");
-            }
+          failures = 0;
+          retryAt = 0;
+          setStatusRetrying(false);
+          setStatus(job.status);
+          setPhase(job.stage || job.progress?.stage);
+          if (job.progress?.percent !== undefined) {
+            setProgress(job.progress.percent);
           }
-        } catch {
-          stopPolling();
+
+          if (job.status === "completed") {
+            stopPolling();
+          } else if (job.status === "partial") {
+            stopPolling();
+            setErrorMessage(job.errorMessage || "Part of the download was imported");
+          } else if (job.status === "failed") {
+            stopPolling();
+            setErrorMessage(job.errorMessage || "Download failed");
+          } else if (job.status === "cancelled") {
+            stopPolling();
+            jobRef.current = null;
+            setStatus("idle");
+          }
+        } catch (error) {
+          if (controller.signal.aborted || !isMountedRef.current || stopPollingRef.current !== stopPolling) return;
+          if ([401, 403, 404].includes(error.status)) {
+            stopPolling();
+            jobRef.current = null;
+            setStatus("failed");
+            setStatusRetrying(false);
+            setErrorMessage("This download is no longer available.");
+          } else {
+            failures += 1;
+            retryAt = Date.now() + Math.min(10000, 1000 * 2 ** (failures - 1));
+            setStatusRetrying(true);
+          }
         } finally {
           inFlight = false;
         }
@@ -166,18 +194,23 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
   let label = `Download ${titleText} with spotDL`;
   let titleAttr = "Download with spotDL";
 
-  if (status === "queued") {
+  if (statusRetrying) {
+    label = `Reconnecting to check the download for ${titleText}`;
+    titleAttr = "Could not refresh download status. Retrying.";
+  } else if (status === "queued") {
     label = `Queued download for ${titleText}`;
     titleAttr = "Queued for download";
   } else if (status === "downloading" || status === "discovering" || status === "processing" || status === "importing") {
-    const pctText = progress !== null ? ` (${progress}%)` : "";
-    label = `Downloading ${titleText}${pctText}`;
-    titleAttr = `Downloading${pctText}`;
+    const waiting = phase === "provider_cooldown" || phase === "retry_wait";
+    const phaseLabel = phase === "conversion" ? "Converting" : phase === "scan" ? "Scanning" : phase === "playlist_creation" ? "Creating playlist for" : downloadPhaseLabels[phase] || "Downloading";
+    const pctText = !waiting && progress !== null ? ` (${Math.round(progress)}%)` : "";
+    label = waiting ? `${phaseLabel} for ${titleText}` : `${phaseLabel} ${titleText}${pctText}`;
+    titleAttr = `${phaseLabel}${pctText}`;
   } else if (status === "completed") {
     label = `${titleText} downloaded to library`;
     titleAttr = "Downloaded to library";
   } else if (status === "partial") {
-    label = `Partially imported ${titleText}`;
+    label = `Partially imported ${titleText}. Click to retry.`;
     titleAttr = errorMessage || "Partially imported";
   } else if (status === "failed") {
     label = `Download failed for ${titleText}. Click to retry.`;
@@ -204,8 +237,9 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
         type="button"
         className={`track-download-btn ${status !== "idle" ? status : ""} ${isWorking ? "active" : ""}`.trim()}
         aria-label={label}
+        aria-describedby={errorMessage ? errorId : undefined}
         title={titleAttr}
-        disabled={isWorking || status === "partial" || status === "completed"}
+        disabled={isWorking || status === "completed"}
         onClick={handleDownload}
       >
         {isWorking ? (
@@ -235,6 +269,7 @@ function TrackDownloadButton({ song, className = "", completedPlaceholder = fals
           </svg>
         ) : <CloudDownloadIcon />}
       </button>
+      {errorMessage && <span id={errorId} hidden>{errorMessage}</span>}
     </div>
   );
 }

@@ -1,122 +1,89 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePlayerActions } from "../context/PlayerItemState";
-import { getAllSongs, getTrackPage } from "../api/musicdeck";
+import { getTrackPage, trackLibraryFilters } from "../api/musicdeck";
 
 import TrackListHeader from "../components/TrackListHeader";
 import VirtualizedTrackList from "../components/VirtualizedTrackList";
 import { usePagedLibrary } from "../hooks/usePagedLibrary";
 import { useMediaQuery } from "../hooks/useMediaQuery";
-import { useCollectorLibrary } from "../hooks/useCollectorLibrary";
-import CollectorFilterBar from "../components/CollectorFilterBar";
+import LibraryBrowseControls from "../components/LibraryBrowseControls";
 import { useViewStateValue } from "../hooks/useViewStateStore";
 import { useServerDeletion } from "../context/ServerDeletionContext";
-import { uniqueTracks } from "../utils/uniqueTracks";
+import { normalizePlaylistSearch } from "../utils/playlistSearch";
+import { libraryTrackSorts } from "../types/libraryTracks";
 import { MOBILE_LAYOUT_QUERY } from "../utils/layoutPreset";
 import { EmptyState, ErrorState, LoadingState } from "../components/ui/PageState";
 
-const compareText = new Intl.Collator(undefined, { sensitivity: "base", numeric: true }).compare;
-const sortChoices = {
-  custom: "Library order",
-  "title-asc": "Title (A–Z)", "title-desc": "Title (Z–A)",
-  "album-asc": "Album (A–Z)", "album-desc": "Album (Z–A)",
-  "duration-asc": "Shortest first", "duration-desc": "Longest first",
-};
-
-function compareTracks(left, right, field, descending) {
-  if (field === "duration") {
-    const leftKnown = Number.isFinite(left.duration) && left.duration > 0;
-    const rightKnown = Number.isFinite(right.duration) && right.duration > 0;
-    if (leftKnown !== rightKnown) return leftKnown ? -1 : 1;
-    if (!leftKnown) return 0;
-    return descending ? right.duration - left.duration : left.duration - right.duration;
-  }
-  const order = compareText(left[field] || "", right[field] || "");
-  return descending ? -order : order;
-}
+const PAGE_SIZE = 100;
 
 function Tracks() {
   const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
-  const { playContext } = usePlayerActions();
+  const { playLibraryTracks } = usePlayerActions();
   const deletion = useServerDeletion();
   const deletedTracks = deletion?.deletedTracks;
   const excludeTrack = useCallback((song) => Boolean(deletedTracks?.has(String(song.id))), [deletedTracks]);
   const [filters, setFilters] = useViewStateValue("/library/tracks", "filters", { favoritesOnly: false, unplayedOnly: false });
-  const activeFilters = useMemo(() => [
-    filters.favoritesOnly ? { field: "favorite", op: "boolean", value: true } : null,
-    filters.unplayedOnly ? { field: "played", op: "boolean", value: false } : null,
-  ].filter(Boolean), [filters]);
-  const loadPage = useCallback((options) => getTrackPage({ ...options, filters: activeFilters }), [activeFilters]);
-  const library = usePagedLibrary(loadPage, excludeTrack);
-  const [sort, setSort] = useState({ field: "custom", descending: false });
-  const sortActive = sort.field !== "custom";
-  const sortBy = useCallback(field => setSort(current => ({
-    field, descending: field !== "custom" && current.field === field && !current.descending,
-  })), []);
-  const collector = useCollectorLibrary("track", { ...filters, exclude: excludeTrack, sortActive });
-  const collectorActive = collector.showSnapshot;
-  const collectorItems = useMemo(() => uniqueTracks(sortActive
-    ? [...collector.items].sort((left, right) => compareTracks(left, right, sort.field, sort.descending))
-    : collector.items), [collector.items, sort, sortActive]);
-  const total = collectorActive ? collectorItems.length : library.total;
-  const getCollectorItem = useCallback(index => collectorItems[index], [collectorItems]);
-  const selectionIdentity = useMemo(() => ({ filters: activeFilters, revision: library.collectionRevision, deletedTracks }), [activeFilters, library.collectionRevision, deletedTracks]);
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setQuery(search.trim()), 180);
+    return () => clearTimeout(timer);
+  }, [search]);
+  const [sort, setSort] = useState("custom");
+  const [field, direction] = sort.split("-");
+  const sortBy = useCallback((field) => setSort((current) =>
+    field === "custom" ? "custom" : `${field}-${current === field + "-asc" ? "desc" : "asc"}`), []);
+  const viewQuery = useMemo(() => ({
+    query, sort, favoritesOnly: Boolean(filters.favoritesOnly), unplayedOnly: Boolean(filters.unplayedOnly),
+  }), [query, sort, filters.favoritesOnly, filters.unplayedOnly]);
+  const loadPage = useCallback((options) => getTrackPage({
+    ...options, ...viewQuery, filters: trackLibraryFilters(viewQuery),
+  }), [viewQuery]);
+  const library = usePagedLibrary(loadPage, excludeTrack, PAGE_SIZE);
+  const total = library.total;
+  const selectionIdentity = useMemo(() => ({ viewQuery, revision: library.collectionRevision, deletedTracks }),
+    [viewQuery, library.collectionRevision, deletedTracks]);
+  const searchTokens = useMemo(() => normalizePlaylistSearch(query).split(/\s+/).filter(Boolean), [query]);
   const loadRange = library.onRangeChange;
   const [, setPageIndex] = useViewStateValue("/library/tracks", "pageIndex", 0);
   const onRangeChange = useCallback((start, end) => {
     loadRange(start, end);
-    setPageIndex(Math.floor(start / 200));
+    setPageIndex(Math.floor(start / PAGE_SIZE));
   }, [loadRange, setPageIndex]);
-
 
   const [actionError, setActionError] = useState("");
   const [preparingQueue, setPreparingQueue] = useState(false);
-  const playbackRequest = useRef(0);
+  const playbackRequest = useRef(null);
 
   useEffect(() => {
-    playbackRequest.current += 1;
-
     setPreparingQueue(false);
-    return () => { playbackRequest.current += 1; };
-  }, [activeFilters, collectorActive, collectorItems]);
+    setActionError("");
+    return () => playbackRequest.current?.abort();
+  }, [viewQuery]);
 
-  const handleTrackPlayback = useCallback(async (song) => {
-    const request = ++playbackRequest.current;
+  const startPlayback = useCallback(async (song, shuffle) => {
+    playbackRequest.current?.abort();
+    const request = new AbortController();
+    playbackRequest.current = request;
     setPreparingQueue(true);
     setActionError("");
     try {
-      // Playback still receives the complete filtered collection, not just the
-      // viewport's cached pages. Enumeration happens only on explicit play.
-      let songs;
-      if (collectorActive) {
-        songs = collectorItems;
-      } else if (!activeFilters.length) {
-        songs = await getAllSongs();
-      } else {
-        songs = [];
-        let total;
-        do {
-          const page = await getTrackPage({ filters: activeFilters, offset: songs.length });
-          if (request !== playbackRequest.current) return;
-          songs.push(...page.items);
-          total = page.total;
-          if (!page.items.length && songs.length < total) throw new Error("The library changed. Please try again.");
-        } while (songs.length < total);
-      }
-      if (request !== playbackRequest.current) return;
-      songs = songs.filter((item) => !excludeTrack(item));
-      const index = songs.findIndex((item) => String(item.id) === String(song.id));
-      if (index < 0) throw new Error("This track is no longer in the collection.");
-      await playContext(songs, index, {
-        type: "collection", id: "library-tracks", name: "Library Tracks", coverArt: null,
-      });
+      await playLibraryTracks({
+        query: viewQuery,
+        trackId: song ? String(song.id) : null,
+        ...(shuffle !== undefined && { shuffle }),
+      }, request.signal, deletedTracks);
     } catch (error) {
-      console.error("Could not play library tracks:", error);
-      if (request === playbackRequest.current) setActionError(error.message || "Could not play the collection.");
+      if (!request.signal.aborted) setActionError(error.message || "Could not play the library.");
     } finally {
-      if (request === playbackRequest.current) setPreparingQueue(false);
+      if (playbackRequest.current === request && !request.signal.aborted) setPreparingQueue(false);
     }
-  }, [activeFilters, collectorActive, collectorItems, excludeTrack, playContext]);
-
+  }, [viewQuery, playLibraryTracks, deletedTracks]);
+  const handleTrackPlayback = useCallback((song) => {
+    if (search.trim() === viewQuery.query) return startPlayback(song);
+  }, [search, startPlayback, viewQuery.query]);
+  const searching = search.trim() !== query;
+  const playbackDisabled = searching || library.loading || !total || preparingQueue;
 
   return <section className="library-section" data-view-loading={library.loading}>
     <div className="library-track-toolbar">
@@ -128,15 +95,12 @@ function Tracks() {
           </button>)}
       </div>
       {!library.loading && <span className="library-track-count">{total} {total === 1 ? "song" : "songs"}</span>}
-      <CollectorFilterBar {...collector.bar} sort={{
-        label: "Sort tracks",
-        value: sortActive ? `${sort.field}-${sort.descending ? "desc" : "asc"}` : "custom",
-        choices: sortChoices,
-        onChange: value => {
-          const [field, direction] = value.split("-");
-          setSort({ field, descending: direction === "desc" });
-        },
-      }} />
+      <div className="library-track-playback" aria-label="Library playback" role="group">
+        <button className="folder-sort-trigger" type="button" disabled={playbackDisabled} onClick={() => startPlayback(null, false)}>Play all</button>
+        <button className="folder-sort-trigger" type="button" disabled={playbackDisabled} onClick={() => startPlayback(null, true)}>Shuffle all</button>
+      </div>
+      <LibraryBrowseControls label="tracks" query={search} onQueryChange={value => setSearch(Array.from(value).slice(0, 200).join(""))} keepSearchOpen
+        sort={sort} onSortChange={setSort} sortChoices={libraryTrackSorts} />
     </div>
     {library.loading && <LoadingState>Loading your songs...</LoadingState>}
     {preparingQueue && <div role="status">Preparing playback...</div>}
@@ -144,13 +108,13 @@ function Tracks() {
     {library.error && <ErrorState>{library.error} <button type="button" onClick={library.retry}>Retry</button></ErrorState>}
     {!library.loading && <div className="track-list track-list--mobile" role="table" aria-label="Tracks"
       aria-rowcount={mobile ? total || undefined : total + 1}>
-      {!mobile && <TrackListHeader sort={{ ...sort, onChange: sortBy }} showDateAdded={false} />}
-      {!total && !library.error && !collector.bar.busy && <EmptyState>{collectorActive ? "No songs match these filters." : "No songs yet."}</EmptyState>}
-      <VirtualizedTrackList itemCount={total} mobile={mobile} getItem={collectorActive ? getCollectorItem : library.getItem}
-        searchTokens={collector.searchTokens}
-        loadSelection={collectorActive ? undefined : library.loadSelection}
-        onRangeChange={collectorActive ? undefined : onRangeChange} dataKey={collectorActive ? collectorItems : selectionIdentity} dynamicHeight
-        onPlay={handleTrackPlayback}   />
+      {!mobile && <TrackListHeader sort={{ field, descending: direction === "desc", onChange: sortBy }} showDateAdded={false} />}
+      {!total && !library.error && <EmptyState>{query || filters.favoritesOnly || filters.unplayedOnly ? "No songs match these filters." : "No songs yet."}</EmptyState>}
+      <VirtualizedTrackList itemCount={total} mobile={mobile} getItem={library.getItem}
+        searchTokens={searchTokens}
+        loadSelection={library.loadSelection}
+        onRangeChange={onRangeChange} dataKey={selectionIdentity} dynamicHeight
+        onPlay={handleTrackPlayback} />
     </div>}
   </section>;
 }

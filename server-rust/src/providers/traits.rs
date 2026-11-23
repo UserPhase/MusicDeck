@@ -4,6 +4,9 @@
 //! `CatalogProvider`, `StreamProvider`, `PlaybackScrobbler`, and optional
 //! `UserDataSync` capabilities from `server/src/backends/*`.
 
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -63,6 +66,13 @@ pub enum ProviderError {
     /// Outbound request blocked by [`crate::services::privacy::PrivacyManager`].
     #[error("Privacy policy blocked provider request: {0}")]
     PrivacyBlocked(String),
+}
+
+/// Result for a requested import path. Paths absent from the result map were unmatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportedTrackMatch {
+    Matched(String),
+    Ambiguous,
 }
 
 /// Polymorphic asynchronous interface implemented by all MusicDeck media backends
@@ -155,13 +165,17 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
     /// Triggers a library scan and (when supported by the provider) polls until completion.
     async fn scan_library(&self) -> Result<LibraryScanResult, ProviderError>;
 
-    /// Finds a newly indexed track by its actual path relative to the shared music root.
-    async fn find_imported_track(
+    /// Confirms the upstream scanner is reachable before doing expensive acquisition work.
+    async fn check_import_library(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Resolves imported paths relative to the shared music root against an indexed library.
+    async fn reconcile_imported_tracks(
         &self,
-        _music_root: &std::path::Path,
-        _relative_path: &str,
-        _title: &str,
-    ) -> Result<Option<Track>, ProviderError> {
+        _music_root: &Path,
+        _relative_paths: &HashSet<&str>,
+    ) -> Result<HashMap<String, ImportedTrackMatch>, ProviderError> {
         Err(ProviderError::Configuration(
             "Indexed import lookup requires Navidrome".into(),
         ))
@@ -176,6 +190,14 @@ pub trait MusicBackend: Send + Sync + std::fmt::Debug {
         Err(ProviderError::Configuration(
             "Upstream playlist import requires Navidrome".into(),
         ))
+    }
+
+    async fn replace_imported_playlist_tracks(
+        &self,
+        _playlist_id: &str,
+        _track_ids: &[String],
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::Configuration("Upstream playlist import requires Navidrome".into()))
     }
 
     /// Finalizes a marked import as private and reads its actual ordered tracks.

@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -12,7 +12,8 @@ use super::spotdl::canonical_spotify_url;
 use crate::audio::tagger::RecordingTags;
 use crate::audio::{AudioTaggerService, is_supported_audio_file};
 use crate::config::AppConfig;
-use crate::providers::BackendRegistry;
+use crate::providers::{BackendRegistry, RegisteredProvider};
+use crate::{db::DbPool, tasks::TaskError};
 
 #[derive(Clone)]
 pub(super) struct AcquisitionLibrary {
@@ -23,6 +24,236 @@ pub(super) struct AcquisitionLibrary {
 pub(super) struct PublishedTrack {
     pub path: PathBuf,
     pub reused: bool,
+}
+
+impl AcquisitionLibrary {
+    pub(super) async fn ready(
+        &self,
+        config: &AppConfig,
+    ) -> Result<(RegisteredProvider, PathBuf), TaskError> {
+        let error = |message: String| TaskError::ExecutionFailed(message);
+        let backend = self
+            .providers
+            .get_primary()
+            .map_err(|err| error(format!("Configure Navidrome before importing: {err}")))?;
+        if backend.provider_type != "navidrome" {
+            return Err(error(
+                "Acquisitions require Navidrome as the primary backend".into(),
+            ));
+        }
+        let root = tokio::fs::canonicalize(&config.music_root)
+            .await
+            .map_err(|err| error(format!("Could not open the shared music directory: {err}")))?;
+        let writable_root = root.clone();
+        tokio::task::spawn_blocking(move || tempfile::tempfile_in(writable_root))
+            .await
+            .map_err(|err| error(err.to_string()))?
+            .map_err(|err| {
+                error(format!(
+                    "Could not write to the shared music directory: {err}"
+                ))
+            })?;
+        backend
+            .provider
+            .check_import_library()
+            .await
+            .map_err(|err| error(format!("Navidrome library is not ready: {err}")))?;
+        Ok((backend, root))
+    }
+}
+
+/// A write-ahead receipt survives failed scans, interrupted publishes, and job-history retention.
+pub(super) struct PublicationJournal<'a> {
+    pub db: &'a DbPool,
+    pub job_id: &'a str,
+}
+
+pub(super) async fn regular_library_file(root: &Path, path: &Path) -> Option<PathBuf> {
+    if !path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    let absolute = root.join(path);
+    let info = tokio::fs::symlink_metadata(&absolute).await.ok()?;
+    let canonical = tokio::fs::canonicalize(&absolute).await.ok()?;
+    (info.is_file()
+        && info.len() > 0
+        && canonical.starts_with(root)
+        && is_supported_audio_file(&canonical))
+    .then_some(canonical)
+}
+
+type AlbumTitles = HashMap<String, Vec<PathBuf>>;
+
+pub(super) struct LibraryRecordingLookup<'a> {
+    root: &'a Path,
+    receipts: HashMap<String, Vec<(String, Vec<u8>)>>,
+    albums: HashMap<PathBuf, AlbumTitles>,
+}
+
+impl<'a> LibraryRecordingLookup<'a> {
+    pub async fn load(db: &DbPool, root: &'a Path, urls: &[&str]) -> io::Result<Self> {
+        let mut receipts = HashMap::<String, Vec<(String, Vec<u8>)>>::new();
+        let root_key = root.to_string_lossy();
+        for batch in urls.chunks(400) {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT spotify_url,path,digest FROM acquisition_library_files WHERE root=",
+            );
+            query
+                .push_bind(root_key.as_ref())
+                .push(" AND spotify_url IN (");
+            {
+                let mut urls = query.separated(", ");
+                for url in batch {
+                    urls.push_bind(*url);
+                }
+            }
+            query.push(") ORDER BY spotify_url,created_at DESC,path");
+            let rows: Vec<(String, String, Vec<u8>)> = query
+                .build_query_as()
+                .fetch_all(db.inner())
+                .await
+                .map_err(io::Error::other)?;
+            for (url, path, digest) in rows {
+                let entries = receipts.entry(url).or_default();
+                if entries.len() < 32 {
+                    entries.push((path, digest));
+                }
+            }
+        }
+        Ok(Self {
+            root,
+            receipts,
+            albums: HashMap::new(),
+        })
+    }
+
+    pub async fn find(
+        &mut self,
+        source: &SpotifyImportTrackMetadata,
+        inspector: &AudioTaggerService,
+    ) -> io::Result<Option<PathBuf>> {
+        let root = self.root;
+        let catalog_url = deezer_track_url(&source.url);
+        let catalog = catalog_url.is_some();
+        let url = catalog_url.or_else(|| spotify_track_url(&source.url));
+        if let Some(saved) = url.as_ref().and_then(|url| self.receipts.get(url)) {
+            for (path, digest) in saved {
+                let relative = PathBuf::from(path.as_str());
+                if let Some(file) = regular_library_file(root, &relative).await
+                    && digest_file(file)
+                        .await
+                        .is_ok_and(|actual| actual.as_slice() == digest)
+                {
+                    return Ok(Some(relative));
+                }
+            }
+        }
+        if url.is_none() && source.isrc.is_none() {
+            return Ok(None);
+        }
+        let album = library_album(source);
+        if !self.albums.contains_key(&album) {
+            let titles = album_titles(root, &album).await?;
+            self.albums.insert(album.clone(), titles);
+        }
+        let title = sanitize_segment(&source.title, "Unknown Track").to_lowercase();
+        let mut matched = None;
+        for relative in self.albums[&album].get(&title).into_iter().flatten() {
+            let Some(file) = regular_library_file(root, relative).await else {
+                continue;
+            };
+            let Ok(tags) = inspector.inspect_recording(&file).await else {
+                continue;
+            };
+            let actual_url = tags.source_url.as_deref().and_then(if catalog {
+                deezer_track_url
+            } else {
+                spotify_track_url
+            });
+            let exact_url = url
+                .as_ref()
+                .zip(actual_url.as_ref())
+                .is_some_and(|(a, b)| a == b);
+            let isrc_match = source
+                .isrc
+                .as_deref()
+                .and_then(normalize_isrc)
+                .zip(tags.metadata.isrc.as_deref().and_then(normalize_isrc))
+                .is_some_and(|(a, b)| a == b);
+            // Exact source identity wins. ISRC-only reuse also needs edition metadata and duration.
+            if exact_url {
+                return Ok(Some(relative.clone()));
+            }
+            if actual_url.is_none()
+                && isrc_match
+                && tags
+                    .metadata
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.eq_ignore_ascii_case(&source.title))
+                && tags
+                    .metadata
+                    .album
+                    .as_deref()
+                    .zip(source.album.as_deref())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                && tags.duration.is_some_and(|duration| {
+                    source.duration > 0.0 && (duration - source.duration).abs() <= 2.0
+                })
+            {
+                // Keep looking for an exact Spotify match even if the ISRC
+                // candidates turn out to be ambiguous.
+                match matched {
+                    None => matched = Some(Some(relative.clone())),
+                    Some(_) => matched = Some(None),
+                }
+            }
+        }
+        Ok(matched.flatten())
+    }
+}
+
+async fn album_titles(root: &Path, album: &Path) -> io::Result<AlbumTitles> {
+    let mut titles = HashMap::<String, Vec<PathBuf>>::new();
+    let Ok(directory) = tokio::fs::canonicalize(root.join(album)).await else {
+        return Ok(titles);
+    };
+    if !directory.starts_with(root) {
+        return Ok(titles);
+    }
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let relative = album.join(entry.file_name());
+        if !is_supported_audio_file(&relative) {
+            continue;
+        }
+        if let Some(stem) = relative
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map(str::to_lowercase)
+        {
+            titles
+                .entry(stem.clone())
+                .or_default()
+                .push(relative.clone());
+            if let Some((base, suffix)) = stem.rsplit_once(" [")
+                && suffix.ends_with(']')
+            {
+                titles.entry(base.to_owned()).or_default().push(relative);
+            }
+        }
+    }
+    Ok(titles)
+}
+
+fn library_album(metadata: &SpotifyImportTrackMetadata) -> PathBuf {
+    PathBuf::from(sanitize_segment(&metadata.artist, "Unknown Artist")).join(sanitize_segment(
+        metadata.album.as_deref().unwrap_or_default(),
+        "Unknown Album",
+    ))
 }
 
 pub(super) fn staging_path(root: &Path, id: &str) -> io::Result<PathBuf> {
@@ -42,6 +273,7 @@ pub(super) async fn publish_staged_track(
     source: &Path,
     metadata: &SpotifyImportTrackMetadata,
     inspector: &AudioTaggerService,
+    journal: &PublicationJournal<'_>,
 ) -> io::Result<PublishedTrack> {
     let source_info = tokio::fs::symlink_metadata(source).await?;
     let source = tokio::fs::canonicalize(source).await?;
@@ -56,13 +288,8 @@ pub(super) async fn publish_staged_track(
         .filter(|_| is_supported_audio_file(&source))
         .ok_or_else(|| io::Error::other("Unsupported downloaded audio format"))?
         .to_ascii_lowercase();
-    let artist = sanitize_segment(&metadata.artist, "Unknown Artist");
-    let album = sanitize_segment(
-        metadata.album.as_deref().unwrap_or_default(),
-        "Unknown Album",
-    );
     let title = sanitize_segment(&metadata.title, "Unknown Track");
-    let relative_album = PathBuf::from(artist).join(album);
+    let relative_album = library_album(metadata);
     let directory = checked_album_directory(root, &relative_album).await?;
     let plain_name = format!("{title}.{extension}");
     let folded_title = title.to_lowercase();
@@ -158,6 +385,12 @@ pub(super) async fn publish_staged_track(
             }
         };
         let relative = relative_album.join(&filename);
+        let file_digest = load_digest(&mut digest, &source).await?;
+        sqlx::query("INSERT OR IGNORE INTO acquisition_library_files(root,path,digest,spotify_url,job_id,created_at) VALUES (?,?,?,?,?,?)")
+            .bind(root.to_string_lossy().as_ref())
+            .bind(navidrome_path(&relative).ok_or_else(|| io::Error::other("Invalid publication path"))?)
+            .bind(file_digest.as_slice()).bind(spotify_url.as_deref()).bind(journal.job_id)
+            .bind(chrono::Utc::now().to_rfc3339()).execute(journal.db.inner()).await.map_err(io::Error::other)?;
         match publish_track(root, &relative, &source).await {
             Ok(()) => {
                 return Ok(PublishedTrack {
@@ -219,6 +452,19 @@ fn spotify_track_url(value: &str) -> Option<String> {
         .filter(|url| url.starts_with("https://open.spotify.com/track/"))
 }
 
+fn normalize_isrc(value: &str) -> Option<String> {
+    let value: String = value.chars().filter(char::is_ascii_alphanumeric).collect();
+    (value.len() == 12).then(|| value.to_ascii_uppercase())
+}
+
+fn deezer_track_url(value: &str) -> Option<String> {
+    let id = value.strip_prefix("https://www.deezer.com/track/")?;
+    id.parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0 && n.to_string() == id)?;
+    Some(value.to_owned())
+}
+
 /// A conflicting recording identifier takes precedence over name, duration, and byte comparison.
 fn recording_match(
     existing: &RecordingTags,
@@ -226,10 +472,18 @@ fn recording_match(
     metadata: &SpotifyImportTrackMetadata,
     spotify_url: Option<&str>,
 ) -> Option<bool> {
-    let normalize_isrc = |value: &str| {
-        let value: String = value.chars().filter(char::is_ascii_alphanumeric).collect();
-        (value.len() == 12).then(|| value.to_ascii_uppercase())
-    };
+    if let Some((expected, actual)) = deezer_track_url(&metadata.url)
+        .zip(existing.source_url.as_deref().and_then(deezer_track_url))
+    {
+        return Some(expected == actual);
+    }
+    let existing_url = existing.source_url.as_deref().and_then(spotify_track_url);
+    let staged_url = spotify_url
+        .map(str::to_owned)
+        .or_else(|| staged.source_url.as_deref().and_then(spotify_track_url));
+    if let Some((existing, staged)) = existing_url.zip(staged_url) {
+        return Some(existing == staged);
+    }
     let existing_isrc = existing.metadata.isrc.as_deref().and_then(normalize_isrc);
     let staged_isrc = metadata
         .isrc
@@ -239,14 +493,6 @@ fn recording_match(
     if let Some((existing, staged)) = existing_isrc.zip(staged_isrc) {
         return Some(existing == staged);
     }
-    let existing_url = existing.source_url.as_deref().and_then(spotify_track_url);
-    let staged_url = spotify_url
-        .map(str::to_owned)
-        .or_else(|| staged.source_url.as_deref().and_then(spotify_track_url));
-    if let Some((existing, staged)) = existing_url.zip(staged_url) {
-        return Some(existing == staged);
-    }
-
     // In the absence of IDs, require matching tags, duration and album position.
     let equal = |actual: Option<&str>, expected: &str| {
         !expected.trim().is_empty()
@@ -288,7 +534,7 @@ pub(super) async fn cleanup_staging(dir: &Path) {
     }
 }
 
-const MAX_PLAYLIST_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_PLAYLIST_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) async fn read_playlist_artifact(path: &Path) -> io::Result<String> {
     if !tokio::fs::symlink_metadata(path).await?.is_file() {
@@ -324,7 +570,9 @@ async fn publish_track(root: &Path, relative: &Path, source: &Path) -> io::Resul
         relative.to_path_buf(),
         source.to_path_buf(),
     );
-    tokio::task::spawn_blocking(move || copy_track(&root, &relative, &source))
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    tokio::task::spawn_blocking(move || copy_track(&root, &relative, &source, &cancel))
         .await
         .map_err(io::Error::other)?
 }
@@ -364,7 +612,23 @@ fn create_album_directory(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     Ok(parent)
 }
 
-fn copy_track(root: &Path, relative: &Path, source: &Path) -> io::Result<()> {
+fn copy_track(
+    root: &Path,
+    relative: &Path,
+    source: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> io::Result<()> {
+    let check_cancelled = || {
+        if cancel.is_cancelled() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Audio publication was cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     let album = relative
         .parent()
         .ok_or_else(|| io::Error::other("Missing album directory"))?;
@@ -387,10 +651,23 @@ fn copy_track(root: &Path, relative: &Path, source: &Path) -> io::Result<()> {
         builder.permissions(fs::Permissions::from_mode(0o644));
     }
     let mut temp = builder.tempfile_in(&parent)?;
-    if io::copy(&mut fs::File::open(source)?, temp.as_file_mut())? != meta.len() {
+    let mut input = fs::File::open(source)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut copied = 0;
+    loop {
+        check_cancelled()?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        temp.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+    if copied != meta.len() {
         return Err(io::Error::other("Downloaded audio changed during the copy"));
     }
     temp.as_file().sync_all()?;
+    check_cancelled()?;
 
     temp.persist_noclobber(&destination)
         .map_err(|err| err.error)?;

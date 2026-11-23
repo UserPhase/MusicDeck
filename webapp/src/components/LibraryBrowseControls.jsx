@@ -4,13 +4,14 @@ import PlaylistSearchBox from "./playlists/PlaylistSearchBox";
 import "../styles/playlist-organization.css";
 import "../styles/collector.css";
 
-export default function LibraryBrowseControls({ label, query, onQueryChange, filter, onFilterChange, choices, sort, onSortChange, sortChoices }) {
+export default function LibraryBrowseControls({ label, query, onQueryChange, filter, onFilterChange, choices, sort, onSortChange, sortChoices, keepSearchOpen = false }) {
   const trigger = useRef(null);
   const [open, setOpen] = useState(false);
   const menuLabel = `${choices ? "Filter" : "Sort"} ${label}`;
   return <div className="collector-panel">
     <div className="collector-panel-heading">
-      <PlaylistSearchBox label={`Search ${label}`} closeLabel={`Close ${label} search`} value={query} onChange={onQueryChange} />
+      <PlaylistSearchBox label={`Search ${label}`} closeLabel={`Close ${label} search`} value={query} onChange={onQueryChange}
+        dismissOnOutsideClick={!keepSearchOpen} />
       <button type="button" ref={trigger} className="folder-sort-trigger" aria-label={menuLabel}
         aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
         {choices ? (filter === "all" ? "Filters" : choices[filter]) : "Sort"}

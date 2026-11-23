@@ -14,6 +14,14 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val releaseSigningInputs = listOf("KEYSTORE", "STORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD")
+    .associateWith { providers.environmentVariable("MUSICDECK_ANDROID_$it").orNull?.takeIf { value -> value.isNotBlank() } }
+val signRelease = releaseSigningInputs.values.any { it != null }
+if (signRelease) {
+    val missing = releaseSigningInputs.filterValues { it == null }.keys
+    require(missing.isEmpty()) { "Missing Android release signing settings: ${missing.joinToString { "MUSICDECK_ANDROID_$it" }}" }
+}
+
 android {
     compileSdk = 37
     ndkVersion = "29.0.13846066"
@@ -24,6 +32,14 @@ android {
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    if (signRelease) {
+        signingConfigs.create("musicdeckRelease") {
+            storeFile = file(releaseSigningInputs.getValue("KEYSTORE")!!)
+            storePassword = releaseSigningInputs.getValue("STORE_PASSWORD")
+            keyAlias = releaseSigningInputs.getValue("KEY_ALIAS")
+            keyPassword = releaseSigningInputs.getValue("KEY_PASSWORD")
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -38,6 +54,7 @@ android {
             }
         }
         getByName("release") {
+            if (signRelease) signingConfig = signingConfigs.getByName("musicdeckRelease")
             optimization {
                enable = true
             }

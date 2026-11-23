@@ -1,5 +1,6 @@
 import {
   request,
+  requestDownloadStatus,
   getPlaylists as fetchPlaylists,
   getPlaylist as fetchPlaylist,
   patchPlaylist as requestUpdatePlaylist,
@@ -73,11 +74,16 @@ export async function startSpotifyPlaylistImport(playlistUrl, timeout) {
   return data.job;
 }
 
-export async function getSpotifyPlaylistImport(jobId) {
-  const data = await request(`/api/v1/playlists/import-spotify/${encodeURIComponent(jobId)}`);
+export async function getSpotifyPlaylistImport(jobId, signal) {
+  const data = await requestDownloadStatus(`/api/v1/playlists/import-spotify/${encodeURIComponent(jobId)}?summary=1`, signal);
   return data.job;
 }
 
+
+export async function cancelSpotifyPlaylistImport(jobId) {
+  const data = await request(`/api/v1/playlists/import-spotify/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+  return data.job;
+}
 
 export async function deletePlaylist(playlistId) {
   return requestDeletePlaylist(playlistId);

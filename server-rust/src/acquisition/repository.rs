@@ -18,16 +18,21 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Executor, Row, Sqlite};
-use tokio::{fs, sync::mpsc, time::Instant};
+use tokio::{fs, time::Instant};
 
 use super::playlist_files::{
-    AcquisitionLibrary, cleanup_staging, navidrome_path, publish_staged_track,
-    read_playlist_artifact, staged_playlist_path, staging_path,
+    AcquisitionLibrary, PublicationJournal, cleanup_staging, read_playlist_artifact,
+    staged_playlist_path, staging_path,
 };
-use super::playlist_timeout::{PlaylistDeadline, PlaylistImportTimeout, PlaylistProgress};
+use super::playlist_timeout::{
+    PLAYLIST_CREATION_TIMEOUT, POST_DOWNLOAD_TIMEOUT, PlaylistDeadline, PlaylistImportTimeout,
+    within_phase,
+};
+use super::progress::{DownloadTelemetry, TrackIssue, monitor_download, safe_title};
+use super::{input::Operand, resume};
 use crate::acquisition::spotdl::{
-    AcquisitionProgress, SpotDLDownloadError, SpotDLDownloaderAdapter, TrackImportRequest,
-    canonical_spotify_url, scan_downloaded_audio_files,
+    SpotDLDownloaderAdapter, TrackImportRequest, canonical_spotify_url, downloader_error_message,
+    scan_downloaded_audio_files,
 };
 use crate::auth::UserRecord;
 use crate::catalog::library::{LibraryItemType, LibraryService, SourceRef};
@@ -92,14 +97,22 @@ pub struct ImportEntry {
     pub status: ImportEntryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_path: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub library_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_track_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate_of: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requires_scan: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) catalog: Option<super::catalog_audio::CatalogTrackDetails>,
 }
 
 /// Batch Spotify playlist import job state (`SpotifyImportJob` / `ImportJob`).
@@ -108,9 +121,9 @@ pub struct ImportEntry {
 pub struct ImportJob {
     pub id: String,
     pub user_id: String,
-    /// `"queued" | "running" | "completed" | "partial" | "failed"`.
+    /// `"queued" | "running" | "completed" | "partial" | "failed" | "cancelled"`.
     pub status: String,
-    /// `"queued" | "fetching" | "downloading" | "scanning" | "completed"`.
+    /// `"queued" | "download" | "conversion" | "scan" | "playlist_creation" | "completed" | "cancelled"`.
     pub stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
@@ -138,6 +151,65 @@ pub struct ImportJob {
     pub failed_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Vec<ImportEntry>>,
+}
+
+impl ImportJob {
+    /// Returns display-safe details without subprocess output or filesystem paths.
+    pub fn track_issues(&self) -> Vec<TrackIssue> {
+        self.manifest
+            .iter()
+            .flatten()
+            .filter_map(ImportEntry::issue)
+            .collect()
+    }
+
+    pub fn downloader_error_code(&self) -> Option<&str> {
+        self.error
+            .as_deref()
+            .and_then(super::spotdl::downloader_failure_code)
+    }
+}
+
+impl ImportEntry {
+    pub(super) fn issue(&self) -> Option<TrackIssue> {
+        let (code, message) = match self.status {
+            ImportEntryStatus::FailedDownload => {
+                let code = self.error_code.as_deref().unwrap_or("download-failed");
+                (code, downloader_error_message(code))
+            }
+            ImportEntryStatus::FailedMetadataMissing => (
+                "missing-metadata",
+                "The source did not provide usable track metadata.",
+            ),
+            ImportEntryStatus::FailedTagging => (
+                "publish-failed",
+                "Audio could not be saved to the shared music directory.",
+            ),
+            ImportEntryStatus::FailedIndexing
+                if self.error_code.as_deref() == Some("indexing-ambiguous") =>
+            {
+                (
+                    "indexing-ambiguous",
+                    "Navidrome reported multiple matches for this file. Check the shared music mount and Report Real Path.",
+                )
+            }
+            ImportEntryStatus::FailedIndexing => (
+                "indexing-failed",
+                "Navidrome could not locate this file in the shared library.",
+            ),
+            ImportEntryStatus::FailedLinking => (
+                "linking-failed",
+                "The track could not be added to the playlist.",
+            ),
+            _ => return None,
+        };
+        Some(TrackIssue {
+            position: self.position,
+            title: safe_title(&self.source.title),
+            code: code.to_owned(),
+            message: message.to_owned(),
+        })
+    }
 }
 
 /// Persisted checkpoint envelope stored in `import_jobs.manifest_json` (`StoredImportJob`).
@@ -171,6 +243,8 @@ pub(super) struct PlaylistCreationIntent {
     connection_id: String,
     tracks: Vec<(String, String)>,
     attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempted_at: Option<i64>,
     upstream_id: Option<String>,
 }
 
@@ -209,7 +283,7 @@ impl SqliteImportJobRepository {
         let db_status = match job.status.as_str() {
             "queued" => "PENDING",
             "running" => "PROCESSING",
-            "failed" | "partial" => "FAILED",
+            "failed" | "partial" | "cancelled" => "FAILED",
             _ => "COMPLETED",
         };
         let now = Utc::now().to_rfc3339();
@@ -234,6 +308,8 @@ impl SqliteImportJobRepository {
                 manifest_json = excluded.manifest_json,
                 updated_at = excluded.updated_at
             WHERE import_jobs.user_id = excluded.user_id
+              AND (json_extract(CASE WHEN json_valid(import_jobs.manifest_json) THEN import_jobs.manifest_json END, '$.job.status') IS NOT 'cancelled'
+                   OR json_extract(excluded.manifest_json, '$.job.status') IN ('queued','cancelled'))
             ",
         )
         .bind(&job.id)
@@ -255,6 +331,36 @@ impl SqliteImportJobRepository {
         Ok(())
     }
 
+    async fn report_download(
+        &self,
+        id: &str,
+        task_id: &str,
+        update: DownloadTelemetry,
+        offset: Option<(usize, usize, usize)>,
+    ) {
+        let (downloaded, expected, current) = match offset {
+            Some((index, count, done)) => (done, Some(count), Some(index + 1)),
+            None => (
+                update.downloaded,
+                update.expected,
+                update
+                    .expected
+                    .map(|count| (update.finished + 1).min(count)),
+            ),
+        };
+        let downloaded = expected.map_or(downloaded, |count| downloaded.min(count));
+        let result = sqlx::query(
+            "UPDATE import_jobs SET total_tracks=COALESCE(?1,total_tracks), updated_at=?2,
+               manifest_json=json_set(manifest_json,'$.job.stage',?3,'$.job.expectedCount',COALESCE(?1,json_extract(manifest_json,'$.job.expectedCount')),
+                 '$.job.downloadedCount',?4,'$.job.currentTrack',?5)
+             WHERE id=?6 AND status='PROCESSING' AND EXISTS(SELECT 1 FROM background_tasks WHERE id=?7 AND state IN ('PROCESSING','PAUSED'))",
+        ).bind(expected.map(|count| count as i64)).bind(Utc::now().to_rfc3339()).bind(update.stage)
+          .bind(downloaded as i64).bind(current.map(|index| index as i64)).bind(id).bind(task_id).execute(self.db.inner()).await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "Could not update playlist download progress");
+        }
+    }
+
     async fn claim_playlist_creation(
         &self,
         record: &mut StoredImportJob,
@@ -266,22 +372,24 @@ impl SqliteImportJobRepository {
         )
         .await
         .map_err(import_db_error)?;
+        let now = Utc::now().timestamp_millis();
         let claimed = sqlx::query(
-            "UPDATE import_jobs SET manifest_json=json_set(manifest_json,'$.playlistIntent.attempted',json('true'))
-             WHERE id=? AND json_extract(manifest_json,'$.playlistIntent.attempted')=0
+            "UPDATE import_jobs SET manifest_json=json_set(manifest_json,'$.playlistIntent.attempted',json('true'),'$.playlistIntent.attemptedAt',?)
+             WHERE id=? AND status='PROCESSING'
                AND EXISTS (SELECT 1 FROM background_tasks WHERE id=? AND state IN ('PROCESSING','PAUSED'))",
-        ).bind(&record.job.id).bind(task_id).execute(&mut *tx).await.map_err(import_db_error)?.rows_affected();
+        ).bind(now).bind(&record.job.id).bind(task_id).execute(&mut *tx).await.map_err(import_db_error)?.rows_affected();
         if claimed == 0 {
             return Err(TaskError::ExecutionFailed(
                 "Playlist creation is already claimed or the task was cancelled".into(),
             ));
         }
         tx.commit().await.map_err(import_db_error)?;
-        record
+        let intent = record
             .playlist_intent
             .as_mut()
-            .expect("claimed playlist intent")
-            .attempted = true;
+            .expect("claimed playlist intent");
+        intent.attempted = true;
+        intent.attempted_at = Some(now);
         Ok(())
     }
 
@@ -310,7 +418,10 @@ impl SqliteImportJobRepository {
         sqlx::query(
             "INSERT INTO playlists (id, owner_user_id, name, description, source_connection_id,
                 source_playlist_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET source_connection_id=excluded.source_connection_id,
+                source_playlist_id=excluded.source_playlist_id, updated_at=excluded.updated_at
+             WHERE playlists.owner_user_id=excluded.owner_user_id",
         )
         .bind(local_id)
         .bind(&job.user_id)
@@ -323,6 +434,11 @@ impl SqliteImportJobRepository {
         .execute(&mut *tx)
         .await
         .map_err(import_db_error)?;
+        sqlx::query("DELETE FROM playlist_items WHERE playlist_id=?")
+            .bind(local_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(import_db_error)?;
         for (position, (provider_id, library_id)) in tracks.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO playlist_items (id, playlist_id, position, connection_id, provider_track_id,
@@ -350,7 +466,7 @@ impl SqliteImportJobRepository {
                 && record.user.get("id").and_then(Value::as_str) == Some(user_id.as_str());
             let valid_status = matches!(
                 record.job.status.as_str(),
-                "queued" | "running" | "completed" | "partial" | "failed"
+                "queued" | "running" | "completed" | "partial" | "failed" | "cancelled"
             );
             if valid_owner && valid_status {
                 return record;
@@ -575,46 +691,88 @@ impl SpotifyPlaylistImportService {
         };
         timeout.validate()?;
 
-        if let (Some(pool), Some(manager)) = (&self.db, tasks) {
-            let mut tx = crate::db::begin_sqlite_write(
-                pool.inner(),
-                "UPDATE import_jobs SET status=status WHERE 0",
-            )
-            .await
-            .map_err(|err| err.to_string())?;
+        let mut tx = match &self.db {
+            Some(pool) => Some(
+                crate::db::begin_sqlite_write(
+                    pool.inner(),
+                    "UPDATE import_jobs SET status=status WHERE 0",
+                )
+                .await
+                .map_err(|err| format!("STORAGE:{err}"))?,
+            ),
+            None if tasks.is_some() => return Err("STORAGE:Database is unavailable".into()),
+            None => None,
+        };
+        let mut resumed = None;
+        if let Some(tx) = &mut tx {
             let manifest: Option<String> = sqlx::query_scalar(
                 "SELECT manifest_json FROM import_jobs
-                 WHERE user_id=? AND status IN ('PENDING','PROCESSING','FAILED')
-                   AND json_extract(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.playlistUrl')=?
-                   AND json_type(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.playlistIntent')='object'
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            ).bind(&user.id).bind(&canonical_url).fetch_optional(&mut *tx).await.map_err(|err| err.to_string())?;
-            if let Some(manifest) = manifest {
-                let mut existing: StoredImportJob =
-                    serde_json::from_str(&manifest).map_err(|err| err.to_string())?;
-                let payload = json!({ "kind": "playlist", "jobId": existing.job.id });
-                let already_running: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM background_tasks WHERE type='SPOTDL_IMPORT'
-                      AND payload_json=? AND state IN ('QUEUED','PROCESSING','PAUSED'))",
+                 WHERE user_id=? AND json_extract(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.playlistUrl')=?
+                   AND (status IN ('PENDING','PROCESSING') OR
+                       json_extract(CASE WHEN json_valid(manifest_json) THEN manifest_json END, '$.job.status') IN ('failed','cancelled','partial'))
+                 ORDER BY status IN ('PENDING','PROCESSING') DESC, created_at DESC, id DESC LIMIT 1",
+            ).bind(&user.id).bind(&canonical_url).fetch_optional(&mut **tx).await.map_err(|err| format!("STORAGE:{err}"))?;
+            let existing = manifest
+                .map(|json| serde_json::from_str::<StoredImportJob>(&json))
+                .transpose()
+                .map_err(|err| format!("STORAGE:{err}"))?;
+            if let Some(existing) = &existing
+                && matches!(existing.job.status.as_str(), "queued" | "running")
+            {
+                return Ok(existing.job.clone());
+            }
+            let limits = self
+                .library
+                .as_ref()
+                .map(|library| {
+                    library
+                        .config
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .acquisition_limits
+                })
+                .unwrap_or_default();
+            super::admission::admit(tx, &user.id, limits).await?;
+            if let (Some(mut existing), Some(manager)) = (existing, tasks) {
+                let ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT id FROM background_tasks WHERE type='SPOTDL_IMPORT' AND payload_json=?",
                 )
-                .bind(payload.to_string())
-                .fetch_one(&mut *tx)
+                .bind(json!({ "kind":"playlist", "jobId":existing.job.id }).to_string())
+                .fetch_all(&mut **tx)
                 .await
-                .map_err(|err| err.to_string())?;
-                if already_running {
-                    return Ok(existing.job);
+                .map_err(|err| format!("STORAGE:{err}"))?;
+                if ids.iter().any(|id| manager.is_executing(id)) {
+                    return Err("CAPACITY:1".into());
                 }
                 existing.job.status = "queued".into();
+                existing.job.stage = "queued".into();
                 existing.job.error = None;
-                SqliteImportJobRepository::save_on(&existing, &mut *tx).await?;
+                existing.timeout = timeout;
+                SqliteImportJobRepository::save_on(&existing, &mut **tx).await?;
                 let task = manager
-                    .enqueue_on(&mut tx, TaskType::SpotdlImport, payload, &user.id, None)
+                    .enqueue_on(
+                        tx,
+                        TaskType::SpotdlImport,
+                        json!({ "kind": "playlist", "jobId": existing.job.id }),
+                        &user.id,
+                        None,
+                    )
                     .await
-                    .map_err(|err| err.to_string())?;
-                tx.commit().await.map_err(|err| err.to_string())?;
-                manager.notify_committed(&task);
-                return Ok(existing.job);
+                    .map_err(|err| format!("STORAGE:{err}"))?;
+                resumed = Some((existing.job, task));
             }
+        }
+
+        if let Some((job, task)) = resumed {
+            tx.take()
+                .expect("admission transaction")
+                .commit()
+                .await
+                .map_err(|err| format!("STORAGE:{err}"))?;
+            if let Some(manager) = tasks {
+                manager.notify_committed(&task);
+            }
+            return Ok(job);
         }
 
         let id = format!("spimp_{}", nanoid!(16));
@@ -653,8 +811,7 @@ impl SpotifyPlaylistImportService {
             timeout,
             download_sample: None,
         };
-        if let Some(pool) = &self.db {
-            let mut tx = pool.inner().begin().await.map_err(|err| err.to_string())?;
+        if let Some(mut tx) = tx {
             SqliteImportJobRepository::save_on(&record, &mut *tx).await?;
             let task = if let Some(manager) = tasks {
                 Some(
@@ -676,11 +833,7 @@ impl SpotifyPlaylistImportService {
             if let (Some(manager), Some(task)) = (tasks, task) {
                 manager.notify_committed(&task);
             }
-        } else if tasks.is_some() {
-            return Err("Database is unavailable".into());
-        }
-
-        if let Ok(mut guard) = self.jobs.write() {
+        } else if let Ok(mut guard) = self.jobs.write() {
             guard.insert(id.clone(), job.clone());
         }
 
@@ -694,7 +847,7 @@ impl SpotifyPlaylistImportService {
         };
         let repo = SqliteImportJobRepository::new(pool.clone());
         for mut record in repo.read_unfinished().await.map_err(|e| e.to_string())? {
-            if record.playlist_intent.is_some() {
+            if record.unreadable_manifest.is_none() {
                 let mut tx = crate::db::begin_sqlite_write(
                     pool.inner(),
                     "UPDATE import_jobs SET status=status WHERE 0",
@@ -735,7 +888,9 @@ impl SpotifyPlaylistImportService {
             if !queued {
                 record.job.status = "failed".into();
                 record.job.stage = "completed".into();
-                record.job.error = Some("Playlist import was interrupted by server restart. Start a new import to try again.".into());
+                record.job.error = Some(
+                    "Playlist import was interrupted. Submit the same link to resume it.".into(),
+                );
                 record.job.current_track = None;
                 record.job.current_track_name = None;
                 if let Err(error) = repo.save(&record).await {
@@ -746,16 +901,38 @@ impl SpotifyPlaylistImportService {
         Ok(())
     }
 
+    pub async fn cancel(
+        &self,
+        id: &str,
+        user_id: &str,
+        manager: &TaskManager,
+    ) -> Result<ImportJob, TaskError> {
+        let pool = self.db.as_ref().ok_or(TaskError::NotFound)?;
+        let job = self.get(id, user_id).await.ok_or(TaskError::NotFound)?;
+        if job.status == "cancelled" {
+            return Ok(job);
+        }
+        let task_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM background_tasks WHERE type='SPOTDL_IMPORT' AND created_by=?
+             AND payload_json=? AND state IN ('QUEUED','PROCESSING','PAUSED') LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(json!({ "kind": "playlist", "jobId": id }).to_string())
+        .fetch_optional(pool.inner())
+        .await
+        .map_err(import_db_error)?;
+        let task_id = task_id.ok_or_else(|| {
+            TaskError::Conflict("Only an active playlist import can be cancelled".into())
+        })?;
+        manager.cancel(&task_id).await?;
+        self.get(id, user_id).await.ok_or(TaskError::NotFound)
+    }
+
     /// Retrieves a [`ImportJob`] by `(job_id, user_id)`.
     pub async fn get(&self, job_id: &str, user_id: &str) -> Option<ImportJob> {
         if let Some(pool) = &self.db {
             let repo = SqliteImportJobRepository::new(pool.clone());
-            if let Some(stored) = repo.get(job_id, user_id).await {
-                if let Ok(mut guard) = self.jobs.write() {
-                    guard.insert(job_id.to_owned(), stored.job.clone());
-                }
-                return Some(stored.job);
-            }
+            return repo.get(job_id, user_id).await.map(|stored| stored.job);
         }
         if let Ok(guard) = self.jobs.read() {
             if let Some(job) = guard.get(job_id) {
@@ -771,9 +948,7 @@ impl SpotifyPlaylistImportService {
     pub async fn get_by_id(&self, job_id: &str) -> Option<ImportJob> {
         if let Some(pool) = &self.db {
             let repo = SqliteImportJobRepository::new(pool.clone());
-            if let Some(stored) = repo.get_by_id(job_id).await {
-                return Some(stored.job);
-            }
+            return repo.get_by_id(job_id).await.map(|stored| stored.job);
         }
         if let Ok(guard) = self.jobs.read() {
             if let Some(job) = guard.get(job_id) {
@@ -799,6 +974,9 @@ impl SpotifyPlaylistImportService {
             .ok_or(TaskError::NotFound)?;
         let repo = SqliteImportJobRepository::new(pool.clone());
         let mut record = repo.get_by_id(job_id).await.ok_or(TaskError::NotFound)?;
+        if record.job.status == "cancelled" {
+            return Err(TaskError::Cancelled);
+        }
         if record.unreadable_manifest.is_some() || record.job.status == "failed" {
             return Err(TaskError::ExecutionFailed(
                 record
@@ -844,6 +1022,9 @@ impl SpotifyPlaylistImportService {
             )
             .await;
         if let Err(err) = &result {
+            if matches!(err, TaskError::Cancelled) || context.cancel_token().is_cancelled() {
+                return Err(TaskError::Cancelled);
+            }
             let keep_intent = record.playlist_intent.is_some();
             if keep_intent {
                 // Reload the durable checkpoint so a failed commit cannot discard
@@ -851,31 +1032,47 @@ impl SpotifyPlaylistImportService {
                 let Some(checkpoint) = repo.get_by_id(job_id).await else {
                     return result.map(|()| record.job);
                 };
-                if checkpoint.job.playlist_id.is_some() {
+                if matches!(checkpoint.job.status.as_str(), "completed" | "partial")
+                    && checkpoint.job.playlist_id.is_some()
+                {
                     return Ok(checkpoint.job);
                 }
                 record = checkpoint;
             }
-            record.job.status = "failed".into();
-            record.job.stage = "completed".into();
+            if let Some(current) = repo.get_by_id(job_id).await {
+                if current.job.status == "cancelled" {
+                    return Err(TaskError::Cancelled);
+                }
+                record.job.stage = current.job.stage;
+                record.job.downloaded_count = current.job.downloaded_count;
+                record.job.expected_count =
+                    record.job.expected_count.or(current.job.expected_count);
+            }
             record.job.error = Some(err.to_string());
-            record.job.playlist_id = None;
             record.job.current_track = None;
             record.job.current_track_name = None;
-            record.job.imported_count = Some(0);
-            record.job.completed_count = Some(0);
-            if !keep_intent {
-                for entry in record.job.manifest.iter_mut().flatten() {
-                    if matches!(
-                        entry.status,
-                        ImportEntryStatus::Ready | ImportEntryStatus::Completed
-                    ) {
-                        entry.status = ImportEntryStatus::FailedLinking;
-                        entry.error = record.job.error.clone();
-                    }
-                }
+            let committed = match record.job.playlist_id.as_deref() {
+                Some(id) => sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM playlist_items WHERE playlist_id=?",
+                )
+                .bind(id)
+                .fetch_one(pool.inner())
+                .await
+                .map_err(import_db_error)? as usize,
+                None => 0,
+            };
+            record.job.status = if record.job.playlist_id.is_some() {
+                "partial"
+            } else {
+                "failed"
             }
-            record.job.failed_count = record.job.expected_count;
+            .into();
+            record.job.imported_count = Some(committed);
+            record.job.completed_count = Some(committed);
+            record.job.failed_count = record
+                .job
+                .expected_count
+                .map(|expected| expected.saturating_sub(committed));
             repo.save(&record)
                 .await
                 .map_err(TaskError::ExecutionFailed)?;
@@ -888,9 +1085,6 @@ impl SpotifyPlaylistImportService {
             {
                 cleanup_staging(&staging_dir).await;
             }
-        }
-        if let Ok(mut cache) = self.jobs.write() {
-            cache.insert(job_id.to_owned(), record.job.clone());
         }
         result.map(|()| record.job)
     }
@@ -909,7 +1103,9 @@ impl SpotifyPlaylistImportService {
                 "Import owner is disabled".into(),
             ));
         }
-        if let Some(intent) = &record.playlist_intent {
+        if let Some(intent) = &record.playlist_intent
+            && record.job.playlist_id.is_none()
+        {
             let backend = self
                 .library
                 .as_ref()
@@ -922,7 +1118,7 @@ impl SpotifyPlaylistImportService {
                     TaskError::ExecutionFailed("The Navidrome import backend is unavailable".into())
                 })?;
             return self
-                .complete_playlist_intent(repo, record, context, backend.provider.as_ref())
+                .complete_bounded(repo, record, context, backend.provider.as_ref())
                 .await;
         }
 
@@ -930,35 +1126,17 @@ impl SpotifyPlaylistImportService {
             parse_spotify_playlist_url(&record.playlist_url).ok_or_else(|| {
                 TaskError::Validation("Stored Spotify playlist URL is invalid".into())
             })?;
-        let library = self
-            .library
-            .as_ref()
-            .zip(config)
-            .map(|(library, cfg)| async {
-                let backend = library.providers.get_primary().map_err(|err| {
-                    TaskError::ExecutionFailed(format!(
-                        "Configure Navidrome before importing: {err}"
-                    ))
-                })?;
-                if backend.provider_type != "navidrome" {
-                    return Err(TaskError::ExecutionFailed(
-                        "Spotify playlist import requires Navidrome as the primary backend".into(),
-                    ));
-                }
-                let root = fs::canonicalize(&cfg.music_root).await.map_err(|err| {
-                    TaskError::ExecutionFailed(format!(
-                        "Could not open the shared music directory: {err}"
-                    ))
-                })?;
-                Ok((backend, root))
-            });
-        let library = match library {
-            Some(load) => Some(load.await?),
+        let library = match self.library.as_ref().zip(config) {
+            Some((library, config)) => Some(library.ready(config).await?),
             None => None,
         };
-
+        let stage = resume::open_stage(
+            staging_dir,
+            library.as_ref().map(|(_, root)| root.as_path()),
+        )
+        .await?;
         record.job.status = "running".into();
-        record.job.stage = "downloading".into();
+        record.job.stage = "download".into();
         let attribution = spotify_playlist_description(None, &url);
         if !record
             .job
@@ -974,235 +1152,240 @@ impl SpotifyPlaylistImportService {
         repo.save(record)
             .await
             .map_err(TaskError::ExecutionFailed)?;
-        fs::create_dir_all(staging_dir).await.map_err(|err| {
-            TaskError::ExecutionFailed(format!(
-                "Could not create playlist staging directory: {err}"
-            ))
-        })?;
-        if !fs::symlink_metadata(staging_dir)
-            .await
-            .is_ok_and(|meta| meta.is_dir())
-        {
-            return Err(TaskError::ExecutionFailed(
-                "Spotify import staging must be a regular directory".into(),
-            ));
-        }
-        if record.job.manifest.is_some() {
-            download_checkpointed_tracks(record, context, downloader, staging_dir).await?;
+        let started = Instant::now();
+        let history = if record.timeout == PlaylistImportTimeout::Auto {
+            repo.historical_download_rate(&record.job.user_id)
+                .await
+                .unwrap_or_default()
         } else {
-            let historical_rate = if record.timeout == PlaylistImportTimeout::Auto {
-                match repo.historical_download_rate(&record.job.user_id).await {
-                    Ok(rate) => rate,
-                    Err(error) => {
-                        tracing::warn!(job_id = %record.job.id, %error, "Could not load playlist download history");
-                        None
+            None
+        };
+        let deadline = PlaylistDeadline::new(record.timeout, history, started).hard_deadline();
+        let mut manifest = match resume::load(&stage).await? {
+            Some(manifest) => manifest,
+            None => match record.job.manifest.clone() {
+                Some(mut entries) if !entries.is_empty() => {
+                    entries.sort_by_key(|entry| entry.position);
+                    for entry in &mut entries {
+                        if entry.library_path.is_none()
+                            && entry
+                                .file_path
+                                .as_deref()
+                                .is_some_and(|path| Path::new(path).is_relative())
+                        {
+                            entry.library_path = entry.file_path.take();
+                        }
+                    }
+                    ManifestDownload {
+                        expected_count: record.job.expected_count.unwrap_or(entries.len()),
+                        name: record.job.playlist_name.clone(),
+                        entries,
+                        indexed_connection: None,
                     }
                 }
-            } else {
-                None
-            };
-            download_playlist(record, context, downloader, staging_dir, &url, historical_rate)
-                .await?;
-        }
-        let job = &mut record.job;
-        job.playlist_name.get_or_insert_with(|| {
-            format!(
-                "Spotify Playlist {}",
-                &spotify_id[..spotify_id.len().min(8)]
-            )
+                _ => {
+                    let job_id = &record.job.id;
+                    resume::discover(
+                        context,
+                        downloader,
+                        &stage,
+                        &[Operand::Spotify { url: url.clone() }],
+                        true,
+                        deadline,
+                        |update| repo.report_download(job_id, context.task_id(), update, None),
+                    )
+                    .await?
+                }
+            },
+        };
+        record.job.expected_count = Some(manifest.expected_count);
+        record.job.playlist_name.get_or_insert_with(|| {
+            manifest.name.clone().unwrap_or_else(|| {
+                format!(
+                    "Spotify Playlist {}",
+                    &spotify_id[..spotify_id.len().min(8)]
+                )
+            })
         });
-        let (backend, music_root) = library.ok_or_else(|| {
+        record.job.manifest = Some(manifest.entries.clone());
+        repo.save(record)
+            .await
+            .map_err(TaskError::ExecutionFailed)?;
+        let previous_ready = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.file_path.is_some() || entry.library_path.is_some())
+            .count();
+        let job_id = record.job.id.clone();
+        let download_error = resume::fetch_missing(
+            context,
+            downloader,
+            &repo.db,
+            &stage,
+            library.as_ref().map(|(_, root)| root.as_path()),
+            &mut manifest,
+            record.timeout,
+            deadline,
+            |update| repo.report_download(&job_id, context.task_id(), update, None),
+        )
+        .await?;
+        let downloaded = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.file_path.is_some() || entry.library_path.is_some())
+            .count();
+        record.job.downloaded_count = Some(downloaded);
+        record.job.manifest = Some(manifest.entries.clone());
+        let new_audio = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.file_path.is_some())
+            .count()
+            .saturating_sub(previous_ready);
+        if new_audio >= 5 {
+            record.download_sample = Some(PlaylistDownloadSample {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                downloaded_tracks: new_audio as u64,
+            });
+        }
+        repo.save(record)
+            .await
+            .map_err(TaskError::ExecutionFailed)?;
+        if downloaded == 0 {
+            return Err(download_error.unwrap_or_else(|| {
+                TaskError::ExecutionFailed(first_import_error(
+                    &record.job,
+                    "No usable tracks were downloaded",
+                ))
+            }));
+        }
+        let (backend, root) = library.ok_or_else(|| {
             TaskError::ExecutionFailed(
                 "Shared Navidrome library is not configured for playlist imports".into(),
             )
         })?;
-        let provider = backend.provider;
-        let connection = backend.connection_id;
-        let stage = fs::canonicalize(staging_dir).await.map_err(|err| {
-            TaskError::ExecutionFailed(format!("Could not open playlist staging files: {err}"))
-        })?;
-
-        let mut entries = job.manifest.take().ok_or_else(|| {
-            TaskError::ExecutionFailed("spotDL returned no playlist entries".into())
-        })?;
-        let expected = job.expected_count.unwrap_or(0).max(entries.len());
-        job.expected_count = Some(expected);
-        job.downloaded_count = Some(
-            entries
-                .iter()
-                .filter(|entry| entry.status == ImportEntryStatus::Downloaded)
-                .count(),
-        );
-
-        let mut published: HashMap<PathBuf, String> = HashMap::new();
-        let tagger = downloader.tagger();
-        for entry in &mut entries {
-            if let Err(err) = context.checkpoint().await {
-                job.manifest = Some(entries);
-                return Err(err);
-            }
-            let Some(staged) = entry.file_path.take().map(PathBuf::from) else {
-                continue;
-            };
-            let staged = fs::canonicalize(staged).await.ok();
-            let transfer = async {
-                let staged = staged
-                    .as_deref()
-                    .ok_or("Downloaded file is missing".to_owned())?;
-                if let Some(path) = published.get(staged) {
-                    return Ok::<String, String>(path.clone());
-                }
-                let publication =
-                    publish_staged_track(&music_root, &stage, staged, &entry.source, &tagger)
-                        .await
-                        .map_err(|err| {
-                            format!("Could not save audio to the shared music directory: {err}")
-                        })?;
-                let path = navidrome_path(&publication.path)
-                    .ok_or("Invalid library import path".to_owned())?;
-                published.insert(staged.to_path_buf(), path.clone());
-                Ok(path)
-            }
-            .await;
-            match transfer {
-                Ok(path) => entry.file_path = Some(path),
-                Err(message) => {
-                    fail_import_entry(&job.id, entry, ImportEntryStatus::FailedDownload, message);
-                }
-            }
-        }
-        job.manifest = Some(entries);
-        job.stage = "scanning".into();
+        let scan_deadline = Instant::now() + POST_DOWNLOAD_TIMEOUT;
+        let journal = PublicationJournal {
+            db: &repo.db,
+            job_id: &job_id,
+        };
+        within_phase(
+            context,
+            scan_deadline,
+            "publication",
+            resume::publish(
+                context,
+                &journal,
+                &stage,
+                &root,
+                &mut manifest,
+                &downloader.tagger(),
+            ),
+        )
+        .await?;
+        record.job.stage = "scan".into();
+        record.job.current_track = None;
+        record.job.manifest = Some(manifest.entries.clone());
         repo.save(record)
             .await
             .map_err(TaskError::ExecutionFailed)?;
-        if published.is_empty() {
-            return Err(TaskError::ExecutionFailed(first_import_error(
-                &record.job,
-                "No audio could be saved to the music library",
-            )));
-        }
+        let progress_job_id = job_id.as_str();
+        let indexed = within_phase(context, scan_deadline, "scan", resume::index(context, backend.provider.as_ref(), &backend.connection_id, &stage, &root, &mut manifest, |count| async move {
+            let result = sqlx::query("UPDATE import_jobs SET manifest_json=json_set(manifest_json,'$.job.importedCount',?),updated_at=? WHERE id=? AND status='PROCESSING'")
+                .bind(count as i64).bind(Utc::now().to_rfc3339()).bind(progress_job_id).execute(repo.db.inner()).await;
+            if let Err(error) = result { tracing::warn!(%error, "Could not report indexed playlist tracks"); }
+        })).await;
+        record.job.manifest = Some(manifest.entries);
+        indexed?;
 
-        context
-            .report(TaskProgressPatch {
-                message: Some(Some(
-                    "Waiting for Navidrome to index the imported files".into(),
-                )),
-                ..Default::default()
-            })
-            .await;
-        context.checkpoint().await?;
-        let cancellation = context.cancel_token();
-        tokio::select! {
-            () = cancellation.cancelled() => return Err(TaskError::Cancelled),
-            result = provider.scan_library() => result.map_err(|err| {
-                TaskError::ExecutionFailed(format!("Audio was saved, but Navidrome could not finish scanning: {err}"))
-            })?,
-        };
-
-        let library = LibraryService::new(
-            repo.db.clone(),
-            Some(music_root.to_string_lossy().into_owned()),
-        );
-        let job = &mut record.job;
-        let entries = job.manifest.as_mut().expect("staged import manifest");
-        let mut tracks = Vec::new();
-        let mut resolved = HashMap::<String, (String, String)>::new();
-        for entry in entries.iter_mut() {
-            context.checkpoint().await?;
-            let Some(path) = entry.file_path.as_deref() else {
-                continue;
-            };
-            let ids = if let Some(ids) = resolved.get(path) {
-                ids.clone()
-            } else {
-                let title = &entry.source.title;
-                let lookup = tokio::select! {
-                    () = cancellation.cancelled() => return Err(TaskError::Cancelled),
-                    result = provider.find_imported_track(&music_root, path, title) => result,
+        let library =
+            LibraryService::new(repo.db.clone(), Some(root.to_string_lossy().into_owned()));
+        let connection = backend.connection_id;
+        let mut known_ids = HashMap::new();
+        let tracks = within_phase(context, scan_deadline, "indexing", async {
+            let mut tracks = Vec::new();
+            for entry in record.job.manifest.iter().flatten() {
+                let Some(id) = entry.provider_track_id.as_ref() else {
+                    continue;
                 };
-                let track = match lookup {
-                    Ok(Some(track)) => track,
-                    Ok(None) => {
-                        fail_import_entry(
-                            &job.id,
-                            entry,
-                            ImportEntryStatus::FailedIndexing,
-                            format!(
-                                "Navidrome did not index {path} with its real path. Check the shared music mount and enable Report Real Path for the MusicDeck player."
-                            ),
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        fail_import_entry(
-                            &job.id,
-                            entry,
-                            ImportEntryStatus::FailedIndexing,
-                            format!("Could not locate {path} in Navidrome: {err}"),
-                        );
-                        continue;
-                    }
+                let library_id = if let Some(id) = known_ids.get(id) {
+                    String::clone(id)
+                } else {
+                    let library_id = library
+                        .ensure_id(
+                            LibraryItemType::Track,
+                            &SourceRef {
+                                connection_id: connection.clone(),
+                                provider_item_id: id.clone(),
+                            },
+                            None,
+                        )
+                        .await
+                        .map_err(import_db_error)?;
+                    known_ids.insert(id.clone(), library_id.clone());
+                    library_id
                 };
-                let provider_id = track.provider_id;
-                let library_id = library
-                    .ensure_id(
-                        LibraryItemType::Track,
-                        &SourceRef {
-                            connection_id: connection.clone(),
-                            provider_item_id: provider_id.clone(),
-                        },
-                        None,
-                    )
-                    .await
-                    .map_err(import_db_error)?;
-                let ids = (provider_id, library_id);
-                resolved.insert(path.to_owned(), ids.clone());
-                ids
-            };
-            entry.provider_track_id = Some(ids.0.clone());
-            entry.status = ImportEntryStatus::Ready;
-            tracks.push(ids);
-        }
-
+                tracks.push((id.clone(), library_id));
+            }
+            Ok(tracks)
+        })
+        .await?;
         if tracks.is_empty() {
             return Err(TaskError::ExecutionFailed(first_import_error(
-                job,
-                "None of the downloaded files were indexed by Navidrome",
+                &record.job,
+                "None of the files could be indexed by Navidrome",
             )));
         }
-        context.checkpoint().await?;
+        record.job.imported_count = Some(tracks.len());
+        let prior = record
+            .playlist_intent
+            .take()
+            .filter(|intent| intent.connection_id == connection);
         record.playlist_intent = Some(PlaylistCreationIntent {
-            marker: format!("MusicDeck import {}", job.id),
+            marker: format!("MusicDeck import {}", record.job.id),
             connection_id: connection,
             tracks,
-            attempted: false,
-            upstream_id: None,
+            attempted: prior.as_ref().is_some_and(|intent| intent.attempted),
+            attempted_at: prior.as_ref().and_then(|intent| intent.attempted_at),
+            upstream_id: prior.and_then(|intent| intent.upstream_id),
         });
-        repo.save(record)
-            .await
-            .map_err(TaskError::ExecutionFailed)?;
-        self.complete_playlist_intent(repo, record, context, provider.as_ref())
+        self.complete_bounded(repo, record, context, backend.provider.as_ref())
             .await?;
-        let completed = record.job.completed_count.unwrap_or_default();
-        let failed = record.job.failed_count.unwrap_or_default();
-        if failed == 0
-            && scan_downloaded_audio_files(&stage)
-                .await
-                .is_ok_and(|files| files.iter().all(|file| published.contains_key(file)))
-        {
-            cleanup_staging(staging_dir).await;
+        if record.job.status == "completed" {
+            cleanup_staging(&stage).await;
         }
-        context
-            .report(TaskProgressPatch {
-                percent: Some(100.0),
-                items_processed: Some(expected as u64),
-                total_items: Some(Some(expected as u64)),
-                message: Some(Some(format!("Imported {completed} of {expected} tracks"))),
-                ..Default::default()
-            })
-            .await;
         Ok(())
+    }
+
+    async fn complete_bounded(
+        &self,
+        repo: &SqliteImportJobRepository,
+        record: &mut StoredImportJob,
+        context: &TaskRunContext,
+        provider: &dyn MusicBackend,
+    ) -> Result<(), TaskError> {
+        within_phase(
+            context,
+            Instant::now() + PLAYLIST_CREATION_TIMEOUT,
+            "playlist creation",
+            async {
+                record.job.status = "running".into();
+                record.job.stage = "playlist_creation".into();
+                repo.save(record)
+                    .await
+                    .map_err(TaskError::ExecutionFailed)?;
+                context
+                    .report(TaskProgressPatch {
+                        percent: Some(95.0),
+                        message: Some(Some("Creating playlist".into())),
+                        ..Default::default()
+                    })
+                    .await;
+                self.complete_playlist_intent(repo, record, context, provider)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn complete_playlist_intent(
@@ -1218,29 +1401,33 @@ impl SpotifyPlaylistImportService {
             .expect("persisted playlist intent")
             .clone();
         let track_ids: Vec<String> = intent.tracks.iter().map(|(id, _)| id.clone()).collect();
-        let upstream_id = if let Some(id) = intent.upstream_id {
-            id
-        } else {
-            let playlists = provider
-                .list_playlists()
+        let existing = match intent.upstream_id.as_deref() {
+            Some(id) => provider
+                .get_playlist(id)
                 .await
-                .map_err(import_provider_error)?;
-            let mut matches = playlists
-                .into_iter()
-                .filter(|playlist| playlist.name == intent.marker);
-            let id = if let Some(existing) = matches.next() {
-                if matches.next().is_some() {
-                    return Err(TaskError::ExecutionFailed(
-                        "Multiple Navidrome playlists match the import checkpoint".into(),
-                    ));
+                .map_err(import_provider_error)?,
+            None => None,
+        };
+        let upstream_id = if let Some(existing) = existing {
+            existing.provider_id
+        } else {
+            let mut markers = matching_markers(provider, &intent.marker).await?;
+            if markers.is_empty()
+                && let Some(attempted) = intent.attempted_at
+            {
+                // Allow a previous timed-out request to become visible before creating again.
+                let wait = attempted
+                    .saturating_add(30_000)
+                    .saturating_sub(Utc::now().timestamp_millis())
+                    .clamp(0, 30_000);
+                if wait > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
+                    markers = matching_markers(provider, &intent.marker).await?;
                 }
-                existing.provider_id
+            }
+            let id = if let Some(id) = markers.first() {
+                id.clone()
             } else {
-                if intent.attempted {
-                    return Err(TaskError::ExecutionFailed(
-                        "Navidrome has not exposed the earlier playlist creation attempt".into(),
-                    ));
-                }
                 context.checkpoint().await?;
                 repo.claim_playlist_creation(record, context.task_id())
                     .await?;
@@ -1249,12 +1436,46 @@ impl SpotifyPlaylistImportService {
                     .await
                     .map_err(import_provider_error)?
             };
+            // Remove surplus internal markers only after checking their names and local ownership.
+            for duplicate in markers.into_iter().filter(|duplicate| duplicate != &id) {
+                let linked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM playlists WHERE source_connection_id=? AND source_playlist_id=?)")
+                    .bind(&intent.connection_id).bind(&duplicate).fetch_one(repo.db.inner()).await.map_err(import_db_error)?;
+                if !linked
+                    && provider
+                        .get_playlist(&duplicate)
+                        .await
+                        .map_err(import_provider_error)?
+                        .is_some_and(|playlist| playlist.name == intent.marker)
+                {
+                    provider
+                        .delete_playlist(&duplicate)
+                        .await
+                        .map_err(import_provider_error)?;
+                }
+            }
             record.playlist_intent.as_mut().unwrap().upstream_id = Some(id.clone());
             repo.save(record)
                 .await
                 .map_err(TaskError::ExecutionFailed)?;
             id
         };
+        let current = provider
+            .get_playlist(&upstream_id)
+            .await
+            .map_err(import_provider_error)?;
+        if current.is_some_and(|playlist| {
+            !playlist.tracks.is_some_and(|tracks| {
+                tracks
+                    .iter()
+                    .map(|track| &track.provider_id)
+                    .eq(track_ids.iter())
+            })
+        }) {
+            provider
+                .replace_imported_playlist_tracks(&upstream_id, &track_ids)
+                .await
+                .map_err(import_provider_error)?;
+        }
         let job = &mut record.job;
         let name = job
             .playlist_name
@@ -1318,6 +1539,23 @@ impl SpotifyPlaylistImportService {
     }
 }
 
+async fn matching_markers(
+    provider: &dyn MusicBackend,
+    marker: &str,
+) -> Result<Vec<String>, TaskError> {
+    let mut ids: Vec<_> = provider
+        .list_playlists()
+        .await
+        .map_err(import_provider_error)?
+        .into_iter()
+        .filter(|playlist| playlist.name == marker)
+        .map(|playlist| playlist.provider_id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 fn import_provider_error(error: crate::providers::ProviderError) -> TaskError {
     TaskError::ExecutionFailed(format!("Navidrome playlist import failed: {error}"))
 }
@@ -1338,127 +1576,105 @@ struct SpotdlPlaylistTrack {
     list_length: Option<usize>,
 }
 
-async fn download_playlist(
-    record: &mut StoredImportJob,
-    context: &TaskRunContext,
-    downloader: &SpotDLDownloaderAdapter,
-    stage: &Path,
-    url: &str,
-    historical_rate: Option<u64>,
-) -> Result<(), TaskError> {
-    let m3u_name = format!("musicdeck-{}.m3u8", record.job.id);
-    let request = TrackImportRequest {
-        spotify_track_url: Some(url.to_owned()),
-        output_directory: stage.to_path_buf(),
-        playlist_m3u_name: Some(m3u_name),
-        // An explicit zero disables the process runner's default timeout. Auto uses the progress deadline below.
-        timeout_ms: Some(record.timeout.maximum_ms().unwrap_or(0)),
-        ..Default::default()
-    };
-    let started = Instant::now();
-    let deadline = PlaylistDeadline::new(record.timeout, historical_rate, started);
-    let batch =
-        download_manifest(context, downloader, &request, &record.job.id, Some(deadline)).await?;
-    let downloaded_tracks = batch
-        .entries
-        .iter()
-        .filter(|entry| entry.file_path.is_some())
-        .count() as u64;
-    if downloaded_tracks >= 5 {
-        record.download_sample = Some(PlaylistDownloadSample {
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            downloaded_tracks,
-        });
-    }
-    if let Some(name) = batch.name {
-        record.job.playlist_name.get_or_insert(name);
-    }
-    record.job.expected_count = Some(batch.expected_count);
-    record.job.manifest = Some(batch.entries);
-    Ok(())
-}
-
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ManifestDownload {
     pub entries: Vec<ImportEntry>,
     pub expected_count: usize,
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_connection: Option<String>,
 }
 
-pub(super) async fn download_manifest(
+pub(super) async fn download_manifest<F>(
     context: &TaskRunContext,
     downloader: &SpotDLDownloaderAdapter,
     request: &TrackImportRequest,
     job_id: &str,
     deadline: Option<PlaylistDeadline>,
-) -> Result<ManifestDownload, TaskError> {
+    hard_deadline: Instant,
+    persist: impl FnMut(DownloadTelemetry) -> F,
+) -> Result<ManifestDownload, TaskError>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
     let m3u_name = request
         .playlist_m3u_name
         .as_deref()
         .ok_or_else(|| TaskError::Validation("Download requires a track manifest".into()))?;
     let stage = &request.output_directory;
-    let (tx, mut rx) = mpsc::unbounded_channel::<AcquisitionProgress>();
-    let ctx = context.clone();
-    let progress = tokio::spawn(async move {
-        while let Some(update) = rx.recv().await {
-            ctx.report(TaskProgressPatch {
-                percent: update.percent.map(|p| p * 0.8),
-                message: Some(update.message.or(update.stage)),
-                ..Default::default()
-            })
-            .await;
-        }
-    });
-    let cancel = context.cancel_token().child_token();
-    let (deadline_tx, mut deadline_rx) = mpsc::unbounded_channel();
-    let deadline_tx = deadline.as_ref().map(|_| deadline_tx);
-    let work = downloader.download_with_cancel(request, cancel.clone(), move |update| {
-        if let Some(tx) = &deadline_tx
-            && let Some(progress) = update.message.as_deref().and_then(PlaylistProgress::from_log)
-        {
-            let _ = tx.send(progress);
-        }
-        let _ = tx.send(update);
-    });
-    tokio::pin!(work);
-    let result = if let Some(deadline) = deadline {
-        tokio::select! {
-            biased;
-            result = &mut work => Ok(result),
-            error = deadline.wait(&mut deadline_rx) => {
-                cancel.cancel();
-                let _ = work.await;
-                Err(error)
-            }
-        }
-    } else {
-        Ok(work.await)
+    let output = monitor_download(
+        context,
+        downloader,
+        request,
+        deadline,
+        hard_deadline,
+        persist,
+    )
+    .await;
+    if matches!(output, Err(TaskError::Cancelled)) {
+        return Err(TaskError::Cancelled);
+    }
+    let stage = fs::canonicalize(stage).await.map_err(import_db_error)?;
+    let (files, track_errors, failed) = match output {
+        Ok(output) => (
+            output.files,
+            output.track_errors,
+            output
+                .failure
+                .map(|error| TaskError::ExecutionFailed(error.to_string())),
+        ),
+        Err(error) => (
+            scan_downloaded_audio_files(&stage)
+                .await
+                .map_err(import_db_error)?,
+            HashMap::new(),
+            Some(error),
+        ),
     };
-    let _ = progress.await;
-    let output = result?.map_err(|err| match err {
-        SpotDLDownloadError::Process(crate::tasks::ProcessError::Cancelled) => TaskError::Cancelled,
-        other => TaskError::ExecutionFailed(other.to_string()),
-    })?;
-    let stage = fs::canonicalize(stage).await.map_err(|err| {
-        TaskError::ExecutionFailed(format!("Could not open spotDL output directory: {err}"))
-    })?;
+    if files.is_empty()
+        && let Some(error) = failed
+    {
+        return Err(error);
+    }
     let mut staged_files = HashSet::new();
-    for path in output.files {
+    for path in files {
         if let Some(path) = staged_playlist_path(&stage, &path.to_string_lossy()).await {
             staged_files.insert(path);
         }
     }
-    let manifest = read_playlist_artifact(&stage.join(&m3u_name))
-        .await
-        .map_err(|err| {
-            TaskError::ExecutionFailed(format!(
-                "spotDL did not provide a readable playlist track list: {err}"
-            ))
-        })?;
-    let metadata: Vec<SpotdlPlaylistTrack> =
-        match read_playlist_artifact(&stage.join("musicdeck-source.spotdl")).await {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+    let source_json = read_playlist_artifact(&stage.join("musicdeck-source.spotdl")).await;
+    let manifest = match read_playlist_artifact(&stage.join(m3u_name)).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if let Ok(json) = &source_json {
+                let mut recovered = resume::occurrence_manifest(json, false)?;
+                resume::harvest(
+                    context,
+                    &stage,
+                    staged_files.iter().cloned(),
+                    &mut recovered,
+                    &downloader.tagger(),
+                )
+                .await?;
+                if recovered
+                    .entries
+                    .iter()
+                    .any(|entry| entry.file_path.is_some())
+                {
+                    return Ok(recovered);
+                }
+            }
+            return Err(failed.unwrap_or_else(|| {
+                TaskError::ExecutionFailed(format!(
+                    "spotDL did not provide a readable track manifest: {error}"
+                ))
+            }));
+        }
+    };
+    let metadata: Vec<SpotdlPlaylistTrack> = source_json
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
     let name = metadata
         .iter()
         .filter_map(|entry| entry.list_name.as_deref())
@@ -1494,17 +1710,6 @@ pub(super) async fn download_manifest(
             });
         let title = source
             .and_then(|track| track.name.as_deref())
-            .filter(|name| !name.trim().is_empty())
-            .or_else(|| {
-                stem.map(|stem| {
-                    let name = if staged_id.is_some() {
-                        stem.rsplit_once(" [").map_or(stem, |(name, _)| name)
-                    } else {
-                        stem
-                    };
-                    name.split_once(" - ").map_or(name, |(_, title)| title)
-                })
-            })
             .unwrap_or_default();
         let path = staged_playlist_path(&stage, line)
             .await
@@ -1532,22 +1737,35 @@ pub(super) async fn download_manifest(
             },
             status: ImportEntryStatus::Downloaded,
             error: None,
+            error_code: None,
             file_path: path.map(|path| path.to_string_lossy().into_owned()),
+            library_path: None,
+            library_reused: false,
             provider_track_id: None,
             duplicate_of: None,
             requires_scan: None,
+            catalog: None,
         };
-        if entry.file_path.is_none() {
+        if source.is_none() {
+            entry.file_path = None;
+            fail_import_entry(
+                job_id,
+                &mut entry,
+                ImportEntryStatus::FailedMetadataMissing,
+                "No matching source metadata was available".into(),
+            );
+        } else if entry.file_path.is_none() {
+            let id = staged_id.or_else(|| source.and_then(|track| track.song_id.as_deref()));
+            entry.error_code = id
+                .and_then(|id| track_errors.get(id))
+                .map(|code| (*code).to_owned());
+            let message =
+                downloader_error_message(entry.error_code.as_deref().unwrap_or("general"));
             fail_import_entry(
                 job_id,
                 &mut entry,
                 ImportEntryStatus::FailedDownload,
-                match output.warning {
-                    Some(code) => {
-                        format!("spotDL did not download track {} ({code})", position + 1)
-                    }
-                    None => format!("spotDL did not download playlist track {}", position + 1),
-                },
+                message.to_owned(),
             );
         }
         entries.push(entry);
@@ -1569,89 +1787,8 @@ pub(super) async fn download_manifest(
         expected_count,
         entries,
         name,
+        indexed_connection: None,
     })
-}
-
-async fn download_checkpointed_tracks(
-    record: &mut StoredImportJob,
-    context: &TaskRunContext,
-    downloader: &SpotDLDownloaderAdapter,
-    stage: &Path,
-) -> Result<(), TaskError> {
-    let job = &mut record.job;
-    let entries = job.manifest.as_mut().expect("stored import manifest");
-    job.expected_count = Some(entries.len());
-    for (index, entry) in entries.iter_mut().enumerate() {
-        context.checkpoint().await?;
-        let previous_status = entry.status;
-        entry.file_path = None;
-        entry.provider_track_id = None;
-        let mut request = TrackImportRequest {
-            output_directory: stage.join(format!("track-{}", index + 1)),
-            ..Default::default()
-        };
-        if let Ok(url) = canonical_spotify_url(&entry.source.url) {
-            request.spotify_track_url = Some(url);
-        } else if previous_status == ImportEntryStatus::Pending
-            && !entry.source.title.trim().is_empty()
-        {
-            request.query = Some(
-                format!(
-                    "{} {}",
-                    entry.source.artist.trim(),
-                    entry.source.title.trim()
-                )
-                .trim()
-                .to_owned(),
-            );
-        } else {
-            fail_import_entry(
-                &job.id,
-                entry,
-                ImportEntryStatus::FailedMetadataMissing,
-                "Stored track has no valid Spotify source".into(),
-            );
-            continue;
-        }
-        let result = downloader
-            .download_with_cancel(&request, context.cancel_token(), |_| {})
-            .await
-            .map(|output| output.files);
-        if matches!(
-            result,
-            Err(SpotDLDownloadError::Process(
-                crate::tasks::ProcessError::Cancelled
-            ))
-        ) {
-            return Err(TaskError::Cancelled);
-        }
-        match result {
-            Ok(files) if files.len() == 1 => {
-                entry.status = ImportEntryStatus::Downloaded;
-                entry.error = None;
-                entry.file_path = Some(files[0].to_string_lossy().into_owned());
-            }
-            Ok(_) => fail_import_entry(
-                &job.id,
-                entry,
-                ImportEntryStatus::FailedDownload,
-                "spotDL did not return exactly one audio file for this track".into(),
-            ),
-            Err(err) => {
-                let message = err.to_string();
-                fail_import_entry(
-                    &job.id,
-                    entry,
-                    ImportEntryStatus::FailedDownload,
-                    message.clone(),
-                );
-                if matches!(err, SpotDLDownloadError::Process(_)) {
-                    return Err(TaskError::ExecutionFailed(message));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn fail_import_entry(
@@ -1701,12 +1838,69 @@ mod playlist_intent_tests {
         .await
         .unwrap();
         let repo = SqliteImportJobRepository::new(db);
-        assert_eq!(repo.historical_download_rate("alice").await.unwrap(), Some(4_000));
-        assert_eq!(repo.historical_download_rate("bob").await.unwrap(), Some(9_000));
-        assert_eq!(repo.historical_download_rate("new-user").await.unwrap(), None);
+        assert_eq!(
+            repo.historical_download_rate("alice").await.unwrap(),
+            Some(4_000)
+        );
+        assert_eq!(
+            repo.historical_download_rate("bob").await.unwrap(),
+            Some(9_000)
+        );
+        assert_eq!(
+            repo.historical_download_rate("new-user").await.unwrap(),
+            None
+        );
     }
 
     struct ResumeImport(SpotifyPlaylistImportService);
+
+    #[tokio::test]
+    async fn restart_requeues_a_download_before_playlist_creation() {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        let store = SpotifyPlaylistImportService::new(Some(db.clone()));
+        let manager = TaskManager::new_with_dispatch(Some(db.clone()), false);
+        manager.initialize_tables().await;
+        manager.register(
+            TaskType::SpotdlImport,
+            Arc::new(ResumeImport(store.clone())),
+        );
+        let repo = SqliteImportJobRepository::new(db.clone());
+        let record = serde_json::from_value::<StoredImportJob>(json!({
+            "job": {"id":"spimp_mid_job","userId":"alice","status":"running","stage":"download"},
+            "playlistUrl":"https://open.spotify.com/playlist/abc123",
+            "user":{"id":"alice","disabled":false},
+        }))
+        .unwrap();
+        repo.save(&record).await.unwrap();
+        let task = manager
+            .enqueue(
+                TaskType::SpotdlImport,
+                json!({"kind":"playlist","jobId":"spimp_mid_job"}),
+                "alice",
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE background_tasks SET state='PROCESSING' WHERE id=?")
+            .bind(&task.id)
+            .execute(db.inner())
+            .await
+            .unwrap();
+        manager.recover_interrupted_tasks().await;
+        store.recover_interrupted_jobs().await.unwrap();
+        assert_eq!(
+            store.get_by_id("spimp_mid_job").await.unwrap().status,
+            "queued"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM background_tasks WHERE id=?")
+            .bind(task.id)
+            .fetch_one(db.inner())
+            .await
+            .unwrap();
+        assert_eq!(state, "QUEUED");
+        manager.close();
+    }
 
     #[async_trait::async_trait]
     impl TaskDefinition for ResumeImport {

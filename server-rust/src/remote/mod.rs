@@ -57,6 +57,8 @@ pub const REGISTRATION_TIMEOUT_MS: u64 = 10_000;
 /// Command acknowledgement timeout (`8,000` ms).
 pub const COMMAND_TIMEOUT_MS: u64 = 8_000;
 const COMMAND_LIFETIME_MS: u64 = 10_000;
+const COLLECTION_COMMAND_TIMEOUT_MS: u64 = 20_000;
+const COLLECTION_COMMAND_LIFETIME_MS: u64 = 22_000;
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(4);
 const PLAYBACK_LEASE_MS: u64 = 5_000;
 
@@ -183,6 +185,10 @@ pub enum RemoteCommand {
         from_here: bool,
         context: Option<RemoteSelectionContext>,
     },
+    /// Resolve a Tracks page query on the active device without sending every track over the socket.
+    PlayLibraryTracks { selection: LibraryPlaybackSelection },
+    /// Recreate a playlist view and start at its selected occurrence on the active device.
+    PlayPlaylist { selection: PlaylistPlaybackSelection },
     /// Play one selected track. Routed through the same queue path as PLAY_SELECTION.
     PlayTrack { track: Value },
     /// Add tracks to the active queue.
@@ -191,6 +197,54 @@ pub enum RemoteCommand {
         next: bool,
         dedupe: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LibraryPlaybackSelection {
+    query: TrackLibraryQuery,
+    track_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shuffle: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrackLibraryQuery {
+    query: String,
+    sort: crate::catalog::snapshot::LibraryTrackSort,
+    favorites_only: bool,
+    unplayed_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlaylistPlaybackSelection {
+    playlist_id: String,
+    start_index: u32,
+    from_here: bool,
+    view: PlaylistPlaybackView,
+    order: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlaylistPlaybackView {
+    query: String,
+    sort: PlaylistTrackSort,
+    descending: bool,
+    locale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PlaylistTrackSort {
+    Custom,
+    Added,
+    Title,
+    Artist,
+    Album,
+    Duration,
 }
 
 /// Collection information associated with a new remote selection.
@@ -207,6 +261,10 @@ pub struct RemoteSelectionContext {
 }
 
 impl RemoteCommand {
+    fn resolves_collection(&self) -> bool {
+        matches!(self, Self::PlayLibraryTracks { .. } | Self::PlayPlaylist { .. })
+    }
+
     fn valid(&self) -> bool {
         let valid_id = |id: &str| !id.is_empty() && id.len() <= 160;
         let valid_tracks = |tracks: &[Value]| {
@@ -249,6 +307,15 @@ impl RemoteCommand {
                     })
             }
             Self::Enqueue { tracks, .. } => valid_tracks(tracks),
+            Self::PlayLibraryTracks { selection } => selection.query.query.chars().count() <= 200
+                && selection.track_id.as_ref().is_none_or(|id| !id.is_empty() && id.len() <= 1024),
+            Self::PlayPlaylist { selection } => !selection.playlist_id.is_empty()
+                && selection.playlist_id.len() <= 1024
+                && selection.view.query.chars().count() <= 4096
+                && (1..=128).contains(&selection.view.locale.len())
+                && selection.view.locale.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && selection.order.len() == 16
+                && selection.order.bytes().all(|byte| byte.is_ascii_hexdigit()),
             _ => true,
         }
     }
@@ -1033,9 +1100,12 @@ impl RemoteControlHub {
                         command,
                     } => {
                         let now_ms = epoch_ms();
-                        let expires_at = expires_at
-                            .unwrap_or(now_ms + COMMAND_LIFETIME_MS)
-                            .min(now_ms + COMMAND_LIFETIME_MS);
+                        let lifetime = if command.resolves_collection() {
+                            COLLECTION_COMMAND_LIFETIME_MS
+                        } else {
+                            COMMAND_LIFETIME_MS
+                        };
+                        let expires_at = expires_at.unwrap_or(now_ms + lifetime).min(now_ms + lifetime);
                         if expires_at <= now_ms {
                             Self::send_error_locked(
                                 &guard,
@@ -1595,11 +1665,16 @@ impl RemoteControlHub {
             let Some(cmd) = guard.commands.get_mut(user_id).and_then(VecDeque::front_mut) else {
                 return;
             };
+            let timeout = if cmd.command.resolves_collection() {
+                COLLECTION_COMMAND_TIMEOUT_MS
+            } else {
+                COMMAND_TIMEOUT_MS
+            };
             let budget = cmd
                 .expires
                 .saturating_duration_since(now)
                 .min(Duration::from_millis(
-                    (cmd.expires_at - now_ms).min(COMMAND_TIMEOUT_MS),
+                    (cmd.expires_at - now_ms).min(timeout),
                 ));
             cmd.deadline = Some(now + budget);
             let target = cmd.target_conn_id.clone();
@@ -3190,6 +3265,16 @@ mod tests {
         let (controller, mut browser) = register("browser", Value::Null);
         while player.try_recv().is_ok() {}
         while browser.try_recv().is_ok() {}
+        let acknowledge = |frame: &Value| {
+            hub.handle_message(
+                &active,
+                serde_json::from_value(json!({
+                    "type": "COMMAND_RESULT", "requestId": frame["requestId"],
+                    "expiresAt": frame["expiresAt"], "ok": true,
+                }))
+                .unwrap(),
+            );
+        };
 
         let command = |index| {
             json!({
@@ -3207,6 +3292,54 @@ mod tests {
         hub.handle_message(&controller, serde_json::from_value(command(2)).unwrap());
         assert_eq!(browser.try_recv().unwrap()["type"], "ERROR");
         assert!(player.try_recv().is_err());
+
+        let library = json!({"type":"COMMAND", "requestId":"play-library", "command": {
+            "type":"PLAY_LIBRARY_TRACKS", "selection": { "trackId": null, "shuffle": true,
+                "query": {"query":"live", "sort":"title-desc", "favoritesOnly":false, "unplayedOnly":true} }
+        }});
+        hub.handle_message(&controller, serde_json::from_value(library.clone()).unwrap());
+        assert!(player.try_recv().is_err());
+        acknowledge(&forwarded);
+        let completed = browser.try_recv().unwrap();
+        assert_eq!(completed["type"], "COMMAND_RESULT");
+        assert_eq!(completed["requestId"], "choose-track");
+        let forwarded = player.try_recv().unwrap();
+        assert_eq!(forwarded["type"], "EXECUTE");
+        assert_eq!(forwarded["command"], library["command"]);
+        assert!(forwarded["timeoutMs"].as_u64().unwrap() > COMMAND_TIMEOUT_MS);
+        acknowledge(&forwarded);
+        assert_eq!(browser.try_recv().unwrap()["requestId"], "play-library");
+
+        let playlist = json!({"type":"COMMAND", "requestId":"play-playlist", "command": {
+            "type":"PLAY_PLAYLIST", "selection": { "playlistId": "large", "startIndex": 1000,
+                "fromHere": true, "order": "1234567890abcdef",
+                "view": {"query":"live", "sort":"title", "descending":true, "locale":"en-US"} }
+        }});
+        let mut invalid = playlist.clone();
+        invalid["command"]["selection"]["order"] = json!("invalid");
+        hub.handle_message(&controller, serde_json::from_value(invalid).unwrap());
+        assert_eq!(browser.try_recv().unwrap()["type"], "ERROR");
+        assert!(player.try_recv().is_err());
+        hub.handle_message(&controller, serde_json::from_value(playlist.clone()).unwrap());
+        let forwarded = player.try_recv().unwrap();
+        assert_eq!(forwarded["type"], "EXECUTE");
+        assert_eq!(forwarded["command"], playlist["command"]);
+        assert!(forwarded["timeoutMs"].as_u64().unwrap() > COMMAND_TIMEOUT_MS);
+        acknowledge(&forwarded);
+        assert_eq!(browser.try_recv().unwrap()["requestId"], "play-playlist");
+    }
+
+    #[test]
+    fn inline_playback_keeps_its_existing_size_limits() {
+        for (count, valid) in [(0, false), (999, true), (1000, true), (1001, false)] {
+            let command = RemoteCommand::PlaySelection {
+                tracks: vec![json!({"id":"track"}); count],
+                start_index: 0,
+                from_here: false,
+                context: None,
+            };
+            assert_eq!(command.valid(), valid, "{count} inline tracks");
+        }
     }
 
     #[test]

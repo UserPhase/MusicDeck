@@ -5,13 +5,13 @@ import { offlineDownloadEngine as engine, storageBoundary } from "../services/st
 import { autoDownloadPolicies } from "../services/storage/AutoDownloadPolicyManager";
 import { useAuth } from "../context/AuthContext";
 import { usePlayer } from "../context/PlayerContext";
-import { getAcquisitions } from "../api/musicdeck";
+import { cancelAcquisition, getAcquisitions, retryAcquisition } from "../api/musicdeck";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 
 jest.mock("../context/AuthContext", () => ({ useAuth: jest.fn() }));
 jest.mock("../context/PlayerContext", () => ({ usePlayer: jest.fn() }));
 jest.mock("../api/playlists", () => ({ getPlaylists: async () => [{ id: "p", name: "Road trip" }] }));
-jest.mock("../api/musicdeck", () => ({ getAcquisitions: jest.fn() }));
+jest.mock("../api/musicdeck", () => ({ cancelAcquisition: jest.fn(), getAcquisitions: jest.fn(), retryAcquisition: jest.fn() }));
 jest.mock("../hooks/useMediaQuery", () => ({ useMediaQuery: jest.fn(() => false) }));
 jest.mock("../components/TrackRow", () => ({ __esModule: true, default: ({ song, onPlay, action, menuAction }: any) =>
   <div><button onClick={onPlay}>Play {song.title}</button>{action}
@@ -47,24 +47,50 @@ test("opens verified downloads offline without treating the local account as aut
   expect(getAcquisitions).not.toHaveBeenCalled();
 });
 
-test("shows server download progress and refreshes until the job completes", async () => {
+test("shows server download progress and treats a partial result as settled", async () => {
   jest.useFakeTimers();
   try {
     Object.defineProperty(navigator, "onLine", { configurable: true, value: true });
     (useAuth as jest.Mock).mockReturnValue({ isAuthenticated: true, session: { id: "alice" } });
     const job = { id: "job", requestedTitle: "Server song", progress: { percent: 42 } };
     (getAcquisitions as jest.Mock).mockResolvedValueOnce([{ ...job, status: "downloading" }])
-      .mockResolvedValue([{ ...job, status: "completed" }]);
+      .mockResolvedValue([{ ...job, status: "partial", errorMessage: "Imported 1 of 2 tracks" }]);
     const view = mount();
     expect(await screen.findByRole("progressbar", { name: "Server song download progress" })).toHaveAttribute("value", "42");
     expect(getAcquisitions).toHaveBeenCalledWith({ ownOnly: true, signal: expect.any(AbortSignal) });
     await act(async () => { jest.advanceTimersByTime(2000); });
-    expect(screen.getByText("Completed")).toBeInTheDocument();
+    expect(screen.getByText("Partially imported")).toBeInTheDocument();
+    expect(screen.getByText("0 active")).toBeInTheDocument();
+    expect(screen.getByText("Imported 1 of 2 tracks")).toBeInTheDocument();
     expect(screen.queryByRole("progressbar", { name: "Server song download progress" })).not.toBeInTheDocument();
     view.unmount();
   } finally {
     jest.useRealTimers();
   }
+});
+
+test("retries a partial server download and can cancel it during the cooldown", async () => {
+  Object.defineProperty(navigator, "onLine", { configurable: true, value: true });
+  (useAuth as jest.Mock).mockReturnValue({ isAuthenticated: true, session: { id: "alice" } });
+  const job = { id: "job", requestedTitle: "Server album" };
+  const waiting = { ...job, status: "downloading", stage: "provider_cooldown" };
+  const cancelled = { ...job, status: "cancelled" };
+  (getAcquisitions as jest.Mock).mockResolvedValueOnce([{
+    ...job, status: "partial", trackErrors: [{ position: 2, title: "Missing song", message: "The provider timed out." }],
+  }]).mockResolvedValueOnce([waiting]).mockResolvedValue([cancelled]);
+  (retryAcquisition as jest.Mock).mockResolvedValueOnce({ job: waiting });
+  (cancelAcquisition as jest.Mock).mockResolvedValueOnce({ job: cancelled });
+  mount();
+
+  const retry = await screen.findByRole("button", { name: "Retry download for Server album" });
+  fireEvent.click(screen.getByText("Track errors (1)"));
+  expect(screen.getByText(/Missing song .* The provider timed out/)).toBeInTheDocument();
+  fireEvent.click(retry);
+  expect(retryAcquisition).toHaveBeenCalledWith("job");
+  expect(await screen.findByText("Waiting for the source provider cooldown")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel download for Server album" }));
+  expect(cancelAcquisition).toHaveBeenCalledWith("job");
+  expect(await screen.findByText("Cancelled")).toBeInTheDocument();
 });
 test("does not make an unreadable manifest entry playable", async () => {
   (engine.readVerifiedTrack as jest.Mock).mockResolvedValue(null);

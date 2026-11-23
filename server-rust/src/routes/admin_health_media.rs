@@ -698,11 +698,21 @@ async fn post_admin_acquisitions_scan_handler(State(state): State<AppState>, _ad
 async fn get_downloader_diagnostics_handler(State(state): State<AppState>, _admin: RequireAdmin) -> Result<Response, ServerError> {
     let adapter = SpotDLDownloaderAdapter::new().with_saved_settings(state.db()).await;
     adapter.tool_paths().map_err(|err| ServerError::ServiceUnavailable(err.to_owned()))?;
-    let diag = adapter.detect_binaries().await;
+    let music_root = state.config().music_root.clone();
+    let storage = tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(music_root).is_ok());
+    let (diag, runtime, writable) = tokio::join!(adapter.detect_binaries(), adapter.probe_runtime(),
+        tokio::time::timeout(std::time::Duration::from_secs(5), storage));
+    let (conversion, python_dependencies, javascript_runtime) = runtime;
+    let navidrome_configured = state.providers().get_primary().is_ok_and(|backend| backend.provider_type == "navidrome");
     let downloaders: Vec<Value> = vec![json!({
         "id": "spotdl",
         "name": "spotDL Downloader",
         "diagnostics": diag,
+        "checks": {
+            "audioConversion": conversion, "pythonDependencies": python_dependencies,
+            "javascriptRuntime": javascript_runtime, "musicRootWritable": matches!(writable, Ok(Ok(true))),
+            "navidromeConfigured": navidrome_configured,
+        },
     })];
     Ok(Json(json!({ "downloaders": downloaders })).into_response())
 }

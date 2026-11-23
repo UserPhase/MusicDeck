@@ -37,6 +37,8 @@ use crate::tasks::{DefaultProcessRunner, ProcessOptions, ProcessRunner};
 pub const LOUDNESS_TARGET: f64 = -16.0;
 /// Maximum allowed true peak ceiling (`-1.0 dBTP`).
 pub const TRUE_PEAK_LIMIT: f64 = -1.0;
+pub(super) const MEASUREMENT_FILTER: &str = "loudnorm=dual_mono=true:print_format=json";
+const LOW_LEVEL_LUFS: f64 = -65.0;
 /// Maximum input audio size for loudness analysis (`256 MiB`).
 pub const MAX_LOUDNESS_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 /// Cache TTL for loudness measurements and normalized streams (`7 days` in milliseconds).
@@ -182,13 +184,23 @@ pub fn parse_loudness(stderr: &str) -> Result<LoudnessMeasurement, String> {
     Ok(measurement)
 }
 
-/// Computes the headroom-safe linear playback gain in dB:
-/// $$\text{gain}_{\text{dB}} = \max\bigl(-60.0,\; \min(12.0,\; I_{\text{target}} - I_{\text{in}},\; -1.0 - \text{TP}_{\text{in}})\bigr)$$
+/// Computes a fixed gain with true-peak protection and a bounded boost.
 #[must_use]
 pub fn measured_playback_gain(integrated_lufs: f64, true_peak_db: f64, target_lufs: f64) -> f64 {
-    let lufs_delta = target_lufs - integrated_lufs;
-    let peak_headroom = TRUE_PEAK_LIMIT - true_peak_db;
-    lufs_delta.min(peak_headroom).clamp(-60.0, 12.0)
+    gain_with_peak_limit(integrated_lufs, true_peak_db, target_lufs, TRUE_PEAK_LIMIT)
+}
+
+pub(super) fn gain_with_peak_limit(
+    integrated_lufs: f64,
+    true_peak_db: f64,
+    target_lufs: f64,
+    peak_limit: f64,
+) -> f64 {
+    // Avoid raising near-silent noise, and leave unusually spiky material below target.
+    let max_boost = if integrated_lufs < LOW_LEVEL_LUFS { 0.0 } else { 12.0 };
+    (target_lufs - integrated_lufs)
+        .min(max_boost)
+        .min(peak_limit - true_peak_db)
 }
 
 /// Builds the canonical playback identity string for loudness caching.
@@ -241,7 +253,7 @@ fn sha256_hex(input: &str) -> String {
 /// Computes the deterministic SHA-256 measurement cache key for `(identity, external_tag)`.
 #[must_use]
 pub fn loudness_measurement_key(identity: &str, external_tag: &str) -> String {
-    sha256_hex(&format!("measurement-v1:{external_tag}:{identity}"))
+    sha256_hex(&format!("measurement-v2:{external_tag}:{identity}"))
 }
 
 /// Computes the deterministic SHA-256 stream cache key for `(identity, external_tag, bit_rate, target_lufs)`.
@@ -253,9 +265,7 @@ pub fn loudness_stream_cache_key(
     target_lufs: i32,
 ) -> String {
     let br = bit_rate.map_or_else(|| String::from("flac"), |b| b.to_string());
-    sha256_hex(&format!(
-        "v2:{target_lufs}:-1:LRA20:{external_tag}:{br}:{identity}"
-    ))
+    sha256_hex(&format!("v3:{target_lufs}:{external_tag}:{br}:{identity}"))
 }
 
 /// Service managing EBU R128 loudness measurements and normalized audio stream caching.
@@ -340,8 +350,6 @@ impl LoudnessService {
             return Ok(cached);
         }
 
-        let filter =
-            format!("loudnorm=I={LOUDNESS_TARGET}:TP={TRUE_PEAK_LIMIT}:LRA=20:print_format=json");
         let args = vec![
             String::from("-nostdin"),
             String::from("-hide_banner"),
@@ -360,7 +368,7 @@ impl LoudnessService {
             String::from("-map"),
             String::from("0:a:0"),
             String::from("-af"),
-            filter,
+            MEASUREMENT_FILTER.into(),
             String::from("-f"),
             String::from("null"),
             String::from("-"),

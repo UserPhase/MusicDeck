@@ -108,13 +108,13 @@
 .playlist-cover-error { max-width: 230px; margin-top: var(--space-2); font-size: 12px; }
 .album-page-info, .playlist-page-info, .artist-page-info { min-width: 0; }
 .album-type, .playlist-type, .artist-type { margin-bottom: var(--space-2); color: var(--text-secondary); font-size: 11px; font-weight: 700; letter-spacing: 1.2px; }
-.album-page-info h1, .playlist-page-info h1 { color: var(--text); font-size: var(--font-detail-heading); font-weight: var(--weight-bold); letter-spacing: -1.2px; line-height: 1.1; }
+.album-page-info h1, .playlist-page-info h1 { color: var(--text); font-size: var(--font-detail-heading); font-weight: var(--weight-bold); letter-spacing: -1.2px; line-height: 1.1; overflow-wrap: anywhere; }
 .playlist-title-edit { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-align: start; cursor: pointer; }
 .playlist-title-edit:focus-visible { outline: var(--focus-ring); outline-offset: 4px; }
 .album-page-artist { display: inline-block; margin-top: var(--space-3); color: var(--accent-text); font-size: 16px; font-weight: 600; text-decoration: none; }
 .album-page-artist:hover { color: var(--text); }
 .album-meta { margin-top: var(--space-2); color: var(--text-secondary); font-size: 13px; }
-.detail-action-row { display: flex; align-items: center; gap: var(--space-4); width: var(--detail-content-width); margin: var(--space-6) auto; }
+.detail-action-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); width: var(--detail-content-width); margin: var(--space-6) auto; }
 .album-play, .playlist-play, .artist-play, .liked-play { display: flex; align-items: center; justify-content: center; gap: var(--space-2); height: 40px; padding: 0 var(--space-4); border-radius: 20px; background: var(--accent); color: var(--bg-app); font-size: 13px; font-weight: 700; transition: background 0.15s ease, transform 0.15s ease; }
 .album-play:hover, .playlist-play:hover, .artist-play:hover, .liked-play:hover { background: var(--accent-hover); transform: scale(1.03); }
 .detail-secondary-action { width: 40px; height: 40px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--text-muted); font-size: 18px; transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease; }
@@ -135,7 +135,7 @@
 .playlist-options-menu .playlist-menu-item > span { width: 16px; color: var(--accent-text); font-size: 16px; text-align: center; }
 .playlist-options-menu .playlist-delete { margin-top: var(--space-1); border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; color: var(--danger-text-strong, #f87171); }
 .playlist-options-menu .playlist-delete:hover:not(:disabled) { background: color-mix(in srgb, var(--danger, #ef4444) 12%, transparent); color: var(--danger-text-strong, #f87171); }
-.playlist-description { max-width: 500px; margin: var(--space-3) 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+.playlist-description { max-width: 500px; margin: var(--space-3) 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .playlist-details-backdrop { position: fixed; z-index: 5000; inset: 0; display: grid; place-items: center; padding: var(--space-5); background: rgb(0 0 0 / 68%); backdrop-filter: blur(8px); }
 .playlist-details-dialog { display: grid; gap: var(--space-2); width: min(42rem, 100%); max-height: calc(100vh - 2.5rem); overflow-y: auto; padding: var(--space-6); border: 1px solid rgb(168 85 247 / 22%); border-radius: 1rem; background: rgb(var(--dialog-rgb) / 96%); color: var(--text); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 55%); }
 .playlist-details-content { display: contents; }

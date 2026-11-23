@@ -44,6 +44,7 @@ ENV VIRTUAL_ENV=/opt/venv
 ENV SPOTDL_HOME=/opt/venv
 ENV PATH="/opt/venv/bin:/usr/local/bin:${PATH}"
 ENV HOME=/app/home
+ENV XDG_CACHE_HOME=/app/cache/runtime
 ENV MUSICDECK_EXTENSIONS_DIR=/extensions
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
@@ -70,9 +71,9 @@ RUN apt-get update \
 # Create dedicated non-root system user/group (`musicdeck`) and initialize directories.
 RUN groupadd --system musicdeck \
   && useradd --system --gid musicdeck --home-dir /app/home musicdeck \
-  && mkdir -p /app/home /app/data /app/config /app/cache /extensions \
+  && mkdir -p /app/home /app/data /app/config /app/cache/runtime /extensions \
   && chown -R musicdeck:musicdeck /app /extensions \
-  && chmod 0700 /app/data
+  && chmod 0700 /app/data /app/home /app/cache/runtime
 
 # Pre-install Deno under `musicdeck`'s HOME for yt-dlp YouTube challenge solving
 # and optional JS extension execution.
@@ -91,7 +92,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/musicdeck-entrypoint \
   && chmod 0755 /usr/local/bin/musicdeck-server /usr/local/bin/init_db /usr/local/bin/shrink_library
 
 EXPOSE 4534
-VOLUME ["/app/data", "/app/config", "/app/cache"]
+VOLUME ["/app/data", "/app/config", "/app/cache", "/app/home"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD if [ -n "${MUSICDECK_BIND_ADDR:-}" ]; then bind="${MUSICDECK_BIND_ADDR}"; \

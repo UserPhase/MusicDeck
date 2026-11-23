@@ -3,6 +3,7 @@ import {
   useState, useSyncExternalStore,
 } from "react";
 import { usePlayer } from "./PlayerContext";
+import type { LibraryPlaybackSelection } from "../types/libraryTracks";
 
 type Song = { id: string | number; [key: string]: unknown };
 interface Actions {
@@ -12,6 +13,7 @@ interface Actions {
     type: string; id: string; name: string; coverArt: string | null;
   }): void | Promise<void>;
   playSongFromSource(song: Song, source: string | { id: string; [key: string]: unknown }): void | Promise<void>;
+  playLibraryTracks(selection: LibraryPlaybackSelection, signal: AbortSignal, excluded?: ReadonlySet<string>): void | Promise<void>;
 }
 interface PlayerValue extends Partial<Actions> {
   currentSong?: Song | null;
@@ -21,13 +23,14 @@ interface PlayerValue extends Partial<Actions> {
 }
 export interface ItemState {
   currentId: string | null;
+  currentPlaylistItemId: string | null;
   isPlaying: boolean;
   likedSongIds: ReadonlySet<string>;
   downloadQuality: string;
 }
 const emptyLikes = new Set<string>();
 const initialState: ItemState = {
-  currentId: null, isPlaying: false, likedSongIds: emptyLikes, downloadQuality: "320kbps",
+  currentId: null, currentPlaylistItemId: null, isPlaying: false, likedSongIds: emptyLikes, downloadQuality: "320kbps",
 };
 
 export function createPlayerItemStore(initial: PlayerValue = {}) {
@@ -39,11 +42,13 @@ export function createPlayerItemStore(initial: PlayerValue = {}) {
     toggleLikeSong: (song) => player.toggleLikeSong?.(song),
     playContext: (songs, index, context) => player.playContext?.(songs, index, context),
     playSongFromSource: (song, source) => player.playSongFromSource?.(song, source),
+    playLibraryTracks: (selection, signal, excluded) => player.playLibraryTracks?.(selection, signal, excluded),
   };
   const update = (value: PlayerValue) => {
     player = value;
     const next: ItemState = {
       currentId: value.currentSong ? String(value.currentSong.id) : null,
+      currentPlaylistItemId: typeof value.currentSong?.playlistItemId === "string" ? value.currentSong.playlistItemId : null,
       isPlaying: Boolean(value.isPlaying),
       likedSongIds: value.likedSongIds ?? emptyLikes,
       downloadQuality: value.downloadQuality ?? "320kbps",
@@ -96,6 +101,7 @@ export function usePlayerItemSelector<T extends object>(selector: (state: ItemSt
   return {
     selected: context ? selected : selector({
       currentId: legacy?.currentSong ? String(legacy.currentSong.id) : null,
+      currentPlaylistItemId: typeof legacy?.currentSong?.playlistItemId === "string" ? legacy.currentSong.playlistItemId : null,
       isPlaying: Boolean(legacy?.isPlaying),
       likedSongIds: legacy?.likedSongIds ?? emptyLikes,
       downloadQuality: legacy?.downloadQuality ?? "320kbps",
@@ -109,12 +115,12 @@ export function usePlayerActions() {
   return usePlayerItemSelector(noSelection).actions;
 }
 
-export function useTrackPlayer(id: string | number) {
-  const select = useCallback((state: ItemState) => ({
-    isCurrentTrack: state.currentId === String(id),
-    isPlaying: state.currentId === String(id) && state.isPlaying,
-    downloadQuality: state.downloadQuality,
-  }), [id]);
+export function useTrackPlayer(id: string | number, playlistItemId?: string) {
+  const select = useCallback((state: ItemState) => {
+    const isCurrentTrack = state.currentId === String(id) &&
+      (!playlistItemId || playlistItemId === state.currentPlaylistItemId);
+    return { isCurrentTrack, isPlaying: isCurrentTrack && state.isPlaying, downloadQuality: state.downloadQuality };
+  }, [id, playlistItemId]);
   const { selected, actions } = usePlayerItemSelector(select);
   return { ...selected, togglePlay: actions.togglePlay };
 }

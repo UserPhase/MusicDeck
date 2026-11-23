@@ -110,12 +110,16 @@ function QueueSidebar({ isOpen, onClose, closeButtonRef }: {
     },
   });
 
-  const allTracks = isQueueTab ? entries.slice(queueIndex + 1) : playHistory.map((song, index) => ({ song, key: `history-${index}` }));
-  const tracks = allTracks.slice(0, isQueueTab ? (showFullQueue ? allTracks.length : QUEUE_DISPLAY_LIMIT) : HISTORY_DISPLAY_LIMIT);
-  const virtual = isQueueTab && tracks.length > 100;
-  const windowed = useVirtualWindow(itemsRef, isOpen && virtual ? tracks.length : 0, 48, false, `${activeTab}:${isOpen}`);
-  const first = virtual ? windowed.start : 0, end = virtual ? windowed.end : tracks.length;
+  const queueStart = Math.max(0, queueIndex + 1);
+  const upcomingCount = Math.max(0, entries.length - queueStart);
+  const trackCount = isQueueTab ? (showFullQueue ? upcomingCount : Math.min(upcomingCount, QUEUE_DISPLAY_LIMIT))
+    : Math.min(playHistory.length, HISTORY_DISPLAY_LIMIT);
+  const virtual = isQueueTab && trackCount > 100;
+  const windowed = useVirtualWindow(itemsRef, isOpen && virtual ? trackCount : 0, 48, false, `${activeTab}:${isOpen}`);
+  const first = virtual ? windowed.start : 0, end = virtual ? windowed.end : trackCount;
   if (!isOpen) return null;
+  const visibleTracks = isQueueTab ? entries.slice(queueStart + first, queueStart + end)
+    : playHistory.slice(first, end).map((song, index) => ({ song, key: `history-${first + index}` }));
   const emptyMessage = isQueueTab ? isRemotePlayback && !queue.length ? "Waiting for the active device’s queue." : "No tracks up next." : "Nothing played yet.";
   const sectionTitle = isQueueTab ? "Up next" : "Recently played";
 
@@ -162,7 +166,7 @@ function QueueSidebar({ isOpen, onClose, closeButtonRef }: {
         </button>
       </div>
       {isQueueTab && !isRemotePlayback && <QueueManager />}
-      {isQueueTab && allTracks.length > QUEUE_DISPLAY_LIMIT && (
+      {isQueueTab && upcomingCount > QUEUE_DISPLAY_LIMIT && (
         <button
           type="button"
           className="queue-sidebar-expand"
@@ -187,11 +191,11 @@ function QueueSidebar({ isOpen, onClose, closeButtonRef }: {
           tabIndex={0}
           ref={listRef}
         >
-          {tracks.length === 0 ? (
+          {trackCount === 0 ? (
             <p className="queue-sidebar-empty">{emptyMessage}</p>
           ) : (
             <div ref={itemsRef} style={virtual ? { paddingTop: windowed.offsets[first], paddingBottom: windowed.totalSize - windowed.offsets[end] } : undefined}>
-            {tracks.slice(first, end).map((entry, offset) => (
+            {visibleTracks.map((entry, offset) => (
               <CompactTrackRow
                 key={entry.key}
                 song={entry.song}
@@ -199,7 +203,7 @@ function QueueSidebar({ isOpen, onClose, closeButtonRef }: {
                 variant={isQueueTab ? "queue" : "history"}
                 showHandle={showTouchHandle}
                 reorder={isQueueTab && reorderEnabled ? {
-                  rowProps: { ...rowProps(entry, queueIndex + first + offset + 1), ...(virtual ? { style: { height: 48, boxSizing: "border-box" } } : {}) },
+                  rowProps: { ...rowProps(entry, queueStart + first + offset), ...(virtual ? { style: { height: 48, boxSizing: "border-box" } } : {}) },
                 } : null}
               />
             ))}</div>

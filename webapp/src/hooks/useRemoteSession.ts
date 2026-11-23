@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PlaybackState, RemoteCommand, RemoteDevice, RemotePlaybackSnapshot, RemotePlayerAdapter, RemoteSessionValue } from "../types/remoteSession";
+import { libraryTrackSorts } from "../types/libraryTracks";
+import { playlistTrackSortLabels } from "../utils/playlistPlayback";
 import { isMediaResumeContext } from "../services/mediaSessions";
 import { getVisualActivity, subscribeVisualActivity } from "../services/visualActivity";
 import { queueDeviceId, queueSyncClient } from "../services/QueueSyncClient";
@@ -112,6 +114,27 @@ function remoteCommand(value: unknown): value is RemoteCommand {
   const tracks = (items: unknown): items is unknown[] => Array.isArray(items) && items.length > 0 && items.length <= 1000 &&
     items.every(track => object(track) && typeof track.id === "string" && track.id.length > 0 && track.id.length <= 1024);
   const context = value.context;
+  if (value.type === "PLAY_LIBRARY_TRACKS") {
+    const selection = value.selection;
+    if (!object(selection) || !object(selection.query)) return false;
+    const { query, sort, favoritesOnly, unplayedOnly } = selection.query;
+    return typeof query === "string" && [...query].length <= 200 &&
+      typeof sort === "string" && Object.hasOwn(libraryTrackSorts, sort) &&
+      typeof favoritesOnly === "boolean" && typeof unplayedOnly === "boolean" &&
+      (selection.trackId === null || (typeof selection.trackId === "string" && selection.trackId.length > 0 && selection.trackId.length <= 1024)) &&
+      (selection.shuffle === undefined || typeof selection.shuffle === "boolean");
+  }
+  if (value.type === "PLAY_PLAYLIST") {
+    const selection = value.selection;
+    if (!object(selection) || !object(selection.view)) return false;
+    const { playlistId, startIndex, fromHere, order, view } = selection;
+    return typeof playlistId === "string" && playlistId.length > 0 && playlistId.length <= 1024 &&
+      typeof startIndex === "number" && Number.isInteger(startIndex) && startIndex >= 0 && startIndex <= 0xffffffff &&
+      typeof fromHere === "boolean" && typeof order === "string" && /^[a-f0-9]{16}$/i.test(order) &&
+      typeof view.locale === "string" && /^[a-z0-9-]{1,128}$/i.test(view.locale) &&
+      typeof view.query === "string" && [...view.query].length <= 4096 &&
+      typeof view.sort === "string" && Object.hasOwn(playlistTrackSortLabels, view.sort) && typeof view.descending === "boolean";
+  }
   return value.type === "PLAY" || value.type === "PAUSE" ||
     value.type === "TOGGLE_SHUFFLE" || value.type === "TOGGLE_REPEAT" ||
     (value.type === "SET_PLAYLIST_LOOP" && typeof value.enabled === "boolean" &&
@@ -178,13 +201,13 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
         ...(leaseServerId.current ? { leaseServerId: leaseServerId.current } : {}) } : {}) });
     return state;
   }, [deviceId, send]);
-  const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object): Promise<void> => new Promise((resolve, reject) => {
+  const request = useCallback((type: "COMMAND" | "TRANSFER_PLAYBACK", payload: object,
+    timeout = type === "COMMAND" ? 10_000 : 25_000): Promise<void> => new Promise((resolve, reject) => {
     if (!userId || userId !== account.current) {
       reject(new Error("The remote account changed"));
       return;
     }
     const requestId = identity();
-    const timeout = type === "COMMAND" ? 10_000 : 25_000;
     const deadline = performance.now() + timeout;
     const expiresAt = Math.floor(timeOrigin.current + deadline + (clockOffset.current ?? 0));
     const timer = window.setTimeout(() => {
@@ -821,7 +844,11 @@ export function useRemoteSession(userId: string | null, adapter: RemotePlayerAda
       for (const [queuedKey, operation] of continuous.current) {
         if (queuedKey !== key) operation.send();
       }
-      if (command.type !== "SEEK" && command.type !== "SET_VOLUME") { await request("COMMAND", { command, targetId }); return; }
+      if (command.type !== "SEEK" && command.type !== "SET_VOLUME") {
+        const collection = command.type === "PLAY_LIBRARY_TRACKS" || command.type === "PLAY_PLAYLIST";
+        await request("COMMAND", { command, targetId }, collection ? 22_000 : undefined);
+        return;
+      }
       // Continuous controls keep only the latest value in each 80 ms window.
       await new Promise<void>((resolve, reject) => {
         const queued = continuous.current.get(key);

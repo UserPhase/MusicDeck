@@ -95,7 +95,7 @@ pub fn classify_integration_request(
         return Some(PrivacyCategory::Imports);
     }
 
-    if (path.starts_with("/api/v1/playlists/import-spotify") && *method == Method::POST)
+    if (path == "/api/v1/playlists/import-spotify" && *method == Method::POST)
         || (path == "/api/acquisitions" && *method == Method::POST)
         || is_acquisition_retry_path(path)
     {

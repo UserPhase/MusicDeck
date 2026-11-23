@@ -64,12 +64,34 @@ test("submits and clears queries from the mobile search page", async () => {
     fireEvent.submit(form);
 
     await screen.findByText(/no results found/i);
-    expect(searchNavidrome).toHaveBeenCalledWith("Digital Love", { mode: expect.any(String), phase: "local" });
+    expect(searchNavidrome).toHaveBeenCalledWith("Digital Love", { mode: expect.any(String), phase: "local", signal: expect.any(AbortSignal) });
     expect(within(form).getByRole("searchbox")).toHaveValue("Digital Love");
 
     fireEvent.change(within(form).getByRole("searchbox"), { target: { value: "" } });
     fireEvent.submit(form);
     expect(screen.getByText(/search for an artist, album or song/i)).toBeInTheDocument();
+  } finally {
+    useMediaQuery.mockReturnValue(false);
+  }
+});
+
+test("aborts both phases of the previous query and ignores its late results", async () => {
+  useMediaQuery.mockReturnValue(true);
+  let finishOld;
+  const old = new Promise(resolve => { finishOld = resolve; });
+  searchNavidrome.mockImplementation(query => query === "old" ? old : Promise.resolve({ results: {
+    album: [{ id: "new-album", title: "New album" }],
+  } }));
+  try {
+    renderSearch("old");
+    await waitFor(() => expect(searchNavidrome).toHaveBeenCalledTimes(2));
+    const obsolete = searchNavidrome.mock.calls.map(([, { signal }]) => signal);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search your music" }), { target: { value: "new" } });
+    fireEvent.submit(screen.getByRole("search", { name: "Music search" }));
+    await screen.findByRole("link", { name: "New album" });
+    expect(obsolete.every(signal => signal.aborted)).toBe(true);
+    await act(async () => finishOld({ results: { album: [{ id: "old-album", title: "Old album" }] } }));
+    expect(screen.queryByRole("link", { name: "Old album" })).not.toBeInTheDocument();
   } finally {
     useMediaQuery.mockReturnValue(false);
   }

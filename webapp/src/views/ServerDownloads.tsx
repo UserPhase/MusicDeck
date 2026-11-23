@@ -1,16 +1,21 @@
 import { useEffect, useState } from "react";
 import { useVisualActivity } from "../hooks/useVisualActivity";
-import { getAcquisitions } from "../api/musicdeck";
+import { cancelAcquisition, getAcquisitions, retryAcquisition } from "../api/musicdeck";
+import { downloadPhaseLabels } from "../services/downloadStatus";
 import { formatStorageSize } from "../utils/browserCache";
 
 const statusLabels = {
   queued: "Queued", discovering: "Finding a source", downloading: "Downloading",
-  processing: "Processing", importing: "Importing", completed: "Completed", failed: "Failed", cancelled: "Cancelled",
+  processing: "Processing", importing: "Importing", completed: "Completed", partial: "Partially imported", failed: "Failed", cancelled: "Cancelled",
 } as const;
 
 type ServerJob = {
   id: string;
   status: keyof typeof statusLabels;
+  stage?: string;
+  downloadedCount?: number;
+  expectedCount?: number;
+  trackErrors?: { position: number; title?: string; message: string }[];
   requestedTitle?: string;
   requestedArtist?: string;
   requestedAlbumId?: string;
@@ -19,9 +24,12 @@ type ServerJob = {
   progress?: { percent?: number; bytesDownloaded?: number; totalBytes?: number; speedBytesPerSecond?: number };
 };
 
-const isActive = ({ status }: ServerJob) => status !== "completed" && status !== "failed" && status !== "cancelled";
+const isActive = ({ status }: ServerJob) => ["queued", "discovering", "downloading", "processing", "importing"].includes(status);
+const phaseLabels: Record<string, string> = downloadPhaseLabels;
 
-function ServerDownloadRow({ job }: { job: ServerJob }) {
+function ServerDownloadRow({ job, online, onUpdate }: { job: ServerJob; online: boolean; onUpdate: (job: ServerJob) => void }) {
+  const [pending, setPending] = useState(false);
+  const [actionError, setActionError] = useState("");
   const title = job.requestedTitle || job.files?.[0]?.title || (job.requestedAlbumId ? "Album download" : "Server download");
   const artist = job.requestedArtist || job.files?.[0]?.artist;
   const progress = job.progress;
@@ -29,10 +37,27 @@ function ServerDownloadRow({ job }: { job: ServerJob }) {
   const total = progress?.totalBytes ?? 0;
   const percent = progress?.percent ?? (total > 0 ? received / total * 100 : undefined);
   const value = typeof percent === "number" && Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : undefined;
+  const active = isActive(job);
+  const canRetry = ["failed", "partial", "cancelled"].includes(job.status);
+  const waiting = job.stage === "provider_cooldown" || job.stage === "retry_wait";
+  async function updateJob() {
+    setPending(true);
+    setActionError("");
+    try {
+      const response = await (active ? cancelAcquisition(job.id) : retryAcquisition(job.id));
+      if (!response?.job) throw new Error("The server did not confirm the update. Check the download status before trying again.");
+      onUpdate(response.job);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Could not update the download. Try again.");
+    } finally {
+      setPending(false);
+    }
+  }
+
   return <li className="server-download-row">
-    <div className="server-download-heading"><strong>{title}</strong><span>{statusLabels[job.status]}</span></div>
+    <div className="server-download-heading"><strong>{title}</strong><span>{(active && phaseLabels[job.stage ?? ""]) || statusLabels[job.status]}</span></div>
     {artist && <p>{artist}</p>}
-    {job.status === "downloading" && <>
+    {job.status === "downloading" && !waiting && <>
       <progress max={100} value={value} aria-label={`${title} download progress`} />
       <p className="server-download-transfer">
         {value !== undefined && <span>{Math.round(value)}%</span>}
@@ -40,13 +65,24 @@ function ServerDownloadRow({ job }: { job: ServerJob }) {
         {Boolean(progress?.speedBytesPerSecond) && <span>{formatStorageSize(progress?.speedBytesPerSecond)}/s</span>}
       </p>
     </>}
-    {job.status === "failed" && job.errorMessage && <p className="downloads-error">{job.errorMessage}</p>}
+    {Boolean(job.expectedCount) && active && typeof job.downloadedCount === "number" && <p>{job.downloadedCount} / {job.expectedCount} tracks downloaded</p>}
+    {(job.status === "failed" || job.status === "partial") && job.errorMessage && <p className="downloads-error">{job.errorMessage}</p>}
+    {Boolean(job.trackErrors?.length) && <details>
+      <summary>Track errors ({job.trackErrors?.length})</summary>
+      <ul>{job.trackErrors?.map(({ position, title, message }) => <li key={position}>{title || `Track ${position}`} · {message}</li>)}</ul>
+    </details>}
+    {(active || canRetry) && <button type="button" disabled={pending || !online} onClick={updateJob}
+      aria-label={`${active ? "Cancel" : "Retry"} download for ${title}`}>
+      {active ? pending ? "Cancelling…" : "Cancel download" : pending ? "Retrying…" : "Retry download"}
+    </button>}
+    {actionError && <p className="downloads-error" role="alert">{actionError}</p>}
   </li>;
 }
 
 export default function ServerDownloads({ online }: { online: boolean }) {
   const [jobs, setJobs] = useState<ServerJob[] | null>(null);
   const [error, setError] = useState(false);
+  const [revision, setRevision] = useState(0);
   const visualActive = useVisualActivity();
 
   useEffect(() => {
@@ -69,7 +105,12 @@ export default function ServerDownloads({ online }: { online: boolean }) {
     }
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [online, visualActive]);
+  }, [online, revision, visualActive]);
+
+  function updateJob(job: ServerJob) {
+    setJobs((current) => current?.map((item) => item.id === job.id ? job : item) ?? [job]);
+    setRevision((value) => value + 1);
+  }
 
   const active = jobs?.filter(isActive) ?? [];
   const recent = jobs?.filter((job) => !isActive(job)).slice(0, 5) ?? [];
@@ -84,7 +125,7 @@ export default function ServerDownloads({ online }: { online: boolean }) {
     {online && !jobs && !error && <p role="status">Checking server downloads…</p>}
     {jobs && !jobs.length && <p>No server downloads yet.</p>}
     {(active.length > 0 || recent.length > 0) && <ul className="server-download-list">
-      {[...active, ...recent].map((job) => <ServerDownloadRow key={job.id} job={job} />)}
+      {[...active, ...recent].map((job) => <ServerDownloadRow key={job.id} job={job} online={online} onUpdate={updateJob} />)}
     </ul>}
   </section>;
 }

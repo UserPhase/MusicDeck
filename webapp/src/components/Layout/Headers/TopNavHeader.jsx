@@ -2,14 +2,11 @@ import Topbar from "../../Topbar";
 
 export const NAV_DRAWER_ID = "app-navigation";
 
-/**
- * Full-width top navigation header shared by the YouTube Music and
- * SoundCloud shells. Pass `drawer` to add the hamburger that toggles the
- * library sidebar as an off-canvas drawer.
- */
-function TopNavHeader({ drawer = null }) {
-  const leading = drawer ? (
+/** Library drawer toggle shared by desktop headers. */
+export function NavDrawerToggle({ drawer, buttonRef }) {
+  return (
     <button
+      ref={buttonRef}
       type="button"
       className={`topbar-drawer-toggle${drawer.isOpen ? " active" : ""}`}
       onClick={drawer.onToggle}
@@ -21,8 +18,10 @@ function TopNavHeader({ drawer = null }) {
         <path d="M4 7h16M4 12h16M4 17h16" />
       </svg>
     </button>
-  ) : null;
+  );
+}
 
+function TopNavHeader({ leading }) {
   return <Topbar leading={leading} showPrimaryNav />;
 }
 

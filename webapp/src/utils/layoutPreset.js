@@ -15,6 +15,8 @@ export const LAYOUT_PRESET_STORAGE_KEY = "musicdeckLayoutPreset";
 /** Every desktop preset falls back to this shell below this width. */
 export const MOBILE_LAYOUT_QUERY = "(max-width: 767px)";
 export const MOBILE_LAYOUT_SHELL = "mobile";
+export const DOCKED_PLAYBACK_QUERY = "(min-width: 1360px)";
+export const DOCKED_LIBRARY_QUERY = "(min-width: 1080px)";
 
 /**
  * Structural rules each archetype hands to <AppLayout />.

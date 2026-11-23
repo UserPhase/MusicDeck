@@ -1,6 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { startVisualPolling } from "../services/visualActivity";
-import { normalizePlaylistSearch, playlistTrackSearchText } from "../utils/playlistSearch";
+import { playlistTrackSearchText } from "../utils/playlistSearch";
+import { playlistPlaybackContext, playlistSearchTokens, playlistTrackSortLabels as trackSortLabels, playlistViewTracks } from "../utils/playlistPlayback";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, useLocation, useNavigate } from "react-router-dom";
 import { DetailBackLink } from "../components/Layout/MobileNavigation";
@@ -39,15 +40,8 @@ import {
 import { usePlayer } from "../context/PlayerContext";
 import "../styles/playlist-organization.css";
 
-const trackSortLabels = { custom: "Custom order", added: "Date added", title: "Title", artist: "Artist", album: "Album", duration: "Duration" };
-const trackSortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const playlistLocale = new Intl.Collator().resolvedOptions().locale;
 const EMPTY_TRACKS = [];
-
-function compareTrackNumbers(left, right, direction) {
-  if (!Number.isFinite(left)) return Number(Number.isFinite(right));
-  if (!Number.isFinite(right)) return -1;
-  return (left - right) * direction;
-}
 
 function PlaylistDescription({ description, mobile }) {
   const id = useId();
@@ -134,26 +128,15 @@ function Playlist() {
   const [trackSortOpen, setTrackSortOpen] = useState(false);
   const trackSortTrigger = useRef(null);
   const deferredQuery = useDeferredValue(trackQuery);
-  const searchTokens = useMemo(() => normalizePlaylistSearch(deferredQuery).trim().split(/\s+/).filter(Boolean), [deferredQuery]);
+  const playlistView = useMemo(() => ({ query: deferredQuery.trim(), sort: trackSort, descending: sortDescending, locale: playlistLocale }),
+    [deferredQuery, trackSort, sortDescending]);
+  const searchTokens = useMemo(() => playlistSearchTokens({ query: deferredQuery, locale: playlistLocale }), [deferredQuery]);
   const entries = playlist?.entry ?? EMPTY_TRACKS;
   const searching = searchTokens.length > 0;
-  const searchIndex = useMemo(() => searching ? entries.map(playlistTrackSearchText) : null, [entries, searching]);
-  const songs = useMemo(() => {
-    if (!searchIndex && trackSort === "custom") return entries;
-    const matches = searchIndex
-      ? entries.filter((_song, index) => searchTokens.every(token => searchIndex[index].includes(token)))
-      : entries.slice();
-    const direction = sortDescending ? -1 : 1;
-    if (trackSort === "added") {
-      return matches.map(song => ({ song, added: Date.parse(song.playlistAddedAt) }))
-        .sort((a, b) => compareTrackNumbers(a.added, b.added, direction)).map(item => item.song);
-    } else if (trackSort === "duration") {
-      matches.sort((a, b) => compareTrackNumbers(a.duration, b.duration, direction));
-    } else if (trackSort !== "custom") {
-      matches.sort((a, b) => direction * trackSortCollator.compare(a[trackSort] || "", b[trackSort] || ""));
-    }
-    return matches;
-  }, [entries, searchIndex, searchTokens, trackSort, sortDescending]);
+  const searchIndex = useMemo(() => searching ? entries.map(track => playlistTrackSearchText(track, playlistLocale)) : undefined, [entries, searching]);
+  const songs = useMemo(() => playlistViewTracks(entries, playlistView, searchTokens, searchIndex),
+    [entries, playlistView, searchTokens, searchIndex]);
+  const playbackContext = useMemo(() => playlist ? playlistPlaybackContext(playlist, playlistView) : null, [playlist, playlistView]);
   const occurrenceIds = useMemo(() => songs.map((song, index) => song.playlistItemId || `${index}:${song.id}`), [songs]);
   const getTrack = useCallback((index) => songs[index], [songs]);
   const getOccurrenceId = useCallback((index) => occurrenceIds[index], [occurrenceIds]);
@@ -274,18 +257,8 @@ function Playlist() {
   };
 
   const handleTrackPlayback = useCallback((_song, index) => {
-    playContext(
-      songs,
-      index,
-      {
-        type: deferredQuery.trim() || trackSort !== "custom" ? "collection" : "playlist",
-        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist?.id) } : {}),
-        id: playlist?.id,
-        name: playlist?.name,
-        coverArt: playlist?.coverArt,
-      }
-    );
-  }, [playContext, songs, deferredQuery, trackSort, playlist?.id, playlist?.name, playlist?.coverArt]);
+    playContext(songs, index, playbackContext, playlistView);
+  }, [playContext, songs, playbackContext, playlistView]);
 
   useEffect(() => {
     function selectAllSongs(event) {
@@ -719,22 +692,7 @@ async function handleRemoveSong(
   }
 
   function playPlaylist() {
-
-    if (songs.length === 0) {
-      return;
-    }
-    playQueue(
-      songs,
-      0,
-      {
-        type: deferredQuery.trim() || trackSort !== "custom" ? "collection" : "playlist",
-        ...(deferredQuery.trim() || trackSort !== "custom" ? { playlistLoopId: String(playlist.id) } : {}),
-        id: playlist.id,
-        name: playlist.name,
-        coverArt: playlist.coverArt,
-      }
-    );
-
+    if (songs.length) playQueue(songs, 0, playbackContext, playlistView);
   }
 
   const songCount = mobile ? playlist.entry?.length ?? 0 : songs.length;

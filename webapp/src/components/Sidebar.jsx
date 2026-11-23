@@ -13,6 +13,7 @@ import {
 } from "../api/playlists";
 import { useAuth } from "../context/AuthContext";
 import { useImport } from "../context/ImportContext";
+import { downloadPhaseLabels } from "../services/downloadStatus";
 import { usePrivacy } from "../context/PrivacyContext";
 import { useLikedAlbums } from "../hooks/useLikedAlbums";
 import { DiscoveryArtwork } from "./DiscoveryCards";
@@ -123,7 +124,13 @@ function Sidebar({ id }) {
   const orderedAlbums = useSidebarOrder(likedAlbums.albums, "liked-albums", owner);
 
   const navigate = useNavigate();
-  const { job: importJob, openProgressToken, startImport, minimize } = useImport();
+  const [cancelPending, setCancelPending] = useState(false);
+  const { job: importJob, statusRetrying, openProgressToken, startImport, cancelImport, minimize } = useImport();
+  const importStage = importJob?.stage;
+  const isScanStage = importStage === "scan" || importStage === "scanning";
+  const waiting = importStage === "provider_cooldown" || importStage === "retry_wait";
+  const trackTotal = (waiting || ["download", "downloading", "conversion"].includes(importStage)) ? importJob?.expectedCount : undefined;
+  const tracksDownloaded = Math.min(importJob?.downloadedCount || 0, trackTotal || 0);
 
   const [playlists, setPlaylists] = useState([]);
 
@@ -237,14 +244,14 @@ function Sidebar({ id }) {
       window.dispatchEvent(new Event("playlistsChanged"));
       setModalStep(null);
       setNotice(importJob.status === "partial"
-        ? { type: "error", text: importJob.error || `Only part of '${importJob.playlistName}' could be imported.` }
+        ? { type: "warning", text: importJob.error || `Only part of '${importJob.playlistName}' could be imported.`, trackErrors: importJob.trackErrors }
         : { type: "success", text: `Successfully imported '${importJob.playlistName}'!` });
       navigate(`/playlist/${encodeURIComponent(importJob.playlistId)}`);
     } else {
-      setNotice({ type: "error", text: importJob.error || "Could not import the Spotify playlist." });
-      setModalStep("import");
+      setNotice({ type: importJob.status === "cancelled" ? "success" : "error", text: importJob.error || "Could not import the Spotify playlist.", trackErrors: importJob.trackErrors });
+      setModalStep(importJob.status === "cancelled" ? null : "import");
     }
-  }, [importJob, modalStep, loadPlaylists, navigate]);
+  }, [importJob, modalStep, loadPlaylists, navigate, setNotice]);
 
   useEffect(() => {
 
@@ -328,6 +335,19 @@ function Sidebar({ id }) {
       setNotice({ type: "error", text: error.message || "Could not create playlist." });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleCancelImport() {
+    if (cancelPending) return;
+    setCancelPending(true);
+    setFormError("");
+    try {
+      await cancelImport();
+    } catch (error) {
+      setFormError(error.message || "Could not cancel the import. You can try again.");
+    } finally {
+      setCancelPending(false);
     }
   }
 
@@ -474,18 +494,29 @@ function Sidebar({ id }) {
                 <div className="playlist-modal-fields">
                   <p className="playlist-modal-intro">{importJob?.playlistName || "Your Spotify playlist"}</p>
                   <div className="playlist-import-counter">
-                    {importJob?.stage === "scanning" ? "Scanning and adding tracks to your library..." : importJob?.expectedCount
-                      ? `Downloading track ${importJob.currentTrack || Math.min((importJob.downloadedCount || 0) + 1, importJob.expectedCount)} of ${importJob.expectedCount}`
-                      : importJob?.downloadedCount ? `Downloading track ${importJob.currentTrack || importJob.downloadedCount + 1}`
-                      : importJob?.stage === "queued" ? "Waiting to start download..." : "Fetching playlist details and queueing download..."}
+                    {waiting ? downloadPhaseLabels[importStage]
+                      : isScanStage ? "Scanning your music library..."
+                      : importStage === "playlist_creation" ? "Creating your playlist..."
+                      : importStage === "conversion" ? "Converting audio..."
+                      : importStage === "queued" ? "Waiting to start download..."
+                      : trackTotal ? `Downloading track ${importJob.currentTrack || Math.min(tracksDownloaded + 1, trackTotal)} of ${trackTotal}`
+                      : "Fetching playlist details and downloading tracks..."}
                   </div>
-                  <div className="playlist-import-track">{importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}` : importJob?.stage === "scanning" ? "Adding downloaded tracks to your library..." : "Preparing tracks..."}</div>
-                  <div className={`playlist-import-bar${!importJob?.expectedCount ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={importJob?.expectedCount || undefined} aria-valuenow={importJob?.expectedCount ? Math.min(importJob.downloadedCount || 0, importJob.expectedCount) : undefined}>
-                    <span style={{ width: importJob?.expectedCount ? `${Math.min(100, 100 * (importJob.downloadedCount || 0) / importJob.expectedCount)}%` : "35%" }} />
+                  {statusRetrying && <p role="status">Could not refresh playlist import status. Reconnecting…</p>}
+                  <div className="playlist-import-track">
+                    {importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}`
+                      : trackTotal ? `${tracksDownloaded} of ${trackTotal} tracks downloaded`
+                      : isScanStage ? importJob?.importedCount ? `${importJob.importedCount} tracks indexed` : "Matching the audio files in Navidrome."
+                      : importStage === "playlist_creation" ? "Saving tracks in playlist order." : "Preparing tracks..."}
                   </div>
+                  <div className={`playlist-import-bar${!trackTotal ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={trackTotal || undefined} aria-valuenow={trackTotal ? tracksDownloaded : undefined}>
+                    <span style={{ width: trackTotal ? `${100 * tracksDownloaded / trackTotal}%` : "35%" }} />
+                  </div>
+                  {formError && <p className="playlist-modal-error" role="alert">{formError}</p>}
                 </div>
                 <div className="playlist-modal-actions">
-                  <button type="button" className="playlist-modal-submit" onClick={closeModal}>Run in Background</button>
+                  <button type="button" className="playlist-modal-back" disabled={cancelPending} onClick={handleCancelImport}>{cancelPending ? "Cancelling..." : "Cancel import"}</button>
+                  <button type="button" className="playlist-modal-submit" onClick={closeModal} disabled={cancelPending}>Run in Background</button>
                 </div>
               </div>
             ) : (
@@ -502,9 +533,9 @@ function Sidebar({ id }) {
                   </select>
                   <p id="spotify-import-timeout-help" className="playlist-modal-help">
                     {timeoutMode === "auto"
-                      ? "Adapts to playlist size, past imports, and download progress. No fixed time limit."
+                      ? "Adapts to playlist size and progress, up to 6 hours."
                       : "Choose a limit from 1 to 120 minutes."}
-                    {" A stalled download stops within 15 minutes."}
+                    {" A stalled download stops within 15 minutes. Scanning and playlist creation have separate limits."}
                   </p>
                   {timeoutMode === "manual" && <>
                     <label htmlFor="spotify-import-timeout-minutes">Maximum download time (minutes)</label>

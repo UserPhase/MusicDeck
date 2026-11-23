@@ -290,7 +290,7 @@ fn ready_payload(
 ) -> Value {
     json!({ "status": "ready", "streamUrl": format!("/api/playback/normalized/{key}"),
         "integratedLufs": artifact.integrated_lufs, "truePeakDb": artifact.true_peak_db,
-        "gainDb": gain.map_or(0.0, |gain| gain.gain_db), "loudness": gain })
+        "gainDb": gain.map(|gain| gain.gain_db), "loudness": gain })
 }
 
 async fn post_playback_normalize_handler(

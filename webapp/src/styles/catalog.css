@@ -1,5 +1,6 @@
 .playlist-grid, .album-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 20px; }
 .home-page { max-width: var(--content-wide); margin: 0 auto; container-type: inline-size; }
+.home-section { container-type: inline-size; }
 .home-hero-gradient {
   position: relative;
   isolation: isolate;

@@ -10,7 +10,7 @@
 //!      (`up_to = Some(target_version)`) for testing legacy database upgrade paths.
 //!    - Wraps every individual migration step in an atomic SQLite transaction (`BEGIN` /
 //!      `COMMIT` / `ROLLBACK`), re-checking `schema_migrations` inside the write lock.
-//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=52) and
+//!    - Handles both declarative multi-statement SQL migrations (1..=38, 40..=54) and
 //!      procedural data-transforming migrations (migration 39: `upgrade-legacy-smart-playlist-projection`).
 //! 2. **Transactional Initial Seeding ([`seed_initial_data`])**:
 //!    - Seeds `roles` (`admin`, `user`) and the primary `backend_connections` row matching
@@ -38,7 +38,7 @@ use crate::db::migrations_sql::{RAW_MIGRATIONS, SMART_PLAYLIST_ACTIVITY_SCHEMA_B
 use crate::db::{DbError, DbPool, protect_database_files};
 
 /// Total number of sequential migrations defined in the MusicDeck schema registry.
-pub const LATEST_SCHEMA_VERSION: u32 = 52;
+pub const LATEST_SCHEMA_VERSION: u32 = 54;
 
 /// Bcrypt work factor (`12`) matching `PASSWORD_COST` in `server/src/auth/passwords.ts`.
 pub const BCRYPT_PASSWORD_COST: u32 = 12;
@@ -62,7 +62,7 @@ pub enum MigrationKind {
 /// Metadata and execution hook for a single schema migration step.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    /// Monotonically increasing migration version identifier (`1..=52`).
+    /// Monotonically increasing migration version identifier (`1..=54`).
     pub id: u32,
     /// Descriptive kebab-case migration slug stored in `schema_migrations.name`.
     pub name: &'static str,

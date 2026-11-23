@@ -67,4 +67,22 @@ pub const RAW_MIGRATIONS: &[(u32, &str, Option<&str>)] = &[
         ALTER TABLE playback_loudness_cache ADD COLUMN track_id TEXT;
         ALTER TABLE playback_loudness_cache ADD COLUMN content_revision TEXT;
     ")),
+    (53, "acquisition-observability-and-admission", Some("
+        ALTER TABLE acquisition_jobs ADD COLUMN track_errors_json TEXT;
+        ALTER TABLE acquisition_jobs ADD COLUMN downloaded_count INTEGER;
+        CREATE TABLE acquisition_submissions (user_id TEXT NOT NULL, submitted_at INTEGER NOT NULL);
+        CREATE INDEX acquisition_submissions_time ON acquisition_submissions(submitted_at, user_id);
+        CREATE TABLE acquisition_provider_cooldown (
+            provider TEXT PRIMARY KEY, blocked_until INTEGER NOT NULL, recent_failures INTEGER NOT NULL
+        );
+    ")),
+    (54, "resumable-acquisitions", Some("
+        ALTER TABLE acquisition_job_inputs ADD COLUMN staging_task_id TEXT;
+        CREATE TABLE acquisition_library_files (
+            root TEXT NOT NULL, path TEXT NOT NULL, digest BLOB NOT NULL,
+            spotify_url TEXT, job_id TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(root, path, digest)
+        );
+        CREATE INDEX acquisition_library_files_identity ON acquisition_library_files(root, spotify_url);
+    ")),
 ];

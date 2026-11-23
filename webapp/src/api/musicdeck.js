@@ -729,17 +729,55 @@ export async function getAllSongs() {
   );
 }
 
-export async function getTrackPage({ offset = 0, limit = 200, filters = [], signal } = {}) {
-  const data = filters.length
+export async function getTrackPage({ offset = 0, limit = 100, filters = [], query = "", sort = "custom", signal } = {}) {
+  const data = filters.length || query || sort !== "custom"
     ? await request("/api/library/tracks/filter", {
-      method: "POST", body: JSON.stringify({ filters, offset, limit }), signal,
+      method: "POST", body: JSON.stringify({ filters, offset, limit, ...(query && { query }), ...(sort !== "custom" && { sort }) }), signal,
     })
     : await request(`/api/tracks?offset=${offset}&limit=${limit}`, { signal });
   return { items: (data.tracks || []).map(toSong), total: data.total, revision: data.revision };
 }
 
-export async function getAlbumPage({ offset = 0, limit = 200, signal } = {}) {
-  const data = await request(`/api/albums?offset=${offset}&limit=${limit}`, { signal });
+export function trackLibraryFilters({ favoritesOnly, unplayedOnly }) {
+  return [
+    ...(favoritesOnly ? [{ field: "favorite", op: "boolean", value: true }] : []),
+    ...(unplayedOnly ? [{ field: "played", op: "boolean", value: false }] : []),
+  ];
+}
+
+export async function getTrackCollection(query, signal) {
+  // Only an explicit playback action enumerates the complete queue. Reuse the
+  // same result ordering and request larger chunks to minimise startup trips.
+  const limit = 500;
+  const options = { ...query, filters: trackLibraryFilters(query), limit, signal };
+  const first = await getTrackPage(options);
+  function check(page, offset) {
+    if (!Number.isInteger(first.total) || first.total < 0 || page.total !== first.total ||
+        page.revision !== first.revision || page.items.length !== Math.min(limit, first.total - offset)) {
+      throw new Error("The library changed while loading playback. Try again.");
+    }
+  }
+  check(first, 0);
+  const tracks = [...first.items];
+  for (let offset = limit; offset < first.total; offset += 3 * limit) {
+    const pages = await Promise.all(Array.from({ length: Math.min(3, Math.ceil((first.total - offset) / limit)) },
+      (_, index) => getTrackPage({ ...options, offset: offset + index * limit })));
+    pages.forEach((page, index) => {
+      check(page, offset + index * limit);
+      tracks.push(...page.items);
+    });
+  }
+  if (new Set(tracks.map(track => track.id)).size !== tracks.length) {
+    throw new Error("The library changed while loading playback. Try again.");
+  }
+  return tracks;
+}
+
+export async function getAlbumPage({ offset = 0, limit = 200, query = "", sort = "library", signal } = {}) {
+  const params = new URLSearchParams({ offset, limit });
+  if (query) params.set("q", query);
+  if (sort !== "library") params.set("sort", sort);
+  const data = await request(`/api/albums?${params}`, { signal });
   return { items: (data.albums || []).map((album) => toAlbum(album)), total: data.total, revision: data.revision };
 }
 
@@ -753,8 +791,8 @@ export async function getCollectorCatalog(includeAlbums, signal) {
   };
 }
 
-export async function getArtists() {
-  const data = await request("/api/artists");
+export async function getArtists(signal) {
+  const data = await request("/api/artists", { signal });
   return (data.artists || []).map((artist) => toArtist(artist));
 }
 
@@ -984,7 +1022,7 @@ export async function searchNavidrome(query, options = {}) {
     params.set("phase", options.phase);
   }
 
-  const data = await request(`/api/search?${params.toString()}`);
+  const data = await request(`/api/search?${params.toString()}`, { signal: options.signal });
 
   return {
     artists: (data.artists || []).map((artist) => toArtist(artist)),
@@ -1006,8 +1044,8 @@ export async function getPlaylists() {
   return (data.playlists || []).map(toPlaylist);
 }
 
-export async function getPlaylist(playlistId, signal) {
-  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`, signal ? { signal } : {});
+export async function getPlaylist(playlistId, signal, options = {}) {
+  const data = await request(`/api/playlists/${encodeURIComponent(playlistId)}`, { ...options, ...(signal && { signal }) });
   return data.playlist ? toPlaylist(data.playlist) : null;
 }
 
@@ -1197,14 +1235,28 @@ export async function createAcquisition(payload) {
   });
 }
 
+export async function requestDownloadStatus(path, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(abort, 10000);
+  try {
+    return await request(path, { signal: controller.signal, cache: "no-store" });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
 /** @param {{ ownOnly?: boolean, signal?: AbortSignal }} [options] */
 export async function getAcquisitions({ ownOnly = false, signal } = {}) {
-  const data = await request(ownOnly ? "/api/acquisitions?scope=mine" : "/api/acquisitions", { signal });
+  const data = await requestDownloadStatus(ownOnly ? "/api/acquisitions?scope=mine" : "/api/acquisitions", signal);
   return data.jobs || [];
 }
 
-export async function getAcquisition(jobId) {
-  const data = await request(`/api/acquisitions/${encodeURIComponent(jobId)}`);
+export async function getAcquisition(jobId, signal) {
+  const data = await requestDownloadStatus(`/api/acquisitions/${encodeURIComponent(jobId)}`, signal);
   return data.job;
 }
 

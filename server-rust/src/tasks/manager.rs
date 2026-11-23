@@ -1443,6 +1443,12 @@ impl TaskManager {
         self.notify_committed(task);
     }
 
+    pub(crate) fn is_executing(&self, id: &str) -> bool {
+        self.registry
+            .read()
+            .map_or(true, |registry| registry.active.contains_key(id))
+    }
+
     /// Lists tasks (`limit` in `1..=500`).
     pub async fn list(
         &self,
@@ -1638,7 +1644,7 @@ impl TaskManager {
             && let Some(job_id) = task.payload["jobId"].as_str()
         {
             sqlx::query("UPDATE import_jobs SET status='FAILED', updated_at=?,
-                manifest_json=json_set(manifest_json,'$.job.status','failed','$.job.stage','completed','$.job.error','Playlist import cancelled')
+                manifest_json=json_set(manifest_json,'$.job.status','cancelled','$.job.stage','cancelled','$.job.error','Playlist import cancelled','$.job.currentTrack',NULL,'$.job.currentTrackName',NULL)
                 WHERE id=? AND status IN ('PENDING','PROCESSING') AND json_valid(manifest_json)")
                 .bind(&now).bind(job_id).execute(&mut *tx).await
                 .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?;
@@ -2174,6 +2180,13 @@ impl TaskManager {
     }
 
     fn start_task(&self, task: Task, definition: Arc<dyn TaskDefinition>) {
+        let Ok(mut registry) = self.registry.write() else {
+            return;
+        };
+        if self.is_stopping() {
+            // Startup recovery will reconcile the claim if shutdown raced dispatch.
+            return;
+        }
         let handle = ActiveTaskHandle {
             cancel_token: CancellationToken::new(),
             manual_pause: Arc::new(AtomicBool::new(false)),
@@ -2182,9 +2195,8 @@ impl TaskManager {
         };
         self.active_slots.fetch_add(1, Ordering::AcqRel);
 
-        if let Ok(mut guard) = self.registry.write() {
-            guard.active.insert(task.id.clone(), handle.clone());
-        }
+        registry.active.insert(task.id.clone(), handle.clone());
+        drop(registry);
 
         let mgr = self.clone();
         tokio::spawn(async move {
@@ -2227,8 +2239,17 @@ impl TaskManager {
             }
             // Disk contention during finalization must neither occupy a worker slot nor rerun the job.
             mgr.spawn_pump();
-            mgr.persist_terminal_state(&task.id, state, error.as_deref())
-                .await;
+            // Keep interrupted imports eligible for checkpoint recovery on startup.
+            if !(mgr.is_stopping()
+                && state == TaskStatus::Cancelled
+                && matches!(
+                    task.task_type,
+                    TaskType::SpotdlDownload | TaskType::SpotdlImport
+                ))
+            {
+                mgr.persist_terminal_state(&task.id, state, error.as_deref())
+                    .await;
+            }
             if let Ok(mut guard) = mgr.registry.write() {
                 guard.active.remove(&task.id);
             }
@@ -2307,6 +2328,28 @@ impl TaskManager {
             for handle in guard.active.values() {
                 handle.cancel_token.cancel();
             }
+        }
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Gives cancelled workers a bounded opportunity to finish process-tree cleanup.
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.close();
+        let drain = async {
+            while self.pumping.load(Ordering::Acquire)
+                || self
+                    .registry
+                    .read()
+                    .is_ok_and(|registry| !registry.active.is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        if tokio::time::timeout(timeout, drain).await.is_err() {
+            tracing::warn!("Timed out waiting for background tasks to shut down");
         }
     }
 }

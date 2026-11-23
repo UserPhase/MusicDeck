@@ -33,6 +33,37 @@
 
 .nav-drawer-scrim { position: fixed; inset: 72px 0 0; z-index: 35; background: rgb(0 0 0 / 42%); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); animation: shell-fade-in 180ms ease both; }
 
+/* Desktop panels share the same state whether docked or over the page. */
+:root[data-playback-overlay] { --desktop-overlay-bottom: var(--player-height); }
+:root[data-layout-shell="apple"] { --desktop-overlay-bottom: 0px; }
+:root[data-playback-overlay] .main.sidebar-open { right: var(--frame); }
+:root[data-playback-overlay] :is(.right-sidebar, .queue-sidebar) {
+  z-index: 18;
+  width: min(var(--right-sidebar-width), calc(100% - 2 * var(--frame)));
+  animation: playback-drawer-in 220ms var(--drawer-ease) both;
+}
+.playback-overlay-scrim {
+  position: fixed;
+  inset: 72px 0 var(--desktop-overlay-bottom);
+  z-index: 15;
+  background: rgb(0 0 0 / 40%);
+  animation: shell-fade-in 160ms ease both;
+}
+:root[data-library-drawer] .main { left: var(--frame); --main-padding-x: clamp(16px, 3vw, 28px); }
+:root[data-library-drawer] .nav-drawer-scrim { bottom: var(--desktop-overlay-bottom); }
+:root:is([data-layout-shell="ytmusic"], [data-library-drawer]) .sidebar {
+  z-index: 40;
+  visibility: hidden;
+  transform: translateX(calc(-100% - var(--frame) * 2));
+  transition: transform 260ms var(--drawer-ease), visibility 0s linear 260ms;
+}
+:root:is([data-layout-shell="ytmusic"], [data-library-drawer])[data-nav-drawer="open"] .sidebar {
+  visibility: visible;
+  transform: none;
+  box-shadow: 0 24px 60px rgb(0 0 0 / 38%);
+  transition: transform 260ms var(--drawer-ease), visibility 0s;
+}
+
 /* ---------- Apple Music: header player ---------- */
 .topbar--player { grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 16px; }
 .topbar--player .homebutton { display: none; }
@@ -97,9 +128,6 @@
 /* ---------- YouTube Music: top nav + drawer + floating player ---------- */
 :root[data-layout-shell="ytmusic"] .main { left: var(--frame); }
 :root[data-layout-shell="ytmusic"] .main.sidebar-open { right: var(--frame); }
-
-:root[data-layout-shell="ytmusic"] .sidebar { z-index: 40; visibility: hidden; transform: translateX(calc(-100% - var(--frame) * 2)); transition: transform 260ms var(--drawer-ease), visibility 0s linear 260ms; }
-:root[data-layout-shell="ytmusic"][data-nav-drawer="open"] .sidebar { visibility: visible; transform: none; box-shadow: 0 24px 60px rgb(0 0 0 / 38%); transition: transform 260ms var(--drawer-ease), visibility 0s; }
 
 :root[data-layout-shell="ytmusic"] .player--drawer { left: var(--frame); right: var(--frame); bottom: var(--frame); height: calc(var(--player-height) - var(--frame) * 2); padding: 0 18px; grid-template-columns: auto minmax(0, 1fr) auto; gap: 22px; border: 1px solid var(--panel-border); border-radius: 18px; box-shadow: var(--panel-shadow); }
 :root[data-layout-shell="ytmusic"] .player--drawer .controls { order: -1; }
@@ -172,11 +200,12 @@
 
 @keyframes shell-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes shell-sheet-in { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
+@keyframes playback-drawer-in { from { opacity: 0; transform: translateX(var(--space-4)); } to { opacity: 1; transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
   .topbar-primary-link, .topbar-drawer-toggle, .header-player-button, .widget-track, .widget-playlist, .player-expand-button, .player-expand-button svg { transition: none; }
   :root[data-layout-shell] .sidebar { transition: none; }
-  .nav-drawer-scrim,
+  .nav-drawer-scrim, .playback-overlay-scrim,
   :root[data-layout-shell] .right-sidebar,
   :root[data-layout-shell] .queue-sidebar { animation: none; }
 }

@@ -1,5 +1,7 @@
 use super::*;
-use crate::acquisition::{PlaylistImportTimeout, SpotDLDownloaderAdapter, SqliteImportJobRepository, StoredImportJob};
+use crate::acquisition::{
+    PlaylistImportTimeout, SpotDLDownloaderAdapter, SqliteImportJobRepository, StoredImportJob,
+};
 use crate::config::AppConfig;
 use crate::providers::{BackendRegistry, NavidromeClient, RegisteredProvider};
 use axum::{
@@ -18,6 +20,27 @@ const FIXTURE_ALBUM: &str = "Fixture Artist/Fixture Album";
 const FIXTURE_NAME: &str = "Imported Fixture Playlist";
 const FIRST_RECORDING: &str = "4cOdK2wGLETKBW3PvgPWqT";
 pub(super) const ALTERNATE_RECORDING: &str = "DifferentRecording";
+const MISSING_SPOTDL: &str = "spotDL failed (missing-downloader): The server could not launch spotDL. Check its configured executable path.";
+
+async fn download_targets(args: &[String], directory: &Path) -> Vec<String> {
+    let Some(index) = args.iter().position(|arg| arg == "download") else {
+        return Vec::new();
+    };
+    let targets = &args[index + 1..];
+    if targets == ["musicdeck-batch-input.spotdl"] {
+        let input = tokio::fs::read(directory.join(&targets[0])).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&input).unwrap();
+        return rows
+            .into_iter()
+            .map(|row| {
+                assert!(row["download_url"].is_null());
+                assert_eq!(row["album_name"], "Fixture Album");
+                row["url"].as_str().unwrap().to_owned()
+            })
+            .collect();
+    }
+    targets.to_vec()
+}
 
 /// Explicit success fixture, injected only by tests; production always spawns spotDL.
 pub(super) struct SuccessfulProcessRunner;
@@ -35,14 +58,15 @@ impl ProcessRunner for SuccessfulProcessRunner {
                 .await
                 .unwrap();
             let id = match file[44] {
-                1 | 2 => FIRST_RECORDING,
+                1 | 2 | 9 => FIRST_RECORDING,
                 3 => ALTERNATE_RECORDING,
                 _ => "SecondRecording",
             };
             return Ok(ProcessExecutionResult {
                 exit_code: Some(0),
                 stdout: json!({
-                    "hasArtwork": false, "sourceUrl": format!("https://open.spotify.com/track/{id}")
+                    "hasArtwork": false, "sourceUrl": format!("https://open.spotify.com/track/{id}"),
+                    "duration": if file[44] == 9 { 60.0 } else { 180.0 }
                 })
                 .to_string(),
                 stderr: String::new(),
@@ -50,6 +74,37 @@ impl ProcessRunner for SuccessfulProcessRunner {
             });
         }
         let directory = options.cwd.expect("download output directory");
+        if args.iter().any(|arg| arg == "save") {
+            let target = args.last().unwrap();
+            let alternate = target.ends_with(ALTERNATE_RECORDING);
+            let titles: &[&str] = if target.contains("/track/") {
+                &["First"]
+            } else {
+                &["Second", "First", "Second"]
+            };
+            let mut metadata = titles.iter().enumerate().map(|(position, title)| {
+                let id = fixture_recording(title, alternate);
+                json!({"name": title, "artist": "Fixture Artist", "album_name": "Fixture Album",
+                    "song_id": id, "url": format!("https://open.spotify.com/track/{id}"), "list_name": FIXTURE_NAME,
+                    "download_url": "https://www.youtube.com/watch?v=invalid-example",
+                    "list_position": position + 1, "list_length": titles.len() })
+            }).collect::<Vec<_>>();
+            if target.contains("/playlist/") {
+                metadata.swap(0, 1);
+            }
+            tokio::fs::write(
+                directory.join("musicdeck-occurrences.spotdl"),
+                json!(metadata).to_string(),
+            )
+            .await
+            .unwrap();
+            return Ok(ProcessExecutionResult {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                signal: None,
+            });
+        }
         // A small valid mono PCM WAV file for the output discovery step.
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
@@ -69,16 +124,22 @@ impl ProcessRunner for SuccessfulProcessRunner {
             tokio::fs::create_dir_all(directory.join(FIXTURE_ALBUM))
                 .await
                 .unwrap();
-            let single = args.last().is_some_and(|target| target.contains("/track/"));
-            let alternate = args
-                .last()
-                .is_some_and(|target| target.ends_with(ALTERNATE_RECORDING));
-            let titles: &[&str] = if single {
-                &["First"]
-            } else {
-                &["Second", "First", "Second"]
-            };
-            for title in titles {
+            let targets = download_targets(args, &directory).await;
+            let single = targets.len() == 1;
+            let alternate = targets
+                .iter()
+                .any(|target| target.ends_with(ALTERNATE_RECORDING));
+            let titles: Vec<&str> = targets
+                .iter()
+                .map(|target| {
+                    if target.ends_with("SecondRecording") {
+                        "Second"
+                    } else {
+                        "First"
+                    }
+                })
+                .collect();
+            for title in &titles {
                 // The playlist encoding differs from the single download even for the same recording.
                 let (id, marker) = match (*title, single, alternate) {
                     ("First", _, true) => (ALTERNATE_RECORDING, 3),
@@ -151,13 +212,16 @@ pub(super) fn fixture_path(title: &str) -> String {
 pub(super) enum NavidromeResult {
     Success,
     MissingTrack,
-    RejectPlaylist,
+    RejectFirstPlaylist,
 }
 
 struct MockNavidrome {
     music_root: PathBuf,
     scans: AtomicUsize,
+    scan_requests: Arc<AtomicUsize>,
     result: NavidromeResult,
+    members: std::sync::Mutex<Vec<String>>,
+    creates: AtomicUsize,
 }
 
 async fn navidrome_request(
@@ -167,7 +231,6 @@ async fn navidrome_request(
     method: axum::http::Method,
     body: Bytes,
 ) -> Json<Value> {
-    assert!(mock.music_root.join(fixture_path("First")).is_file());
     for title in ["First", "Second"] {
         let path = mock.music_root.join(fixture_path(title));
         if !path.exists() {
@@ -183,6 +246,7 @@ async fn navidrome_request(
             .collect();
     let result = match endpoint.as_str() {
         "startScan.view" => {
+            mock.scan_requests.fetch_add(1, Ordering::SeqCst);
             mock.scans.store(0, Ordering::SeqCst);
             json!({"status":"ok", "scanStatus":{"scanning":true}})
         }
@@ -191,56 +255,49 @@ async fn navidrome_request(
             json!({"status":"ok", "scanStatus":{"scanning":poll == 0, "count":2}})
         }
         "search3.view" => {
-            assert!(mock.scans.load(Ordering::SeqCst) >= 2);
-            let title = &query["query"];
+            assert_eq!(query["query"], "", "imports browse the library in bulk");
+            assert_eq!(query["artistCount"], "0");
+            assert_eq!(query["albumCount"], "0");
+            let offset: usize = query["songOffset"].parse().unwrap();
+            let limit: usize = query["songCount"].parse().unwrap();
             let mut songs = vec![
-                json!({"id":"wrong-path", "title":title, "path":format!("/music/Existing/{}", fixture_path(title))}),
+                json!({"id":"wrong-path", "title":"First", "path":format!("/music/Existing/{}", fixture_path("First"))}),
             ];
-            if !(matches!(mock.result, NavidromeResult::MissingTrack) && title == "First") {
-                for file in std::fs::read_dir(mock.music_root.join(FIXTURE_ALBUM)).unwrap() {
-                    let file = file.unwrap();
-                    let path = file.path();
-                    let stem = path.file_stem().unwrap().to_str().unwrap();
-                    if stem == title || stem.starts_with(&format!("{title} [")) {
-                        songs.push(json!({"id":format!("nav-{stem}"), "title":title,
-                            "path":format!("/music/{FIXTURE_ALBUM}/{}", file.file_name().to_string_lossy())}));
-                    }
+            for file in std::fs::read_dir(mock.music_root.join(FIXTURE_ALBUM)).unwrap() {
+                let file = file.unwrap();
+                let path = file.path();
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                if matches!(mock.result, NavidromeResult::MissingTrack) && stem == "First" {
+                    continue;
                 }
+                songs.push(json!({"id":format!("nav-{stem}"), "title":"Different indexed title",
+                    "path":format!("/music/{FIXTURE_ALBUM}/{}", file.file_name().to_string_lossy())}));
             }
-            json!({"status":"ok", "searchResult3":{"song":songs}})
+            songs.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            json!({"status":"ok", "searchResult3":{"song":songs.into_iter().skip(offset).take(limit).collect::<Vec<_>>()}})
         }
         "getPlaylists.view" => json!({"status":"ok", "playlists":{"playlist":[]}}),
         "getPlaylist.view" => {
-            let ids = if matches!(mock.result, NavidromeResult::MissingTrack) {
-                vec!["nav-Second", "nav-Second"]
-            } else {
-                vec!["nav-Second", "nav-First", "nav-Second"]
-            };
+            let ids = mock.members.lock().unwrap();
             let entries: Vec<_> = ids.iter().map(|id| json!({"id":id, "title":id})).collect();
             json!({"status":"ok", "playlist":{"id":"nav-playlist","name":FIXTURE_NAME,"entry":entries}})
         }
         "createPlaylist.view" => {
             assert_eq!(method, axum::http::Method::POST);
             let params: Vec<_> = url::form_urlencoded::parse(&body).collect();
-            assert!(
-                params
-                    .iter()
-                    .any(|(key, value)| key == "name" && value.starts_with("MusicDeck import spimp_"))
-            );
+            assert!(params.iter().any(|(key, value)| (key == "name"
+                && value.starts_with("MusicDeck import spimp_"))
+                || (key == "playlistId" && value == "nav-playlist")));
             let ids: Vec<_> = params
                 .iter()
                 .filter(|(key, _)| key == "songId")
-                .map(|(_, value)| value.as_ref())
+                .map(|(_, value)| value.to_string())
                 .collect();
-            let expected = if matches!(mock.result, NavidromeResult::MissingTrack) {
-                vec!["nav-Second", "nav-Second"]
-            } else {
-                vec!["nav-Second", "nav-First", "nav-Second"]
-            };
-            assert_eq!(ids, expected);
-            if matches!(mock.result, NavidromeResult::RejectPlaylist) {
+            let create = mock.creates.fetch_add(1, Ordering::SeqCst);
+            if matches!(mock.result, NavidromeResult::RejectFirstPlaylist) && create == 0 {
                 json!({"status":"failed", "error":{"code":0, "message":"fixture rejected playlist"}})
             } else {
+                *mock.members.lock().unwrap() = ids.clone();
                 let entries: Vec<_> = ids.iter().map(|id| json!({"id":id})).collect();
                 json!({"status":"ok", "playlist":{"id":"nav-playlist", "entry":entries}})
             }
@@ -265,13 +322,18 @@ pub(super) async fn import_fixture(
     SpotifyPlaylistImportService,
     AcquisitionService,
     tokio::task::JoinHandle<()>,
+    Arc<AtomicUsize>,
 ) {
+    let scan_requests = Arc::new(AtomicUsize::new(0));
     let server = Router::new()
         .route("/rest/:endpoint", any(navidrome_request))
         .with_state(Arc::new(MockNavidrome {
             music_root: music_root.into(),
             scans: AtomicUsize::new(0),
+            scan_requests: scan_requests.clone(),
             result,
+            members: std::sync::Mutex::new(Vec::new()),
+            creates: AtomicUsize::new(0),
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = AppConfig::default();
@@ -291,10 +353,362 @@ pub(super) async fn import_fixture(
             .with_library(config.clone(), providers.clone()),
         AcquisitionService::new(Some(pool)).with_library(config, providers),
         task,
+        scan_requests,
     )
 }
 
 struct PlaylistTimeoutRunner(u64);
+
+fn fixture_user() -> UserRecord {
+    UserRecord {
+        id: "alice".into(),
+        username: "alice".into(),
+        display_name: "Alice".into(),
+        role: UserRole::User,
+        avatar_ref: None,
+        avatar_url: None,
+        disabled: false,
+        is_master_admin: false,
+        external_search_enabled: true,
+        external_playback_enabled: true,
+        last_login_at: None,
+        last_playback_at: None,
+        created_at: "2026-01-01".into(),
+        updated_at: "2026-01-01".into(),
+    }
+}
+
+struct InterruptedBatchRunner {
+    timeout: bool,
+    provider_timeout: bool,
+    downloads: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct NicheTrackRunner {
+    attempts: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+}
+
+#[async_trait::async_trait]
+impl ProcessRunner for NicheTrackRunner {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        options: ProcessOptions,
+    ) -> Result<ProcessExecutionResult, ProcessError> {
+        let stage = options.cwd.clone();
+        let result = SuccessfulProcessRunner.run(command, args, options).await?;
+        if args.iter().any(|arg| arg == "save") {
+            let path = stage.unwrap().join("musicdeck-occurrences.spotdl");
+            let mut rows: Vec<serde_json::Value> =
+                serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            for row in &mut rows {
+                row["duration"] = json!(180.0);
+            }
+            tokio::fs::write(path, serde_json::to_vec(&rows).unwrap())
+                .await
+                .unwrap();
+        } else if args.iter().any(|arg| arg == "download") {
+            let stage = stage.unwrap();
+            let targets = download_targets(args, &stage).await;
+            let arg = |name: &str| {
+                args.windows(2)
+                    .find(|pair| pair[0] == name)
+                    .map(|pair| pair[1].as_str())
+            };
+            let phase = if let Some(query) = arg("--search-query") {
+                assert_eq!(query, "{artist} - {title} {album}");
+                "edition"
+            } else if arg("--audio") == Some("soundcloud") {
+                assert_eq!(arg("soundcloud"), Some("--threads"));
+                "soundcloud"
+            } else {
+                "standard"
+            };
+            assert_eq!(
+                arg("--threads"),
+                Some(if phase == "standard" { "3" } else { "2" })
+            );
+            assert!(!args.iter().any(|arg| arg == "--dont-filter-results"));
+            match phase {
+                "standard" => {
+                    tokio::fs::remove_file(
+                        stage.join(staged_fixture_path("First", FIRST_RECORDING)),
+                    )
+                    .await
+                    .unwrap();
+                    let errors = format!(
+                        "https://open.spotify.com/track/{FIRST_RECORDING} - AudioProviderError: No results found"
+                    );
+                    tokio::fs::write(stage.join("musicdeck-errors.txt"), errors)
+                        .await
+                        .unwrap();
+                }
+                "edition" => {
+                    let path = stage.join(staged_fixture_path("First", FIRST_RECORDING));
+                    let mut wav = tokio::fs::read(&path).await.unwrap();
+                    wav[44] = 9;
+                    tokio::fs::write(path, wav).await.unwrap();
+                }
+                _ => {}
+            }
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((phase.to_owned(), targets));
+        }
+        Ok(result)
+    }
+}
+
+#[tokio::test]
+async fn niche_track_fallback_rejects_wrong_duration_and_only_retries_the_missing_recording() {
+    let db = DbPool::connect_memory().await.unwrap();
+    run_migrations(&db, None).await.unwrap();
+    seed_test_user(&db).await;
+    let music = tempfile::tempdir().unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    let (imports, acquisitions, mock, scans) =
+        import_fixture(db.clone(), music.path(), NavidromeResult::Success).await;
+    let tasks = TaskManager::new(Some(db.clone()));
+    tasks.initialize_tables().await;
+    let process = Arc::new(NicheTrackRunner::default());
+    tasks.register(
+        TaskType::SpotdlImport,
+        Arc::new(
+            SpotdlRunner::with_services(Some(db.clone()), acquisitions, imports.clone())
+                .with_downloader(Arc::new(SpotDLDownloaderAdapter::with_runner(
+                    process.clone(),
+                )))
+                .with_output_dir(stage.path()),
+        ),
+    );
+    let job = imports
+        .start(
+            "https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
+            &fixture_user(),
+            Some(&tasks),
+        )
+        .await
+        .unwrap();
+    let task: String = sqlx::query_scalar(
+        "SELECT id FROM background_tasks WHERE json_extract(payload_json,'$.jobId')=?",
+    )
+    .bind(&job.id)
+    .fetch_one(db.inner())
+    .await
+    .unwrap();
+    tasks
+        .wait_for_settlement(&task, Duration::from_secs(8))
+        .await
+        .unwrap();
+    let imported = imports.get(&job.id, "alice").await.unwrap();
+    assert_eq!(imported.status, "completed", "{:?}", imported.error);
+    assert_eq!(imported.imported_count, Some(3));
+    let published = tokio::fs::read(music.path().join(fixture_path("First")))
+        .await
+        .unwrap();
+    assert_eq!(published[44], 1, "the wrong-duration edition was discarded");
+    let first = format!("https://open.spotify.com/track/{FIRST_RECORDING}");
+    assert_eq!(
+        *process.attempts.lock().unwrap(),
+        [
+            (
+                "standard".into(),
+                vec![
+                    "https://open.spotify.com/track/SecondRecording".into(),
+                    first.clone()
+                ]
+            ),
+            ("edition".into(), vec![first.clone()]),
+            ("soundcloud".into(), vec![first]),
+        ]
+    );
+    assert_eq!(scans.load(Ordering::SeqCst), 1);
+    tasks.close();
+    mock.abort();
+}
+
+#[async_trait::async_trait]
+impl ProcessRunner for InterruptedBatchRunner {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        options: ProcessOptions,
+    ) -> Result<ProcessExecutionResult, ProcessError> {
+        let first_batch = if args.iter().any(|arg| arg == "download") {
+            assert_eq!(args.last().unwrap(), "musicdeck-batch-input.spotdl");
+            let targets = download_targets(args, options.cwd.as_deref().unwrap()).await;
+            let mut downloads = self.downloads.lock().unwrap();
+            downloads.push(targets);
+            downloads.len() == 1
+        } else {
+            false
+        };
+        let stage = options.cwd.clone();
+        let mut output = SuccessfulProcessRunner.run(command, args, options).await?;
+        if first_batch {
+            let stage = stage.unwrap();
+            let file = stage.join(staged_fixture_path("First", FIRST_RECORDING));
+            // Leave a recognizable but truncated recording and destroy spotDL's end-of-run artifacts.
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .await
+                .unwrap()
+                .set_len(50)
+                .await
+                .unwrap();
+            tokio::fs::remove_file(stage.join("batch.m3u8"))
+                .await
+                .unwrap();
+            tokio::fs::remove_file(stage.join("musicdeck-source.spotdl"))
+                .await
+                .unwrap();
+            if self.timeout {
+                return Err(ProcessError::TimedOut(1000));
+            }
+            output.exit_code = Some(1);
+            if self.provider_timeout {
+                tokio::fs::write(
+                    stage.join("musicdeck-errors.txt"),
+                    format!("https://open.spotify.com/track/{FIRST_RECORDING} - ReadTimeout: provider timed out\n"),
+                )
+                .await
+                .unwrap();
+            } else {
+                output.stderr = "FFmpegError: fixture download was interrupted".into();
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[tokio::test]
+async fn resumes_interrupted_playlists_in_place_and_reuses_library_audio() {
+    for (timeout, provider_timeout) in [(false, false), (true, false), (false, true)] {
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        seed_test_user(&db).await;
+        let music = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let (imports, acquisitions, navidrome, scan_requests) =
+            import_fixture(db.clone(), music.path(), NavidromeResult::Success).await;
+        let manager = TaskManager::new(Some(db.clone()));
+        manager.initialize_tables().await;
+        let process = Arc::new(InterruptedBatchRunner {
+            timeout,
+            provider_timeout,
+            downloads: std::sync::Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn TaskDefinition> = Arc::new(
+            SpotdlRunner::with_services(Some(db.clone()), acquisitions.clone(), imports.clone())
+                .with_downloader(Arc::new(SpotDLDownloaderAdapter::with_runner(
+                    process.clone(),
+                )))
+                .with_output_dir(stage.path()),
+        );
+        manager.register(TaskType::SpotdlDownload, runner.clone());
+        manager.register(TaskType::SpotdlImport, runner);
+        let user = fixture_user();
+        let url = "https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM";
+        let task_for = |id: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT id FROM background_tasks WHERE json_extract(payload_json,'$.jobId')=? ORDER BY created_at DESC LIMIT 1")
+                    .bind(id).fetch_one(db.inner()).await.unwrap()
+            }
+        };
+        let initial = imports.start(url, &user, Some(&manager)).await.unwrap();
+        let first_task = task_for(initial.id.clone()).await;
+        if provider_timeout {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if imports.get(&initial.id, "alice").await.unwrap().stage == "retry_wait" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the transient failure should expose a retry wait");
+        }
+        manager
+            .wait_for_settlement(&first_task, Duration::from_secs(8))
+            .await
+            .unwrap();
+        if !provider_timeout {
+            let partial = imports.get(&initial.id, "alice").await.unwrap();
+            assert_eq!(partial.status, "partial", "{:?}", partial.error);
+            assert_eq!(partial.imported_count, Some(2));
+            assert_eq!(partial.manifest.as_ref().unwrap()[2].duplicate_of, Some(1));
+            let playlist_id = partial.playlist_id.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while manager.is_executing(&first_task) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let resumed = imports.start(url, &user, Some(&manager)).await.unwrap();
+            assert_eq!(resumed.id, initial.id);
+            manager
+                .wait_for_settlement(&task_for(initial.id.clone()).await, Duration::from_secs(8))
+                .await
+                .unwrap();
+            let finished = imports.get(&initial.id, "alice").await.unwrap();
+            assert_eq!(finished.playlist_id.as_deref(), Some(playlist_id.as_str()));
+        }
+        let finished = imports.get(&initial.id, "alice").await.unwrap();
+        assert_eq!(finished.status, "completed", "{:?}", finished.error);
+        let ordered: Vec<String> = sqlx::query_scalar(
+            "SELECT provider_track_id FROM playlist_items WHERE playlist_id=? ORDER BY position",
+        )
+        .bind(finished.playlist_id.unwrap())
+        .fetch_all(db.inner())
+        .await
+        .unwrap();
+        assert_eq!(ordered, ["nav-Second", "nav-First", "nav-Second"]);
+
+        let scans_before_reuse = scan_requests.load(Ordering::SeqCst);
+        let already_present = acquisitions
+            .create_job(
+                AcquisitionCreateOptions {
+                    user_id: "alice".into(),
+                    track_id: Some(format!("https://open.spotify.com/track/{FIRST_RECORDING}")),
+                    ..Default::default()
+                },
+                Some(&manager),
+            )
+            .await
+            .unwrap();
+        manager
+            .wait_for_settlement(
+                &task_for(already_present.id.clone()).await,
+                Duration::from_secs(8),
+            )
+            .await
+            .unwrap();
+        let reused = acquisitions
+            .get_job(&already_present.id, "alice", false)
+            .await
+            .unwrap();
+        assert_eq!(reused.status, AcquisitionJobStatus::Completed);
+        assert!(reused.files.unwrap()[0].reused);
+        assert_eq!(scan_requests.load(Ordering::SeqCst), scans_before_reuse);
+        let downloads = process.downloads.lock().unwrap();
+        assert_eq!(downloads.len(), 2);
+        assert_eq!(downloads[0].len(), 2);
+        assert_eq!(
+            downloads[1],
+            [format!("https://open.spotify.com/track/{FIRST_RECORDING}")]
+        );
+        manager.close();
+        navidrome.abort();
+    }
+}
 
 #[async_trait::async_trait]
 impl ProcessRunner for PlaylistTimeoutRunner {
@@ -304,7 +718,9 @@ impl ProcessRunner for PlaylistTimeoutRunner {
         args: &[String],
         options: ProcessOptions,
     ) -> Result<ProcessExecutionResult, ProcessError> {
-        assert_eq!(options.timeout_ms, Some(self.0));
+        if args.iter().any(|arg| arg == "download") {
+            assert_eq!(options.timeout_ms, Some(self.0));
+        }
         SuccessfulProcessRunner.run(command, args, options).await
     }
 }
@@ -312,15 +728,27 @@ impl ProcessRunner for PlaylistTimeoutRunner {
 #[tokio::test]
 async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_every_track() {
     for (case, status, imported, timeout, timeout_ms) in [
-        (NavidromeResult::MissingTrack, "partial", 2, PlaylistImportTimeout::Auto, 0),
-        (NavidromeResult::RejectPlaylist, "failed", 0, PlaylistImportTimeout::Manual { minutes: 90 }, 5_400_000),
+        (
+            NavidromeResult::MissingTrack,
+            "partial",
+            2,
+            PlaylistImportTimeout::Auto,
+            0,
+        ),
+        (
+            NavidromeResult::RejectFirstPlaylist,
+            "failed",
+            0,
+            PlaylistImportTimeout::Manual { minutes: 90 },
+            5_400_000,
+        ),
     ] {
         let db = DbPool::connect_memory().await.unwrap();
         run_migrations(&db, None).await.unwrap();
         seed_test_user(&db).await;
         let music = tempfile::tempdir().unwrap();
         let stage = tempfile::tempdir().unwrap();
-        let (imports, _, mock) = import_fixture(db.clone(), music.path(), case).await;
+        let (imports, _, mock, _) = import_fixture(db.clone(), music.path(), case).await;
         let mut record: StoredImportJob = serde_json::from_value(json!({
             "job": {"id":"spimp_fixture", "userId":"alice", "status":"queued", "stage":"queued"},
             "playlistUrl":"https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
@@ -388,6 +816,36 @@ async fn playlist_import_reports_partial_or_failed_when_navidrome_cannot_link_ev
         assert_eq!(playlists, i64::from(imported > 0));
         assert!(music.path().join(fixture_path("First")).is_file());
         assert!(stage.path().join("spimp_fixture").exists());
+        if imported == 0 {
+            // A failed upstream request can leave a durable attempt with no remote marker.
+            // Age the fixture's request so the test exercises reconciliation without its grace wait.
+            sqlx::query("UPDATE import_jobs SET manifest_json=json_set(manifest_json,'$.playlistIntent.attemptedAt',0) WHERE id='spimp_fixture'")
+                .execute(db.inner()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while manager.is_executing(&task.id) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let rerun = imports
+                .start(
+                    "https://open.spotify.com/playlist/37i9dQZF1DXdLEN7aqioXM",
+                    &fixture_user(),
+                    Some(&manager),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rerun.id, "spimp_fixture");
+            let task_id: String = sqlx::query_scalar("SELECT id FROM background_tasks WHERE id<>? AND json_extract(payload_json,'$.jobId')='spimp_fixture'")
+                .bind(&task.id).fetch_one(db.inner()).await.unwrap();
+            manager
+                .wait_for_settlement(&task_id, Duration::from_secs(8))
+                .await
+                .unwrap();
+            let resumed = imports.get("spimp_fixture", "alice").await.unwrap();
+            assert_eq!(resumed.status, "completed", "{:?}", resumed.error);
+        }
         mock.abort();
     }
 }
@@ -427,7 +885,7 @@ impl ProcessRunner for EmptyAudioRunner {
         Ok(ProcessExecutionResult {
             exit_code: Some(0),
             stdout: String::new(),
-            stderr: "AudioProviderError".into(),
+            stderr: "AudioProviderError: No audio source found".into(),
             signal: None,
         })
     }
@@ -437,7 +895,7 @@ impl ProcessRunner for EmptyAudioRunner {
 async fn zero_byte_audio_fails_even_if_spotdl_exits_zero() {
     assert_failed_downloads(
         SpotDLDownloaderAdapter::with_runner(Arc::new(EmptyAudioRunner)),
-        "spotDL produced no usable audio (no-match)",
+        "spotDL failed (no-match): The downloader could not match this recording to an audio source.",
         false,
         false,
     )
@@ -451,7 +909,7 @@ async fn album_acquisition_reports_partial_and_preserves_unindexed_staging() {
     seed_test_user(&db).await;
     let music = tempfile::tempdir().unwrap();
     let stage = tempfile::tempdir().unwrap();
-    let (playlists, acquisitions, mock) =
+    let (playlists, acquisitions, mock, _) =
         import_fixture(db.clone(), music.path(), NavidromeResult::MissingTrack).await;
     let manager = TaskManager::new(Some(db.clone()));
     manager.initialize_tables().await;
@@ -501,13 +959,18 @@ async fn album_acquisition_reports_partial_and_preserves_unindexed_staging() {
             .iter()
             .all(|file| file.provider_track_id.as_deref() == Some("nav-Second"))
     );
-    assert!(
-        stage
-            .path()
-            .join(format!("{}-{task_id}", job.id))
-            .join(staged_fixture_path("First", FIRST_RECORDING))
-            .is_file()
-    );
+    let attempt = stage.path().join(format!("{}-{task_id}", job.id));
+    let checkpoint = std::fs::read_to_string(attempt.join("musicdeck-checkpoint.json")).unwrap();
+    let checkpoint: Value = serde_json::from_str(&checkpoint).unwrap();
+    let file = checkpoint["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source"]["title"] == "First")
+        .unwrap()["filePath"]
+        .as_str()
+        .unwrap();
+    assert!(Path::new(file).is_file());
     mock.abort();
 }
 
@@ -679,7 +1142,7 @@ async fn missing_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
     assert!(matches!(error, ProcessError::SpawnFailed { .. }));
     assert_failed_downloads(
         SpotDLDownloaderAdapter::new().with_spotdl_path(executable),
-        &error.to_string(),
+        MISSING_SPOTDL,
         true,
         false,
     )
@@ -701,7 +1164,7 @@ async fn invalid_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
     assert!(matches!(error, ProcessError::SpawnFailed { .. }));
     assert_failed_downloads(
         SpotDLDownloaderAdapter::new().with_spotdl_path(path),
-        &error.to_string(),
+        MISSING_SPOTDL,
         true,
         false,
     )
@@ -709,21 +1172,17 @@ async fn invalid_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
 }
 
 #[tokio::test]
-async fn injected_spawn_failure_preserves_exact_error_and_aborts_partial_playlist() {
-    let error = ProcessError::SpawnFailed {
-        command: String::from("configured-spotdl"),
-        reason: String::from("fixture: access denied while starting spotDL"),
-    };
+async fn injected_spawn_failure_hides_process_details_and_aborts_partial_playlist() {
     let downloader = SpotDLDownloaderAdapter::with_runner(Arc::new(SpawnFailureRunner))
         .with_spotdl_path("configured-spotdl");
-    assert_failed_downloads(downloader, &error.to_string(), true, false).await;
+    assert_failed_downloads(downloader, MISSING_SPOTDL, true, false).await;
 }
 
 #[tokio::test]
 async fn successful_exit_without_audio_fails_instead_of_inventing_imported_files() {
     assert_failed_downloads(
         SpotDLDownloaderAdapter::with_runner(Arc::new(NoOutputRunner)),
-        "spotDL exited successfully but produced no audio files",
+        "spotDL did not return source track details. Check the playlist URL and server credentials.",
         false,
         false,
     )
@@ -740,13 +1199,8 @@ fn unconfigured_spotdl_without_path_binary_fails_using_production_defaults() {
                 .await
                 .expect_err("spotdl must be absent from isolated PATH");
             assert!(matches!(error, ProcessError::SpawnFailed { .. }));
-            assert_failed_downloads(
-                SpotDLDownloaderAdapter::new(),
-                &error.to_string(),
-                true,
-                true,
-            )
-            .await;
+            assert_failed_downloads(SpotDLDownloaderAdapter::new(), MISSING_SPOTDL, true, true)
+                .await;
         });
         return;
     }

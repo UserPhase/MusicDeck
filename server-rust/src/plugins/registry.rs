@@ -1104,7 +1104,7 @@ impl SpotDLDownloaderPlugin {
                 name: String::from("SpotDL Downloader"),
                 version: String::from("1.0.0"),
                 description: Some(String::from(
-                    "Configures spotDL downloads and Spotify playlist imports: audio format, Spotify credentials, optional YouTube cookies, and binary paths.",
+                    "Configures the shared download format, Spotify credentials, optional YouTube cookies, and downloader paths.",
                 )),
                 author: None,
                 capabilities: vec![String::from("acquisition")],
@@ -1121,15 +1121,15 @@ impl SpotDLDownloaderPlugin {
                             options: Some(vec![
                                 PluginConfigOption {
                                     value: json!("best"),
-                                    label: String::from("Best source quality (M4A) — recommended"),
+                                    label: String::from("Default (M4A) - recommended"),
                                 },
                                 PluginConfigOption {
                                     value: json!("m4a"),
-                                    label: String::from("M4A — original bitrate"),
+                                    label: String::from("M4A (AAC)"),
                                 },
                                 PluginConfigOption {
                                     value: json!("opus"),
-                                    label: String::from("Opus — original bitrate"),
+                                    label: String::from("Opus"),
                                 },
                                 PluginConfigOption {
                                     value: json!("mp3"),
@@ -1148,7 +1148,9 @@ impl SpotDLDownloaderPlugin {
                                     label: String::from("WAV — uncompressed, very large files"),
                                 },
                             ]),
-                            description: None,
+                            description: Some(String::from(
+                                "Applies to spotDL and Deezer/YouTube Music downloads.",
+                            )),
                             secret: false,
                             required: false,
                             default: Some(json!("best")),
@@ -1223,8 +1225,7 @@ impl MusicDeckPlugin for SpotDLDownloaderPlugin {
     }
 
     fn validate_config(&self, config: &Value) -> Result<(), PluginErrorClassification> {
-        let fmt = config.get("outputFormat").and_then(Value::as_str);
-        SpotDLOutputFormat::parse(fmt).map_err(|msg| PluginErrorClassification {
+        SpotDLOutputFormat::from_plugin_config(config).map_err(|msg| PluginErrorClassification {
             status: PluginErrorStatus::NotConfigured,
             message: msg,
         })?;

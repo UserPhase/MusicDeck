@@ -133,6 +133,7 @@ function Search() {
   ] = useState(Boolean(query.trim()));
   const [externalLoading, setExternalLoading] = useState(false);
   const [resolvedSearch, setResolvedSearch] = useState("");
+  const [startedSearch, setStartedSearch] = useState("");
 
 
   const [
@@ -144,6 +145,7 @@ function Search() {
   const [preferredSourceMode, setSourceMode] = useState(() => ["library", "hybrid", "external"].includes(savedFilters.sourceMode) ? savedFilters.sourceMode : "hybrid");
   const { canMetadata } = usePrivacy();
   const sourceMode = canMetadata ? preferredSourceMode : "library";
+  const searchKey = `${query}\u001f${sourceMode}`;
   const hasChosenSourceMode = useRef(Boolean(savedFilters.sourceMode));
 
 
@@ -152,7 +154,7 @@ function Search() {
     playSongFromSource,
   } = usePlayer();
 
-  const playableResults = isMobile && deletion?.deletedTracks?.size
+  const playableResults = deletion?.deletedTracks?.size
     ? results.track.filter((song) => !deletion.deletedTracks.has(String(song.id))) : results.track;
 
   function handleTrackPlayback(song, index) {
@@ -190,7 +192,8 @@ function Search() {
    */
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const { signal } = controller;
 
     if (!query.trim()) {
 
@@ -206,26 +209,27 @@ function Search() {
       setExternalLoading(false);
       setError(null);
 
-      return () => {
-        cancelled = true;
-      };
+      setStartedSearch("");
+      return;
 
     }
 
 
     const empty = { artist: [], album: [], track: [], playlist: [], degraded: false };
+    setStartedSearch(searchKey);
     setResults(empty);
     setError(null);
     setLoading(true);
     setExternalLoading(sourceMode !== "library");
 
     function addPhase(data, phase) {
-      if (cancelled) return;
+      if (signal.aborted) return;
       setResults((current) => {
         const next = { ...current, degraded: current.degraded || Boolean(data?.degraded) };
         for (const type of ["artist", "album", "track", "playlist"]) {
           const incoming = data?.results?.[type] || [];
-          const existing = current[type].filter((item) => !incoming.some((other) => other.id === item.id));
+          const incomingIds = new Set(incoming.map(item => item.id));
+          const existing = current[type].filter(item => !incomingIds.has(item.id));
           next[type] = phase === "local" ? [...incoming, ...existing] : [...existing, ...incoming];
         }
         return next;
@@ -233,31 +237,30 @@ function Search() {
     }
 
     async function run() {
-      const local = sourceMode === "external" ? null : searchNavidrome(query, { mode: sourceMode, phase: "local" })
+      const local = sourceMode === "external" ? null : searchNavidrome(query, { mode: sourceMode, phase: "local", signal })
         .then((data) => addPhase(data, "local"))
-        .finally(() => { if (!cancelled) setLoading(false); });
-      const external = sourceMode === "library" ? null : searchNavidrome(query, { mode: sourceMode, phase: "external" })
+        .finally(() => { if (!signal.aborted) setLoading(false); });
+      const external = sourceMode === "library" ? null : searchNavidrome(query, { mode: sourceMode, phase: "external", signal })
         .then((data) => addPhase(data, "external"))
         .finally(() => {
-          if (!cancelled) {
+          if (!signal.aborted) {
             setExternalLoading(false);
             if (sourceMode === "external") setLoading(false);
           }
         });
       const outcomes = await Promise.allSettled([local, external].filter(Boolean));
-      if (!cancelled) setResolvedSearch(`${query}\u001f${sourceMode}`);
-      if (!cancelled && outcomes.every((outcome) => outcome.status === "rejected")) {
+      if (signal.aborted) return;
+      setResolvedSearch(searchKey);
+      if (outcomes.every((outcome) => outcome.status === "rejected")) {
         setError(outcomes[0]?.reason?.message || "Could not search your music.");
       }
     }
 
     run();
 
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
 
-  }, [query, sourceMode]);
+  }, [query, searchKey, sourceMode]);
 
   function chooseSourceMode(mode) {
     if (mode === sourceMode) return;
@@ -299,7 +302,7 @@ function Search() {
    * LOADING
    */
 
-  if (loading) {
+  if (loading || startedSearch !== searchKey) {
 
     return (
 
@@ -353,7 +356,7 @@ function Search() {
 
   return (
 
-    <div className="search-page" data-view-loading={externalLoading || resolvedSearch !== `${query}\u001f${sourceMode}`}>
+    <div className="search-page" data-view-loading={externalLoading || resolvedSearch !== searchKey}>
 
 
       {/* HEADER */}

@@ -3,6 +3,7 @@ import {
   getAlbums,
   getAlbumPage,
   getTrackPage,
+  getTrackCollection,
   getArtist,
   getArtistOverview,
   getArtistPortrait,
@@ -170,7 +171,7 @@ test("library pages preserve totals and revisions, normalize items, and forward 
   await getTrackPage({ offset: 200, filters, signal: controller.signal });
   expect(global.fetch).toHaveBeenLastCalledWith("/api/library/tracks/filter",
     expect.objectContaining({ method: "POST", signal: controller.signal,
-      body: JSON.stringify({ filters, offset: 200, limit: 200 }) }));
+      body: JSON.stringify({ filters, offset: 200, limit: 100 }) }));
   global.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({
     albums: [{ id: "album-1", name: "Album", artistName: "Artist", artworkId: "cover-1" }],
     total: 2000, revision: "snapshot-b",
@@ -180,6 +181,27 @@ test("library pages preserve totals and revisions, normalize items, and forward 
     items: [{ id: "album-1", artist: "Artist", coverArt: "cover-1" }] });
   expect(global.fetch).toHaveBeenLastCalledWith("/api/albums?offset=1000&limit=200",
     expect.objectContaining({ signal: controller.signal }));
+});
+
+test("enumerates a filtered playback queue in order across 500-track batches and rejects a changed revision", async () => {
+  const signal = new AbortController().signal;
+  const query = { query: "live", sort: "duration-desc", favoritesOnly: true, unplayedOnly: false };
+  let changed = false;
+  global.fetch.mockImplementation(async (_url, options) => {
+    const { offset, limit, ...selection } = JSON.parse(options.body);
+    expect(selection).toEqual({ query: "live", sort: "duration-desc", filters: [{ field: "favorite", op: "boolean", value: true }] });
+    expect(options.signal).toBe(signal);
+    return { ok: true, status: 200, json: async () => ({ total: 1205, revision: changed && offset ? "new" : "stable",
+      tracks: Array.from({ length: Math.min(limit, 1205 - offset) }, (_, index) => ({ id: String(offset + index) })),
+    }) };
+  });
+  const queue = await getTrackCollection(query, signal);
+  expect(queue.map(track => track.id)).toEqual(Array.from({ length: 1205 }, (_, index) => String(index)));
+  expect(global.fetch.mock.calls.map(([url, options]) => [url, JSON.parse(options.body).offset])).toEqual([
+    ["/api/library/tracks/filter", 0], ["/api/library/tracks/filter", 500], ["/api/library/tracks/filter", 1000],
+  ]);
+  changed = true;
+  await expect(getTrackCollection(query, signal)).rejects.toThrow("library changed");
 });
 
 test("silence scan uses selected parameters and saved analysis requests the matching profile", async () => {

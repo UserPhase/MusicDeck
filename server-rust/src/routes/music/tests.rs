@@ -1314,6 +1314,15 @@ async fn library_pages_cover_albums_past_500_and_revise_when_same_count_rows_shi
     assert_eq!(late["albums"][1]["providerId"], "album-501");
     assert_eq!(late["revision"], first["revision"]);
     assert_eq!(late["degraded"], false);
+    let sorted = read("/api/albums?offset=0&limit=100&sort=za").await;
+    let sorted_next = read("/api/albums?offset=100&limit=100&sort=za").await;
+    assert_eq!(sorted["total"], 504);
+    assert_eq!(sorted["albums"][0]["providerId"], "album-503");
+    assert_eq!(sorted_next["albums"][0]["providerId"], "album-403");
+    assert_eq!(sorted_next["revision"], sorted["revision"]);
+    let matches = read("/api/albums?offset=0&limit=100&q=ALB%C3%9AM%20503&sort=az").await;
+    assert_eq!(matches["total"], 1);
+    assert_eq!(matches["albums"][0]["providerId"], "album-503");
     assert_eq!(
         read("/api/albums?offset=504&limit=2").await["albums"],
         json!([])
@@ -1340,6 +1349,54 @@ async fn library_pages_cover_albums_past_500_and_revise_when_same_count_rows_shi
         read("/api/tracks?offset=0&limit=1").await["revision"],
         shifted["revision"]
     );
+}
+
+#[tokio::test]
+async fn track_pages_sort_and_search_beyond_the_first_hundred() {
+    let (_, state, session) = playback_state(true).await;
+    let tracks = (0..1205).map(|index| {
+        let mut track = catalog_test_track(&format!("song-{index}"), &format!("Café Song {index}"));
+        track.duration_seconds = (index > 0).then_some(index);
+        track
+    }).collect();
+    set_catalog_fixture(&state, tracks, vec![]);
+
+    let (status, first) = json_response(request(&state, &session, "GET", "/api/tracks?offset=0&limit=100", None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["total"], 1205);
+    assert_eq!(first["tracks"].as_array().unwrap().len(), 100);
+    let (status, late) = json_response(request(&state, &session, "GET", "/api/tracks?offset=1200&limit=100", None).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(late["tracks"].as_array().unwrap().len(), 5);
+    assert_eq!(late["revision"], first["revision"]);
+
+    let page = |body: Value| {
+        let state = &state;
+        let session = &session;
+        async move {
+            let (status, page) = json_response(request(state, session, "POST", "/api/library/tracks/filter", Some(&body)).await).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            page
+        }
+    };
+    let descending = page(json!({"limit":100,"query":"cafe","sort":"title-desc"})).await;
+    assert_eq!(descending["total"], 1205);
+    assert_eq!(descending["tracks"][0]["providerId"], "song-1204");
+    let next = page(json!({"limit":100,"offset":100,"query":"cafe","sort":"title-desc"})).await;
+    assert_eq!(next["tracks"][0]["providerId"], "song-1104");
+    assert_eq!(next["revision"], descending["revision"]);
+    let matched = page(json!({"limit":100,"query":"1204 Cafe","sort":"duration-asc"})).await;
+    assert_eq!(matched["total"], 1);
+    assert_eq!(matched["tracks"][0]["providerId"], "song-1204");
+    let shortest = page(json!({"limit":1,"sort":"duration-asc"})).await;
+    assert_eq!(shortest["tracks"][0]["providerId"], "song-1");
+    let unknown = page(json!({"limit":1,"offset":1204,"sort":"duration-desc"})).await;
+    assert_eq!(unknown["tracks"][0]["providerId"], "song-0");
+
+    // Refresh exercises the bulk SQLite identity maps for existing identities.
+    state.catalog_snapshots().invalidate().await;
+    let refreshed = page(json!({"limit":100,"offset":100,"query":"cafe","sort":"title-desc"})).await;
+    assert_eq!(refreshed, next);
 }
 
 #[tokio::test]

@@ -15,8 +15,9 @@ jest.mock("../Sidebar", () => ({ id }) => <aside data-testid="library-sidebar" i
 jest.mock("../QueueSidebar", () => ({ isOpen, onClose, closeButtonRef }) => isOpen && (
   <aside data-testid="queue-panel"><button ref={closeButtonRef} onClick={onClose}>Close queue</button></aside>
 ));
-jest.mock("../NowPlayingSidebar", () => ({ isOpen, covered, onOpenQueue, queueButtonRef }) => isOpen && (
+jest.mock("../NowPlayingSidebar", () => ({ isOpen, covered, onOpenQueue, queueButtonRef, closeButtonRef }) => isOpen && (
   <aside data-testid="now-playing-panel" hidden={covered}>
+    <button ref={closeButtonRef}>Close Now Playing</button>
     <button ref={queueButtonRef} onClick={onOpenQueue}>Queue</button>
   </aside>
 ));
@@ -47,13 +48,25 @@ function RoutedPage() {
   return <p>Page content</p>;
 }
 
-function mockMatchMedia(isMobile) {
-  window.matchMedia = jest.fn().mockImplementation((query) => ({
-    matches: isMobile,
-    media: query,
-    addEventListener: jest.fn(),
-    removeEventListener: jest.fn(),
-  }));
+function mockMatchMedia(isMobile, initialWidth = isMobile ? 390 : 1600) {
+  let width = initialWidth;
+  const lists = [];
+  window.matchMedia = jest.fn().mockImplementation((query) => {
+    const [, limit, value] = query.match(/(min|max)-width:\s*(\d+)px/) ?? [];
+    const listeners = new Set();
+    const list = {
+      get matches() { return limit === "min" ? width >= Number(value) : limit === "max" && width <= Number(value); },
+      media: query,
+      addEventListener: (_event, listener) => listeners.add(listener),
+      removeEventListener: (_event, listener) => listeners.delete(listener),
+    };
+    lists.push({ list, listeners });
+    return list;
+  });
+  return next => act(() => {
+    width = next;
+    for (const { list, listeners } of lists) for (const listener of listeners) listener(list);
+  });
 }
 
 function playerState(overrides = {}) {
@@ -248,8 +261,49 @@ test("auto-opens Now Playing on a new track only in docked-panel shells", () => 
   expect(setActiveSidebar).not.toHaveBeenCalledWith("now-playing");
   unmount();
 
+  mockMatchMedia(false, 1200);
+  const narrow = renderLayout("spotify");
+  expect(setActiveSidebar).not.toHaveBeenCalledWith("now-playing");
+  narrow.unmount();
+
+  mockMatchMedia(false);
   renderLayout("spotify");
   expect(setActiveSidebar).toHaveBeenCalledWith("now-playing");
+});
+
+test("resizing moves the existing desktop panels to overlays and restores the docked layout", () => {
+  const resize = mockMatchMedia(false);
+  const setActiveSidebar = jest.fn();
+  usePlayer.mockReturnValue(playerState({ activeSidebar: "now-playing", setActiveSidebar }));
+  const { container } = renderLayout("spotify");
+  const main = container.querySelector("main");
+  const panel = screen.getByTestId("now-playing-panel");
+  const library = screen.getByTestId("library-sidebar");
+
+  expect(main).not.toHaveAttribute("inert");
+  resize(1200);
+  expect(document.documentElement).toHaveAttribute("data-playback-overlay");
+  expect(document.documentElement).not.toHaveAttribute("data-library-drawer");
+  expect(main).toHaveAttribute("inert");
+  expect(screen.getByTestId("now-playing-panel")).toBe(panel);
+  expect(screen.getByRole("button", { name: "Close Now Playing" })).toHaveFocus();
+
+  resize(1000);
+  expect(document.documentElement).toHaveAttribute("data-library-drawer");
+  fireEvent.click(screen.getByRole("button", { name: "Open menu" }));
+  expect(document.documentElement.dataset.navDrawer).toBe("open");
+  expect(screen.getByTestId("library-sidebar")).toBe(library);
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(document.documentElement.dataset.navDrawer).toBeUndefined();
+  expect(screen.getByRole("button", { name: "Open menu" })).toHaveFocus();
+
+  resize(1600);
+  expect(document.documentElement).not.toHaveAttribute("data-playback-overlay");
+  expect(document.documentElement).not.toHaveAttribute("data-library-drawer");
+  expect(screen.getByRole("main")).toBe(main);
+  expect(screen.getByTestId("now-playing-panel")).toBe(panel);
+  expect(setActiveSidebar).not.toHaveBeenCalled();
+  expect(mounts).toBe(1);
 });
 
 test("cleans up the shell attribute on unmount", () => {

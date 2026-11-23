@@ -66,6 +66,10 @@ mod tests {
         // Quiet track (-24.0 LUFS) with high peak (-0.5 dBTP) is clamped by true peak headroom (-1.0 - (-0.5) = -0.5 dB)
         let peak_clamped = measured_playback_gain(-24.0, -0.5, -16.0);
         assert!((peak_clamped - (-0.5)).abs() < 1e-6);
+        assert_eq!(measured_playback_gain(-40.0, -30.0, -16.0), 12.0);
+        assert_eq!(measured_playback_gain(-67.0, -47.0, -16.0), 0.0);
+        assert_eq!(measured_playback_gain(-67.0, 0.0, -16.0), -1.0);
+        assert!(parse_loudness(&stderr.replace("-12.40", "-inf")).is_err());
     }
 
     #[test]

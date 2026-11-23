@@ -34,9 +34,9 @@ fi
 groupmod --non-unique --gid "$PGID" musicdeck
 usermod --non-unique --uid "$PUID" --gid "$PGID" musicdeck
 
-mkdir -p /app/home /app/data /app/config /app/cache
+mkdir -p /app/home /app/data /app/config /app/cache/runtime
 chown -R "$PUID:$PGID" /app/home /app/data /app/config /app/cache
-chmod 0700 /app/data
+chmod 0700 /app/data /app/home /app/cache/runtime
 
 if [ -d /data ]; then
   chown -R "$PUID:$PGID" /data
@@ -45,7 +45,8 @@ fi
 
 # Refresh spotDL / yt-dlp / ytmusicapi at most once per 24h when SPOTDL_AUTO_UPDATE=1
 if [ "${SPOTDL_AUTO_UPDATE:-0}" = "1" ]; then
-  update_stamp=/app/cache/spotdl-last-update
+  # The virtualenv is image-owned. A recreated container needs its own update marker.
+  update_stamp="${SPOTDL_HOME:-/opt/venv}/.musicdeck-last-update"
   now="$(date +%s)"
   last_update=0
   if [ -r "$update_stamp" ]; then

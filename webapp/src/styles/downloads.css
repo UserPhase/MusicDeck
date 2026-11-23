@@ -63,11 +63,15 @@
 .downloads-notice a { color: var(--accent); }
 .downloads-confirm { position: fixed; bottom: 120px; left: 50%; transform: translateX(-50%); z-index: 1100; max-width: calc(100vw - 32px); background: var(--panel-chrome, #222); padding: 20px; border: 1px solid var(--accent); box-shadow: 0 10px 40px #0006; }
 .downloads-confirm button { margin-right: 8px; }
-.downloads-tracks.track-list { --track-grid-columns: 2.5rem minmax(0, 4fr) minmax(0, 3fr) 1.5rem 3rem 7.5rem; --track-grid-gap: .65rem; }
+.downloads-tracks.track-list {
+  --track-number-column: 2.5rem;
+  --track-duration-column: 3rem;
+  --track-actions-column: 7.5rem;
+  --track-grid-columns: var(--track-number-column) minmax(0, 4fr) minmax(0, 3fr) 1.5rem var(--track-duration-column) var(--track-actions-column);
+  --track-grid-gap: .65rem;
+}
 .downloads-tracks .downloads-remove { padding: 7px 9px; font-size: 11px; }
 :root[data-layout-shell="mobile"] .downloads-confirm { bottom: calc(var(--mobile-dock) + 8px); }
 :root[data-layout-shell="mobile"] .downloads-view :is(button, .downloads-toolbar input) { min-width: 44px; min-height: 44px; }
 .offline-available-badge { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 10px; line-height: 1.5; white-space: nowrap; border: 1px solid var(--panel-border); border-radius: 4px; padding: 1px 5px; margin-left: 8px; vertical-align: middle; }
 @media (max-width: 640px) { .downloads-hero { align-items: start; flex-direction: column; }.downloads-boundary { padding: 16px; }.downloads-toolbar input { width: 100%; min-width: 0; }.downloads-queue article { flex-wrap: wrap; }.downloads-queue article > div:first-child { flex-basis: 100%; } }
-@media (max-width: 1024px) { .downloads-tracks.track-list { --track-grid-columns: 2.5rem minmax(0, 4fr) minmax(0, 3fr) 3rem 7.5rem; } }
-@media (max-width: 768px) { .downloads-tracks.track-list { --track-grid-columns: 2rem minmax(0, 1fr) 2.5rem 6.5rem; --track-grid-gap: .4rem; }.downloads-tracks .track { padding-inline: .25rem; } }

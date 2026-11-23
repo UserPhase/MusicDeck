@@ -15,6 +15,7 @@ import {
 
 jest.mock("./musicdeck", () => ({
   request: jest.requireActual("./musicdeck").request,
+  requestDownloadStatus: jest.requireActual("./musicdeck").requestDownloadStatus,
   getPlaylists: jest.fn(),
   getPlaylist: jest.fn(),
   createPlaylist: jest.fn(),
@@ -27,6 +28,20 @@ jest.mock("./musicdeck", () => ({
 
 beforeEach(() => {
   jest.clearAllMocks();
+});
+
+test("aborts a stalled Spotify import status request after ten seconds", async () => {
+  jest.useFakeTimers();
+  try {
+    global.fetch = jest.fn((_path, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    const result = expect(getSpotifyPlaylistImport("job-1")).rejects.toMatchObject({ name: "AbortError" });
+    jest.advanceTimersByTime(10000);
+    await result;
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test("playlist recommendations request fresh data and allow a valid empty result", async () => {
@@ -175,5 +190,5 @@ test("starts and polls a Spotify playlist import with session credentials", asyn
     method: "POST", credentials: "include", body: JSON.stringify({ playlistUrl: "https://open.spotify.com/playlist/abc123", timeout }),
   }));
   await expect(getSpotifyPlaylistImport("job-1")).resolves.toMatchObject({ playlistId: "mdpl_1" });
-  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1", expect.objectContaining({ credentials: "include" }));
+  expect(global.fetch).toHaveBeenCalledWith("/api/v1/playlists/import-spotify/job-1?summary=1", expect.objectContaining({ credentials: "include" }));
 });

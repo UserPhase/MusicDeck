@@ -96,6 +96,13 @@ async fn run_server() -> Result<(), ServerError> {
     let local_addr = listener.local_addr()?;
     state.tasks().enable_dispatch();
     let scrobbles = state.scrobble_queue().clone();
+    let tasks = state.tasks().clone();
+    let retention = tokio::spawn(
+        state
+            .acquisitions()
+            .clone()
+            .run_retention(state.tasks().clone()),
+    );
     let router = create_router(state);
     tracing::info!(
         address = %local_addr,
@@ -103,12 +110,19 @@ async fn run_server() -> Result<(), ServerError> {
     );
 
     let worker = scrobbles.start_worker();
+    let tasks_on_signal = tasks.clone();
     let serving = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tasks_on_signal.close();
+    })
     .await;
+    tasks.shutdown(std::time::Duration::from_secs(6)).await;
+    retention.abort();
+    let _ = retention.await;
     scrobbles.close();
     if let Some(worker) = worker {
         worker
@@ -163,14 +177,19 @@ mod tests {
 
         recover_background_work(&state).await;
 
-        let status: String = sqlx::query_scalar("SELECT status FROM import_jobs WHERE id = 'broken'")
-            .fetch_one(db.inner())
-            .await
-            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM import_jobs WHERE id = 'broken'")
+                .fetch_one(db.inner())
+                .await
+                .unwrap();
         assert_eq!(status, "FAILED");
         let request = Request::get("/api/health").body(Body::empty()).unwrap();
         assert_eq!(
-            create_router(state).oneshot(request).await.unwrap().status(),
+            create_router(state)
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
     }

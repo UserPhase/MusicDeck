@@ -15,9 +15,8 @@
 //!     - Broadcasts live `job.created`, `job.updated`, `job.progress`, `job.completed`, `job.failed`,
 //!       and `job.cancelled` events via `tokio::sync::broadcast`
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::Utc;
 use nanoid::nanoid;
@@ -26,11 +25,14 @@ use serde_json::json;
 use sqlx::Row;
 use tokio::sync::broadcast;
 
-use super::input::{AcquisitionKind, AcquisitionResult, ValidatedTarget};
+use super::input::{AcquisitionKind, AcquisitionResult, DeezerTarget, Operand, ValidatedTarget};
 use super::playlist_files::{
-    AcquisitionLibrary, cleanup_staging, navidrome_path, publish_staged_track, staging_path,
+    AcquisitionLibrary, PublicationJournal, cleanup_staging, regular_library_file, staging_path,
 };
-use super::repository::download_manifest;
+use super::playlist_timeout::{POST_DOWNLOAD_TIMEOUT, PlaylistImportTimeout, within_phase};
+use super::progress::{DownloadTelemetry, ProviderRetries, TrackIssue};
+use super::repository::{ImportEntry, download_manifest};
+use super::resume;
 use crate::acquisition::spotdl::{
     AcquisitionProgress, SpotDLDownloaderAdapter, TrackImportRequest, scan_downloaded_audio_files,
 };
@@ -39,41 +41,9 @@ use crate::db::DbPool;
 use crate::providers::BackendRegistry;
 use crate::registry::SourceCandidate;
 use crate::tasks::{TaskError, TaskManager, TaskProgressPatch, TaskRunContext, TaskType};
+use tokio::time::Instant;
 
-/// Capacity and rate-limiting thresholds for the acquisition subsystem (`DEFAULT_ACQUISITION_LIMITS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcquisitionLimits {
-    pub max_pending: usize,
-    pub max_pending_per_user: usize,
-    pub submission_window_ms: i64,
-    pub submissions_per_user: usize,
-    pub submissions_global: usize,
-    pub max_rate_entries: usize,
-    pub retention_ms: i64,
-    pub max_retained_jobs: i64,
-    pub cleanup_interval_ms: u64,
-    pub sse_per_user: usize,
-    pub sse_global: usize,
-}
-
-impl Default for AcquisitionLimits {
-    fn default() -> Self {
-        Self {
-            max_pending: 50,
-            max_pending_per_user: 10,
-            submission_window_ms: 60_000,
-            submissions_per_user: 20,
-            submissions_global: 100,
-            max_rate_entries: 10_000,
-            retention_ms: 7 * 24 * 60 * 60_000,
-            max_retained_jobs: 1_000,
-            cleanup_interval_ms: 60_000,
-            sse_per_user: 3,
-            sse_global: 20,
-        }
-    }
-}
+pub use crate::config::AcquisitionLimits;
 
 /// Error returned when pending acquisition queues or rate limits are saturated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -95,8 +65,10 @@ impl AcquisitionCapacityError {
 pub enum AcquisitionJobError {
     #[error("Job not found")]
     NotFound,
-    #[error("Only settled failed or cancelled jobs can be retried")]
+    #[error("Only settled failed, cancelled, or partial jobs can be retried")]
     NotRetryable,
+    #[error(transparent)]
+    Capacity(#[from] AcquisitionCapacityError),
     #[error("Could not queue acquisition: {0}")]
     Storage(String),
 }
@@ -109,6 +81,7 @@ impl AcquisitionJobError {
             Self::NotFound => "ACQUISITION_NOT_FOUND",
             Self::NotRetryable => "ACQUISITION_NOT_RETRYABLE",
             Self::Storage(_) => "ACQUISITION_STORAGE_ERROR",
+            Self::Capacity(_) => "ACQUISITION_CAPACITY",
         }
     }
 }
@@ -232,6 +205,10 @@ pub struct AcquisitionJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub track_errors: Vec<TrackIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<AcquiredFileRecord>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -296,27 +273,17 @@ fn safe_acquisition_failure(code: Option<&str>) -> &'static str {
     }
 }
 
-#[derive(Default)]
-struct SubmissionRateWindow {
-    global_timestamps: Vec<i64>,
-    per_user_timestamps: HashMap<String, Vec<i64>>,
-}
-
 /// Service managing on-demand media acquisition jobs, SQLite persistence, and SSE broadcasting.
 #[derive(Clone)]
 pub struct AcquisitionService {
     db: Option<DbPool>,
-    limits: AcquisitionLimits,
-    rate_window: Arc<Mutex<SubmissionRateWindow>>,
     events_tx: broadcast::Sender<AcquisitionEvent>,
     library: Option<AcquisitionLibrary>,
 }
 
 impl std::fmt::Debug for AcquisitionService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcquisitionService")
-            .field("limits", &self.limits)
-            .finish()
+        f.debug_struct("AcquisitionService").finish()
     }
 }
 
@@ -327,8 +294,6 @@ impl AcquisitionService {
         let (events_tx, _) = broadcast::channel(256);
         Self {
             db,
-            limits: AcquisitionLimits::default(),
-            rate_window: Arc::new(Mutex::new(SubmissionRateWindow::default())),
             events_tx,
             library: None,
         }
@@ -343,6 +308,27 @@ impl AcquisitionService {
         self
     }
 
+    /// Prunes expired history and per-attempt staging while the server is running.
+    pub async fn run_retention(self, tasks: TaskManager) {
+        let (Some(db), Some(library)) = (&self.db, &self.library) else {
+            return;
+        };
+        loop {
+            let config = library
+                .config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Err(error) = super::retention::prune(db, &config, &tasks).await {
+                tracing::warn!(%error, "Could not clean up expired acquisition jobs");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                config.acquisition_limits.cleanup_interval_ms.max(1000),
+            ))
+            .await;
+        }
+    }
+
     /// Subscribes to live [`AcquisitionEvent`] broadcasts.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<AcquisitionEvent> {
@@ -355,23 +341,26 @@ impl AcquisitionService {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r"
-            UPDATE acquisition_jobs
-            SET status = 'failed',
-                stage = 'failed',
-                error_code = 'SERVER_RESTARTED',
-                error_message = 'Acquisition was interrupted by server restart',
-                updated_at = ?,
-                completed_at = ?
-            WHERE status IN ('discovering', 'downloading', 'processing', 'importing')
-               OR (status='queued' AND NOT EXISTS (SELECT 1 FROM background_tasks WHERE id=acquisition_jobs.active_task_id AND state='QUEUED'))
-            ",
+        let mut tx = crate::db::begin_sqlite_write(
+            pool.inner(),
+            "UPDATE acquisition_jobs SET status=status WHERE 0",
         )
-        .bind(&now)
-        .bind(&now)
-        .execute(pool.inner())
         .await?;
+        sqlx::query("UPDATE background_tasks SET state='QUEUED', error=NULL, started_at=NULL, finished_at=NULL, updated_at=?
+            WHERE type='SPOTDL_DOWNLOAD' AND state='FAILED' AND error='Task was interrupted by a server restart'
+              AND EXISTS (SELECT 1 FROM acquisition_jobs j JOIN acquisition_job_inputs i ON i.job_id=j.id
+              WHERE j.active_task_id=background_tasks.id AND j.status IN ('queued','discovering','downloading','processing','importing'))")
+            .bind(&now).execute(&mut *tx).await?;
+        sqlx::query("UPDATE acquisition_jobs SET status='queued',stage='queued',updated_at=?
+            WHERE status IN ('discovering','downloading','processing','importing')
+              AND EXISTS (SELECT 1 FROM background_tasks WHERE id=active_task_id AND state='QUEUED')")
+            .bind(&now).execute(&mut *tx).await?;
+        sqlx::query("UPDATE acquisition_jobs SET status='failed',stage='failed',error_code='SERVER_RESTARTED',
+            error_message='Acquisition was interrupted. Retry to resume it.',updated_at=?,completed_at=?
+            WHERE status IN ('queued','discovering','downloading','processing','importing')
+              AND NOT EXISTS (SELECT 1 FROM background_tasks WHERE id=active_task_id AND state='QUEUED')")
+            .bind(&now).bind(&now).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -435,6 +424,11 @@ impl AcquisitionService {
                 .ok()
                 .flatten()
                 .and_then(|n| usize::try_from(n).ok()),
+            downloaded_count: optional_integer("downloaded_count")
+                .and_then(|n| usize::try_from(n).ok()),
+            track_errors: optional_text("track_errors_json")
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
             requested_title: optional_text("requested_title"),
             requested_artist: optional_text("requested_artist"),
             container_id: optional_text("container_id"),
@@ -451,69 +445,17 @@ impl AcquisitionService {
         })
     }
 
-    async fn check_capacity_and_rate_limits(
-        &self,
-        user_id: &str,
-    ) -> Result<(), AcquisitionCapacityError> {
-        let Some(pool) = &self.db else {
-            return Err(AcquisitionCapacityError::new(60));
-        };
-
-        let global_pending: i64 = sqlx::query(
-            r"
-            SELECT COUNT(*) AS n FROM acquisition_jobs
-            WHERE status IN ('queued', 'discovering', 'downloading', 'processing', 'importing')
-            ",
-        )
-        .fetch_one(pool.inner())
-        .await
-        .ok()
-        .and_then(|r| r.try_get("n").ok())
-        .unwrap_or(0);
-
-        if (global_pending as usize) >= self.limits.max_pending {
-            return Err(AcquisitionCapacityError::new(60));
-        }
-
-        let user_pending: i64 = sqlx::query(
-            r"
-            SELECT COUNT(*) AS n FROM acquisition_jobs
-            WHERE user_id = ?
-              AND status IN ('queued', 'discovering', 'downloading', 'processing', 'importing')
-            ",
-        )
-        .bind(user_id)
-        .fetch_one(pool.inner())
-        .await
-        .ok()
-        .and_then(|r| r.try_get("n").ok())
-        .unwrap_or(0);
-
-        if (user_pending as usize) >= self.limits.max_pending_per_user {
-            return Err(AcquisitionCapacityError::new(60));
-        }
-
-        let now_ms = Utc::now().timestamp_millis();
-        let cutoff = now_ms - self.limits.submission_window_ms;
-
-        if let Ok(mut guard) = self.rate_window.lock() {
-            guard.global_timestamps.retain(|&ts| ts > cutoff);
-            if guard.global_timestamps.len() >= self.limits.submissions_global {
-                return Err(AcquisitionCapacityError::new(60));
-            }
-            let user_vec = guard
-                .per_user_timestamps
-                .entry(user_id.to_owned())
-                .or_default();
-            user_vec.retain(|&ts| ts > cutoff);
-            if user_vec.len() >= self.limits.submissions_per_user {
-                return Err(AcquisitionCapacityError::new(60));
-            }
-            user_vec.push(now_ms);
-            guard.global_timestamps.push(now_ms);
-        }
-
-        Ok(())
+    fn limits(&self) -> AcquisitionLimits {
+        self.library
+            .as_ref()
+            .map(|library| {
+                library
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .acquisition_limits
+            })
+            .unwrap_or_default()
     }
 
     /// Validates `options`, creates a new [`AcquisitionJob`] in `acquisition_jobs`, and enqueues it on `tasks`.
@@ -524,9 +466,6 @@ impl AcquisitionService {
     ) -> Result<AcquisitionJob, String> {
         let target = ValidatedTarget::resolve(&options)?;
         let input = serde_json::to_string(&target).map_err(|e| e.to_string())?;
-        self.check_capacity_and_rate_limits(&options.user_id)
-            .await
-            .map_err(|e| format!("CAPACITY:{}", e.retry_after))?;
         let pool = self.db.as_ref().ok_or("Database is unavailable")?;
         let id = format!("acq_{}", nanoid!(16));
         let now = Utc::now().to_rfc3339();
@@ -552,11 +491,42 @@ impl AcquisitionService {
             .as_deref()
             .or_else(|| candidate.map(|item| item.id.as_str()));
 
-        let mut tx = pool
-            .inner()
-            .begin()
+        let mut tx = crate::db::begin_sqlite_write(
+            pool.inner(),
+            "UPDATE acquisition_jobs SET status=status WHERE 0",
+        )
+        .await
+        .map_err(|e| format!("STORAGE:{e}"))?;
+        if tasks.is_some() {
+            // Coalesce inside the admission transaction so repeated clicks don't
+            // consume queue capacity or start an additional worker.
+            let row = sqlx::query(
+                "SELECT j.* FROM acquisition_jobs j JOIN acquisition_job_inputs i ON i.job_id=j.id
+                 JOIN background_tasks t ON t.id=j.active_task_id
+                 WHERE j.user_id=?1 AND j.container_id IS ?2 AND COALESCE(j.auto_play,0)=?3
+                 AND t.state IN ('QUEUED','PROCESSING','PAUSED')
+                 AND j.status IN ('queued','discovering','downloading','processing','importing')
+                 AND CASE WHEN json_valid(i.input_json) THEN
+                     json_extract(i.input_json,'$.kind')=json_extract(?4,'$.kind')
+                     AND json_extract(i.input_json,'$.operands')=json_extract(?4,'$.operands')
+                     AND json_extract(i.input_json,'$.deezer') IS json_extract(?4,'$.deezer')
+                     ELSE 0 END
+                 ORDER BY j.created_at DESC LIMIT 1",
+            )
+            .bind(&options.user_id)
+            .bind(&options.container_id)
+            .bind(options.auto_play.unwrap_or(false))
+            .bind(&input)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| format!("STORAGE:{e}"))?;
+            if let Some(row) = row {
+                let job = Self::map_row(&row).ok_or("STORAGE:Could not read active acquisition")?;
+                tx.commit().await.map_err(|e| format!("STORAGE:{e}"))?;
+                return Ok(job);
+            }
+        }
+        super::admission::admit(&mut tx, &options.user_id, self.limits()).await?;
         sqlx::query(
             "INSERT INTO acquisition_jobs (
                 id, user_id, status, source_provider, source_candidate_id, requested_track_id, requested_album_id,
@@ -700,7 +670,7 @@ impl AcquisitionService {
             }
             _ => {}
         }
-        let row = sqlx::query("UPDATE acquisition_jobs SET status='downloading', stage='downloading', active_task_id=?,
+        let row = sqlx::query("UPDATE acquisition_jobs SET status='downloading', stage='download', active_task_id=?,
             updated_at=? WHERE id=? AND status='queued' AND (active_task_id IS NULL OR active_task_id=?)")
             .bind(context.task_id()).bind(Utc::now().to_rfc3339()).bind(id).bind(context.task_id())
             .execute(pool.inner()).await.map_err(task_db_error)?;
@@ -720,7 +690,10 @@ impl AcquisitionService {
             .as_ref()
             .map(|cfg| std::path::PathBuf::from(&cfg.acquisition_tmp_dir))
             .unwrap_or_else(|| std::env::temp_dir().join("musicdeck-acquisitions"));
-        let attempt = format!("{id}-{}", context.task_id());
+        let staging_task: String = sqlx::query_scalar("UPDATE acquisition_job_inputs SET staging_task_id=COALESCE(staging_task_id,?) WHERE job_id=? RETURNING staging_task_id")
+            .bind(context.task_id()).bind(id).fetch_optional(pool.inner()).await.map_err(task_db_error)?
+            .unwrap_or_else(|| context.task_id().to_owned());
+        let attempt = format!("{id}-{staging_task}");
         let staging_dir = staging_path(output_dir.unwrap_or(&default_stage), &attempt);
         let result = match &staging_dir {
             Ok(stage) => {
@@ -732,22 +705,41 @@ impl AcquisitionService {
             ))),
         };
         if let Err(err) = &result {
+            if let Some(committed) = self.get_job_from_pool(pool, id).await
+                && matches!(
+                    committed.status,
+                    AcquisitionJobStatus::Completed | AcquisitionJobStatus::Partial
+                )
+            {
+                return Ok(committed);
+            }
             let cancelled =
                 matches!(err, TaskError::Cancelled) || context.cancel_token().is_cancelled();
+            if cancelled && context.manager().is_stopping() {
+                return Err(TaskError::Cancelled);
+            }
+            let message = err.to_string();
             let (status, code) = if cancelled {
                 ("cancelled", "CANCELLED")
             } else {
-                ("failed", "ACQUISITION_FAILED")
+                (
+                    "failed",
+                    super::spotdl::downloader_failure_code(&message)
+                        .unwrap_or("ACQUISITION_FAILED"),
+                )
             };
             let now = Utc::now().to_rfc3339();
-            sqlx::query("UPDATE acquisition_jobs SET status=?, stage=?, error_code=?, error_message=?, updated_at=?, completed_at=?
+            sqlx::query("UPDATE acquisition_jobs SET status=?, stage=CASE WHEN ?='cancelled' THEN 'cancelled' ELSE stage END, error_code=?, error_message=?, updated_at=?, completed_at=?
                 WHERE id=? AND active_task_id=? AND status IN ('downloading','importing')")
-                .bind(status).bind(status).bind(code).bind(err.to_string()).bind(&now).bind(&now)
+                .bind(status).bind(status).bind(code).bind(&message).bind(&now).bind(&now)
                 .bind(id).bind(context.task_id()).execute(pool.inner()).await.map_err(task_db_error)?;
             if let Ok(stage) = &staging_dir {
-                if scan_downloaded_audio_files(stage)
+                if resume::load(stage)
                     .await
-                    .is_ok_and(|files| files.is_empty())
+                    .is_ok_and(|checkpoint| checkpoint.is_none())
+                    && scan_downloaded_audio_files(stage)
+                        .await
+                        .is_ok_and(|files| files.is_empty())
                 {
                     cleanup_staging(stage).await;
                 }
@@ -767,6 +759,30 @@ impl AcquisitionService {
         self.get_job_from_pool(pool, id)
             .await
             .ok_or(TaskError::NotFound)
+    }
+
+    async fn report_download(
+        &self,
+        pool: &DbPool,
+        id: &str,
+        task_id: &str,
+        update: DownloadTelemetry,
+    ) {
+        let to_i64 = |value: u64| value.min(i64::MAX as u64) as i64;
+        let changed = sqlx::query(
+            "UPDATE acquisition_jobs SET stage=?, percent=COALESCE(?,percent), bytes_downloaded=COALESCE(?,bytes_downloaded),
+             total_bytes=COALESCE(?,total_bytes), speed_bytes_per_second=?, expected_count=COALESCE(?,expected_count), downloaded_count=?, updated_at=?
+             WHERE id=? AND active_task_id=? AND status='downloading'",
+        ).bind(update.stage).bind(update.percent).bind(update.bytes.map(to_i64)).bind(update.total_bytes.map(to_i64))
+         .bind(update.speed.map(to_i64)).bind(update.expected.map(|n| n as i64)).bind(update.downloaded as i64)
+         .bind(Utc::now().to_rfc3339()).bind(id).bind(task_id).execute(pool.inner()).await;
+        match changed {
+            Ok(result) if result.rows_affected() > 0 => {
+                self.emit_job(pool, id, "job.progress").await
+            }
+            Err(error) => tracing::warn!(%error, "Could not update acquisition download progress"),
+            _ => {}
+        }
     }
 
     async fn execute_media_job(
@@ -794,147 +810,240 @@ impl AcquisitionService {
                 )
             })?;
         let job_id = &job.id;
-        let request = TrackImportRequest {
-            output_directory: stage.to_path_buf(),
-            playlist_m3u_name: Some(format!("musicdeck-{job_id}.m3u8")),
-            operands: target.operands,
-            ..Default::default()
+        let library = match self.library.as_ref().zip(config) {
+            Some((library, config)) => Some(library.ready(config).await?),
+            None => None,
         };
-        tokio::fs::create_dir_all(stage)
-            .await
-            .map_err(task_db_error)?;
-        if !tokio::fs::symlink_metadata(stage)
-            .await
-            .map_err(task_db_error)?
-            .is_dir()
-        {
+        let stage =
+            resume::open_stage(stage, library.as_ref().map(|(_, root)| root.as_path())).await?;
+        let download_end = Instant::now() + std::time::Duration::from_secs(5 * 60);
+        let cached = resume::load(&stage).await?;
+        let catalog_checkpoint = cached
+            .as_ref()
+            .is_some_and(|manifest| manifest.entries.iter().any(|entry| entry.catalog.is_some()));
+        let catalog_enabled = config.is_some_and(|cfg| cfg.acquisition_deezer_ytdlp);
+        if catalog_checkpoint && !catalog_enabled {
             return Err(TaskError::Validation(
-                "Acquisition staging must be a regular directory".into(),
+                "Re-enable the Deezer downloader to resume this job, or start a new import.".into(),
             ));
         }
-        let batch = download_manifest(context, downloader, &request, job_id, None).await?;
-        let (library, config) = self.library.as_ref().zip(config).ok_or_else(|| {
-            TaskError::ExecutionFailed("Shared Navidrome library is not configured".into())
-        })?;
-        let backend = library.providers.get_primary().map_err(task_db_error)?;
-        if backend.provider_type != "navidrome" {
-            return Err(TaskError::ExecutionFailed(
-                "Downloads require Navidrome as the primary backend".into(),
-            ));
-        }
-        let stage_root = tokio::fs::canonicalize(stage)
-            .await
-            .map_err(task_db_error)?;
-        let music_root = tokio::fs::canonicalize(&config.music_root)
-            .await
-            .map_err(task_db_error)?;
-        let expected = batch
-            .expected_count
-            .max(target.expected_count.unwrap_or(0))
-            .max(batch.entries.len());
-        let mut published = Vec::new();
-        let mut failure = None;
-        let tagger = downloader.tagger();
-        for entry in batch.entries {
-            context.checkpoint().await?;
-            let Some(source) = entry.file_path.as_deref().map(std::path::PathBuf::from) else {
-                failure = failure.or(entry.error);
-                continue;
+        let mut deezer = target.deezer.clone();
+        if deezer.is_empty()
+            && matches!(
+                target.operands.as_slice(),
+                [Operand::TrackSearch { .. } | Operand::AlbumSearch { .. }]
+            )
+        {
+            let id = match target.kind {
+                AcquisitionKind::Track => job.requested_track_id.as_deref(),
+                AcquisitionKind::Album => job.requested_album_id.as_deref(),
+                _ => None,
             };
-            match publish_staged_track(&music_root, &stage_root, &source, &entry.source, &tagger)
-                .await
-            {
-                Ok(publication) => published.push((source, publication, entry.source)),
-                Err(err) => {
-                    tracing::warn!(job_id, error = %err, "Could not publish downloaded audio");
-                    failure.get_or_insert_with(|| {
-                        format!("Could not publish downloaded audio: {err}")
-                    });
-                }
+            if let Some(id) = id.and_then(|id| DeezerTarget::parse(id, target.kind)) {
+                deezer.push(id);
             }
         }
-        if published.is_empty() {
-            return Err(TaskError::ExecutionFailed(
-                failure.unwrap_or_else(|| "No usable tracks were downloaded".into()),
-            ));
+        let use_catalog =
+            catalog_checkpoint || (catalog_enabled && cached.is_none() && !deezer.is_empty());
+        let root = library.as_ref().map(|(_, root)| root.as_path());
+        let report = |update| self.report_download(pool, job_id, context.task_id(), update);
+        let source_provider = if use_catalog {
+            "deezer-ytdlp"
+        } else {
+            "spotdl"
+        };
+        if job.source_provider.as_deref() != Some(source_provider) {
+            sqlx::query("UPDATE acquisition_jobs SET source_provider=? WHERE id=? AND active_task_id=? AND status='downloading'")
+                .bind(source_provider).bind(job_id).bind(context.task_id()).execute(pool.inner()).await.map_err(task_db_error)?;
         }
-
-        context.checkpoint().await?;
-        let phase = sqlx::query("UPDATE acquisition_jobs SET status='importing', stage='indexing', percent=85,
-            expected_count=?, imported_count=0, updated_at=? WHERE id=? AND active_task_id=? AND status='downloading'")
-            .bind(expected as i64).bind(Utc::now().to_rfc3339()).bind(job_id).bind(context.task_id())
+        let (mut manifest, download_error) = if use_catalog {
+            let worker = super::catalog_audio::CatalogAudio::new(
+                downloader,
+                pool,
+                context,
+                &stage,
+                download_end,
+            )?;
+            let work = worker.acquire(&deezer, cached, root, report);
+            let permitted = async {
+                match downloader.catalog_tools().2 {
+                    Some(privacy) => privacy
+                        .run_external(crate::services::privacy::PrivacyCategory::Imports, work)
+                        .await
+                        .map_err(|error| TaskError::ExecutionFailed(error.to_string()))?,
+                    None => work.await,
+                }
+            };
+            context
+                .cancel_token()
+                .run_until_cancelled(permitted)
+                .await
+                .ok_or(TaskError::Cancelled)??
+        } else {
+            let mut manifest = match cached {
+                Some(manifest) => manifest,
+                None if target
+                    .operands
+                    .iter()
+                    .any(|operand| matches!(operand, super::input::Operand::Manual { .. })) =>
+                {
+                    let request = TrackImportRequest {
+                        output_directory: stage.clone(),
+                        playlist_m3u_name: Some(format!("musicdeck-{job_id}.m3u8")),
+                        operands: target.operands.clone(),
+                        ..Default::default()
+                    };
+                    let mut retries = ProviderRetries::default();
+                    let manifest = loop {
+                        let report =
+                            |update| self.report_download(pool, job_id, context.task_id(), update);
+                        match download_manifest(
+                            context,
+                            downloader,
+                            &request,
+                            job_id,
+                            None,
+                            download_end,
+                            report,
+                        )
+                        .await
+                        {
+                            Ok(manifest) => break manifest,
+                            Err(error) => {
+                                let message = error.to_string();
+                                let code = super::spotdl::downloader_failure_code(&message)
+                                    .unwrap_or("general");
+                                if !retries
+                                    .wait(context, download_end, code, |stage| {
+                                        report(DownloadTelemetry {
+                                            stage,
+                                            ..Default::default()
+                                        })
+                                    })
+                                    .await?
+                                {
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    };
+                    resume::save(&stage, &manifest).await?;
+                    manifest
+                }
+                None => {
+                    resume::discover(
+                        context,
+                        downloader,
+                        &stage,
+                        &target.operands,
+                        target.kind == AcquisitionKind::Playlist,
+                        download_end,
+                        |update| self.report_download(pool, job_id, context.task_id(), update),
+                    )
+                    .await?
+                }
+            };
+            let download_error = resume::fetch_missing(
+                context,
+                downloader,
+                pool,
+                &stage,
+                root,
+                &mut manifest,
+                PlaylistImportTimeout::Auto,
+                download_end,
+                report,
+            )
+            .await?;
+            (manifest, download_error)
+        };
+        let expected = if use_catalog {
+            manifest.expected_count
+        } else {
+            manifest
+                .expected_count
+                .max(target.expected_count.unwrap_or(0))
+        };
+        let downloaded = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.file_path.is_some() || entry.library_path.is_some())
+            .count();
+        self.save_track_issues(pool, context, job_id, &manifest.entries)
+            .await?;
+        if downloaded == 0 {
+            return Err(download_error.unwrap_or_else(|| {
+                TaskError::ExecutionFailed("No usable tracks were downloaded".into())
+            }));
+        }
+        let (backend, music_root) = library.ok_or_else(|| {
+            TaskError::ExecutionFailed("Shared Navidrome library is not configured".into())
+        })?;
+        let scan_deadline = Instant::now() + POST_DOWNLOAD_TIMEOUT;
+        let journal = PublicationJournal { db: pool, job_id };
+        within_phase(
+            context,
+            scan_deadline,
+            "publication",
+            resume::publish(
+                context,
+                &journal,
+                &stage,
+                &music_root,
+                &mut manifest,
+                &downloader.tagger(),
+            ),
+        )
+        .await?;
+        self.save_track_issues(pool, context, job_id, &manifest.entries)
+            .await?;
+        let phase = sqlx::query("UPDATE acquisition_jobs SET status='importing',stage='scan',percent=85,
+            downloaded_count=?,expected_count=?,imported_count=0,updated_at=? WHERE id=? AND active_task_id=? AND status='downloading'")
+            .bind(downloaded as i64).bind(expected as i64).bind(Utc::now().to_rfc3339()).bind(job_id).bind(context.task_id())
             .execute(pool.inner()).await.map_err(task_db_error)?;
         if phase.rows_affected() != 1 {
             return Err(TaskError::Cancelled);
         }
         self.emit_job(pool, job_id, "job.updated").await;
-        context
-            .report(TaskProgressPatch {
-                percent: Some(85.0),
-                message: Some(Some("Indexing downloaded tracks in Navidrome".into())),
-                ..Default::default()
-            })
-            .await;
-        let cancel = context.cancel_token();
-        tokio::select! {
-            () = cancel.cancelled() => return Err(TaskError::Cancelled),
-            scan = backend.provider.scan_library() => scan.map_err(|err| TaskError::ExecutionFailed(format!("Navidrome scan failed: {err}")))?,
-        };
-        let mut indexed = std::collections::HashSet::new();
+        let indexed = within_phase(context, scan_deadline, "scan", resume::index(context, backend.provider.as_ref(), &backend.connection_id, &stage, &music_root, &mut manifest, |count| async move {
+            let percent = 85.0 + 10.0 * count as f64 / expected.max(1) as f64;
+            let result = sqlx::query("UPDATE acquisition_jobs SET imported_count=?,percent=?,updated_at=? WHERE id=? AND active_task_id=? AND status='importing'")
+                .bind(count as i64).bind(percent).bind(Utc::now().to_rfc3339()).bind(job_id).bind(context.task_id()).execute(pool.inner()).await;
+            if let Err(error) = result { tracing::warn!(%error, "Could not report indexed acquisition tracks"); }
+        })).await;
+        self.save_track_issues(pool, context, job_id, &manifest.entries)
+            .await?;
+        indexed?;
         let mut files = Vec::new();
-        for (staged, publication, source) in published {
-            context.checkpoint().await?;
-            let Some(path) = navidrome_path(&publication.path) else {
-                failure.get_or_insert_with(|| {
-                    "An imported path could not be read by Navidrome".into()
-                });
+        for entry in &manifest.entries {
+            let (Some(path), Some(id)) = (
+                entry.library_path.as_deref(),
+                entry.provider_track_id.as_ref(),
+            ) else {
                 continue;
             };
-            let lookup = tokio::select! {
-                () = cancel.cancelled() => return Err(TaskError::Cancelled),
-                result = backend.provider.find_imported_track(&music_root, &path, &source.title) => result,
+            let Some(path) = regular_library_file(&music_root, Path::new(path)).await else {
+                continue;
             };
-            match lookup {
-                Ok(Some(track)) => {
-                    let destination = music_root.join(&publication.path);
-                    let size = tokio::fs::metadata(&destination)
-                        .await
-                        .map_err(task_db_error)?
-                        .len();
-                    if size == 0 {
-                        failure.get_or_insert_with(|| "Published audio is empty".into());
-                        continue;
-                    }
-                    indexed.insert(staged);
-                    files.push(AcquiredFileRecord {
-                        path: destination.to_string_lossy().into_owned(),
-                        title: Some(source.title),
-                        artist: Some(source.artist),
-                        album: source.album,
-                        size: Some(size),
-                        provider_track_id: Some(track.provider_id),
-                        connection_id: Some(backend.connection_id.clone()),
-                        reused: publication.reused,
-                        status: "imported".into(),
-                    });
-                }
-                result => {
-                    let message = match result {
-                        Ok(None) => format!(
-                            "Navidrome did not index {path}. Check the shared music mount and Report Real Path."
-                        ),
-                        Err(err) => format!("Could not resolve {path} in Navidrome: {err}"),
-                        _ => unreachable!(),
-                    };
-                    tracing::warn!(job_id, %message, "Downloaded track could not be indexed");
-                    failure.get_or_insert(message);
-                }
-            }
+            let size = tokio::fs::metadata(&path)
+                .await
+                .map_err(task_db_error)?
+                .len();
+            files.push(AcquiredFileRecord {
+                path: path.to_string_lossy().into_owned(),
+                title: Some(entry.source.title.clone()),
+                artist: Some(entry.source.artist.clone()),
+                album: entry.source.album.clone(),
+                size: Some(size),
+                provider_track_id: Some(id.clone()),
+                connection_id: Some(backend.connection_id.clone()),
+                reused: entry.library_reused,
+                status: "imported".into(),
+            });
         }
-
         if files.is_empty() {
             return Err(TaskError::ExecutionFailed(
-                failure.unwrap_or_else(|| "No downloaded tracks were indexed".into()),
+                "No downloaded tracks were indexed".into(),
             ));
         }
         context.checkpoint().await?;
@@ -945,21 +1054,22 @@ impl AcquisitionService {
             "partial"
         };
         let error = (count != expected).then(|| {
-            format!(
-                "Imported {count} of {expected} tracks. {}",
-                failure
-                    .as_deref()
-                    .unwrap_or("Some tracks were unavailable.")
-            )
+            format!("Imported {count} of {expected} tracks. Some tracks are still unavailable.")
         });
+        let issues: Vec<_> = manifest
+            .entries
+            .iter()
+            .filter_map(ImportEntry::issue)
+            .collect();
+        let errors_json = serde_json::to_string(&issues).map_err(task_db_error)?;
         let files_json = serde_json::to_string(&files).map_err(task_db_error)?;
         let now = Utc::now().to_rfc3339();
         let mut tx = pool.inner().begin().await.map_err(task_db_error)?;
         let updated = sqlx::query("UPDATE acquisition_jobs SET status=?, stage=?, percent=100, files_json=?,
-            imported_count=?, expected_count=?, error_message=?, updated_at=?, completed_at=?
+            imported_count=?, expected_count=?, error_message=?, track_errors_json=?, updated_at=?, completed_at=?
             WHERE id=? AND active_task_id=? AND status='importing'
             AND EXISTS(SELECT 1 FROM background_tasks WHERE id=? AND state IN ('PROCESSING','PAUSED'))")
-            .bind(status).bind(status).bind(&files_json).bind(count as i64).bind(expected as i64).bind(error)
+            .bind(status).bind(status).bind(&files_json).bind(count as i64).bind(expected as i64).bind(error).bind(errors_json)
             .bind(&now).bind(&now).bind(job_id).bind(context.task_id()).bind(context.task_id())
             .execute(&mut *tx).await.map_err(task_db_error)?;
         if updated.rows_affected() != 1 {
@@ -967,17 +1077,15 @@ impl AcquisitionService {
         }
         if let Some(container) = &job.container_id {
             sqlx::query("INSERT INTO acquisition_containers (container_key, provider_id, job_id, status, files_json, created_at, updated_at)
-                VALUES (?, 'spotdl', ?, ?, ?, ?, ?) ON CONFLICT(container_key) DO UPDATE SET job_id=excluded.job_id,
+                VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(container_key) DO UPDATE SET job_id=excluded.job_id, provider_id=excluded.provider_id,
                 status=excluded.status, files_json=excluded.files_json, updated_at=excluded.updated_at")
-                .bind(container).bind(job_id).bind(if status == "completed" { "ready" } else { "partial" })
+                .bind(container).bind(source_provider)
+                .bind(job_id).bind(if status == "completed" { "ready" } else { "partial" })
                 .bind(&files_json).bind(&now).bind(&now).execute(&mut *tx).await.map_err(task_db_error)?;
         }
         tx.commit().await.map_err(task_db_error)?;
-        if scan_downloaded_audio_files(&stage_root)
-            .await
-            .is_ok_and(|paths| paths.iter().all(|path| indexed.contains(path)))
-        {
-            cleanup_staging(stage).await;
+        if status == "completed" {
+            cleanup_staging(&stage).await;
         }
         self.emit_job(
             pool,
@@ -998,6 +1106,20 @@ impl AcquisitionService {
                 ..Default::default()
             })
             .await;
+        Ok(())
+    }
+
+    async fn save_track_issues(
+        &self,
+        pool: &DbPool,
+        context: &TaskRunContext,
+        job_id: &str,
+        entries: &[ImportEntry],
+    ) -> Result<(), TaskError> {
+        let issues: Vec<_> = entries.iter().filter_map(ImportEntry::issue).collect();
+        let json = serde_json::to_string(&issues).map_err(task_db_error)?;
+        sqlx::query("UPDATE acquisition_jobs SET track_errors_json=? WHERE id=? AND active_task_id=? AND status IN ('downloading','importing')")
+            .bind(json).bind(job_id).bind(context.task_id()).execute(pool.inner()).await.map_err(task_db_error)?;
         Ok(())
     }
 
@@ -1080,11 +1202,52 @@ impl AcquisitionService {
         {
             return Err(AcquisitionJobError::NotRetryable);
         }
-        let mut tx = pool.inner().begin().await.map_err(storage)?;
+        if !matches!(
+            job.status,
+            AcquisitionJobStatus::Failed
+                | AcquisitionJobStatus::Cancelled
+                | AcquisitionJobStatus::Partial
+        ) {
+            return Err(AcquisitionJobError::NotRetryable);
+        }
+        let mut tx = crate::db::begin_sqlite_write(
+            pool.inner(),
+            "UPDATE acquisition_jobs SET status=status WHERE 0",
+        )
+        .await
+        .map_err(storage)?;
+        let previous_task: Option<String> =
+            sqlx::query_scalar("SELECT active_task_id FROM acquisition_jobs WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(storage)?;
+        if previous_task
+            .as_deref()
+            .is_some_and(|id| tasks.is_executing(id))
+        {
+            return Err(AcquisitionJobError::NotRetryable);
+        }
+        if let Some(previous_task) = previous_task {
+            sqlx::query("UPDATE acquisition_job_inputs SET staging_task_id=COALESCE(staging_task_id,?) WHERE job_id=?")
+                .bind(previous_task).bind(id).execute(&mut *tx).await.map_err(storage)?;
+        }
+        super::admission::admit(&mut tx, &job.user_id, self.limits())
+            .await
+            .map_err(|error| {
+                if let Some(seconds) = error
+                    .strip_prefix("CAPACITY:")
+                    .and_then(|value| value.parse().ok())
+                {
+                    AcquisitionCapacityError::new(seconds).into()
+                } else {
+                    AcquisitionJobError::Storage(error)
+                }
+            })?;
         let now = Utc::now().to_rfc3339();
         let claimed = sqlx::query("UPDATE acquisition_jobs SET status='queued', stage='queued',
-            error_code=NULL, error_message=NULL, completed_at=NULL, percent=0, updated_at=?, imported_count=0
-            WHERE id=? AND user_id=? AND status IN ('failed','cancelled')
+            error_code=NULL, error_message=NULL, completed_at=NULL, percent=0, bytes_downloaded=0, total_bytes=NULL, speed_bytes_per_second=NULL, downloaded_count=NULL, track_errors_json=NULL, updated_at=?, imported_count=0
+            WHERE id=? AND user_id=? AND status IN ('failed','cancelled','partial')
             AND EXISTS(SELECT 1 FROM acquisition_job_inputs WHERE job_id=?)")
             .bind(&now).bind(id).bind(&job.user_id).bind(id)
             .execute(&mut *tx).await.map_err(storage)?;

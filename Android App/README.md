@@ -1,6 +1,8 @@
 # MusicDeck Android
 
-This Tauri v2 shell uses package ID `app.musicdeck.android` and supports Android 7.0 (API 24) and later. Its bundled React launcher tests and selects a server. A regular Android WebView loads the gateway without desktop IPC, so the UI, API, media, cookies, and device-control socket share the selected origin. **Android APK releases** in the launcher opens GitHub for sideloadable updates. Update the MusicDeck web gateway to get the current mobile UI.
+This Tauri v2 shell uses package ID `app.musicdeck.android` and supports Android 7.0 (API 24) and later. Its bundled React launcher tests and selects a server. A regular Android WebView loads the gateway without desktop IPC, so the UI, API, media, cookies, and device-control socket share the selected origin. On launch, the APK checks GitHub for a newer Android release. **Update** downloads, verifies, and submits the APK to Android for an in-place update. Android can ask you to allow MusicDeck to install apps or confirm the update. **Later** dismisses the prompt. **Android APK releases** remains available in the launcher. Update the MusicDeck web gateway to get the current mobile UI.
+
+Publish APKs under `android-<version>` or `android-<version>-preview` using the Gradle names `app-<flavor>-<build-type>.apk`. The updater reads the GitHub asset's SHA-256 and selects the installed build type and a supported device ABI. Use a higher Android `versionCode` and retain the installed APK's signing key for future updates.
 
 ## Windows setup
 
@@ -57,6 +59,67 @@ To run the shell directly, start an Android emulator or connect a phone, then ru
 ```powershell
 & "$env:ANDROID_HOME\platform-tools\adb.exe" devices
 npm run android:dev
+```
+
+## Signed release APK
+
+From `Android App`, set the signing variables in the build environment using the release keystore. Keep these values out of the repository. Use the same keystore and alias for all release updates, and advance the app version so the Android `versionCode` increases.
+
+| Environment variable | Value |
+| --- | --- |
+| `MUSICDECK_ANDROID_KEYSTORE` | Absolute path to the release keystore |
+| `MUSICDECK_ANDROID_STORE_PASSWORD` | Keystore password |
+| `MUSICDECK_ANDROID_KEY_ALIAS` | Release key alias |
+| `MUSICDECK_ANDROID_KEY_PASSWORD` | Release key password |
+
+```powershell
+npm run android:build -- --apk --target aarch64 --split-per-abi
+$apk = Get-Item .\src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk -ErrorAction Stop
+& "$env:ANDROID_HOME\build-tools\36.0.0\apksigner.bat" verify --print-certs $apk.FullName
+```
+
+A build with no signing variables produces an unsigned release artifact. Check the signing certificate against the previous public release and install the APK over it on a test device before uploading the new APK to GitHub Releases.
+
+### Windows ADB startup and in-place upgrade
+
+Use the Android SDK's `platform-tools\adb.exe`. Run these commands from a regular Windows PowerShell session under the account that will authorize the phone. If `start-server` exits before listing devices, run `& $adb nodaemon server` to see the first error. A permission error creating `.android` requires write access to the Windows user profile. Port 5037 is ADB's default local listener.
+
+```powershell
+$adb = Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe'
+New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.android') | Out-Null
+& $adb version
+& $adb start-server
+& $adb server-status
+& $adb devices -l
+```
+
+Connect the unlocked phone with a USB data cable, enable USB debugging, and accept the authorization prompt. For wireless debugging on Android 11 or newer, pair on the same network with `adb pair PHONE_IP:PAIR_PORT`, then use `adb connect PHONE_IP:CONNECT_PORT` if the phone does not appear automatically. The pairing dialog and the Wireless debugging settings screen show the two ports. Proceed when `devices -l` lists the phone as `device`.
+
+With the previous public APK installed, compare the signing certificate SHA-256 fingerprints before updating. You can use the previous public APK file or pull its installed base APK. Both builds must use `app.musicdeck.android`, and the candidate should have a higher `versionCode`. A debug-signed public preview requires its original signing identity for an in-place update.
+
+```powershell
+$serial = 'SERIAL_FROM_ADB_DEVICES'
+$package = 'app.musicdeck.android'
+$apk = (Get-Item .\src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk -ErrorAction Stop).FullName
+$signer = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0\apksigner.bat'
+$base = & $adb -s $serial shell pm path $package | Where-Object { $_ -match '^package:.+/base\.apk\s*$' } | Select-Object -First 1
+if (-not $base) { throw 'Install and configure the previous public APK before testing an upgrade.' }
+$previous = Join-Path $env:TEMP 'musicdeck-previous-base.apk'
+& $adb -s $serial pull ($base.Trim() -replace '^package:', '') $previous
+if ($LASTEXITCODE -ne 0) { throw 'Could not read the installed APK certificate.' }
+& $signer verify --print-certs $previous
+if ($LASTEXITCODE -ne 0) { throw 'The installed APK signature could not be verified.' }
+& $signer verify --print-certs $apk
+if ($LASTEXITCODE -ne 0) { throw 'The candidate APK signature could not be verified.' }
+& $adb -s $serial shell dumpsys package $package | Select-String 'versionCode=|versionName=|lastUpdateTime='
+```
+
+After both signatures verify and the fingerprints match, run the update and confirm ADB prints `Success` and the phone reports the candidate version. Reopen MusicDeck and check the saved gateway and any offline downloads you created for the test. If Android reports a signature mismatch or a downgrade, stop and keep the installed copy so its data is preserved.
+
+```powershell
+& $adb -s $serial install -r $apk
+if ($LASTEXITCODE -ne 0) { throw 'MusicDeck upgrade failed.' }
+& $adb -s $serial shell dumpsys package $package | Select-String 'versionCode=|versionName=|lastUpdateTime='
 ```
 
 ## Connect and verify playback

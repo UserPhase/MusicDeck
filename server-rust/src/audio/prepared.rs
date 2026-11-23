@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use super::ffmpeg::AUDIO_INPUT_FORMATS;
 use super::loudness::{
     LOUDNESS_CACHE_TTL_MS, LoudnessMeasurement, LoudnessService, MAX_LOUDNESS_INPUT_BYTES,
-    TRUE_PEAK_LIMIT, loudness_stream_cache_key, parse_loudness, read_measurement,
+    MEASUREMENT_FILTER, TRUE_PEAK_LIMIT, gain_with_peak_limit, loudness_stream_cache_key,
+    parse_loudness, read_measurement,
     store_measurement,
 };
 use crate::catalog::LibraryService;
@@ -342,31 +343,29 @@ impl PreparedAudio {
             return Err(PreparationError::Work("Empty audio source".into()));
         }
 
-        let peak = if request.bitrate.is_some() {
+        // Leave extra room for peaks introduced by the lossy encoder or a channel conversion.
+        let peak_limit = if request.bitrate.is_some() {
             -2.0
         } else {
-            TRUE_PEAK_LIMIT
+            TRUE_PEAK_LIMIT - 0.1
         };
-        let filter = format!("loudnorm=I={}:TP={peak}:LRA=20", request.target);
         let tag = request.access.tag();
-        let (measurement, offset) = match read_measurement(&self.db, &request.identity, tag).await?
-        {
-            Some(measurement) => (measurement, "0".to_owned()),
+        let measurement = match read_measurement(&self.db, &request.identity, tag).await? {
+            Some(measurement) => measurement,
             None => {
-                let measurement = self.measure(&input, request.preview, &filter).await?;
-                let offset = measurement.target_offset.clone();
+                let measurement = self.measure(&input, request.preview).await?;
                 self.check_revision(request.track_revision.as_ref()).await?;
                 store_measurement(&self.db, &request.identity, tag, &measurement).await?;
-                (measurement, offset)
+                measurement
             }
         };
-        let filter = format!(
-            "{filter}:measured_I={}:measured_TP={}:measured_LRA={}:measured_thresh={}:offset={offset}:linear=true",
-            measurement.input_i,
-            measurement.input_tp,
-            measurement.input_lra,
-            measurement.input_thresh
-        );
+        let (Some(integrated), Some(true_peak)) =
+            (measurement.integrated_lufs(), measurement.true_peak_db())
+        else {
+            return Err(PreparationError::Work("Audio has no measurable loudness".into()));
+        };
+        let gain = gain_with_peak_limit(integrated, true_peak, f64::from(request.target), peak_limit);
+        let filter = format!("volume={gain}dB:precision=double");
         let mut args = input_args(&input, request.preview);
         extend(
             &mut args,
@@ -377,8 +376,6 @@ impl PreparedAudio {
                 "-1",
                 "-af",
                 &filter,
-                "-ar",
-                "48000",
                 "-c:a",
             ],
         );
@@ -404,13 +401,7 @@ impl PreparedAudio {
                 "Prepared audio exceeds its output limit".into(),
             ));
         }
-        let verification = self
-            .measure(
-                &output,
-                false,
-                &format!("loudnorm=I={}:TP={TRUE_PEAK_LIMIT}:LRA=20", request.target),
-            )
-            .await?;
+        let verification = self.measure(&output, false).await?;
         let (Some(lufs), Some(peak)) =
             (verification.integrated_lufs(), verification.true_peak_db())
         else {
@@ -418,9 +409,9 @@ impl PreparedAudio {
                 "Prepared audio has no valid loudness measurement".into(),
             ));
         };
-        if (lufs - f64::from(request.target)).abs() > 1.0 || peak > TRUE_PEAK_LIMIT + 0.1 {
+        if (lufs - (integrated + gain)).abs() > 1.0 || peak > TRUE_PEAK_LIMIT {
             return Err(PreparationError::Work(
-                "Prepared audio did not meet the loudness target".into(),
+                "Prepared audio did not pass the loudness or peak check".into(),
             ));
         }
         let _publication = self.publication.lock().await;
@@ -491,7 +482,6 @@ impl PreparedAudio {
         &self,
         path: &Path,
         preview: bool,
-        filter: &str,
     ) -> Result<LoudnessMeasurement, PreparationError> {
         let mut args = input_args(path, preview);
         extend(
@@ -500,7 +490,7 @@ impl PreparedAudio {
                 "-map",
                 "0:a:0",
                 "-af",
-                &format!("{filter}:print_format=json"),
+                MEASUREMENT_FILTER,
                 "-f",
                 "null",
                 "-",
@@ -737,19 +727,38 @@ mod tests {
             );
             let input = args.windows(2).find(|pair| pair[0] == "-i").unwrap();
             let mut integrated = "-23.00";
+            let mut peak = "-12";
             if args.iter().any(|arg| arg == "-c:a") {
-                tokio::fs::write(args.last().unwrap(), b"prepared-audio")
+                assert!(!args.iter().any(|arg| arg == "-ar"));
+                let crest = tokio::fs::read(&input[1]).await.unwrap() == b"high crest";
+                let filter = if crest {
+                    "volume=-1dB:precision=double"
+                } else {
+                    "volume=7dB:precision=double"
+                };
+                assert!(args.windows(2).any(|pair| pair == ["-af", filter]));
+                let output: &[u8] = if crest { b"high crest" } else { b"prepared-audio" };
+                tokio::fs::write(args.last().unwrap(), output)
                     .await
                     .unwrap();
             } else if input[1].contains("output.") {
-                integrated = "-16.00";
+                if tokio::fs::read(&input[1]).await.unwrap() == b"high crest" {
+                    integrated = "-33.00";
+                    peak = "-2";
+                } else {
+                    integrated = "-16.00";
+                    peak = "-5";
+                }
+            } else if tokio::fs::read(&input[1]).await.unwrap() == b"high crest" {
+                integrated = "-32.00";
+                peak = "-1";
             }
             Ok(ProcessExecutionResult {
                 exit_code: Some(0),
                 stdout: String::new(),
                 signal: None,
                 stderr: serde_json::json!({
-                    "input_i": integrated, "input_tp": "-2", "input_lra": "4",
+                    "input_i": integrated, "input_tp": peak, "input_lra": "4",
                     "input_thresh": "-29", "target_offset": "0.0", "output_i": "-16",
                     "output_tp": "-2"
                 })
@@ -782,6 +791,23 @@ mod tests {
         Box::pin(futures_util::stream::once(async {
             Ok(bytes::Bytes::from_static(b"sample"))
         }))
+    }
+
+    #[tokio::test]
+    async fn normalization_accepts_a_verified_below_target_peak_limited_encode() {
+        let (worker, _) = fixture().await;
+        let request = Preparation { bitrate: Some(192), ..work("high crest") };
+        let key = request.key();
+        let mut done = worker.start(request, None, || async {
+            let body: MediaBody = Box::pin(futures_util::stream::once(async {
+                Ok(bytes::Bytes::from_static(b"high crest"))
+            }));
+            Ok(body)
+        }).unwrap();
+        let _ = done.wait_for(|ready| *ready).await.unwrap();
+        let artifact = worker.artifact(&key).await.unwrap().unwrap();
+        assert_eq!(artifact.integrated_lufs, -33.0);
+        assert_eq!(artifact.true_peak_db, -2.0);
     }
 
     #[tokio::test]

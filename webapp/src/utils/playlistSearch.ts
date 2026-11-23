@@ -1,5 +1,5 @@
-export function normalizePlaylistSearch(value: string): string {
-  return value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase();
+export function normalizePlaylistSearch(value: string, locale?: string): string {
+  return value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase(locale);
 }
 
 export function playlistSearchMatches(text: string, tokens: readonly string[]): [number, number][] {
@@ -33,10 +33,10 @@ export function playlistSearchMatches(text: string, tokens: readonly string[]): 
   }
   return ranges;
 }
-export function playlistTrackSearchText(track: Record<string, any>): string {
+export function playlistTrackSearchText(track: Record<string, any>, locale?: string): string {
   const metadata = track.metadata || {};
   const genres = track.genres || metadata.genres || track.genre || metadata.genre || [];
   const names = (Array.isArray(genres) ? genres : [genres]).map(genre => typeof genre === "string" ? genre : genre?.name || "");
   return normalizePlaylistSearch([track.title, track.artist || track.artistName || metadata.artistName,
-    track.album || track.albumName || metadata.albumName, ...names].filter(Boolean).join(" "));
+    track.album || track.albumName || metadata.albumName, ...names].filter(Boolean).join(" "), locale);
 }

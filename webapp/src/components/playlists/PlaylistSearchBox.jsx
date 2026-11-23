@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-export default function PlaylistSearchBox({ label, placeholder = label, closeLabel = "Close playlist search", value, onChange }) {
+export default function PlaylistSearchBox({ label, placeholder = label, closeLabel = "Close playlist search", value, onChange, dismissOnOutsideClick = true }) {
   const [open, setOpen] = useState(() => Boolean(value));
   const field = useRef(null);
   const trigger = useRef(null);
@@ -8,7 +8,7 @@ export default function PlaylistSearchBox({ label, placeholder = label, closeLab
   const close = () => { setOpen(false); onChange(""); trigger.current?.focus(); };
 
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open || !dismissOnOutsideClick) return undefined;
     const dismiss = (event) => {
       if (field.current?.contains(event.target)) return;
       setOpen(false);
@@ -16,7 +16,7 @@ export default function PlaylistSearchBox({ label, placeholder = label, closeLab
     };
     document.addEventListener("click", dismiss, true);
     return () => document.removeEventListener("click", dismiss, true);
-  }, [open, onChange]);
+  }, [open, onChange, dismissOnOutsideClick]);
 
   return <div className={open ? "playlist-track-search" : undefined} ref={field}>
     <button type="button" className="folder-sort-trigger playlist-search-trigger" ref={trigger}

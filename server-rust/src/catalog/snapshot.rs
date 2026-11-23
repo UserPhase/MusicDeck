@@ -5,6 +5,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use serde::Deserialize;
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use tokio::sync::Mutex;
 
 use super::{Available, CatalogListResult, CatalogService};
@@ -13,6 +15,23 @@ use crate::providers::{Album, ProviderError, Track};
 
 const WINDOW_TTL: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LibraryTrackSort {
+    #[default]
+    Custom,
+    TitleAsc,
+    TitleDesc,
+    AlbumAsc,
+    AlbumDesc,
+    DurationAsc,
+    DurationDesc,
+}
+
+pub(crate) fn library_search_text(value: &str) -> String {
+    value.nfkd().filter(|character| !is_combining_mark(*character)).flat_map(char::to_lowercase).collect()
+}
+
 #[derive(Debug)]
 pub(crate) struct CatalogSnapshot<T> {
     pub items: Vec<Available<T>>,
@@ -20,6 +39,7 @@ pub(crate) struct CatalogSnapshot<T> {
     pub degraded: bool,
     expires_at: Instant,
     track_grid: OnceLock<(Vec<usize>, String)>,
+    track_search: OnceLock<Vec<String>>,
 }
 
 impl<T> CatalogSnapshot<T> {
@@ -38,11 +58,20 @@ impl<T> CatalogSnapshot<T> {
             degraded: result.degraded,
             expires_at: Instant::now() + WINDOW_TTL,
             track_grid: OnceLock::new(),
+            track_search: OnceLock::new(),
         }
     }
 }
 
 impl CatalogSnapshot<Track> {
+    pub(crate) fn track_search(&self) -> &[String] {
+        self.track_search.get_or_init(|| self.items.iter().map(|track| {
+            let item = &track.item;
+            library_search_text(&format!("{} {} {} {}", item.title, item.artist_name, item.album_name,
+                item.genres.as_deref().unwrap_or_default().join(" ")))
+        }).collect())
+    }
+
     pub(crate) fn unique_tracks(&self) -> (impl ExactSizeIterator<Item = &Available<Track>>, &str) {
         let (indices, revision) = self.track_grid.get_or_init(|| {
             let mut seen = TrackDedup::default();

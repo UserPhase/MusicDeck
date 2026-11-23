@@ -1522,6 +1522,7 @@ dependencies = [
  "image",
  "ipnet",
  "jsonwebtoken",
+ "libc",
  "md-5",
  "memchr",
  "nanoid",
@@ -1549,6 +1550,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

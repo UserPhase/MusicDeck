@@ -56,7 +56,7 @@ use crate::state::AppState;
 use crate::streaming::{proxy_upstream_stream, send_error_response};
 
 mod library_views;
-use library_views::{post_filter_tracks_handler, post_library_matches_handler};
+use library_views::{AlbumPage, AlbumSort, TrackPage, post_filter_tracks_handler, post_library_matches_handler};
 
 #[cfg(test)]
 mod tests;
@@ -173,22 +173,34 @@ async fn list_albums_handler(
         .map(|l| l.clamp(1, 500));
     let offset = params.get("offset").and_then(|s| s.parse::<usize>().ok());
 
-    if let Some(offset) = offset {
+    if offset.is_some() || params.contains_key("q") || params.contains_key("sort") {
+        let offset = offset.unwrap_or_default();
+        let query = params.get("q").map_or("", String::as_str).trim();
+        let sort = params.get("sort").map_or(Ok(AlbumSort::default()), |value| {
+            serde_json::from_value::<AlbumSort>(Value::String(value.clone()))
+        });
+        let Ok(sort) = sort else {
+            return send_error_response(StatusCode::BAD_REQUEST, "Invalid album sort order", "BAD_REQUEST");
+        };
+        if query.chars().count() > 200 {
+            return send_error_response(StatusCode::BAD_REQUEST, "Album search exceeds 200 characters", "BAD_REQUEST");
+        }
         return match state.catalog_snapshots().albums(&catalog).await {
             Ok(snapshot) => {
-                let albums: Vec<_> = snapshot
-                    .items
-                    .iter()
-                    .skip(offset)
-                    .take(limit.unwrap_or(200) as usize)
-                    .collect();
-                Json(json!({
-                    "albums": albums,
-                    "total": snapshot.items.len(),
-                    "revision": snapshot.revision,
-                    "degraded": snapshot.degraded,
-                }))
-                .into_response()
+                let limit = limit.unwrap_or(200) as usize;
+                let ordered;
+                let (albums, total, revision) = if query.is_empty() && matches!(sort, AlbumSort::Library) {
+                    (snapshot.items.iter().skip(offset).take(limit).collect(), snapshot.items.len(), snapshot.revision.as_str())
+                } else {
+                    let mut matches: Vec<_> = snapshot.items.iter().collect();
+                    sort.arrange(&mut matches, query);
+                    let total = matches.len();
+                    ordered = crate::catalog::snapshot::catalog_revision(
+                        matches.iter().map(|album| album.item.id.as_str()), snapshot.degraded,
+                    );
+                    (matches.into_iter().skip(offset).take(limit).collect(), total, ordered.as_str())
+                };
+                Json(AlbumPage { albums, total, revision, degraded: snapshot.degraded }).into_response()
             }
             Err(err) => {
                 send_error_response(StatusCode::BAD_GATEWAY, err.to_string(), "BACKEND_ERROR")
@@ -1970,13 +1982,7 @@ async fn list_tracks_handler(
             });
     let tracks: Vec<_> = unique.skip(offset).take(limit).collect();
 
-    Json(json!({
-        "tracks": tracks,
-        "total": total,
-        "offset": offset,
-        "revision": revision,
-        "degraded": snapshot.degraded,
-    }))
+    Json(TrackPage { tracks, total, offset, revision, degraded: snapshot.degraded })
     .into_response()
 }
 

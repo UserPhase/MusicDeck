@@ -8,7 +8,7 @@
 //! physical network ports.
 //!
 //! ## Architectural Constraints
-//! - **Zero `unsafe`**: Enforced at the crate boundary via `#![forbid(unsafe_code)]`.
+//! - **Native process isolation**: OS calls are confined to the external process tree module.
 //! - **Lock-Free Read Path on Hot State**: [`AppState`] wraps immutable configuration
 //!   and thread-safe service handles inside an [`std::sync::Arc`], making router state
 //!   cloning $O(1)$ across concurrent Tokio worker tasks.
@@ -16,7 +16,7 @@
 //!   MusicDeck's canonical `{ "error": { "code": "...", "message": "..." } }` JSON
 //!   structure via [`error::ServerError`].
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::sync::Arc;
 use std::time::Instant;

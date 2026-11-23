@@ -1,5 +1,7 @@
 import type { MediaResumeContext } from "../services/mediaSessions";
 import type { PersistedQueueTrack, QueueCheckpoint } from "../services/storage/QueueDatabase";
+import type { LibraryPlaybackSelection } from "./libraryTracks";
+import type { PlaylistPlaybackSelection } from "../utils/playlistPlayback";
 
 export type RemoteCommand =
   | { type: "PLAY" } | { type: "PAUSE" }
@@ -12,6 +14,8 @@ export type RemoteCommand =
   | { type: "PLAY_QUEUE_ENTRY"; entry_id: string }
   | { type: "MOVE_QUEUE_ENTRY"; entry_id: string; target_id: string }
   | { type: "PLAY_SELECTION"; tracks: PersistedQueueTrack[]; start_index: number; from_here: boolean; context: QueueCheckpoint["context"] }
+  | { type: "PLAY_LIBRARY_TRACKS"; selection: LibraryPlaybackSelection }
+  | { type: "PLAY_PLAYLIST"; selection: PlaylistPlaybackSelection }
   | { type: "ENQUEUE"; tracks: PersistedQueueTrack[]; next: boolean; dedupe: boolean };
 export interface RemotePlayerState {
   current_track: { id: string; title: string; artist?: string; album?: string; cover_art?: string } | null;

@@ -360,7 +360,8 @@ test("clicking a playlist row starts its full playback context", async () => {
       id: playlist.id,
       name: playlist.name,
       coverArt: playlist.coverArt,
-    }
+    },
+    expect.objectContaining({ query: "", sort: "custom", descending: false })
   );
 });
 
@@ -390,9 +391,10 @@ test("a large playlist passes every occurrence to playback and delays offscreen 
     expect(getPlaylistRecommendations).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Play playlist" }));
-    expect(playQueue).toHaveBeenCalledWith(entry, 0, expect.objectContaining({ id: "mdpl_1", type: "playlist" }));
+    const view = expect.objectContaining({ query: "", sort: "custom", descending: false });
+    expect(playQueue).toHaveBeenCalledWith(entry, 0, expect.objectContaining({ id: "mdpl_1", type: "playlist" }), view);
     fireEvent.click(within(grid).getByRole("button", { name: "Play Track 1" }));
-    expect(playContext).toHaveBeenCalledWith(entry, 1, expect.objectContaining({ id: "mdpl_1", type: "playlist" }));
+    expect(playContext).toHaveBeenCalledWith(entry, 1, expect.objectContaining({ id: "mdpl_1", type: "playlist" }), view);
 
     act(() => showRecommendations());
     expect(await screen.findByRole("heading", { name: "Recommended" })).toBeInTheDocument();

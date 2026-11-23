@@ -14,11 +14,15 @@
 //!   fetch 500-item pages and abort with [`ProviderError::PaginationStalled`] if a non-empty
 //!   page yields zero unseen album IDs.
 
+mod import_paths;
+
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use http::header::{ACCEPT_ENCODING, IF_RANGE, RANGE};
 use md5::{Digest, Md5};
 use serde_json::Value;
@@ -31,7 +35,8 @@ use crate::providers::models::{
     Playlist, PlaylistUpdateInput, ReplayGainMetadata, SearchPagination, SearchResult,
     StreamResult, Track, TrackArtistCredit, format_artwork_url, format_stream_url,
 };
-use crate::providers::traits::{MusicBackend, ProviderError};
+use crate::providers::traits::{ImportedTrackMatch, MusicBackend, ProviderError};
+use import_paths::ImportPathIndex;
 
 /// Control-plane HTTP timeout (`15,000` ms) matching `NAVIDROME_REQUEST_TIMEOUT_MS`.
 pub const NAVIDROME_REQUEST_TIMEOUT_MS: u64 = 15_000;
@@ -547,8 +552,11 @@ impl MusicBackend for NavidromeClient {
         let mut tracks_by_id: HashMap<String, Track> = HashMap::new();
         let mut ordered_ids: Vec<String> = Vec::new();
 
-        for album in albums {
-            for track in self.get_album_tracks(&album.id).await? {
+        let mut batches = stream::iter(albums)
+            .map(|album| async move { self.get_album_tracks(&album.id).await })
+            .buffered(8);
+        while let Some(batch) = batches.try_next().await? {
+            for track in batch {
                 if !tracks_by_id.contains_key(&track.id) {
                     ordered_ids.push(track.id.clone());
                 }
@@ -844,73 +852,108 @@ impl MusicBackend for NavidromeClient {
         })?
     }
 
-    async fn find_imported_track(
+    async fn check_import_library(&self) -> Result<(), ProviderError> {
+        let status = self.request_json("getScanStatus", &[], NAVIDROME_REQUEST_TIMEOUT_MS).await?;
+        let scanner = &status["scanStatus"];
+        let scanning = scanner["scanning"].as_bool().ok_or_else(|| ProviderError::Upstream {
+            provider: "Navidrome", message: "Missing library scanner status".into(),
+        })?;
+        if scanner["error"].as_str().is_some_and(|error| !error.is_empty())
+            || (!scanning && scanner["count"].as_u64() == Some(0)) {
+            // A prior mount error may have been repaired. Refresh the scanner once before downloading.
+            self.scan_library().await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_imported_tracks(
         &self,
-        music_root: &std::path::Path,
-        relative_path: &str,
-        title: &str,
-    ) -> Result<Option<Track>, ProviderError> {
-        let suffix = format!("/{relative_path}");
-        let root = music_root.to_string_lossy().replace('\\', "/");
-        let root = root
-            .strip_prefix("//?/")
-            .unwrap_or(&root)
-            .trim_end_matches('/');
-        let exact_path = format!("{root}{suffix}");
-        // The Compose stack mounts the same library at /music in Navidrome.
-        let compose_path = format!("/music{suffix}");
-        let root_prefix = format!("{root}/");
-        let mut alternate: Option<Track> = None;
-        let mut ambiguous = false;
-        for offset in (0..500).step_by(100) {
-            let result = self
+        music_root: &Path,
+        relative_paths: &HashSet<&str>,
+    ) -> Result<HashMap<String, ImportedTrackMatch>, ProviderError> {
+        const PAGE_SIZE: usize = 500;
+        let mut index = ImportPathIndex::new(music_root, relative_paths);
+        if index.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let _scan = self.scan_lock.lock().await;
+        let started = std::time::Instant::now();
+        let mut offset = 0;
+        let mut requests = 0;
+        let mut pages = HashSet::new();
+        loop {
+            let response = self
                 .request_json(
                     "search3",
                     &[
-                        ("query", title.to_owned()),
+                        ("query", String::new()),
                         ("artistCount", "0".into()),
                         ("albumCount", "0".into()),
-                        ("songCount", "100".into()),
+                        ("songCount", PAGE_SIZE.to_string()),
                         ("songOffset", offset.to_string()),
                     ],
                     NAVIDROME_REQUEST_TIMEOUT_MS,
                 )
                 .await?;
-            let Some(songs) = result["searchResult3"]["song"].as_array() else {
-                break;
+            requests += 1;
+            let result = response
+                .get("searchResult3")
+                .and_then(Value::as_object)
+                .ok_or_else(|| ProviderError::Upstream {
+                    provider: "Navidrome",
+                    message: "Missing searchResult3 in library browse response".into(),
+                })?;
+            let songs = match result.get("song") {
+                None | Some(Value::Null) => break,
+                Some(Value::Array(songs)) if songs.is_empty() => break,
+                Some(Value::Array(songs)) => songs,
+                Some(_) => {
+                    return Err(ProviderError::Upstream {
+                        provider: "Navidrome",
+                        message: "Invalid song list in library browse response".into(),
+                    });
+                }
             };
-            for song in songs {
-                let (Some(id), Some(path)) = (song["id"].as_str(), song["path"].as_str()) else {
-                    continue;
-                };
-                if id.is_empty() {
-                    continue;
-                }
-                let path = path.replace('\\', "/");
-                let path = path.strip_prefix("//?/").unwrap_or(&path);
-                if path == relative_path || path == exact_path || path == compose_path {
-                    return Ok(Some(map_subsonic_track(song)));
-                }
-                // Some deployments use different absolute mount paths on the two servers.
-                // A suffix under a known root is a different track. An unknown mount
-                // can only be used when the suffix identifies a unique result.
-                if !path.starts_with(&root_prefix)
-                    && !path.starts_with("/music/")
-                    && path.ends_with(&suffix)
-                    && (path.starts_with('/') || path.as_bytes().get(1) == Some(&b':'))
+            // Offset is measured in returned rows, even when a server clamps our page size
+            // or a row has no usable path. Stop only at an empty page.
+            let mut identity: Vec<_> = songs
+                .iter()
+                .map(|song| (song["id"].as_str(), song["path"].as_str()))
+                .collect();
+            identity.sort_unstable();
+            let mut fingerprint = DefaultHasher::new();
+            identity.hash(&mut fingerprint);
+            if !pages.insert(fingerprint.finish()) {
+                return Err(ProviderError::PaginationStalled {
+                    provider: "Navidrome",
+                    entity: "track",
+                });
+            }
+            for (id, path) in identity {
+                if let (Some(id), Some(path)) = (id, path)
+                    && !id.is_empty()
                 {
-                    if let Some(track) = &alternate {
-                        ambiguous |= track.provider_id != id;
-                    } else {
-                        alternate = Some(map_subsonic_track(song));
-                    }
+                    index.observe(path, id);
                 }
             }
-            if songs.len() < 100 {
-                break;
-            }
+            offset += songs.len();
         }
-        Ok(if ambiguous { None } else { alternate })
+        let results = index.finish();
+        let ambiguous = results
+            .values()
+            .filter(|result| matches!(result, ImportedTrackMatch::Ambiguous))
+            .count();
+        tracing::info!(
+            requests,
+            browsed_tracks = offset,
+            requested_paths = relative_paths.len(),
+            matched = results.len() - ambiguous,
+            ambiguous,
+            unmatched = relative_paths.len() - results.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Reconciled imported files against Navidrome library"
+        );
+        Ok(results)
     }
 
     async fn create_imported_playlist(
@@ -935,6 +978,14 @@ impl MusicBackend for NavidromeClient {
                 provider: "Navidrome",
                 message: "Navidrome did not return the created playlist ID".into(),
             })
+    }
+
+    async fn replace_imported_playlist_tracks(&self, playlist_id: &str, track_ids: &[String]) -> Result<(), ProviderError> {
+        let mut form = vec![("playlistId", playlist_id)];
+        form.extend(track_ids.iter().map(|id| ("songId", id.as_str())));
+        let url = self.build_url("createPlaylist", &[])?;
+        self.send_json(self.http.post(url).form(&form), NAVIDROME_REQUEST_TIMEOUT_MS).await?;
+        Ok(())
     }
 
     async fn finalize_imported_playlist(

@@ -1,4 +1,5 @@
-.track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) minmax(3.75rem, 1fr) 5rem 4.5rem; --track-grid-gap: 1rem; width: 100%; margin-inline: auto; }
+.track-list { --track-grid-columns: 3.125rem minmax(0, 4fr) minmax(0, 3fr) minmax(3.75rem, 1fr) 5rem 4.5rem; --track-grid-gap: 1rem; width: 100%; min-width: 0; margin-inline: auto; }
+:root[data-layout-shell]:not([data-layout-shell="mobile"]) .main .track-list:not(.track-list--compact) { container-type: inline-size; container-name: track-table; }
 .track-list--compact { --track-grid-columns: 2.25rem minmax(0, 1fr) 2.5rem 4.25rem; --track-grid-gap: .5rem; min-width: 0; }
 .track-list--compact .track { min-width: 0; min-height: 3.4rem; padding: .35rem .5rem; border: 1px solid transparent; border-radius: .5rem; }
 .track-list--compact .track-album, .track-list--compact .track-server-status { display: none; }
@@ -169,16 +170,19 @@
   .home-continue .home-continue-grid { grid-template-columns: 1fr; }
 }
 
-@media (max-width: 64rem) {
-  .track-list { --track-grid-columns: 3.125rem minmax(12.5rem, 4fr) minmax(9.375rem, 3fr) 5rem 4.5rem; --track-grid-gap: .875rem; }
-  .track-list-header > :nth-child(4),
-  .track:not(.track-mobile-row) > :nth-child(4) { display: none; }
+@container track-table (max-width: 44rem) {
+  .track-list :is(.track-list-header, .track) {
+    --track-grid-columns: var(--track-number-column, 3.125rem) minmax(0, 4fr) minmax(0, 3fr) var(--track-duration-column, 5rem) var(--track-actions-column, 4.5rem);
+    --track-grid-gap: .75rem;
+  }
+  .track-list :is(.track-list-header, .track) > :nth-child(4) { display: none; }
 }
 
-@media (max-width: 48rem) {
-  .track-list { --track-grid-columns: 3.125rem minmax(0, 1fr) 5rem 4.5rem; --track-grid-gap: .75rem; }
-  .track-list-header > :nth-child(3),
-  .track:not(.track-mobile-row) > :nth-child(3) { display: none; }
+@container track-table (max-width: 34rem) {
+  .track-list :is(.track-list-header, .track) {
+    --track-grid-columns: var(--track-number-column, 3.125rem) minmax(0, 1fr) var(--track-duration-column, 5rem) var(--track-actions-column, 4.5rem);
+  }
+  .track-list :is(.track-list-header, .track) > :nth-child(3) { display: none; }
 }
 @keyframes track-download-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 @keyframes track-equalizer-pulse { from { transform: scaleY(0.45); } to { transform: scaleY(1.45); } }

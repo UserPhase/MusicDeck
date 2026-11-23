@@ -24,6 +24,25 @@ const songs = Array.from({ length: 17 }, (_, index) => ({
 }));
 const play = () => {};
 
+test("playing one playlist occurrence keeps another copy of the same track playable", () => {
+  const first = { ...songs[0], id: "duplicate-playlist-track", playlistItemId: "first-copy" };
+  const second = { ...first, playlistItemId: "second-copy" };
+  const onPlay = jest.fn(), togglePlay = jest.fn();
+  const view = currentSong => <MemoryRouter>
+    <PlayerItemStateProvider value={{ currentSong, isPlaying: true, togglePlay }}>
+      <TrackRow song={first} index={0} onPlay={onPlay} />
+      <TrackRow song={second} index={1} onPlay={onPlay} />
+    </PlayerItemStateProvider>
+  </MemoryRouter>;
+  const { rerender } = render(view(first));
+  fireEvent.click(screen.getByRole("button", { name: `Play ${second.title}`, exact: true }));
+  expect(onPlay).toHaveBeenCalledWith(second, 1);
+  expect(togglePlay).not.toHaveBeenCalled();
+  rerender(view(second));
+  fireEvent.click(screen.getByRole("button", { name: `Pause ${second.title}`, exact: true }));
+  expect(togglePlay).toHaveBeenCalledTimes(1);
+});
+
 test("real row subtrees isolate favorites, playback changes and device-download events", async () => {
   readOfflineTrack.mockResolvedValue(null);
   const onRender = jest.fn();

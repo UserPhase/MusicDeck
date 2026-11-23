@@ -26,7 +26,16 @@ export function validLoudness(value) {
 export function loudnessGainDb(measurement, target = DEFAULT_LOUDNESS_TARGET) {
   const safe = validLoudness(measurement);
   if (!safe || !LOUDNESS_TARGETS.includes(target)) return undefined;
-  return Math.max(-60, Math.min(12, target - safe.integratedLufs, -1 - safe.truePeakDb));
+  const maxBoost = safe.integratedLufs < -65 ? 0 : 12;
+  return Math.min(maxBoost, target - safe.integratedLufs, -1 - safe.truePeakDb);
+}
+
+export function preparedPlaybackGainDb(output, original, target) {
+  const encoded = validLoudness(output);
+  if (!encoded || !LOUDNESS_TARGETS.includes(target)) return undefined;
+  const source = validLoudness(original);
+  const desired = source ? source.integratedLufs + loudnessGainDb(source, target) : target;
+  return Math.min(desired - encoded.integratedLufs, source ? 12 : 0, -1 - encoded.truePeakDb);
 }
 
 export function trackGainDb(song, target) {
@@ -34,5 +43,8 @@ export function trackGainDb(song, target) {
   if (measured !== undefined) return measured;
   // Legacy gains were measured at -16; peak limiting makes offsets unreliable.
   const legacy = song?.normalizationGainDb ?? song?.metadata?.normalizationGainDb;
-  return target === DEFAULT_LOUDNESS_TARGET && Number.isFinite(legacy) ? legacy : undefined;
+  if (target !== DEFAULT_LOUDNESS_TARGET || !Number.isFinite(legacy)) return undefined;
+  if (legacy <= 0) return legacy;
+  const peak = replayGainMetadata(song).trackPeak;
+  return peak > 0 ? Math.min(legacy, 12, -1 - 20 * Math.log10(peak)) : undefined;
 }

@@ -63,7 +63,7 @@ class LocalNetworkPlugin(private val host: Activity) : Plugin(host) {
     @Command
     fun openReleases(invoke: Invoke) {
         host.runOnUiThread {
-            val page = Uri.parse("https://github.com/UserPhase/MusicDeck/releases")
+            val page = Uri.parse(ANDROID_RELEASES_URL)
             try {
                 host.startActivity(Intent(Intent.ACTION_VIEW, page))
                 invoke.resolve()

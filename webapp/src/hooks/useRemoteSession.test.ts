@@ -346,6 +346,21 @@ test("correlates invalid executions without invoking playback", async () => {
   expect(ws.sent).toContainEqual({ type: "COMMAND_RESULT", requestId: "invalid", expiresAt: 123, ok: false, message: "Invalid playback command" });
 });
 
+test("executes and acknowledges a compact playlist command after the ordinary command window", async () => {
+  const player = adapter();
+  player.command.mockImplementation(() => new Promise(resolve => { window.setTimeout(resolve, 9000); }));
+  renderHook(() => useRemoteSession("user", player));
+  const ws = FakeSocket.instances[0];
+  act(() => ws.open());
+  const command = { type: "PLAY_PLAYLIST", selection: { playlistId: "large", startIndex: 1000, fromHere: true,
+    view: { query: "", sort: "custom", descending: false, locale: "en-US" }, order: "1234567890abcdef" } };
+  const expiresAt = Date.now() + 22_000;
+  await receive(ws, { type: "EXECUTE", requestId: "playlist", expiresAt, timeoutMs: 20_000, command });
+  await act(async () => { jest.advanceTimersByTime(9000); });
+  expect(player.command).toHaveBeenCalledWith(command, expect.any(AbortSignal));
+  expect(ws.sent).toContainEqual(expect.objectContaining({ type: "COMMAND_RESULT", requestId: "playlist", expiresAt, ok: true }));
+});
+
 test("expires queued executions and preserves the output on a transient close", async () => {
   const player = adapter();
   let complete!: () => void;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
 
 use crate::error::ApiJson;
 use axum::Json;
@@ -11,7 +12,7 @@ use super::{build_catalog_and_resolver, require_db};
 use crate::AppState;
 use crate::auth::AuthenticatedUser;
 use crate::catalog::merge::{strong_recording_ids, title_key};
-use crate::catalog::snapshot::catalog_revision;
+use crate::catalog::snapshot::{LibraryTrackSort, catalog_revision, library_search_text};
 use crate::catalog::track_dedup::TrackDedup;
 use crate::catalog::{
     Available, CatalogEntityType, UnifiedCatalogItem, normalize_music_text, recordings_match,
@@ -19,7 +20,7 @@ use crate::catalog::{
 use crate::db::{DbError, DbPool};
 use crate::error::ServerError;
 use crate::profile::LibraryFilter;
-use crate::providers::{IdentityHints, Track, TrackArtistCredit};
+use crate::providers::{Album, IdentityHints, Track, TrackArtistCredit};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FilterTracksBody {
@@ -28,6 +29,101 @@ pub(super) struct FilterTracksBody {
     #[serde(default)]
     offset: usize,
     limit: Option<usize>,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    sort: LibraryTrackSort,
+}
+
+#[derive(Serialize)]
+pub(super) struct TrackPage<'a, T> {
+    pub tracks: Vec<T>,
+    pub total: usize,
+    pub offset: usize,
+    pub revision: &'a str,
+    pub degraded: bool,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortPart<'a> {
+    Number(usize, &'a str),
+    Text(&'a str),
+}
+
+struct NaturalText(String);
+
+impl Ord for NaturalText {
+    fn cmp(&self, other: &Self) -> Ordering {
+        fn parts(text: &str) -> impl Iterator<Item = SortPart<'_>> {
+            text.as_bytes().chunk_by(|left, right| left.is_ascii_digit() == right.is_ascii_digit()).map(|part| {
+                // ASCII digit boundaries never split multi-byte UTF-8 characters.
+                let text = std::str::from_utf8(part).expect("sort key is UTF-8");
+                if part[0].is_ascii_digit() {
+                    let digits = text.trim_start_matches('0');
+                    SortPart::Number(digits.len(), digits)
+                } else {
+                    SortPart::Text(text)
+                }
+            })
+        }
+        parts(&self.0).cmp(parts(&other.0))
+    }
+}
+
+impl PartialOrd for NaturalText {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+impl PartialEq for NaturalText {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+
+impl Eq for NaturalText {}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum AlbumSort {
+    #[default]
+    Library,
+    Az,
+    Za,
+    Newest,
+    Oldest,
+    Artist,
+    ArtistReverse,
+}
+
+impl AlbumSort {
+    pub(super) fn arrange(self, albums: &mut Vec<&Available<Album>>, query: &str) {
+        let query = library_search_text(query);
+        let tokens: Vec<_> = query.split_whitespace().collect();
+        if !tokens.is_empty() {
+            albums.retain(|album| {
+                let text = library_search_text(&format!("{} {}", album.item.name, album.item.artist_name));
+                tokens.iter().all(|token| text.contains(token))
+            });
+        }
+        let title = |album: &&Available<Album>| NaturalText(library_search_text(&album.item.name));
+        let artist = |album: &&Available<Album>| NaturalText(library_search_text(&album.item.artist_name));
+        let year = |album: &&Available<Album>| album.item.year.filter(|year| *year > 0);
+        match self {
+            Self::Library => {},
+            Self::Az => albums.sort_by_cached_key(title),
+            Self::Za => albums.sort_by_cached_key(|album| Reverse(title(album))),
+            Self::Newest => albums.sort_by_cached_key(|album| (year(album).is_none(), Reverse(year(album)), title(album))),
+            Self::Oldest => albums.sort_by_cached_key(|album| (year(album).is_none(), year(album), title(album))),
+            Self::Artist => albums.sort_by_cached_key(|album| (artist(album), title(album))),
+            Self::ArtistReverse => albums.sort_by_cached_key(|album| (Reverse(artist(album)), title(album))),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct AlbumPage<'a> {
+    pub albums: Vec<&'a Available<Album>>,
+    pub total: usize,
+    pub revision: &'a str,
+    pub degraded: bool,
 }
 
 fn filter_matches(filter: &LibraryFilter, value: &Value) -> bool {
@@ -161,7 +257,7 @@ pub(super) async fn post_filter_tracks_handler(
         Err(rejection) => return Ok(rejection.into_response()),
     };
     let limit = body.limit.unwrap_or(100);
-    if !(1..=500).contains(&limit)
+    if !(1..=500).contains(&limit) || body.query.chars().count() > 200
         || body.filters.iter().any(|filter| {
             filter.field.is_empty()
                 || !matches!(
@@ -178,12 +274,22 @@ pub(super) async fn post_filter_tracks_handler(
         Err(response) => return Ok(response),
     };
     let snapshot = state.catalog_snapshots().tracks(&catalog).await;
-    let activity = user_track_activity(require_db(&state)?, &auth.user.id).await?;
-    let mut ids = Vec::new();
-    let mut page = Vec::with_capacity(limit);
+    let annotations = !body.filters.is_empty() || (body.query.is_empty() && matches!(body.sort, LibraryTrackSort::Custom));
+    let activity = if annotations {
+        user_track_activity(require_db(&state)?, &auth.user.id).await?
+    } else {
+        HashMap::new()
+    };
+    let query = library_search_text(&body.query);
+    let tokens: Vec<_> = query.split_whitespace().collect();
+    let search = (!tokens.is_empty()).then(|| snapshot.track_search());
+    let mut matches = Vec::new();
     let mut seen = TrackDedup::default();
 
-    for track in &snapshot.items {
+    for (index, track) in snapshot.items.iter().enumerate() {
+        if search.is_some_and(|text| !tokens.iter().all(|token| text[index].contains(token))) {
+            continue;
+        }
         let (favorite, play_count, last_played_at) = activity
             .get(&track.item.id)
             .map_or((false, 0, None), |(favorite, count, last)| {
@@ -212,23 +318,28 @@ pub(super) async fn post_filter_tracks_handler(
             .map_err(|error| ServerError::Internal(error.to_string()))?
             && seen.insert_track(&track.item)
         {
-            if ids.len() >= body.offset && page.len() < limit {
-                page.push(
-                    serde_json::to_value(&annotated)
-                        .map_err(|error| ServerError::Internal(error.to_string()))?,
-                );
-            }
-            ids.push(track.item.id.as_str());
+            matches.push(annotated);
         }
     }
 
-    Ok(Json(json!({
-        "tracks": page,
-        "total": ids.len(),
-        "revision": catalog_revision(ids, snapshot.degraded),
-        "degraded": snapshot.degraded,
-    }))
-    .into_response())
+    match body.sort {
+        LibraryTrackSort::Custom => {}
+        LibraryTrackSort::TitleAsc => matches.sort_by_cached_key(|row| NaturalText(library_search_text(&row.track.item.title))),
+        LibraryTrackSort::TitleDesc => matches.sort_by_cached_key(|row| Reverse(NaturalText(library_search_text(&row.track.item.title)))),
+        LibraryTrackSort::AlbumAsc => matches.sort_by_cached_key(|row| NaturalText(library_search_text(&row.track.item.album_name))),
+        LibraryTrackSort::AlbumDesc => matches.sort_by_cached_key(|row| Reverse(NaturalText(library_search_text(&row.track.item.album_name)))),
+        LibraryTrackSort::DurationAsc => matches.sort_by_key(|row| row.track.item.duration_seconds.filter(|&value| value > 0).unwrap_or(u32::MAX)),
+        LibraryTrackSort::DurationDesc => matches.sort_by_key(|row| Reverse(row.track.item.duration_seconds.unwrap_or(0))),
+    }
+    let revision = catalog_revision(matches.iter().map(|row| row.track.item.id.as_str()), snapshot.degraded);
+    let total = matches.len();
+    let page = matches.into_iter().skip(body.offset).take(limit);
+    let response = if annotations {
+        Json(TrackPage { tracks: page.collect::<Vec<_>>(), total, offset: body.offset, revision: &revision, degraded: snapshot.degraded }).into_response()
+    } else {
+        Json(TrackPage { tracks: page.map(|row| row.track).collect(), total, offset: body.offset, revision: &revision, degraded: snapshot.degraded }).into_response()
+    };
+    Ok(response)
 }
 
 const MAX_MATCH_ITEMS: usize = 100;

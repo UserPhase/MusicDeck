@@ -179,4 +179,20 @@ describe("TrackDownloadButton", () => {
 
     expect(screen.getByRole("button", { name: "Bohemian Rhapsody downloaded to library" })).toBeInTheDocument();
   });
+
+  test("continues polling the same job after a transient status failure", async () => {
+    createAcquisition.mockResolvedValueOnce({ status: "downloading", jobId: "retry-status" });
+    getAcquisition.mockRejectedValueOnce(new Error("connection lost"))
+      .mockResolvedValueOnce({ status: "downloading", stage: "conversion", progress: { percent: 30 } })
+      .mockResolvedValueOnce({ status: "completed" });
+    render(<TrackDownloadButton song={mockSong} />);
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /with spotDL/ })); });
+    await act(async () => { jest.advanceTimersByTime(1000); });
+    expect(screen.getByRole("button", { name: /Reconnecting to check the download for Bohemian Rhapsody/ })).toBeDisabled();
+    await act(async () => { jest.advanceTimersByTime(1000); });
+    expect(screen.getByRole("button", { name: "Converting Bohemian Rhapsody (30%)" })).toBeDisabled();
+    await act(async () => { jest.advanceTimersByTime(1000); });
+    expect(screen.getByRole("button", { name: /downloaded to library/ })).toBeInTheDocument();
+    expect(createAcquisition).toHaveBeenCalledTimes(1);
+  });
 });

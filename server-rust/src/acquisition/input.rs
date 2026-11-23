@@ -86,6 +86,37 @@ pub(super) struct ValidatedTarget {
     pub kind: AcquisitionKind,
     pub operands: Vec<Operand>,
     pub expected_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deezer: Vec<DeezerTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DeezerTarget {
+    Track(u64),
+    Album(u64),
+}
+
+impl DeezerTarget {
+    pub fn parse(value: &str, kind: AcquisitionKind) -> Option<Self> {
+        let id = match kind {
+            AcquisitionKind::Track => value.strip_prefix("external_deezer_track_")?,
+            AcquisitionKind::Album => value.strip_prefix("external_deezer_album_")?,
+            _ => return None,
+        };
+        if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let id: u64 = id.parse().ok()?;
+        if id == 0 {
+            return None;
+        }
+        Some(if kind == AcquisitionKind::Track {
+            Self::Track(id)
+        } else {
+            Self::Album(id)
+        })
+    }
 }
 
 impl AcquisitionResult {
@@ -211,6 +242,31 @@ impl ValidatedTarget {
             .or_else(|| manual.as_deref().and_then(manual_kind))
             .or(kind_hint)
             .unwrap_or(AcquisitionKind::Track);
+        let mut deezer = Vec::new();
+        if spotify.is_none() && manual.is_none() {
+            if kind == AcquisitionKind::Artist && !options.albums.is_empty() {
+                deezer = options
+                    .albums
+                    .iter()
+                    .map(|album| {
+                        if album.spotify_url().is_some() {
+                            return None;
+                        }
+                        DeezerTarget::parse(album.id.as_deref()?, album.kind)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default();
+                let mut seen = std::collections::HashSet::new();
+                deezer.retain(|id| seen.insert(*id));
+            } else if let Some(id) = result
+                .and_then(|item| item.id.as_deref())
+                .or(options.track_id.as_deref())
+                .or(options.album_id.as_deref())
+                .and_then(|id| DeezerTarget::parse(id, kind))
+            {
+                deezer.push(id);
+            }
+        }
         if kind_hint.is_some_and(|hint| {
             hint != kind
                 && !(hint == AcquisitionKind::Album
@@ -283,6 +339,62 @@ impl ValidatedTarget {
             kind,
             operands,
             expected_count,
+            deezer,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn target(options: Value) -> ValidatedTarget {
+        ValidatedTarget::resolve(&serde_json::from_value(options).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn keeps_deezer_targets_for_tracks_albums_and_selected_album_batches() {
+        let track = target(json!({
+            "result":{"type":"track","id":"external_deezer_track_42","title":"Ellipse","artist":"Sequin"}
+        }));
+        assert_eq!(track.deezer, [DeezerTarget::Track(42)]);
+        let album = json!({"type":"album","id":"external_deezer_album_437231177","title":"Eden","artist":"Sequin"});
+        assert_eq!(
+            target(json!({"result": album.clone()})).deezer,
+            [DeezerTarget::Album(437231177)]
+        );
+        let batch = target(json!({
+            "result":{"type":"artist","id":"external_deezer_artist_8","title":"Sequin"},
+            "albums":[album.clone(), {"type":"album","id":"external_deezer_album_50","title":"Other record","artist":"Sequin"}, album]
+        }));
+        assert_eq!(
+            batch.deezer,
+            [DeezerTarget::Album(437231177), DeezerTarget::Album(50)]
+        );
+    }
+
+    #[test]
+    fn explicit_spotify_and_manual_sources_keep_the_original_path() {
+        let result = json!({"type":"album","id":"external_deezer_album_437231177","title":"Eden","artist":"Sequin"});
+        let spotify = target(
+            json!({"result":result.clone(),"spotifyUrl":"https://open.spotify.com/album/123"}),
+        );
+        assert!(spotify.deezer.is_empty());
+        let manual = target(
+            json!({"result":result,"sourceUrl":"https://music.youtube.com/playlist?list=OLAK5uy_fixture"}),
+        );
+        assert!(manual.deezer.is_empty());
+        assert!(matches!(
+            manual.operands.as_slice(),
+            [Operand::Manual { .. }]
+        ));
+        assert!(!crate::config::AppConfig::default().acquisition_deezer_ytdlp);
+        let enabled = crate::config::AppConfig::load_from_iter([(
+            "MUSICDECK_DEEZER_YTDLP".to_owned(),
+            "true".to_owned(),
+        )])
+        .unwrap();
+        assert!(enabled.acquisition_deezer_ytdlp);
     }
 }

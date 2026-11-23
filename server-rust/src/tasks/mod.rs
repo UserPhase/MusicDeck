@@ -7,6 +7,7 @@
 
 pub mod manager;
 pub mod process_runner;
+mod process_tree;
 pub mod scheduler;
 
 pub use manager::{
@@ -68,6 +69,59 @@ mod tests {
     }
 
     struct FailingProcessRunner;
+
+    #[tokio::test]
+    async fn shutdown_cancels_spotdl_workers_and_leaves_them_eligible_for_restart_recovery() {
+        use tokio::sync::Notify;
+
+        struct ShutdownProbe(Arc<Notify>);
+        #[async_trait::async_trait]
+        impl TaskDefinition for ShutdownProbe {
+            fn validate(&self, payload: &Value) -> bool {
+                payload.is_object()
+            }
+
+            async fn run(&self, _: Value, context: TaskRunContext) -> Result<(), TaskError> {
+                self.0.notify_one();
+                context.cancel_token().cancelled().await;
+                Err(TaskError::Cancelled)
+            }
+        }
+
+        let db = DbPool::connect_memory().await.unwrap();
+        run_migrations(&db, None).await.unwrap();
+        let tasks = TaskManager::new(Some(db.clone()));
+        tasks.initialize_tables().await;
+        let running = Arc::new(Notify::new());
+        tasks.register(
+            TaskType::SpotdlDownload,
+            Arc::new(ShutdownProbe(running.clone())),
+        );
+        let task = tasks
+            .enqueue(TaskType::SpotdlDownload, json!({}), "admin", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), running.notified())
+            .await
+            .unwrap();
+
+        tasks.shutdown(Duration::from_secs(2)).await;
+        assert!(!tasks.is_executing(&task.id));
+        assert_eq!(
+            tasks.get(&task.id).await.unwrap().state,
+            TaskStatus::Processing
+        );
+
+        let restarted = TaskManager::new(Some(db));
+        restarted.recover_interrupted_tasks().await;
+        let recovered = restarted.get(&task.id).await.unwrap();
+        assert_eq!(recovered.state, TaskStatus::Failed);
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some("Task was interrupted by a server restart")
+        );
+        restarted.close();
+    }
 
     #[async_trait::async_trait]
     impl ProcessRunner for FailingProcessRunner {
@@ -301,7 +355,7 @@ mod tests {
 
         let music_root = tempfile::tempdir().expect("shared music root");
         let staging = tempfile::tempdir().expect("SpotDL staging root");
-        let (spotify_imports, acquisitions, navidrome) = spotdl::import_fixture(
+        let (spotify_imports, acquisitions, navidrome, _) = spotdl::import_fixture(
             pool.clone(),
             music_root.path(),
             spotdl::NavidromeResult::Success,
@@ -455,7 +509,7 @@ mod tests {
                 entry.status,
                 crate::acquisition::ImportEntryStatus::Completed
             );
-            let path = entry.file_path.unwrap();
+            let path = entry.library_path.unwrap();
             assert_eq!(path, spotdl::fixture_path(&entry.source.title));
             assert!(music_root.path().join(path).is_file());
         }
@@ -612,7 +666,9 @@ mod tests {
         assert_eq!(settled.state, TaskStatus::Failed);
         assert_eq!(
             settled.error.as_deref(),
-            Some("spotDL failed (no-match): exit Some(1)")
+            Some(
+                "spotDL failed (no-match): The downloader could not match this recording to an audio source."
+            )
         );
 
         let failed_job = acquisitions
@@ -622,7 +678,9 @@ mod tests {
         assert_eq!(failed_job.status, AcquisitionJobStatus::Failed);
         assert_eq!(
             failed_job.error_message.as_deref(),
-            Some("spotDL failed (no-match): exit Some(1)")
+            Some(
+                "spotDL failed (no-match): The downloader could not match this recording to an audio source."
+            )
         );
 
         manager.close();

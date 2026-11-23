@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::privacy::ExternalCategory;
 
+use super::process_tree::ProcessTree;
+
 /// Maximum bytes retained per standard stream (`512 KiB`).
 pub const MAX_CAPTURE_BYTES_PER_STREAM: usize = 512 * 1024;
 /// Maximum bytes retained in a partial line buffer (`64 KiB`).
@@ -185,11 +187,22 @@ impl ProcessRunner for DefaultProcessRunner {
             cmd.envs(&options.env);
         }
 
+        ProcessTree::configure(&mut cmd);
         let mut child = cmd.spawn().map_err(|err| ProcessError::SpawnFailed {
             command: command.to_owned(),
             reason: err.to_string(),
         })?;
 
+        let tree = match ProcessTree::attach(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                return Err(ProcessError::Io(format!(
+                    "Could not isolate process tree: {error}"
+                )));
+            }
+        };
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
 
@@ -204,88 +217,102 @@ impl ProcessRunner for DefaultProcessRunner {
             .filter(|&ms| ms > 0)
             .map(Duration::from_millis);
 
-        let drive_io = async {
-            let mut out_buf = [0_u8; 8192];
-            let mut err_buf = [0_u8; 8192];
-            let mut out_eof = stdout_pipe.is_none();
-            let mut err_eof = stderr_pipe.is_none();
+        let status = {
+            let drive_io = async {
+                let mut out_buf = [0_u8; 8192];
+                let mut err_buf = [0_u8; 8192];
+                let mut out_eof = stdout_pipe.is_none();
+                let mut err_eof = stderr_pipe.is_none();
 
-            while !out_eof || !err_eof {
-                tokio::select! {
-                    res = async {
-                        match stdout_pipe.as_mut() {
-                            Some(s) => s.read(&mut out_buf).await,
-                            None => Ok(0),
-                        }
-                    }, if !out_eof => {
-                        match res {
-                            Ok(0) | Err(_) => out_eof = true,
-                            Ok(n) => {
-                                process_stream_chunk(
-                                    &mut stdout_data,
-                                    &mut stdout_line_buf,
-                                    &out_buf[..n],
-                                    options.on_stdout_chunk.as_ref(),
-                                    options.on_stdout_line.as_ref(),
-                                );
+                while !out_eof || !err_eof {
+                    tokio::select! {
+                        res = async {
+                            match stdout_pipe.as_mut() {
+                                Some(s) => s.read(&mut out_buf).await,
+                                None => Ok(0),
+                            }
+                        }, if !out_eof => {
+                            match res {
+                                Ok(0) => out_eof = true,
+                                Err(err) => return Err(ProcessError::Io(err.to_string())),
+                                Ok(n) => {
+                                    process_stream_chunk(
+                                        &mut stdout_data,
+                                        &mut stdout_line_buf,
+                                        &out_buf[..n],
+                                        options.on_stdout_chunk.as_ref(),
+                                        options.on_stdout_line.as_ref(),
+                                    );
+                                }
                             }
                         }
-                    }
-                    res = async {
-                        match stderr_pipe.as_mut() {
-                            Some(s) => s.read(&mut err_buf).await,
-                            None => Ok(0),
-                        }
-                    }, if !err_eof => {
-                        match res {
-                            Ok(0) | Err(_) => err_eof = true,
-                            Ok(n) => {
-                                process_stream_chunk(
-                                    &mut stderr_data,
-                                    &mut stderr_line_buf,
-                                    &err_buf[..n],
-                                    options.on_stderr_chunk.as_ref(),
-                                    options.on_stderr_line.as_ref(),
-                                );
+                        res = async {
+                            match stderr_pipe.as_mut() {
+                                Some(s) => s.read(&mut err_buf).await,
+                                None => Ok(0),
                             }
-                        }
-                    }
-                }
-            }
-
-            child
-                .wait()
-                .await
-                .map_err(|err| ProcessError::Io(err.to_string()))
-        };
-
-        let status = match timeout_duration {
-            Some(dur) => {
-                tokio::select! {
-                    () = cancel_token.cancelled() => {
-                        let _ = child.kill().await;
-                        return Err(ProcessError::Cancelled);
-                    }
-                    timed = tokio::time::timeout(dur, drive_io) => {
-                        match timed {
-                            Ok(res) => res?,
-                            Err(_) => {
-                                let _ = child.kill().await;
-                                return Err(ProcessError::TimedOut(options.timeout_ms.unwrap_or(0)));
+                        }, if !err_eof => {
+                            match res {
+                                Ok(0) => err_eof = true,
+                                Err(err) => return Err(ProcessError::Io(err.to_string())),
+                                Ok(n) => {
+                                    process_stream_chunk(
+                                        &mut stderr_data,
+                                        &mut stderr_line_buf,
+                                        &err_buf[..n],
+                                        options.on_stderr_chunk.as_ref(),
+                                        options.on_stderr_line.as_ref(),
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
-            None => {
-                tokio::select! {
-                    () = cancel_token.cancelled() => {
-                        let _ = child.kill().await;
-                        return Err(ProcessError::Cancelled);
-                    }
-                    res = drive_io => res?,
+
+                Ok::<(), ProcessError>(())
+            };
+            tokio::pin!(drive_io);
+            let deadline = async {
+                match timeout_duration {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => std::future::pending().await,
                 }
+            };
+            tokio::pin!(deadline);
+
+            let mut drained = false;
+            let result = tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => Err(ProcessError::Cancelled),
+                () = &mut deadline => Err(ProcessError::TimedOut(options.timeout_ms.unwrap_or(0))),
+                status = child.wait() => status.map_err(|err| ProcessError::Io(err.to_string())),
+                io = &mut drive_io => {
+                    drained = true;
+                    match io {
+                        Ok(()) => tokio::select! {
+                            biased;
+                            () = cancel_token.cancelled() => Err(ProcessError::Cancelled),
+                            () = &mut deadline => Err(ProcessError::TimedOut(options.timeout_ms.unwrap_or(0))),
+                            status = child.wait() => status.map_err(|err| ProcessError::Io(err.to_string())),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            // A helper may hold a pipe after the parent exits. Terminate the whole tree
+            // before draining buffered output, and bound the drain independently.
+            drop(tree);
+            if result.is_err() {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             }
+            if !drained
+                && result.is_ok()
+                && let Ok(io) = tokio::time::timeout(Duration::from_secs(2), &mut drive_io).await
+            {
+                io?;
+            }
+            result?
         };
 
         if let Some(ref cb) = options.on_stdout_line {
@@ -309,5 +336,138 @@ impl ProcessRunner for DefaultProcessRunner {
             stderr: String::from_utf8_lossy(&stderr_data).into_owned(),
             signal: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODE: &str = "MUSICDECK_TEST_PROCESS_TREE_MODE";
+    const MARKER: &str = "MUSICDECK_TEST_PROCESS_TREE_MARKER";
+
+    fn fixture_args() -> Vec<String> {
+        [
+            "--exact",
+            "tasks::process_runner::tests::process_fixture",
+            "--nocapture",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    #[test]
+    fn process_fixture() {
+        let Ok(mode) = std::env::var(MODE) else {
+            return;
+        };
+        if mode == "flood" {
+            use std::io::Write;
+
+            let chunk = [b'x'; 8192];
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            for _ in 0..=MAX_CAPTURE_BYTES_PER_STREAM / chunk.len() {
+                stdout.write_all(&chunk).unwrap();
+                stderr.write_all(&chunk).unwrap();
+            }
+            writeln!(stdout, "stdout complete").unwrap();
+            writeln!(stderr, "stderr complete").unwrap();
+            return;
+        }
+        let marker = PathBuf::from(std::env::var_os(MARKER).expect("fixture marker"));
+        if mode == "descendant" {
+            std::fs::write(&marker, b"started").unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::write(&marker, b"survived").unwrap();
+            return;
+        }
+        let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(fixture_args())
+            .env(MODE, "descendant")
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if std::fs::read(&marker).is_ok_and(|contents| contents == b"started") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "descendant must start before parent exits");
+        if mode != "exit" {
+            let _ = descendant.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn drains_both_full_pipes_without_growing_capture_buffers() {
+        let output = DefaultProcessRunner::new()
+            .run(
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                &fixture_args(),
+                ProcessOptions {
+                    timeout_ms: Some(8_000),
+                    env: HashMap::from([(MODE.into(), "flood".into())]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES_PER_STREAM);
+        assert_eq!(output.stderr.len(), MAX_CAPTURE_BYTES_PER_STREAM);
+        assert!(output.stdout.contains("stdout complete"));
+        assert!(output.stderr.ends_with("stderr complete\n"));
+    }
+
+    #[tokio::test]
+    async fn cleans_up_descendants_after_parent_exit_timeout_and_cancellation() {
+        let executable = std::env::current_exe().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let runner = DefaultProcessRunner::new();
+        let mut markers = Vec::new();
+        for (mode, timeout) in [("exit", 8_000), ("timeout", 1_500), ("cancel", 8_000)] {
+            let marker = folder.path().join(mode);
+            markers.push(marker.clone());
+            let token = CancellationToken::new();
+            let args = fixture_args();
+            let work = runner.run(
+                executable.to_str().unwrap(),
+                &args,
+                ProcessOptions {
+                    timeout_ms: Some(timeout),
+                    cancel_token: Some(token.clone()),
+                    env: HashMap::from([
+                        (MODE.into(), mode.into()),
+                        (MARKER.into(), marker.to_string_lossy().into_owned()),
+                    ]),
+                    ..Default::default()
+                },
+            );
+            let cancel = async {
+                if mode != "cancel" {
+                    return;
+                }
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !std::fs::read(&marker).is_ok_and(|contents| contents == b"started") {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("descendant started");
+                token.cancel();
+            };
+            let (result, ()) = tokio::join!(work, cancel);
+            assert_eq!(std::fs::read(&marker).unwrap(), b"started", "{mode}");
+            match mode {
+                "exit" => assert_eq!(result.unwrap().exit_code, Some(0)),
+                "timeout" => assert_eq!(result.unwrap_err(), ProcessError::TimedOut(timeout)),
+                _ => assert_eq!(result.unwrap_err(), ProcessError::Cancelled),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for marker in markers {
+            assert_eq!(std::fs::read(marker).unwrap(), b"started");
+        }
     }
 }

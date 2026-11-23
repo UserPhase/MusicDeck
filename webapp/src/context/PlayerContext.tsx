@@ -22,6 +22,8 @@ import {
 import { usePrivacy } from "./PrivacyContext";
 import { useRemoteSession } from "../hooks/useRemoteSession";
 import type { RemotePlaybackSnapshot, RemotePlayerAdapter } from "../types/remoteSession";
+import type { LibraryPlaybackSelection } from "../types/libraryTracks";
+import { playlistOrder, playlistPlaybackContext, playlistViewTracks, type PlaylistPlaybackView } from "../utils/playlistPlayback";
 import {
   getStreamUrl,
   getListeningTrack,
@@ -36,6 +38,7 @@ import {
   getAutoplayTracks,
   getPlaylist,
   getRandomSongs,
+  getTrackCollection,
   RECOMMENDATION_FEEDBACK_CHANGED_EVENT,
   getUserSettings,
   updateUserSettings,
@@ -68,6 +71,7 @@ import {
   DEFAULT_LOUDNESS_TARGET,
   LOUDNESS_TARGETS,
   loudnessGainDb,
+  preparedPlaybackGainDb,
   replayGainMetadata,
   trackGainDb,
   validLoudness,
@@ -184,8 +188,9 @@ export interface PlayerContextValue {
   queueTracks: (tracks: Song[]) => void;
   playTracksNext: (tracks: Song[]) => void;
   playSongFromSource: (song: Song, source: PlayableSourceRef) => Promise<void>;
-  playContext: (tracks: Song[], startIndex?: number, context?: PlaybackContextInfo | null) => Promise<void>;
-  playQueue: (songs: Song[], startIndex?: number, context?: PlaybackContextInfo | null) => Promise<void>;
+  playContext: (tracks: Song[], startIndex?: number, context?: PlaybackContextInfo | null, playlistView?: PlaylistPlaybackView) => Promise<void>;
+  playLibraryTracks: (selection: LibraryPlaybackSelection, signal: AbortSignal, excluded?: ReadonlySet<string>) => Promise<void>;
+  playQueue: (songs: Song[], startIndex?: number, context?: PlaybackContextInfo | null, playlistView?: PlaylistPlaybackView) => Promise<void>;
   resumeMedia: (songs: Song[], index: number, context: PlaybackContextInfo, positionSeconds: number) => Promise<void>;
   playQueueSong: (index: number) => Promise<void>;
   moveQueueItem: (from: number, to: number) => void;
@@ -789,7 +794,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       return { normalized: true, loudness: validLoudness(result), originalLoudness: validLoudness(result.loudness),
         gainDb: result.gainDb, streamUrl: result.streamUrl };
     }
-    return { normalized: false, gainDb: result?.gainDb };
+    return { normalized: false, gainDb: result?.gainDb, originalLoudness: validLoudness(result) };
   }
 
   function originalPlaybackUrl(song: Song, source: unknown, previewUrl: string | null): string {
@@ -1577,15 +1582,13 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         streamQualityRef.current === "direct" ||
         albumPlayback(binding.song) ||
         target !== normalizationTargetRef.current ||
-        sourceCacheRef.current.get(entryId)?.normalized ||
-        typeof result.gainDb !== "number" ||
-        !Number.isFinite(result.gainDb)
+        sourceCacheRef.current.get(entryId)?.normalized
       ) {
         return;
       }
       binding.measurement =
         validLoudness(result.loudness) ??
-        (result.status === "measured" ? validLoudness(result) : binding.measurement);
+        (result.status !== "ready" ? validLoudness(result) : undefined) ?? binding.measurement;
       if (result.status === "ready" && typeof result.streamUrl === "string" && NORMALIZED_STREAM.test(result.streamUrl)) {
         if (!sourceCacheRef.current.has(entryId)) {
           // Not handed to the engine yet: its load will pick the normalized stream at unity gain.
@@ -1595,7 +1598,9 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         }
         if (upgradeUpcomingStream(entryId, binding, result, result.streamUrl)) return;
       }
-      applyLevel(entryId, decibelsToLevel(result.gainDb));
+      if (typeof result.gainDb === "number" && Number.isFinite(result.gainDb)) {
+        applyLevel(entryId, decibelsToLevel(result.gainDb));
+      }
     });
   }
 
@@ -1635,7 +1640,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         ? info.loudness
         : previewUrl
           ? undefined
-          : validLoudness(entry.track.loudness ?? entry.track.metadata?.loudness),
+          : info.originalLoudness ?? validLoudness(entry.track.loudness ?? entry.track.metadata?.loudness),
     };
     bindingsRef.current.set(entry.entryId, binding);
     applyLevel(entry.entryId, gainByEntryRef.current.get(entry.entryId) ?? initialLevel(entry, info));
@@ -1645,25 +1650,46 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     requestEntryNormalization(entry.entryId, binding);
   }
 
+  const abortNormalization = useCallback(() => {
+    normalizationControllersRef.current.forEach((controller) => controller.abort());
+    normalizationRequestsRef.current.clear();
+  }, []);
+
   const changeNormalizationTarget = useCallback((value: number | string) => {
     const target = Number(value);
     if (!LOUDNESS_TARGETS.includes(target) || target === normalizationTargetRef.current) return;
     normalizationTargetRef.current = target;
     setNormalizationTarget(target);
     if (!replayGainEnabledRef.current) return;
-    for (const [entryId, binding] of Array.from(bindingsRef.current.entries())) {
+    abortNormalization();
+    const state = stateRef.current;
+    const live = [currentEntryOf(state), upcomingEntryOf(state)];
+    const liveIds = new Set(live.map(entry => entry?.entryId));
+    for (const cache of [bindingsRef.current, sourceCacheRef.current, gainByEntryRef.current]) {
+      for (const entryId of cache.keys()) if (!liveIds.has(entryId)) cache.delete(entryId);
+    }
+    for (const entry of live) {
+      if (!entry) continue;
+      const { entryId } = entry;
+      const binding = bindingsRef.current.get(entryId);
+      if (!binding) continue;
       if (albumPlayback(binding.song)) continue;
-      const gain = loudnessGainDb(binding.measurement, target);
+      const resolved = sourceCacheRef.current.get(entryId);
+      if (resolved?.normalized) {
+        const gain = preparedPlaybackGainDb(resolved.loudness, resolved.originalLoudness, target);
+        if (typeof gain === "number" && Number.isFinite(gain)) applyLevel(entryId, decibelsToLevel(gain));
+        continue;
+      }
+      binding.normalized = false;
+      const gain = loudnessGainDb(binding.measurement, target) ?? importedGainDb(binding.song, binding.previewUrl);
       if (typeof gain === "number" && Number.isFinite(gain)) applyLevel(entryId, decibelsToLevel(gain));
-      else if (!binding.normalized) requestEntryNormalization(entryId, binding);
+      else {
+        applyLevel(entryId, initialLevel(entry, { normalized: false }));
+        requestEntryNormalization(entryId, binding);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const abortNormalization = useCallback(() => {
-    normalizationControllersRef.current.forEach((controller) => controller.abort());
-    normalizationRequestsRef.current.clear();
-  }, []);
+  }, [abortNormalization]);
 
   useEffect(() => () => abortNormalization(), [abortNormalization]);
 
@@ -2354,13 +2380,23 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     startQueue(selected, index, context, options);
   }
 
-  function playOnActiveDevice(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null, fromHere = false) {
+  function playOnActiveDevice(tracks: Song[], startIndex: number, context: PlaybackContextInfo | null,
+    fromHere = false, playlistView?: PlaylistPlaybackView) {
     if (!remotePlayer) return null;
     if (tracks.some(track => track.offlineOnly || songSource(track).source)) {
       setPlaybackMessage("Choose this device in Devices to play a device-only track or source.");
       return Promise.resolve();
     }
     remote.clearError();
+    if (context?.id && playlistView) {
+      if ([...playlistView.query].length > 4096) {
+        setPlaybackMessage("Shorten the playlist search before playing on another device.");
+        return Promise.resolve();
+      }
+      return controlRemote({ type: "PLAY_PLAYLIST", selection: {
+        playlistId: context.id, startIndex, fromHere, view: playlistView, order: playlistOrder(tracks),
+      } });
+    }
     return controlRemote({
       type: "PLAY_SELECTION",
       tracks: tracks.map(track => {
@@ -2442,18 +2478,45 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     storeRef.current.injectNextMany(tracks);
   }
 
-  async function playContext(tracks: Song[], startIndex = 0, context: PlaybackContextInfo | null = null) {
+  async function playContext(tracks: Song[], startIndex = 0, context: PlaybackContextInfo | null = null, playlistView?: PlaylistPlaybackView) {
     if (!Array.isArray(tracks) || tracks.length === 0) return;
     const safeStart = Number.isInteger(startIndex) && startIndex >= 0 && startIndex < tracks.length ? startIndex : 0;
-    const remoteSelection = playOnActiveDevice(tracks, safeStart, context, true);
+    const remoteSelection = playOnActiveDevice(tracks, safeStart, context, true, playlistView);
     if (remoteSelection) return remoteSelection;
     startSelection(tracks, safeStart, context, true);
   }
 
-  async function playQueue(songs: Song[], startIndex = 0, context: PlaybackContextInfo | null = null) {
+  async function prepareLibrarySelection(selection: LibraryPlaybackSelection, signal?: AbortSignal, excluded?: ReadonlySet<string>) {
+    const tracks: Song[] = (await getTrackCollection(selection.query, signal))
+      .filter((track: Song) => !excluded?.has(String(track.id)));
+    if (signal?.aborted) throw new DOMException("Loading playback was cancelled.", "AbortError");
+    const index = selection.trackId !== null ? tracks.findIndex(track => String(track.id) === selection.trackId)
+      : selection.shuffle ? Math.floor(Math.random() * tracks.length) : 0;
+    if (!tracks[index]) throw new Error(selection.trackId ? "This track is no longer in the library view." : "There are no matching tracks to play.");
+    const reason = unplayableReasonFor(tracks[index]);
+    if (reason) throw new Error(reason);
+    return () => {
+      if (selection.shuffle !== undefined) {
+        shuffleEnabledRef.current = selection.shuffle;
+        setIsShuffleEnabled(selection.shuffle);
+      }
+      startSelection(tracks, index, { type: "collection", id: "library-tracks", name: "Library Tracks", coverArt: null }, selection.trackId !== null);
+    };
+  }
+
+  async function playLibraryTracks(selection: LibraryPlaybackSelection, signal: AbortSignal, excluded?: ReadonlySet<string>) {
+    if (remotePlayer) {
+      await remote.command({ type: "PLAY_LIBRARY_TRACKS", selection });
+      return;
+    }
+    const start = await prepareLibrarySelection(selection, signal, excluded);
+    if (!signal.aborted) start();
+  }
+
+  async function playQueue(songs: Song[], startIndex = 0, context: PlaybackContextInfo | null = null, playlistView?: PlaylistPlaybackView) {
     if (!Array.isArray(songs) || songs.length === 0) return;
     const safeStart = Number.isInteger(startIndex) && startIndex >= 0 && startIndex < songs.length ? startIndex : 0;
-    const remoteSelection = playOnActiveDevice(songs, safeStart, context);
+    const remoteSelection = playOnActiveDevice(songs, safeStart, context, false, playlistView);
     if (remoteSelection) return remoteSelection;
     startSelection(songs, safeStart, context, false);
   }
@@ -2622,7 +2685,8 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     if (engineRef.current?.isRemoteOutput) throw new Error("Stop Google Cast before transferring playback to another device.");
     const state = stateRef.current;
     const entry = currentEntryOf(state);
-    if (!entry || state.entries.length > 5000 || state.entries.some((item) => !isLibraryPlayable(item.track) ||
+    if (state.entries.length > 5000) throw new Error("Playback transfer supports up to 5,000 tracks. Start a smaller queue and try again.");
+    if (!entry || state.entries.some((item) => !isLibraryPlayable(item.track) ||
         songSource(item.track).source || item.track.offlineOnly)) {
       throw new Error("Only queues of local library tracks can be transferred. External previews and device-only sources cannot move between devices.");
     }
@@ -2701,6 +2765,29 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
         const reason = unplayableReasonFor(selected);
         if (reason) throw new Error(reason);
         await applyAndWait(() => startSelection(tracks, command.start_index, command.context, command.from_here));
+        return;
+      }
+      if (command.type === "PLAY_LIBRARY_TRACKS") {
+        if (remote.isRemote) throw new Error("The active player changed. Try playing the library again.");
+        const start = await prepareLibrarySelection(command.selection, signal);
+        await applyAndWait(start);
+        return;
+      }
+      if (command.type === "PLAY_PLAYLIST") {
+        if (remote.isRemote) throw new Error("The active player changed. Try playing the playlist again.");
+        const { playlistId, startIndex, fromHere, view, order } = command.selection;
+        const playlist = await getPlaylist(playlistId, signal, { cache: "no-store" });
+        checkCancellation();
+        if (!playlist) throw new Error("This playlist is no longer available.");
+        const tracks = playlistViewTracks(playlist.entry, view);
+        if (!tracks.length) throw new Error("There are no matching playlist tracks to play.");
+        if (!tracks[startIndex] || playlistOrder(tracks) !== order) {
+          throw new Error("The playlist order changed. Refresh the playlist and try again.");
+        }
+        const reason = unplayableReasonFor(tracks[startIndex]);
+        if (reason) throw new Error(reason);
+        const context = playlistPlaybackContext(playlist, view);
+        await applyAndWait(() => startSelection(tracks, startIndex, context, fromHere));
         return;
       }
       if (!currentEntryOf(stateRef.current)) throw new Error("The selected device has no loaded queue");
@@ -2933,9 +3020,11 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
   const repeatMode = displayedQueue ? repeatModeOf(displayedQueue) : "off";
   const liveTracks = useMemo(() => liveQueueState?.entries.map((entry): Song => ({
     id: entry.trackId, title: entry.title, artist: entry.artist, album: entry.album, duration: entry.duration,
-    mediaResume: entry.resume,
+    mediaResume: entry.resume, playlistItemId: entry.resume?.occurrenceId ?? undefined,
   })), [liveQueueState]);
-  const accountSong = accountTracks?.[accountIndex] ?? liveTracks?.[liveQueueState?.index ?? -1];
+  const liveSong = liveTracks?.[liveQueueState?.index ?? -1];
+  const accountSong = accountTracks?.[accountIndex] ?? liveSong;
+  const remoteOccurrence = liveQueueState ? liveSong : accountSong;
   const pausedAccountQueue = remotePlayer ? null : accountQueue;
   const displayedLoopPlaylist = remotePlayer
     ? (liveQueueState ? liveQueueState.loopPlaylistId : accountQueue?.checkpoint.loopPlaylistId) ?? null
@@ -2992,6 +3081,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       ...accountSong, id: remoteTrack.id, title: remoteTrack.title || accountSong?.title,
       artist: remoteTrack.artist || accountSong?.artist, album: remoteTrack.album || accountSong?.album,
       coverArt: remoteTrack.cover_art || accountSong?.coverArt, source: accountSong?.source ?? { kind: "library" },
+      playlistItemId: sameSongId(remoteOccurrence, remoteTrack) ? remoteOccurrence?.playlistItemId : undefined,
     } : null)
       : accountQueue ? accountSong ?? null : currentSong,
     activeSidebar,
@@ -3049,6 +3139,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
     playTracksNext,
     playSongFromSource,
     playContext,
+    playLibraryTracks,
     playQueue,
     resumeMedia,
     playQueueSong: remotePlayer ? async (index) => {
@@ -3117,7 +3208,7 @@ export function PlayerProvider({ children }: { children?: ReactNode }) {
       <PlayerItemStateProvider
         value={{
           currentSong: value.currentSong, isPlaying: value.isPlaying, likedSongIds, downloadQuality,
-          togglePlay: value.togglePlay, toggleLikeSong, playContext, playSongFromSource,
+          togglePlay: value.togglePlay, toggleLikeSong, playContext, playLibraryTracks, playSongFromSource,
         }}
       >
         {children}

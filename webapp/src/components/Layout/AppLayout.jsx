@@ -6,6 +6,8 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useRouteScrollRestoration } from "../../hooks/useViewStateStore";
 import {
   DEFAULT_LAYOUT_PRESET,
+  DOCKED_LIBRARY_QUERY,
+  DOCKED_PLAYBACK_QUERY,
   MOBILE_LAYOUT_QUERY,
   MOBILE_LAYOUT_SHELL,
   getLayoutPresetConfig,
@@ -17,7 +19,7 @@ import Player from "../Player";
 import QueueSidebar from "../QueueSidebar";
 import NowPlayingSidebar from "../NowPlayingSidebar";
 import AppleHeaderPlayer from "./HeaderPlayers/AppleHeaderPlayer";
-import TopNavHeader, { NAV_DRAWER_ID } from "./Headers/TopNavHeader";
+import TopNavHeader, { NAV_DRAWER_ID, NavDrawerToggle } from "./Headers/TopNavHeader";
 import DrawerPlayerBar from "./PlayerBars/DrawerPlayerBar";
 import WidgetSidebar from "./WidgetSidebar";
 import MobileNavBar from "./MobileNavBar";
@@ -57,6 +59,10 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
   const queueButtonRef = useRef(null);
   const lyricsButtonRef = useRef(null);
   const previousPanelRef = useRef(null);
+  const navToggleRef = useRef(null);
+  const mainPanelToggleRef = useRef(null);
+  const overlayTriggerRef = useRef(null);
+  const previousDesktopPanelRef = useRef(null);
   useRouteScrollRestoration(mainRef);
   const {
     currentSong,
@@ -65,14 +71,19 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
     autoOpenSidebar,
   } = usePlayer();
   const isMobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
+  const dockPlayback = useMediaQuery(DOCKED_PLAYBACK_QUERY);
+  const dockLibrary = useMediaQuery(DOCKED_LIBRARY_QUERY);
   const shell = isMobile ? MOBILE_LAYOUT_SHELL : getLayoutPresetConfig(preset).value;
   const config = getLayoutPresetConfig(preset).shell;
-  const usesDrawerNav = shell === "ytmusic";
+  const compactLibrary = !isMobile && config.navigation === "sidebar" && !dockLibrary;
+  const usesDrawerNav = shell === "ytmusic" || compactLibrary;
+  const overlayPlayback = !isMobile && shell !== "ytmusic" && !dockPlayback;
   const [isNavDrawerOpen, setIsNavDrawerOpen] = useState(false);
   const previousTrackIdRef = useRef(null);
   const { panel: mobilePanel, hasNowPlaying, open: openMobilePanel, close: closeMobilePanel } =
     useMobilePlaybackOverlays(isMobile);
   const isPanelOpen = isMobile ? Boolean(mobilePanel) : activeSidebar !== "none";
+  const desktopOverlayOpen = overlayPlayback && isPanelOpen;
   const mobileNowPlayingOpen = mobilePanel === "now-playing" || mobilePanel === "lyrics";
   const mobileQueueOpen = mobilePanel === "queue";
   const closePanel = useCallback(() => setActiveSidebar("none"), [setActiveSidebar]);
@@ -80,10 +91,14 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
   useLayoutEffect(() => {
     const root = document.documentElement;
     root.dataset.layoutShell = shell;
+    root.toggleAttribute("data-library-drawer", compactLibrary);
+    root.toggleAttribute("data-playback-overlay", overlayPlayback);
     return () => {
       delete root.dataset.layoutShell;
+      root.removeAttribute("data-library-drawer");
+      root.removeAttribute("data-playback-overlay");
     };
-  }, [shell]);
+  }, [shell, compactLibrary, overlayPlayback]);
 
   const pageUrl = location.pathname + location.search + location.hash;
   useEffect(() => {
@@ -114,7 +129,35 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
 
   useEffect(() => {
     setIsNavDrawerOpen(false);
-  }, [location.pathname, shell]);
+  }, [location.pathname, shell, usesDrawerNav]);
+
+  useEffect(() => {
+    if (compactLibrary && isNavDrawerOpen) {
+      document.getElementById(NAV_DRAWER_ID)?.querySelector(".nav-item")?.focus({ preventScroll: true });
+    }
+  }, [compactLibrary, isNavDrawerOpen]);
+
+  useEffect(() => {
+    const previous = previousDesktopPanelRef.current;
+    previousDesktopPanelRef.current = desktopOverlayOpen ? activeSidebar : null;
+    if (desktopOverlayOpen && previous !== activeSidebar && !isNavDrawerOpen) {
+      overlayTriggerRef.current ??= document.activeElement;
+      const close = activeSidebar === "queue" ? queueCloseRef.current : nowPlayingCloseRef.current;
+      close?.focus({ preventScroll: true });
+    } else if (!isPanelOpen || isMobile) {
+      const trigger = overlayTriggerRef.current;
+      overlayTriggerRef.current = null;
+      if (!isMobile && trigger) {
+        const target = trigger.isConnected && trigger !== document.body ? trigger : mainPanelToggleRef.current;
+        target?.focus({ preventScroll: true });
+      }
+    }
+  }, [activeSidebar, desktopOverlayOpen, isMobile, isNavDrawerOpen, isPanelOpen]);
+
+  const closeNavDrawer = useCallback(() => {
+    setIsNavDrawerOpen(false);
+    navToggleRef.current?.focus({ preventScroll: true });
+  }, []);
 
   useEffect(() => {
     // The command palette uses the shared desktop sidebar action.
@@ -124,19 +167,20 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
   }, [activeSidebar, isMobile, openMobilePanel, setActiveSidebar]);
 
   useEffect(() => {
-    if (!isNavDrawerOpen && (!mobilePanel || mobilePanel === "lyrics")) return undefined;
+    if (!isNavDrawerOpen && !desktopOverlayOpen && (!mobilePanel || mobilePanel === "lyrics")) return undefined;
     const closeOnEscape = (event) => {
       if (event.defaultPrevented || event.key !== "Escape") return;
-      if (isNavDrawerOpen) setIsNavDrawerOpen(false);
+      if (isNavDrawerOpen) closeNavDrawer();
+      else if (desktopOverlayOpen) closePanel();
       else closeMobilePanel();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [closeMobilePanel, isNavDrawerOpen, mobilePanel]);
+  }, [closeMobilePanel, closeNavDrawer, closePanel, desktopOverlayOpen, isNavDrawerOpen, mobilePanel]);
 
   // Auto-open Now Playing on a new track only where the panel docks beside
   // the page; in sheet/widget/mobile shells it would cover the content.
-  const canAutoOpenPanel = shell === "spotify" || shell === "apple";
+  const canAutoOpenPanel = dockPlayback && (shell === "spotify" || shell === "apple");
   useEffect(() => {
     const nextTrackId = currentSong?.id == null ? null : String(currentSong.id);
     const isNewTrack = Boolean(nextTrackId) && nextTrackId !== previousTrackIdRef.current;
@@ -151,13 +195,14 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
     () => setActiveSidebar((current) => current === "queue" ? "none" : "queue"),
     [setActiveSidebar],
   );
-  const drawer = usesDrawerNav ? { isOpen: isNavDrawerOpen, onToggle: toggleNavDrawer } : null;
+  const leading = usesDrawerNav && <NavDrawerToggle buttonRef={navToggleRef}
+    drawer={{ isOpen: isNavDrawerOpen, onToggle: toggleNavDrawer }} />;
 
   let header;
   if (shell === MOBILE_LAYOUT_SHELL) header = <Topbar key="header-mobile" mobile />;
-  else if (config.header === "player") header = <Topbar key="header-player" playerSlot={<AppleHeaderPlayer />} />;
-  else if (config.header === "topnav") header = <TopNavHeader key="header-topnav" drawer={drawer} />;
-  else header = <Topbar key="header-standard" />;
+  else if (config.header === "player") header = <Topbar key="header-player" leading={leading} playerSlot={<AppleHeaderPlayer />} />;
+  else if (config.header === "topnav") header = <TopNavHeader key="header-topnav" leading={leading} />;
+  else header = <Topbar key="header-standard" leading={leading} />;
 
   let player = null;
   if (shell === MOBILE_LAYOUT_SHELL) {
@@ -177,15 +222,16 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
       <div inert={mobileNowPlayingOpen || undefined}>
         {header}
         {usesDrawerNav && isNavDrawerOpen && (
-          <div key="nav-scrim" className="nav-drawer-scrim" aria-hidden="true" onClick={() => setIsNavDrawerOpen(false)} />
+          <div key="nav-scrim" className="nav-drawer-scrim" aria-hidden="true" onClick={closeNavDrawer} />
         )}
         <Sidebar key="sidebar" id={NAV_DRAWER_ID} />
         <main ref={mainRef} key="main" className={`main${isPanelOpen ? " sidebar-open" : ""}`}
-          inert={mobileQueueOpen || undefined}>
+          inert={mobileQueueOpen || desktopOverlayOpen || (compactLibrary && isNavDrawerOpen) || undefined}>
           {showPanelToggle && (
             <button
               className="main-now-playing-toggle"
               type="button"
+              ref={mainPanelToggleRef}
               onClick={() => setActiveSidebar("now-playing")}
               aria-label="Open Now Playing sidebar"
             >
@@ -201,6 +247,7 @@ function AppLayout({ preset = DEFAULT_LAYOUT_PRESET, children }) {
           </div>
         </main>
         {mobileQueueOpen && <div className="mobile-queue-scrim" aria-hidden="true" onClick={closeMobilePanel} />}
+        {desktopOverlayOpen && <div className="playback-overlay-scrim" aria-hidden="true" onClick={closePanel} />}
         <QueueSidebar
           key="queue-panel"
           isOpen={isMobile ? mobileQueueOpen : activeSidebar === "queue"}

@@ -492,6 +492,8 @@ pub struct AppConfig {
     pub jellyfin: JellyfinConfig,
     /// Acquisition concurrency, rate, and retention limits.
     pub acquisition_limits: AcquisitionLimits,
+    /// Prefer Deezer metadata and direct yt-dlp for eligible external imports.
+    pub acquisition_deezer_ytdlp: bool,
     /// Directory containing trusted server extensions (`MUSICDECK_EXTENSIONS_DIR`).
     pub extensions_dir: String,
     /// Root folder where music files are stored and scanned (`MUSICDECK_MUSIC_ROOT`).
@@ -517,6 +519,7 @@ impl Default for AppConfig {
             navidrome: NavidromeConfig::default(),
             jellyfin: JellyfinConfig::default(),
             acquisition_limits: AcquisitionLimits::default(),
+            acquisition_deezer_ytdlp: false,
             extensions_dir: String::from("./extensions"),
             music_root: String::from("./data/music"),
             spotify_import_subdir: String::from("Spotify Imports"),
@@ -586,7 +589,11 @@ impl AppConfig {
 
         let (host, port) = parse_listener_addr(env)?;
         let public_url = read_env(env, "MUSICDECK_PUBLIC_URL", "http://localhost:4534");
-        let default_cors_origin = if is_production { &public_url } else { "http://localhost:3000" };
+        let default_cors_origin = if is_production {
+            &public_url
+        } else {
+            "http://localhost:3000"
+        };
         let cors_origin = read_env(env, "MUSICDECK_CORS_ORIGIN", default_cors_origin);
         let trusted_proxies =
             parse_trusted_proxies(&read_env(env, "MUSICDECK_TRUSTED_PROXIES", ""))?;
@@ -748,6 +755,9 @@ impl AppConfig {
             navidrome,
             jellyfin,
             acquisition_limits,
+            acquisition_deezer_ytdlp: env
+                .get_var("MUSICDECK_DEEZER_YTDLP")
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             extensions_dir: read_env(env, "MUSICDECK_EXTENSIONS_DIR", "./extensions"),
             music_root: read_env(env, "MUSICDECK_MUSIC_ROOT", "./data/music"),
             spotify_import_subdir: read_env(
@@ -1093,10 +1103,7 @@ mod tests {
 
     fn base_valid_env() -> HashMap<String, String> {
         HashMap::from([
-            (
-                String::from("MUSICDECK_DB_PATH"),
-                String::from(":memory:"),
-            ),
+            (String::from("MUSICDECK_DB_PATH"), String::from(":memory:")),
             (
                 String::from("MUSICDECK_SESSION_SECRET"),
                 String::from("local-production-secret-key"),
@@ -1156,8 +1163,14 @@ mod tests {
             cfg.network.trusted_proxy_strings(),
             vec!["127.0.0.1", "10.20.0.0/24", "::1"]
         );
-        assert!(cfg.network.is_trusted_proxy(&IpAddr::V4(Ipv4Addr::new(10, 20, 0, 99))));
-        assert!(!cfg.network.is_trusted_proxy(&IpAddr::V4(Ipv4Addr::new(10, 21, 0, 1))));
+        assert!(
+            cfg.network
+                .is_trusted_proxy(&IpAddr::V4(Ipv4Addr::new(10, 20, 0, 99)))
+        );
+        assert!(
+            !cfg.network
+                .is_trusted_proxy(&IpAddr::V4(Ipv4Addr::new(10, 21, 0, 1)))
+        );
 
         for unsafe_proxy in [
             "true",
@@ -1211,7 +1224,10 @@ mod tests {
         // Missing secret file must fail loudly
         env.insert(
             String::from("MUSICDECK_SESSION_SECRET_FILE"),
-            temp_dir.join("nonexistent.secret").to_string_lossy().into_owned(),
+            temp_dir
+                .join("nonexistent.secret")
+                .to_string_lossy()
+                .into_owned(),
         );
         let err = AppConfig::load_from_source(&env).unwrap_err();
         assert!(matches!(err, ConfigError::UnreadableSecretFile { .. }));

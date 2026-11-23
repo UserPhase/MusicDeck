@@ -39,6 +39,7 @@ export interface Track {
   albumId?: string | null;
   duration?: number | null;
   playlistAddedAt?: string;
+  playlistItemId?: string;
   isDownloaded?: boolean;
   provider?: string;
   inLibrary?: boolean;
@@ -50,8 +51,7 @@ export interface Track {
   [key: string]: unknown;
 }
 
-/** Metadata and callbacks remain ordinary props. Playback and pending device
- * downloads are selected by song ID inside the row, not passed by the list. */
+/** Metadata and callbacks remain ordinary props. Each row selects its own playback and download state. */
 export interface TrackRowProps {
   song: Track;
   index: number;
@@ -155,7 +155,7 @@ function TrackRow({
     downloadQuality = "320kbps",
     isPlaying,
     togglePlay,
-  } = useTrackPlayer(song.id);
+  } = useTrackPlayer(song.id, song.playlistItemId);
   const rowRef = useRef<HTMLDivElement>(null);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const [contextPoint, setContextPoint] = useState<{ x: number; y: number } | null>(null);

@@ -22,6 +22,7 @@ import {
 } from "./PlayerContext";
 import { createQueueSnapshot, queueStorageKey } from "../utils/queuePersistence";
 import * as remoteSessionModule from "../hooks/useRemoteSession";
+import { playlistOrder, playlistPlaybackContext } from "../utils/playlistPlayback";
 
 import {
   getCurrentSession,
@@ -29,6 +30,7 @@ import {
   getAutoplayTracks,
   getPlaylist,
   getRandomSongs,
+  getTrackCollection,
   getStarred,
   getStreamUrl,
   inspectAudioStream,
@@ -55,6 +57,7 @@ jest.mock("../api/musicdeck", () => ({
   getAutoplayTracks: jest.fn(),
   getPlaylist: jest.fn(),
   getRandomSongs: jest.fn(),
+  getTrackCollection: jest.fn(),
   RECOMMENDATION_FEEDBACK_CHANGED_EVENT: "musicdeck:recommendation-feedback-changed",
   getStarred: jest.fn(),
   getStreamUrl: jest.fn(),
@@ -82,6 +85,8 @@ const songs = [
   { id: "song-2", title: "Song two" },
   { id: "song-3", title: "Song three" },
 ];
+
+const librarySelection = { query: { query: "live", sort: "title-asc", favoritesOnly: false, unplayedOnly: false }, trackId: null, shuffle: true };
 
 const playlistSongs = [
   { id: "playlist-1", title: "Playlist one" },
@@ -2136,6 +2141,33 @@ test("already prepared upcoming tracks start from the normalized cache without d
   expect(activeAudio(container).volume).toBe(1);
 });
 
+test("retargeting a prepared track holds its position and leaves prior tracks out of analysis", async () => {
+  jest.useFakeTimers();
+  try {
+    const { container } = renderPlayer({ normalize: true });
+    const url = normalizedUrl("b");
+    prepareNormalizedPlayback.mockImplementation(id => Promise.resolve(id === "song-2"
+      ? { status: "ready", streamUrl: url, gainDb: -6, integratedLufs: -16, truePeakDb: -2,
+        loudness: { integratedLufs: -10, truePeakDb: -1 } }
+      : { status: "unavailable" }));
+    await playerReady();
+    fireEvent.click(screen.getByText("album-start"));
+    await act(async () => {});
+    fireEvent.click(screen.getByText("next"));
+    await waitFor(() => expect(activeAudio(container)).toHaveAttribute("src", url));
+    const { audio, loads } = streamingDeck(container);
+    startDeckPlaying(audio, 180, 24);
+    fireEvent.timeUpdate(audio);
+    fireEvent.click(screen.getByText("target-18"));
+    await act(async () => jest.advanceTimersByTime(8000));
+    expect(audio).toHaveAttribute("src", url);
+    expect(audio.currentTime).toBe(24);
+    expect(audio.volume).toBeCloseTo(10 ** (-2 / 20));
+    expect(loads).toEqual([]);
+    expect(prepareNormalizedPlayback).not.toHaveBeenCalledWith("song-1", null, null, expect.anything(), "original", -18);
+  } finally { jest.useRealTimers(); }
+});
+
 test("an expired normalized stream falls back at the same position and applies only the original gain", async () => {
   jest.useFakeTimers();
   try {
@@ -3034,12 +3066,20 @@ test("remote now-playing and transport controls reflect the selected device with
     return { status: "connected", devices: [active], deviceId: "phone", activeDevice: active, isRemote: true, playback,
       enabled: true, busy: false, error: "", name: "Phone", command, transfer: jest.fn(), enable: jest.fn(), rename: jest.fn(), clearError: jest.fn() };
   });
+  const playlist = { id: "large-playlist", name: "Large playlist" };
+  const playlistView = { query: "", sort: "custom", descending: false, locale: "en-US" };
+  const playlistTracks = Array.from({ length: 1001 }, (_, index) => ({
+    id: `track-${index % 1000}`, playlistItemId: `entry-${index}`,
+  }));
   function LocalRestore() {
-    const { currentSong, restoreSavedQueue } = usePlayer();
+    const { currentSong, restoreSavedQueue, playLibraryTracks, playQueue, playContext } = usePlayer();
     return <>
       <div data-testid="live-metadata">{currentSong?.artist} / {currentSong?.coverArt}</div>
       <button onClick={() => restoreSavedQueue({ version: 2, entries: [{ entryId: "local-saved", track: songs[0] }] },
         { ...checkpoint, wasPlaying: false })}>restore-local-queue</button>
+      <button onClick={() => playLibraryTracks(librarySelection, new AbortController().signal)}>remote library shuffle</button>
+      <button onClick={() => playQueue(playlistTracks, 0, playlistPlaybackContext(playlist, playlistView), playlistView)}>remote playlist</button>
+      <button onClick={() => playContext(playlistTracks, 1000, playlistPlaybackContext(playlist, playlistView), playlistView)}>remote playlist from entry</button>
     </>;
   }
   const view = renderPlayer({ children: <><PlayerHarness /><LocalRestore /></> });
@@ -3076,6 +3116,19 @@ test("remote now-playing and transport controls reflect the selected device with
       type: "PLAY_SELECTION", tracks: songs.map(song => expect.objectContaining({ id: song.id })),
       start_index: 1, from_here: true, context: { type: "album", id: "", name: "Album", coverArt: null },
     });
+    fireEvent.click(screen.getByRole("button", { name: "remote library shuffle" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "PLAY_LIBRARY_TRACKS", selection: librarySelection });
+    expect(getTrackCollection).not.toHaveBeenCalled();
+    const order = playlistOrder(playlistTracks);
+    fireEvent.click(screen.getByRole("button", { name: "remote playlist", exact: true }));
+    expect(command).toHaveBeenLastCalledWith({ type: "PLAY_PLAYLIST", selection: {
+      playlistId: playlist.id, startIndex: 0, fromHere: false, view: playlistView, order,
+    } });
+    fireEvent.click(screen.getByRole("button", { name: "remote playlist from entry" }));
+    expect(command).toHaveBeenLastCalledWith({ type: "PLAY_PLAYLIST", selection: {
+      playlistId: playlist.id, startIndex: 1000, fromHere: true, view: playlistView, order,
+    } });
+    expect(getPlaylist).not.toHaveBeenCalled();
     const commandsSent = command.mock.calls.length;
     playback = { ...active, track: active.current_track, is_playing: true, revision: 2, queue: {
       ...checkpoint, repeatAll: true, shuffle: true, loopPlaylistId: "test-playlist",
@@ -3171,6 +3224,116 @@ test("loads a controller's selection on the active player from the requested tra
     expect(acknowledged).toBe(true);
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(1);
     expect(command).not.toHaveBeenCalled();
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test("the active device resolves a 1,205-track library reference and retains the complete shuffled repeat queue", async () => {
+  let adapter;
+  const session = remoteSessionModule.useRemoteSession();
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return session;
+  });
+  const tracks = Array.from({ length: 1205 }, (_, index) => ({ id: `large-${index}`, title: `Track ${index}` }));
+  getTrackCollection.mockResolvedValue(tracks);
+  const view = renderPlayer();
+  try {
+    await playerReady();
+    const controller = new AbortController();
+    let result;
+    await act(async () => {
+      result = adapter.command({ type: "PLAY_LIBRARY_TRACKS", selection: librarySelection }, controller.signal);
+    });
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent(/^large-/));
+    const audio = activeAudio(view.container);
+    startDeckPlaying(audio, 200, 0);
+    fireEvent.playing(audio);
+    await act(async () => { await result; });
+    expect(getTrackCollection).toHaveBeenCalledWith(librarySelection.query, controller.signal);
+    expect(adapter.queue().shuffle).toBe(true);
+    expect(adapter.queue().entries).toHaveLength(1205);
+    expect(new Set(adapter.queue().entries.map(entry => entry.trackId))).toEqual(new Set(tracks.map(track => track.id)));
+    await act(async () => { await adapter.command({ type: "TOGGLE_REPEAT" }); });
+    expect(adapter.queue().repeatAll).toBe(true);
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test.each([999, 1000, 1001])("resolves a %i-entry playlist with duplicate tracks in exact order on the active device", async count => {
+  let adapter;
+  const session = remoteSessionModule.useRemoteSession();
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return session;
+  });
+  const viewOptions = { query: "", sort: "custom", descending: false, locale: "en-US" };
+  const entry = Array.from({ length: count }, (_, index) => ({
+    id: `playlist-track-${index % (count - 1)}`, playlistItemId: `playlist-occurrence-${index}`, title: `Song ${index}`,
+  }));
+  const playlist = { id: "remote-playlist", name: "Remote set", entry };
+  const view = renderPlayer();
+  getPlaylist.mockResolvedValue(playlist);
+  try {
+    await playerReady();
+    const controller = new AbortController();
+    let result;
+    await act(async () => {
+      result = adapter.command({ type: "PLAY_PLAYLIST", selection: {
+        playlistId: playlist.id, startIndex: 0, fromHere: false, view: viewOptions, order: playlistOrder(entry),
+      } }, controller.signal);
+    });
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("playlist-track-0"));
+    const audio = activeAudio(view.container);
+    startDeckPlaying(audio, 200, 0);
+    fireEvent.playing(audio);
+    await act(async () => { await result; });
+    expect(getPlaylist).toHaveBeenCalledWith(playlist.id, controller.signal, { cache: "no-store" });
+    const queue = adapter.queue();
+    expect(queue.entries.map(row => [row.trackId, row.resume.occurrenceId]))
+      .toEqual(entry.map(track => [track.id, track.playlistItemId]));
+    expect(new Set(queue.entries.map(row => row.occurrenceId)).size).toBe(count);
+    expect(queue.context).toMatchObject({ id: playlist.id, type: "playlist" });
+  } finally { view.unmount(); hook.mockRestore(); }
+});
+
+test("starts at the chosen filtered and sorted playlist occurrence and rejects stale or empty views", async () => {
+  let adapter;
+  const session = remoteSessionModule.useRemoteSession();
+  const hook = jest.spyOn(remoteSessionModule, "useRemoteSession").mockImplementation((_user, player) => {
+    adapter = player;
+    return session;
+  });
+  const entry = [
+    { id: "same", playlistItemId: "first", title: "Echo 2", artist: "Café" },
+    { id: "other", playlistItemId: "second", title: "Echo 10", artist: "Café" },
+    { id: "same", playlistItemId: "third", title: "Echo 2", artist: "Café" },
+    { id: "omitted", playlistItemId: "fourth", title: "Unrelated", artist: "Other" },
+  ];
+  const playlist = { id: "remote-playlist", name: "Remote set", entry };
+  const command = { type: "PLAY_PLAYLIST", selection: { playlistId: playlist.id, startIndex: 1, fromHere: true,
+    view: { query: "cafe", sort: "title", descending: true, locale: "en-US" },
+    order: playlistOrder([entry[1], entry[0], entry[2]]),
+  } };
+  const view = renderPlayer();
+  getPlaylist.mockResolvedValue(playlist);
+  try {
+    await playerReady();
+    let result;
+    await act(async () => { result = adapter.command(command); });
+    await waitFor(() => expect(screen.getByTestId("current-song")).toHaveTextContent("same"));
+    const audio = activeAudio(view.container);
+    startDeckPlaying(audio, 200, 0);
+    fireEvent.playing(audio);
+    await act(async () => { await result; });
+    const queue = adapter.queue();
+    expect(queue.entries.map(row => row.trackId)).toEqual(["same", "same"]);
+    expect(new Set(queue.entries.map(row => row.occurrenceId)).size).toBe(2);
+    expect(queue.context).toMatchObject({ id: playlist.id, type: "collection", playlistLoopId: playlist.id });
+
+    getPlaylist.mockResolvedValueOnce({ ...playlist, entry: [entry[2], entry[1], entry[0], entry[3]] });
+    await act(async () => { await expect(adapter.command(command)).rejects.toThrow(/playlist order changed/i); });
+    getPlaylist.mockResolvedValueOnce({ ...playlist, entry: [] });
+    await act(async () => { await expect(adapter.command(command)).rejects.toThrow(/no matching playlist tracks/i); });
+    expect(adapter.queue()).toEqual(queue);
   } finally { view.unmount(); hook.mockRestore(); }
 });
 

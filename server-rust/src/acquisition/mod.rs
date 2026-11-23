@@ -5,14 +5,20 @@
 //! [`canonical_manual_acquisition_url`], [`SqliteImportJobRepository`], [`ImportJob`],
 //! [`SpotifyPlaylistImportService`], and [`AcquisitionService`].
 
+mod admission;
+mod catalog_audio;
 mod input;
 mod playlist_files;
 mod playlist_timeout;
+mod progress;
 pub mod repository;
+mod resume;
+mod retention;
 pub mod service;
 pub mod spotdl;
 pub use input::{AcquisitionKind, AcquisitionResult};
 pub use playlist_timeout::PlaylistImportTimeout;
+pub use progress::TrackIssue;
 
 pub use repository::{
     ImportEntry, ImportEntryStatus, ImportJob, PlaylistImportForbiddenError,
@@ -36,6 +42,68 @@ mod tests {
     use super::*;
     use crate::db::{DbPool, run_migrations};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn source_errors_are_specific_and_only_provider_errors_trigger_cooldown() {
+        let pool = DbPool::connect_memory().await.unwrap();
+        run_migrations(&pool, None).await.unwrap();
+        let cases = [
+            (
+                "AudioProviderError: HTTP Error 403: Forbidden",
+                "provider-forbidden",
+            ),
+            ("Spotify HTTP Error 429: Too Many Requests", "rate-limited"),
+            ("Sign in to confirm you're not a bot", "bot-challenge"),
+            (
+                "No supported JavaScript runtime could be found",
+                "missing-js-runtime",
+            ),
+            (
+                "ModuleNotFoundError: No module named 'yt_dlp'",
+                "downloader-dependency",
+            ),
+            (
+                "PermissionError: Permission denied: '/data/.spotdl/cache'",
+                "downloader-cache",
+            ),
+            (
+                "Cookie file does not look like a Netscape format cookies file",
+                "auth-required",
+            ),
+            (
+                "requests.exceptions.ReadTimeout: provider timed out",
+                "provider-timeout",
+            ),
+            ("Connection reset by peer", "provider-network"),
+            ("AudioProviderError: No results found", "no-match"),
+            (
+                "FFmpegError: Invalid data found when processing input",
+                "bad-media-input",
+            ),
+            ("AudioProviderError", "general"),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(classify_spotdl_error(output), expected);
+        }
+        super::admission::note_provider_failure(&pool, "no-match").await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition_provider_cooldown")
+            .fetch_one(pool.inner())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        super::admission::note_provider_failure(&pool, "rate-limited").await;
+        super::admission::note_provider_failure(&pool, "bot-challenge").await;
+        let (until, streak): (i64, i64) = sqlx::query_as("SELECT blocked_until,recent_failures FROM acquisition_provider_cooldown WHERE provider='spotdl'")
+            .fetch_one(pool.inner()).await.unwrap();
+        assert_eq!(streak, 2);
+        assert!(until - chrono::Utc::now().timestamp_millis() > 60_000);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            super::admission::wait_for_provider(&pool, &cancel, || std::future::ready(())).await,
+            Err(crate::tasks::ProcessError::Cancelled)
+        );
+    }
 
     #[test]
     fn parses_spotdl_progress_and_validates_canonical_acquisition_urls() {

@@ -17,17 +17,17 @@ function sourceSlot(index: number, omitted: readonly number[]) {
   return index + low;
 }
 
-function pagesForRange(start: number, end: number, omitted: readonly number[]) {
+function pagesForRange(start: number, end: number, omitted: readonly number[], pageSize: number) {
   const pages: number[] = [];
-  const first = Math.floor(sourceSlot(start, omitted) / PAGE_SIZE);
-  const last = Math.floor(sourceSlot(Math.max(start, end - 1), omitted) / PAGE_SIZE);
+  const first = Math.floor(sourceSlot(start, omitted) / pageSize);
+  const last = Math.floor(sourceSlot(Math.max(start, end - 1), omitted) / pageSize);
   for (let page = first; page <= last; page += 1) pages.push(page);
   return pages;
 }
 
 /** Sparse random-access pages keep the server's total slot count independent
  * of the cache. Fast jumps request the destination, not every preceding page. */
-export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item: T) => boolean) {
+export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item: T) => boolean, pageSize = PAGE_SIZE) {
   const [view, setView] = useState({ total: 0, loading: true, error: "", revision: 0 });
   const cache = useRef(new Map<number, T[]>());
   const pending = useRef(new Map<number, AbortController>());
@@ -59,12 +59,11 @@ export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item:
         const controller = new AbortController();
         requests.set(page, controller);
         Promise.resolve().then(() => loadPage({
-          offset: page * PAGE_SIZE, limit: PAGE_SIZE, signal: controller.signal,
+          offset: page * pageSize, limit: pageSize, signal: controller.signal,
         })).then((result) => {
           if (generation.current !== run || controller.signal.aborted) return;
           if (!Number.isInteger(result.total) || result.total < 0 ||
-            result.items.length > PAGE_SIZE ||
-            result.items.length !== Math.min(PAGE_SIZE, Math.max(0, result.total - page * PAGE_SIZE))) {
+            result.items.length !== Math.min(pageSize, Math.max(0, result.total - page * pageSize))) {
             throw new Error("The library returned an invalid page. Please reload.");
           }
           if (snapshotRevision.current !== result.revision ||
@@ -78,10 +77,10 @@ export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item:
           cache.current.set(page, result.items);
           const hidden = new Set(omitted.current);
           result.items.forEach((item, index) => {
-            if (excluded.current?.(item)) hidden.add(page * PAGE_SIZE + index);
+            if (excluded.current?.(item)) hidden.add(page * pageSize + index);
           });
           omitted.current = [...hidden].sort((left, right) => left - right);
-          wanted.current = pagesForRange(range.current.start, range.current.end, omitted.current);
+          wanted.current = pagesForRange(range.current.start, range.current.end, omitted.current, pageSize);
           for (const key of cache.current.keys()) {
             if (cache.current.size <= MAX_CACHED_PAGES) break;
             if (!wanted.current.includes(key)) cache.current.delete(key);
@@ -107,36 +106,36 @@ export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item:
       requests.clear();
       pumpRef.current = () => {};
     };
-  }, [loadPage]);
+  }, [loadPage, pageSize]);
 
   const onRangeChange = useCallback((start: number, end: number) => {
     range.current = { start, end };
-    const pages = pagesForRange(start, end, omitted.current);
+    const pages = pagesForRange(start, end, omitted.current, pageSize);
     wanted.current = pages;
     // Stale destinations must not occupy both network slots while flinging.
     pending.current.forEach((controller, page) => {
       if (!pages.includes(page)) controller.abort();
     });
     pumpRef.current();
-  }, []);
+  }, [pageSize]);
   useEffect(() => {
     excluded.current = excludeItem;
     const hidden = new Set(omitted.current);
     cache.current.forEach((items, page) => items.forEach((item, index) => {
-      if (excludeItem?.(item)) hidden.add(page * PAGE_SIZE + index);
+      if (excludeItem?.(item)) hidden.add(page * pageSize + index);
     }));
     if (hidden.size === omitted.current.length) return;
     omitted.current = [...hidden].sort((left, right) => left - right);
     setView((old) => ({ ...old, total: (snapshotTotal.current ?? old.total) - hidden.size, revision: old.revision + 1 }));
     onRangeChange(range.current.start, range.current.end);
-  }, [excludeItem, onRangeChange]);
+  }, [excludeItem, onRangeChange, pageSize]);
   const getItem = useCallback((index: number) => {
     const source = sourceSlot(index, omitted.current);
-    return cache.current.get(Math.floor(source / PAGE_SIZE))?.[source % PAGE_SIZE];
+    return cache.current.get(Math.floor(source / pageSize))?.[source % pageSize];
   },
     // The revision makes new pages visible to memoized lists.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [view.revision]);
+    [view.revision, pageSize]);
   const retry = useCallback(() => {
     failed.current.clear();
     setView((old) => ({ ...old, error: "" }));
@@ -149,19 +148,19 @@ export function usePagedLibrary<T>(loadPage: PageLoader<T>, excludeItem?: (item:
     const pages = new Map<number, T[]>();
     for (const slot of sources) {
       if (!Number.isInteger(slot) || slot < 0 || total === undefined || slot >= total) throw new Error("The library selection is no longer valid. Select the tracks again.");
-      const page = Math.floor(slot / PAGE_SIZE);
+      const page = Math.floor(slot / pageSize);
       if (pages.has(page)) continue;
       if (signal.aborted) throw new DOMException("Loading selected tracks was cancelled.", "AbortError");
-      const result = await loadPage({ offset: page * PAGE_SIZE, limit: PAGE_SIZE, signal });
+      const result = await loadPage({ offset: page * pageSize, limit: pageSize, signal });
       if (signal.aborted) throw new DOMException("Loading selected tracks was cancelled.", "AbortError");
       if (run !== generation.current || result.total !== total || result.revision !== revision) throw new Error("The library changed while loading selected tracks. Select them again.");
       pages.set(page, result.items);
     }
     return sources.map((slot) => {
-      const item = pages.get(Math.floor(slot / PAGE_SIZE))?.[slot % PAGE_SIZE];
+      const item = pages.get(Math.floor(slot / pageSize))?.[slot % pageSize];
       if (item === undefined || excluded.current?.(item)) throw new Error("A selected track is no longer available. Select the tracks again.");
       return item;
     });
-  }, [loadPage]);
+  }, [loadPage, pageSize]);
   return { ...view, getItem, onRangeChange, retry, loadSelection, collectionRevision: snapshotRevision.current };
 }

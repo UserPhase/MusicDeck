@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 pub const SPOTDL_LIBRARY_TEMPLATE: &str =
     "{artists}/{album}/{artists} - {title} [{track-id}].{output-ext}";
 
-/// Supported spotDL output container formats (`SpotDLOutputFormat`).
+/// Output containers shared by spotDL and the Deezer downloader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SpotDLOutputFormat {
@@ -57,11 +57,19 @@ impl SpotDLOutputFormat {
             "ogg" => Ok(Self::Ogg),
             "opus" => Ok(Self::Opus),
             "wav" => Ok(Self::Wav),
-            _ => Err(String::from("Choose a supported spotDL audio format")),
+            _ => Err(String::from("Choose a supported download audio format")),
         }
     }
 
-    /// Concrete container argument passed to `spotdl --format`.
+    pub(crate) fn from_plugin_config(config: &serde_json::Value) -> Result<Self, String> {
+        match config.get("outputFormat") {
+            None | Some(serde_json::Value::Null) => Ok(Self::default()),
+            Some(serde_json::Value::String(format)) => Self::parse(Some(format)),
+            Some(_) => Err(String::from("Choose a supported download audio format")),
+        }
+    }
+
+    /// On-disk extension and concrete `spotdl --format` argument.
     #[must_use]
     pub const fn container_arg(self) -> &'static str {
         match self {
@@ -71,6 +79,13 @@ impl SpotDLOutputFormat {
             Self::Ogg => "ogg",
             Self::Opus => "opus",
             Self::Wav => "wav",
+        }
+    }
+
+    pub(super) const fn ytdlp_format_arg(self) -> &'static str {
+        match self {
+            Self::Ogg => "vorbis",
+            _ => self.container_arg(),
         }
     }
 
@@ -131,11 +146,15 @@ pub fn canonical_spotify_url(raw: &str) -> Result<String, AcquisitionValidationE
     if url.host_str() != Some("open.spotify.com") {
         return Err(AcquisitionValidationError);
     }
-    let re = Regex::new(
-        r"^/(?:intl-[a-zA-Z0-9-]+/)?(track|album|playlist|artist)/([a-zA-Z0-9]{1,64})/?$",
-    )
-    .expect("valid regex");
-    let caps = re.captures(url.path()).ok_or(AcquisitionValidationError)?;
+    static SPOTIFY_PATH: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^/(?:intl-[a-zA-Z0-9-]+/)?(track|album|playlist|artist)/([a-zA-Z0-9]{1,64})/?$",
+        )
+        .expect("valid regex")
+    });
+    let caps = SPOTIFY_PATH
+        .captures(url.path())
+        .ok_or(AcquisitionValidationError)?;
     let kind = caps.get(1).unwrap().as_str();
     let id = caps.get(2).unwrap().as_str();
     Ok(format!("https://open.spotify.com/{kind}/{id}"))
@@ -225,6 +244,21 @@ pub struct TrackImportRequest {
     pub timeout_ms: Option<u64>,
     #[serde(skip)]
     pub(crate) operands: Vec<Operand>,
+    #[serde(skip)]
+    pub(crate) saved_batch: bool,
+    #[serde(skip)]
+    pub(crate) audio_search: AudioSearch,
+}
+
+pub(super) const BATCH_INPUT: &str = "musicdeck-batch-input.spotdl";
+pub(super) const OCCURRENCES_FILE: &str = "musicdeck-occurrences.spotdl";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum AudioSearch {
+    #[default]
+    Standard,
+    Edition,
+    SoundCloud,
 }
 
 /// Validates a [`TrackImportRequest`] against the acquisition URL & query security policy.
@@ -333,9 +367,9 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
     } else if lower.contains("skipping") && lower.contains("(file already exists)") {
         progress.stage = Some(String::from("processing"));
         matched = true;
-    } else if lower.contains("metadata")
-        || lower.contains("tagging")
+    } else if lower.contains("tagging")
         || lower.contains("applying tags")
+        || lower.contains(": embedding")
     {
         progress.stage = Some(String::from("tagging"));
         matched = true;
@@ -347,8 +381,9 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
         matched = true;
     }
 
-    let pct_re = Regex::new(r"(\d{1,3}(?:\.\d+)?)%").expect("valid regex");
-    if let Some(caps) = pct_re.captures(trimmed) {
+    static PERCENT: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(\d{1,3}(?:\.\d+)?)%").expect("valid regex"));
+    if let Some(caps) = PERCENT.captures(trimmed) {
         if let Ok(p) = caps[1].parse::<f64>() {
             if (0.0..=100.0).contains(&p) {
                 progress.percent = Some(p.round());
@@ -357,18 +392,21 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
         }
     }
 
-    let speed_re = Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)/s").expect("valid regex");
-    if let Some(caps) = speed_re.captures(trimmed) {
+    static SPEED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)/s").expect("valid regex")
+    });
+    if let Some(caps) = SPEED.captures(trimmed) {
         if let Some(bps) = parse_byte_size_with_unit(&caps[1], &caps[2]) {
             progress.speed_bytes_per_second = Some(bps);
             matched = true;
         }
     }
 
-    let bytes_re =
+    static BYTES: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*([kmgt]i?b)\s*/\s*(\d+(?:\.\d+)?)\s*([kmgt]i?b)")
-            .expect("valid regex");
-    if let Some(caps) = bytes_re.captures(trimmed) {
+            .expect("valid regex")
+    });
+    if let Some(caps) = BYTES.captures(trimmed) {
         progress.bytes_downloaded = parse_byte_size_with_unit(&caps[1], &caps[2]);
         progress.total_bytes = parse_byte_size_with_unit(&caps[3], &caps[4]);
         matched = true;
@@ -392,29 +430,350 @@ pub fn parse_spotdl_progress(line: &str) -> Option<AcquisitionProgress> {
 #[must_use]
 pub fn classify_spotdl_error(output: &str) -> &'static str {
     let lower = output.to_ascii_lowercase();
-    if lower.contains("rate/request limit")
-        || lower.contains("rate limit")
-        || lower.contains("http 429")
-        || lower.contains("too many requests")
+    if [
+        "rate/request limit",
+        "rate limit",
+        "too many requests",
+        "http 429",
+        "http error 429",
+        "status code 429",
+        "response [429]",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
     {
         "rate-limited"
-    } else if lower.contains("sign in to confirm")
-        || lower.contains("cookies are required")
-        || lower.contains("use --cookies")
-        || lower.contains("cookie file is invalid")
-        || lower.contains("login required")
-        || lower.contains("age-restricted")
+    } else if [
+        "confirm you\u{2019}re not a bot",
+        "confirm you're not a bot",
+        "confirm you are not a bot",
+        "bot challenge",
+        "captcha",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "bot-challenge"
+    } else if [
+        "no supported javascript runtime",
+        "no javascript runtime",
+        "javascript runtime is required",
+        "deno is not installed",
+        "deno executable not found",
+        "javascript challenge provider",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "missing-js-runtime"
+    } else if [
+        "cookies are required",
+        "use --cookies",
+        "cookie file is invalid",
+        "does not look like a netscape format cookies file",
+        "could not find cookies database",
+        "invalid_grant",
+        "access token expired",
+        "login required",
+        "age-restricted",
+        "http error 401",
+        "invalid client",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
     {
         "auth-required"
-    } else if lower.contains("no results found")
-        || lower.contains("audioprovidererror")
-        || lower.contains("could not match")
+    } else if [
+        "http 403",
+        "http error 403",
+        "status code 403",
+        "403 forbidden",
+        "response [403]",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "provider-forbidden"
+    } else if [
+        "ffmpeg not found",
+        "ffmpeg was not found",
+        "ffmpeg is not installed",
+        "ffprobe and ffmpeg not found",
+        "ffmpeg and ffprobe not found",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "missing-converter"
+    } else if [
+        "no module named 'yt_dlp'",
+        "no module named 'ytmusicapi'",
+        "no module named 'spotipy'",
+        "update yt-dlp",
+        "yt-dlp is outdated",
+        "unable to extract initial player response",
+        "yt-dlp-ejs is not installed",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "downloader-dependency"
+    } else if [
+        "permissionerror",
+        "permission denied",
+        "database is locked",
+        "database disk image is malformed",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+        && [
+            ".spotdl",
+            "yt-dlp/cache",
+            "yt-dlp\\cache",
+            "cookie",
+            "cache",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        "downloader-cache"
+    } else if [
+        "timed out",
+        "timeouterror",
+        "readtimeout",
+        "connecttimeout",
+        "http error 504",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "provider-timeout"
+    } else if [
+        "invalid data found when processing input",
+        "error opening input",
+        "moov atom not found",
+        "invalid input",
+        "error decoding",
+        "invalid audio",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "bad-media-input"
+    } else if [
+        "ffmpegerror",
+        "ffmpeg exited",
+        "ffmpeg conversion failed",
+        "conversion failed",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "ffmpeg-error"
+    } else if [
+        "no results found",
+        "no match found",
+        "could not match",
+        "could not find audio for",
+        "no audio source found",
+        "no matching song",
+        "no matches found",
+        "no album matches found on spotify",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
     {
         "no-match"
-    } else if lower.contains("ffmpeg") && (lower.contains("not found") || lower.contains("error")) {
-        "ffmpeg-error"
+    } else if [
+        "requested format is not available",
+        "video unavailable",
+        "private video",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "source-unavailable"
+    } else if [
+        "connection reset",
+        "remote end closed connection",
+        "connection refused",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "network is unreachable",
+        "http error 502",
+        "http error 503",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        "provider-network"
     } else {
         "general"
+    }
+}
+
+pub(super) fn downloader_error_message(code: &str) -> &'static str {
+    match code {
+        "rate-limited" => {
+            "The source provider is rate limiting downloads. Try again after the cooldown."
+        }
+        "bot-challenge" => {
+            "The source provider returned a bot challenge. Check the downloader's runtime and sign-in configuration."
+        }
+        "missing-js-runtime" => {
+            "The downloader could not find a supported JavaScript runtime for the source."
+        }
+        "auth-required" => "The source provider requires valid sign-in credentials or cookies.",
+        "provider-forbidden" => {
+            "The source provider refused the request (HTTP 403). Wait for the cooldown and check provider access before retrying."
+        }
+        "missing-converter" => "FFmpeg is missing or could not be found by the downloader.",
+        "downloader-dependency" => {
+            "The downloader has a missing or incompatible dependency. Update the server's spotDL and yt-dlp installation."
+        }
+        "downloader-cache" => {
+            "The downloader could not access its cache or cookies. Check that the server can read the cookie file and write to the downloader cache."
+        }
+        "bad-media-input" => "The conversion tool could not open or decode the downloaded audio.",
+        "ffmpeg-error" => "FFmpeg failed while converting the audio.",
+        "no-match" => "The downloader could not match this recording to an audio source.",
+        "catalog-unavailable" => {
+            "Deezer did not return complete metadata for the requested release."
+        }
+        "catalog-limit" => "The Deezer downloader supports batches of up to 100 tracks.",
+        "catalog-ambiguous" => {
+            "Multiple YouTube Music recordings fit the Deezer metadata. Choose a specific source to avoid the wrong version."
+        }
+        "catalog-no-match" => {
+            "YouTube Music did not return a recording matching the Deezer title, artist, album and duration."
+        }
+        "catalog-runtime" => {
+            "The Deezer downloader needs Python with ytmusicapi, yt-dlp, and Mutagen installed. Check PYTHON_PATH."
+        }
+        "catalog-tagging" => "Could not write or verify Deezer audio tags.",
+        "download-format-missing" => {
+            "The downloader did not produce audio in the configured format."
+        }
+        "source-unavailable" => {
+            "The matched recording or media format is unavailable from the source provider."
+        }
+        "recording-mismatch" => {
+            "The downloaded audio could not be verified against the requested recording and duration."
+        }
+        "provider-network" => {
+            "The downloader lost its connection to the source provider. Check the server's internet connection and retry."
+        }
+        "provider-timeout" => {
+            "The source provider did not respond in time. Retry when the provider is reachable."
+        }
+        "missing-downloader" => {
+            "The server could not launch spotDL. Check its configured executable path."
+        }
+        "download-timeout" => {
+            "The download reached its time limit. Retry to resume missing tracks."
+        }
+        _ => "The downloader did not produce usable audio.",
+    }
+}
+
+pub(super) fn downloader_failure_code(message: &str) -> Option<&str> {
+    if message.starts_with("Failed to spawn process ") {
+        return Some("missing-downloader");
+    }
+    message
+        .split_once("spotDL failed (")
+        .or_else(|| message.split_once("Deezer download failed ("))
+        .and_then(|(_, suffix)| suffix.split_once("): "))
+        .map(|(code, _)| code)
+}
+
+async fn error_by_track(
+    output: &str,
+    started: std::time::SystemTime,
+) -> HashMap<String, &'static str> {
+    static CONVERSION_LOG: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"ffmpeg_error_[0-9-]{19}\.txt").expect("valid regex")
+    });
+    let details: HashMap<_, _> = output.lines().filter_map(track_error_line).collect();
+    let mut references = HashMap::new();
+    for details in details.values() {
+        if let Some(report) = CONVERSION_LOG.find(details) {
+            *references.entry(report.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut errors = HashMap::new();
+    for (id, details) in details {
+        let mut code = classify_spotdl_error(details);
+        if code == "ffmpeg-error"
+            && let Some(report) = CONVERSION_LOG.find(details)
+            && references.get(report.as_str()) == Some(&1)
+            && let Some(report_code) = read_conversion_code(report.as_str(), started).await
+        {
+            code = report_code;
+        }
+        errors.insert(id.to_owned(), code);
+    }
+    errors
+}
+
+fn track_error_line(line: &str) -> Option<(&str, &str)> {
+    let (_, tail) = line.split_once("https://open.spotify.com/track/")?;
+    let (id, details) = tail.split_once(" - ")?;
+    (!id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some((id, details))
+}
+
+pub(super) async fn saved_track_errors(
+    directory: &Path,
+    started: std::time::SystemTime,
+) -> HashMap<String, &'static str> {
+    let path = directory.join("musicdeck-errors.txt");
+    if !tokio::fs::symlink_metadata(&path).await.is_ok_and(|info| {
+        info.is_file() && info.modified().is_ok_and(|modified| modified >= started)
+    }) {
+        return HashMap::new();
+    }
+    let output = super::playlist_files::read_playlist_artifact(&path)
+        .await
+        .unwrap_or_default();
+    error_by_track(&output, started).await
+}
+
+async fn read_conversion_code(
+    filename: &str,
+    started: std::time::SystemTime,
+) -> Option<&'static str> {
+    let home = PathBuf::from(std::env::var_os(if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    })?);
+    let mut root = home.join(".spotdl");
+    if cfg!(target_os = "linux") {
+        let xdg = home.join(".config/spotdl");
+        if tokio::fs::metadata(&xdg)
+            .await
+            .is_ok_and(|info| info.is_dir())
+        {
+            root = xdg;
+        }
+    }
+    let report = root.join("errors").join(filename);
+    let info = tokio::fs::symlink_metadata(&report).await.ok()?;
+    if !info.is_file() || info.len() > 128 * 1024 || info.modified().ok()? < started {
+        return None;
+    }
+    let canonical = tokio::fs::canonicalize(&report).await.ok()?;
+    let parent = tokio::fs::canonicalize(&home).await.ok()?;
+    if !canonical.starts_with(parent) {
+        return None;
+    }
+    let contents = super::playlist_files::read_playlist_artifact(&canonical)
+        .await
+        .ok()?;
+    match classify_spotdl_error(&contents) {
+        code @ ("bad-media-input" | "missing-converter") => Some(code),
+        _ => None,
     }
 }
 
@@ -436,9 +795,33 @@ pub struct SpotDLDiagnosticResult {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpotDLDownloadError {
     #[error(transparent)]
-    Process(#[from] ProcessError),
+    Process(ProcessError),
     #[error("{0}")]
     Download(String),
+    #[error("spotDL failed ({code}): {message}")]
+    Classified {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+impl SpotDLDownloadError {
+    fn classified(code: &'static str) -> Self {
+        Self::Classified {
+            code,
+            message: downloader_error_message(code),
+        }
+    }
+}
+
+impl From<ProcessError> for SpotDLDownloadError {
+    fn from(error: ProcessError) -> Self {
+        match error {
+            ProcessError::SpawnFailed { .. } => Self::classified("missing-downloader"),
+            ProcessError::TimedOut(_) => Self::classified("download-timeout"),
+            error => Self::Process(error),
+        }
+    }
 }
 
 /// Adapter orchestrating `spotdl` CLI executions via [`ProcessRunner`].
@@ -446,7 +829,7 @@ pub(crate) enum SpotDLDownloadError {
 pub struct SpotDLDownloaderAdapter {
     spotdl_path: String,
     ffmpeg_path: String,
-    output_format: SpotDLOutputFormat,
+    output_format: Result<SpotDLOutputFormat, String>,
     runner: Arc<dyn ProcessRunner>,
     timeout_ms: u64,
     client_id: Option<String>,
@@ -455,6 +838,7 @@ pub struct SpotDLDownloaderAdapter {
     cookie_temp: Option<Arc<tempfile::TempPath>>,
     privacy: Option<PrivacyManager>,
     startup_error: Option<String>,
+    cooldown_db: Option<DbPool>,
 }
 
 impl std::fmt::Debug for SpotDLDownloaderAdapter {
@@ -480,7 +864,7 @@ impl SpotDLDownloaderAdapter {
         Self {
             spotdl_path: std::env::var("SPOTDL_PATH").unwrap_or_else(|_| String::from("spotdl")),
             ffmpeg_path: std::env::var("FFMPEG_PATH").unwrap_or_else(|_| String::from("ffmpeg")),
-            output_format: SpotDLOutputFormat::Best,
+            output_format: Ok(SpotDLOutputFormat::Best),
             runner: Arc::new(DefaultProcessRunner::new()),
             timeout_ms: 300_000,
             client_id: None,
@@ -489,6 +873,7 @@ impl SpotDLDownloaderAdapter {
             cookie_temp: None,
             privacy: None,
             startup_error: None,
+            cooldown_db: None,
         }
     }
 
@@ -504,6 +889,18 @@ impl SpotDLDownloaderAdapter {
         crate::audio::AudioTaggerService::with_runner(Arc::clone(&self.runner))
     }
 
+    pub(super) fn catalog_tools(&self) -> (&dyn ProcessRunner, &str, Option<&PrivacyManager>) {
+        (
+            self.runner.as_ref(),
+            &self.ffmpeg_path,
+            self.privacy.as_ref(),
+        )
+    }
+
+    pub(super) fn output_format(&self) -> Result<SpotDLOutputFormat, &str> {
+        self.output_format.as_ref().copied().map_err(String::as_str)
+    }
+
     /// Overrides the executable; otherwise `SPOTDL_PATH` or `spotdl` on PATH is used.
     #[must_use]
     pub fn with_spotdl_path(mut self, path: impl Into<String>) -> Self {
@@ -512,6 +909,7 @@ impl SpotDLDownloaderAdapter {
     }
 
     pub(crate) async fn with_saved_settings(mut self, db: Option<&DbPool>) -> Self {
+        self.cooldown_db = db.cloned();
         if let Err(err) = self.load_settings(db).await {
             self.startup_error = Some(err);
         }
@@ -522,20 +920,31 @@ impl SpotDLDownloaderAdapter {
         let Some(db) = db else {
             return Ok(());
         };
-        let row: Option<(bool, String)> = sqlx::query_as(
+        let saved = sqlx::query_as::<_, (bool, String)>(
             "SELECT enabled, config_json FROM plugin_configs WHERE plugin_id = 'spotdl-downloader'",
         )
         .fetch_optional(db.inner())
         .await
-        .map_err(|_| "Could not load spotDL plugin settings")?;
-        let Some((enabled, raw)) = row else {
+        .map_err(|_| "Could not load downloader settings")
+        .and_then(|row| {
+            row.map(|(enabled, raw)| {
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .map(|config| (enabled, config))
+                    .map_err(|_| "Invalid saved downloader settings")
+            })
+            .transpose()
+        })
+        .inspect_err(|error| {
+            self.output_format = Err((*error).to_owned());
+        })?;
+        let Some((enabled, config)) = saved else {
             return Ok(());
         };
+        self.output_format = SpotDLOutputFormat::from_plugin_config(&config);
+        self.output_format().map_err(str::to_owned)?;
         if !enabled {
             return Err("The spotDL Downloader plugin is disabled".into());
         }
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|_| "Invalid saved spotDL plugin settings")?;
         let setting = |key: &str| {
             config[key]
                 .as_str()
@@ -548,7 +957,6 @@ impl SpotDLDownloaderAdapter {
         if let Some(path) = setting("ffmpegPath") {
             self.ffmpeg_path = executable_path(path)?;
         }
-        self.output_format = SpotDLOutputFormat::parse(setting("outputFormat"))?;
         self.client_id = setting("clientId").map(str::to_owned);
         self.client_secret = setting("clientSecret").map(str::to_owned);
         if self.client_id.is_some() != self.client_secret.is_some() {
@@ -591,7 +999,7 @@ impl SpotDLDownloaderAdapter {
         self.client_id = client_id;
         self.client_secret = client_secret;
         self.cookie_file = cookie_file;
-        self.output_format = output_format;
+        self.output_format = Ok(output_format);
     }
 
     /// Builds the `spotdl` command-line argument array for `request`.
@@ -642,7 +1050,9 @@ impl SpotDLDownloaderAdapter {
         });
 
         let mut args = vec![String::from("--simple-tui"), String::from("--audio")];
-        if request.broaden_audio_search {
+        if request.audio_search == AudioSearch::SoundCloud {
+            args.push("soundcloud".into());
+        } else if request.broaden_audio_search {
             args.extend([
                 String::from("soundcloud"),
                 String::from("youtube"),
@@ -651,6 +1061,17 @@ impl SpotDLDownloaderAdapter {
         } else {
             args.extend([String::from("youtube-music"), String::from("youtube")]);
         }
+        if request.audio_search == AudioSearch::Edition {
+            args.extend(["--search-query".into(), "{artist} - {title} {album}".into()]);
+        }
+        // Up to two acquisition jobs can run at once. Narrow fallback requests
+        // also use fewer workers so hard-to-match tracks don't flood providers.
+        let threads = if request.audio_search == AudioSearch::Standard {
+            "3"
+        } else {
+            "2"
+        };
+        args.extend(["--threads".into(), threads.into()]);
 
         args.extend([
             String::from("--id3-separator"),
@@ -660,7 +1081,8 @@ impl SpotDLDownloaderAdapter {
             String::from("--output"),
             output_template,
         ]);
-        args.extend(spotdl_format_args(self.output_format));
+        let format = self.output_format().map_err(|_| AcquisitionValidationError)?;
+        args.extend(spotdl_format_args(format));
         args.extend([
             String::from("--detect-formats"),
             String::from("mp3"),
@@ -711,7 +1133,9 @@ impl SpotDLDownloaderAdapter {
         }
 
         args.push("download".into());
-        if request.operands.is_empty() {
+        if request.saved_batch {
+            args.push(BATCH_INPUT.into());
+        } else if request.operands.is_empty() {
             args.push(target);
         } else {
             for operand in &request.operands {
@@ -778,6 +1202,48 @@ impl SpotDLDownloaderAdapter {
         }
     }
 
+    /// Exercises local conversion and the runtime dependencies without an upstream request.
+    pub(crate) async fn probe_runtime(&self) -> (bool, bool, bool) {
+        let options = || ProcessOptions {
+            timeout_ms: Some(5_000),
+            ..ProcessOptions::default()
+        };
+        let ffmpeg_args = [
+            "-hide_banner",
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=8000:cl=mono",
+            "-t",
+            "0.05",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "null",
+            "-",
+        ]
+        .map(str::to_owned);
+        let python_args = ["-c", "import spotdl, yt_dlp, ytmusicapi, mutagen; from spotdl.utils.deno import is_deno_installed; raise SystemExit(0 if is_deno_installed() else 2)"]
+            .map(str::to_owned);
+        let deno_args = ["--version".to_owned()];
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let (converter, packages, deno) = tokio::join!(
+            self.runner.run(&self.ffmpeg_path, &ffmpeg_args, options()),
+            self.runner.run(python, &python_args, options()),
+            self.runner.run("deno", &deno_args, options()),
+        );
+        let converter_ok = converter.is_ok_and(|result| result.exit_code == Some(0));
+        let python_status = packages.ok().and_then(|result| result.exit_code);
+        (
+            converter_ok,
+            matches!(python_status, Some(0 | 2)),
+            python_status == Some(0) || deno.is_ok_and(|result| result.exit_code == Some(0)),
+        )
+    }
+
     /// Executes a `spotdl` download request, invoking `on_progress` as stdout/stderr lines arrive.
     pub async fn download<F>(
         &self,
@@ -792,6 +1258,84 @@ impl SpotDLDownloaderAdapter {
             .map_err(|err| err.to_string())
     }
 
+    /// Resolves source metadata before any audio work starts.
+    pub(super) async fn resolve_sources<F>(
+        &self,
+        request: &TrackImportRequest,
+        cancel: CancellationToken,
+        report_stage: impl Fn(&'static str) -> F,
+    ) -> Result<String, SpotDLDownloadError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        if let Some(error) = &self.startup_error {
+            return Err(SpotDLDownloadError::Download(error.clone()));
+        }
+        let path = request.output_directory.join(OCCURRENCES_FILE);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(SpotDLDownloadError::Download(err.to_string())),
+        }
+        let mut args = self
+            .build_cli_args(request)
+            .map_err(|err| SpotDLDownloadError::Download(err.to_string()))?;
+        let operation = args.len() - request.operands.len().max(1) - 1;
+        args[operation] = "save".into();
+        let save = args
+            .iter()
+            .position(|arg| arg == "--save-file")
+            .expect("save-file argument");
+        args[save + 1] = OCCURRENCES_FILE.into();
+        // An empty list disables lyrics lookups during metadata discovery.
+        args.insert(save, "--lyrics".into());
+        if let Some(db) = &self.cooldown_db {
+            super::admission::wait_for_provider(db, &cancel, || report_stage("provider_cooldown"))
+                .await?;
+        }
+        report_stage("discovering").await;
+        let run = self.runner.run(
+            &self.spotdl_path,
+            &args,
+            ProcessOptions {
+                cwd: Some(request.output_directory.clone()),
+                cancel_token: Some(cancel),
+                timeout_ms: Some(request.timeout_ms.unwrap_or(self.timeout_ms)),
+                ..Default::default()
+            },
+        );
+        let result = if let Some(privacy) = &self.privacy {
+            privacy
+                .run_external(PrivacyCategory::Imports, run)
+                .await
+                .map_err(|err| SpotDLDownloadError::Download(err.to_string()))??
+        } else {
+            run.await?
+        };
+        let code = classify_spotdl_error(&format!("{}\n{}", result.stdout, result.stderr));
+        if result.exit_code != Some(0) {
+            if let Some(db) = &self.cooldown_db {
+                super::admission::note_provider_failure(db, code).await;
+            }
+            return Err(SpotDLDownloadError::classified(code));
+        }
+        match super::playlist_files::read_playlist_artifact(&path).await {
+            Ok(json) => Ok(json),
+            Err(_) => {
+                if let Some(db) = &self.cooldown_db {
+                    super::admission::note_provider_failure(db, code).await;
+                }
+                Err(if code == "general" {
+                    SpotDLDownloadError::Download(
+                        "spotDL did not return source track details. Check the playlist URL and server credentials.".into(),
+                    )
+                } else {
+                    SpotDLDownloadError::classified(code)
+                })
+            }
+        }
+    }
+
     pub(crate) async fn download_checked<F>(
         &self,
         request: &TrackImportRequest,
@@ -800,9 +1344,13 @@ impl SpotDLDownloaderAdapter {
     where
         F: Fn(AcquisitionProgress) + Send + Sync + 'static,
     {
-        self.download_with_cancel(request, CancellationToken::new(), on_progress)
-            .await
-            .map(|output| output.files)
+        let output = self
+            .download_with_cancel(request, CancellationToken::new(), on_progress)
+            .await?;
+        if let Some(error) = output.failure {
+            return Err(error);
+        }
+        Ok(output.files)
     }
 
     pub(super) async fn download_with_cancel<F>(
@@ -832,6 +1380,31 @@ impl SpotDLDownloaderAdapter {
         env.insert(String::from("COLUMNS"), String::from("240"));
         env.insert(String::from("NO_COLOR"), String::from("1"));
 
+        if let Some(db) = &self.cooldown_db {
+            super::admission::wait_for_provider(db, &cancel, || {
+                cb_arc(AcquisitionProgress {
+                    stage: Some("provider_cooldown".into()),
+                    ..Default::default()
+                });
+                std::future::ready(())
+            })
+            .await?;
+        }
+        cb_arc(AcquisitionProgress {
+            stage: Some("downloading".into()),
+            ..Default::default()
+        });
+        let error_log = request.output_directory.join("musicdeck-errors.txt");
+        match tokio::fs::remove_file(&error_log).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(SpotDLDownloadError::Download(
+                    "Could not prepare downloader diagnostics in the staging directory".into(),
+                ));
+            }
+        }
+        let started = std::time::SystemTime::now();
         let work = self.runner.run(
             &self.spotdl_path,
             &args,
@@ -857,22 +1430,46 @@ impl SpotDLDownloaderAdapter {
             privacy
                 .run_external(PrivacyCategory::Imports, work)
                 .await
-                .map_err(|err| SpotDLDownloadError::Download(err.to_string()))??
+                .map_err(|err| SpotDLDownloadError::Download(err.to_string()))?
         } else {
-            work.await?
+            work.await
         };
-        let saved_errors = super::playlist_files::read_playlist_artifact(
-            &request.output_directory.join("musicdeck-errors.txt"),
-        )
-        .await
-        .unwrap_or_default();
-        let combined = format!("{}\n{}\n{}", res.stdout, res.stderr, saved_errors);
-        let code = classify_spotdl_error(&combined);
-        if res.exit_code != Some(0) {
-            return Err(SpotDLDownloadError::Download(format!(
-                "spotDL failed ({code}): exit {:?}",
-                res.exit_code
-            )));
+        let saved_errors = super::playlist_files::read_playlist_artifact(&error_log)
+            .await
+            .unwrap_or_default();
+        let (combined, exit_failed, process_failure) = match res {
+            Ok(res) => (
+                format!("{}\n{}\n{saved_errors}", res.stdout, res.stderr),
+                res.exit_code != Some(0),
+                None,
+            ),
+            Err(ProcessError::Cancelled) => return Err(ProcessError::Cancelled.into()),
+            Err(error) => (saved_errors, true, Some(SpotDLDownloadError::from(error))),
+        };
+        let track_errors = error_by_track(&combined, started).await;
+        let global = combined
+            .lines()
+            .filter(|line| track_error_line(line).is_none())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut code = classify_spotdl_error(&global);
+        if let Some(&first) = track_errors.values().next() {
+            if track_errors.values().all(|value| *value == first)
+                && (code == "general" || (code == "ffmpeg-error" && first == "bad-media-input"))
+            {
+                code = first;
+            }
+        }
+        if let Some(db) = &self.cooldown_db {
+            let cooldown = ["rate-limited", "bot-challenge", "provider-forbidden"]
+                .into_iter()
+                .find(|category| {
+                    (exit_failed && code == *category)
+                        || track_errors.values().any(|value| value == category)
+                });
+            if let Some(category) = cooldown {
+                super::admission::note_provider_failure(db, category).await;
+            }
         }
 
         let files = scan_downloaded_audio_files(&request.output_directory)
@@ -880,24 +1477,35 @@ impl SpotDLDownloaderAdapter {
             .map_err(|err| {
                 SpotDLDownloadError::Download(format!("Could not read spotDL output: {err}"))
             })?;
-        if files.is_empty() {
-            let message = if code == "general" {
-                "spotDL exited successfully but produced no audio files".into()
+        let failure = process_failure.or_else(|| {
+            if exit_failed {
+                Some(SpotDLDownloadError::classified(code))
+            } else if files.is_empty()
+                && (track_errors.is_empty() || request.playlist_m3u_name.is_none())
+            {
+                Some(if code == "general" {
+                    SpotDLDownloadError::Download(
+                        "spotDL exited successfully but produced no audio files".into(),
+                    )
+                } else {
+                    SpotDLDownloadError::classified(code)
+                })
             } else {
-                format!("spotDL produced no usable audio ({code})")
-            };
-            return Err(SpotDLDownloadError::Download(message));
-        }
+                None
+            }
+        });
         Ok(DownloadOutput {
             files,
-            warning: (code != "general").then_some(code),
+            track_errors,
+            failure,
         })
     }
 }
 
 pub(super) struct DownloadOutput {
     pub files: Vec<PathBuf>,
-    pub warning: Option<&'static str>,
+    pub track_errors: HashMap<String, &'static str>,
+    pub failure: Option<SpotDLDownloadError>,
 }
 
 fn executable_path(raw: &str) -> Result<String, String> {
@@ -936,6 +1544,42 @@ pub(super) async fn scan_downloaded_audio_files(dir: &Path) -> std::io::Result<V
 mod settings_tests {
     use super::*;
 
+    #[test]
+    fn shared_output_formats_normalize_to_downloader_arguments_and_extensions() {
+        use serde_json::json;
+
+        for (setting, extension, ytdlp_format) in [
+            ("best", "m4a", "m4a"),
+            (" M4A ", "m4a", "m4a"),
+            ("mp3", "mp3", "mp3"),
+            ("flac", "flac", "flac"),
+            ("ogg", "ogg", "vorbis"),
+            ("opus", "opus", "opus"),
+            ("wav", "wav", "wav"),
+        ] {
+            let format = SpotDLOutputFormat::from_plugin_config(&json!({"outputFormat": setting}))
+                .unwrap();
+            assert_eq!(format.container_arg(), extension);
+            assert_eq!(spotdl_format_args(format)[1], extension);
+            assert_eq!(format.ytdlp_format_arg(), ytdlp_format);
+        }
+        for config in [
+            json!({}),
+            json!({"outputFormat": null}),
+            json!({"outputFormat": " "}),
+        ] {
+            assert_eq!(
+                SpotDLOutputFormat::from_plugin_config(&config),
+                Ok(SpotDLOutputFormat::Best)
+            );
+        }
+        for invalid in [json!("aac"), json!(320)] {
+            assert!(
+                SpotDLOutputFormat::from_plugin_config(&json!({"outputFormat": invalid})).is_err()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn saved_plugin_configuration_supplies_downloader_arguments() {
         let db = DbPool::connect_memory().await.unwrap();
@@ -959,6 +1603,7 @@ mod settings_tests {
         let adapter = SpotDLDownloaderAdapter::new()
             .with_saved_settings(Some(&db))
             .await;
+        assert_eq!(adapter.output_format(), Ok(SpotDLOutputFormat::Mp3));
         assert_eq!(
             adapter.tool_paths(),
             Ok(("fixture-downloader", "fixture-ffmpeg"))
@@ -993,5 +1638,15 @@ mod settings_tests {
         );
         drop(adapter);
         assert!(!cookie.exists());
+
+        sqlx::query("UPDATE plugin_configs SET enabled=0 WHERE plugin_id='spotdl-downloader'")
+            .execute(db.inner())
+            .await
+            .unwrap();
+        let disabled = SpotDLDownloaderAdapter::new()
+            .with_saved_settings(Some(&db))
+            .await;
+        assert!(disabled.tool_paths().is_err());
+        assert_eq!(disabled.output_format(), Ok(SpotDLOutputFormat::Mp3));
     }
 }

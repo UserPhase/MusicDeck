@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::library::{LibraryItemType, LibraryService, SourceRef};
+use crate::catalog::library::{LibraryItemType, LibraryService, ProviderIdentities, SourceRef};
 use crate::logger::{LogBuffer, LogInput, LogLevel, server_logs};
 use crate::providers::{
     Album, Artist, BackendRegistry, ProviderError, SearchPagination, Track, format_artwork_url,
@@ -162,7 +162,7 @@ impl CatalogService {
         track: Track,
         connection_id: &str,
     ) -> Result<Available<Track>, ProviderError> {
-        self.resolve_track_ids(track, connection_id, true, None)
+        self.resolve_track_ids(track, connection_id, true, None, None)
             .await?
             .ok_or_else(|| ProviderError::Configuration("Track identity is missing".into()))
     }
@@ -175,9 +175,35 @@ impl CatalogService {
         library_id: &str,
         sources: &[SourceRef],
     ) -> Result<Available<Track>, ProviderError> {
-        self.resolve_track_ids(track, connection_id, true, Some((library_id, sources)))
+        self.resolve_track_ids(track, connection_id, true, Some((library_id, sources)), None)
             .await?
             .ok_or_else(|| ProviderError::Configuration("Track identity is missing".into()))
+    }
+
+    async fn resolve_track_identity(
+        &self,
+        kind: LibraryItemType,
+        provider_id: &str,
+        connection_id: &str,
+        register_missing: bool,
+        identities: Option<&mut ProviderIdentities>,
+    ) -> Result<Option<String>, ProviderError> {
+        let mut bucket = identities.map(|identities| identities.entry(kind).or_default());
+        if let Some(id) = bucket.as_ref().and_then(|ids| ids.get(provider_id)) {
+            return Ok(Some(id.clone()));
+        }
+        let source = SourceRef { connection_id: connection_id.into(), provider_item_id: provider_id.into() };
+        let result = if register_missing {
+            self.library.ensure_id(kind, &source, None).await.map(Some)
+        } else if bucket.is_none() {
+            self.library.find_id(kind, &source).await
+        } else {
+            return Ok(None);
+        }.map_err(|error| ProviderError::Configuration(error.to_string()))?;
+        if let (Some(ids), Some(id)) = (bucket.take(), result.as_ref()) {
+            ids.insert(provider_id.into(), id.clone());
+        }
+        Ok(result)
     }
 
     async fn resolve_track_ids(
@@ -186,40 +212,26 @@ impl CatalogService {
         connection_id: &str,
         register_missing: bool,
         mapped: Option<(&str, &[SourceRef])>,
+        mut identities: Option<&mut ProviderIdentities>,
     ) -> Result<Option<Available<Track>>, ProviderError> {
-        let resolve_id = async |item_type, provider_item_id: &str| {
-            let source = SourceRef {
-                connection_id: connection_id.to_owned(),
-                provider_item_id: provider_item_id.to_owned(),
-            };
-            let result = if register_missing {
-                self.library
-                    .ensure_id(item_type, &source, None)
-                    .await
-                    .map(Some)
-            } else {
-                self.library.find_id(item_type, &source).await
-            };
-            result.map_err(|err| ProviderError::Configuration(err.to_string()))
-        };
         let md_id = if let Some((id, _)) = mapped {
             id.to_owned()
         } else {
-            let Some(id) = resolve_id(LibraryItemType::Track, &track.provider_id).await? else {
+            let Some(id) = self.resolve_track_identity(LibraryItemType::Track, &track.provider_id, connection_id, register_missing, identities.as_deref_mut()).await? else {
                 return Ok(None);
             };
             id
         };
 
         if let Some(ref artist_id) = track.artist_id {
-            track.artist_id = resolve_id(LibraryItemType::Artist, artist_id).await?;
+            track.artist_id = self.resolve_track_identity(LibraryItemType::Artist, artist_id, connection_id, register_missing, identities.as_deref_mut()).await?;
         }
 
         if let Some(ref mut credits) = track.artist_credits {
             for credit in credits.iter_mut() {
                 if let Some(ref raw_artist_id) = credit.id {
                     if !raw_artist_id.trim().is_empty() && !raw_artist_id.starts_with("md_") {
-                        if let Ok(id) = resolve_id(LibraryItemType::Artist, raw_artist_id).await {
+                        if let Ok(id) = self.resolve_track_identity(LibraryItemType::Artist, raw_artist_id, connection_id, register_missing, identities.as_deref_mut()).await {
                             credit.id = id;
                         }
                     }
@@ -228,11 +240,11 @@ impl CatalogService {
         }
 
         if let Some(ref album_id) = track.album_id {
-            track.album_id = resolve_id(LibraryItemType::Album, album_id).await?;
+            track.album_id = self.resolve_track_identity(LibraryItemType::Album, album_id, connection_id, register_missing, identities.as_deref_mut()).await?;
         }
 
         if let Some(ref art_id) = track.artwork_id {
-            let md_art = resolve_id(LibraryItemType::Artwork, art_id).await?;
+            let md_art = self.resolve_track_identity(LibraryItemType::Artwork, art_id, connection_id, register_missing, identities).await?;
             track.artwork_url = format_artwork_url(md_art.as_deref());
             track.artwork_id = md_art;
         }
@@ -584,9 +596,21 @@ impl CatalogService {
             }
             match entry.provider.list_tracks().await {
                 Ok(tracks) => {
+                    if tracks.is_empty() { continue; }
+                    let (identities, sources) = tokio::join!(
+                        self.library.provider_identities(&entry.connection_id),
+                        self.library.provider_track_sources(&entry.connection_id),
+                    );
+                    let mut identities = identities.ok();
+                    let sources = sources.ok();
                     for track in tracks {
+                        let mapped_id = identities.as_ref().and_then(|ids| ids.get(&LibraryItemType::Track))
+                            .and_then(|ids| ids.get(&track.provider_id)).cloned();
+                        let mapped = mapped_id.as_deref().and_then(|id| {
+                            sources.as_ref()?.get(id).map(|sources| (id, sources.as_slice()))
+                        });
                         match self
-                            .resolve_track_ids(track, &entry.connection_id, register_missing, None)
+                            .resolve_track_ids(track, &entry.connection_id, register_missing, mapped, identities.as_mut())
                             .await
                         {
                             Ok(Some(stamped)) => items.push(stamped),

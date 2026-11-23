@@ -12,6 +12,7 @@
 //!   completes a library rescan, invalidating stale silence-trim and loudness caches.
 
 use chrono::Utc;
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Row};
@@ -67,6 +68,8 @@ pub struct SourceRef {
     /// Provider-native item identifier.
     pub provider_item_id: String,
 }
+
+pub(crate) type ProviderIdentities = HashMap<LibraryItemType, HashMap<String, String>>;
 
 /// Optional track content hint observed during catalog reads (`contentRevision.ts`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -212,6 +215,48 @@ impl LibraryService {
         .bind(item_type.as_str())
         .fetch_optional(self.db.inner())
         .await?)
+    }
+
+    pub(crate) async fn provider_identities(
+        &self,
+        connection_id: &str,
+    ) -> Result<ProviderIdentities, DbError> {
+        let mut identities = ProviderIdentities::new();
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT item_type, provider_item_id, library_item_id FROM library_item_sources
+             WHERE connection_id = ? ORDER BY provider_item_id, item_type, library_item_id",
+        )
+        .bind(connection_id)
+        .fetch_all(self.db.inner())
+        .await?;
+        for (kind, provider_id, library_id) in rows {
+            if let Some(kind) = LibraryItemType::parse_str(&kind) {
+                identities.entry(kind).or_default().entry(provider_id).or_insert(library_id);
+            }
+        }
+        Ok(identities)
+    }
+
+    pub(crate) async fn provider_track_sources(
+        &self,
+        connection_id: &str,
+    ) -> Result<HashMap<String, Vec<SourceRef>>, DbError> {
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT source.library_item_id, source.connection_id, source.provider_item_id
+             FROM library_item_sources AS source JOIN (
+                 SELECT DISTINCT library_item_id FROM library_item_sources
+                 WHERE connection_id = ? AND item_type = 'track'
+             ) AS owned USING (library_item_id)
+             ORDER BY source.created_at ASC",
+        )
+        .bind(connection_id)
+        .fetch_all(self.db.inner())
+        .await?;
+        let mut sources = HashMap::<String, Vec<SourceRef>>::new();
+        for (id, connection_id, provider_item_id) in rows {
+            sources.entry(id).or_default().push(SourceRef { connection_id, provider_item_id });
+        }
+        Ok(sources)
     }
 
     /// Convenience wrapper for `ensure_id(LibraryItemType::Artwork, ref_item, None)`.

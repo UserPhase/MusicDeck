@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 
 import Sidebar, { isSpotifyPlaylistUrl } from "./Sidebar";
@@ -9,6 +9,7 @@ import {
   createPlaylist,
   startSpotifyPlaylistImport,
   getSpotifyPlaylistImport,
+  cancelSpotifyPlaylistImport,
 } from "../api/playlists";
 
 import {
@@ -23,6 +24,7 @@ jest.mock("../api/playlists", () => ({
   createPlaylist: jest.fn(),
   startSpotifyPlaylistImport: jest.fn(),
   getSpotifyPlaylistImport: jest.fn(),
+  cancelSpotifyPlaylistImport: jest.fn(),
 }));
 
 jest.mock("../api/musicdeck", () => ({
@@ -257,7 +259,7 @@ test("opens the imported playlist when the background job completes", async () =
   fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
   fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123?si=link" } });
   expect(screen.getByLabelText("Download timeout")).toHaveValue("auto");
-  expect(screen.getByLabelText("Download timeout")).toHaveAccessibleDescription(/no fixed time limit/i);
+  expect(screen.getByLabelText("Download timeout")).toHaveAccessibleDescription(/up to 6 hours/i);
   expect(screen.queryByLabelText(/maximum download time/i)).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
 
@@ -299,7 +301,61 @@ test("warns about missing songs while opening a partially imported playlist", as
   fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
 
   await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_partial"));
-  expect(screen.getByRole("alert")).toHaveTextContent("Imported 7 of 15 songs");
+  expect(screen.getByText(/Imported 7 of 15 songs/)).toHaveAttribute("role", "status");
+});
+
+test("a minimized partial import shows its track errors and an open-playlist link", async () => {
+  startSpotifyPlaylistImport.mockResolvedValue({ id: "job-background", status: "running", stage: "conversion" });
+  getSpotifyPlaylistImport.mockResolvedValue({
+    id: "job-background", status: "partial", playlistId: "mdpl_background", playlistName: "Mixed results",
+    error: "Imported 1 of 2 tracks.",
+    trackErrors: [{ position: 2, title: "Missing song", code: "no-match", message: "No matching audio." }],
+  });
+  renderSidebar([]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
+  fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
+  fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  expect(await screen.findByText("Converting audio...")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Run in Background" }));
+  const link = await screen.findByRole("link", { name: "Open playlist" }, { timeout: 3000 });
+  expect(link).toHaveAttribute("href", "/playlist/mdpl_background");
+  expect(screen.getByText("Track errors (1)")).toBeInTheDocument();
+  expect(screen.getByTestId("route")).toHaveTextContent(/^\/$/);
+  fireEvent.click(link);
+  expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_background");
+});
+
+test("restores a saved import after a transient failure and shows its provider cooldown", async () => {
+  jest.useFakeTimers();
+  try {
+    sessionStorage.setItem("musicdeck:spotify-import:test-user", "job-restore");
+    getSpotifyPlaylistImport.mockRejectedValueOnce(new Error("Connection lost"))
+      .mockResolvedValueOnce({ id: "job-restore", status: "running", stage: "provider_cooldown" });
+    const view = renderSidebar([]);
+    expect(await screen.findByText("Could not refresh playlist import status. Reconnecting…")).toBeInTheDocument();
+    await act(async () => { jest.advanceTimersByTime(3000); });
+    fireEvent.click(screen.getByRole("button", { name: "Show playlist import progress" }));
+    expect(screen.getByText("Waiting for the source provider cooldown")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel import" })).toBeEnabled();
+    view.unmount();
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("cancels an active playlist import from the progress dialog", async () => {
+  startSpotifyPlaylistImport.mockResolvedValue({ id: "job-cancel", status: "running", stage: "scan" });
+  cancelSpotifyPlaylistImport.mockResolvedValue({ id: "job-cancel", status: "cancelled", error: "Playlist import cancelled" });
+  renderSidebar([]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
+  fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
+  fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Cancel import" }));
+  expect(await screen.findByText("Playlist import cancelled")).toBeInTheDocument();
+  expect(cancelSpotifyPlaylistImport).toHaveBeenCalledWith("job-cancel");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
 test("keeps the dialog loading while the import job is queued and polls for completion", async () => {
@@ -313,7 +369,7 @@ test("keeps the dialog loading while the import job is queued and polls for comp
 
   expect(await screen.findByRole("dialog", { name: "Importing Playlist..." })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Run in Background" })).toBeEnabled();
-  await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-2"), { timeout: 3000 });
+  await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-2", expect.any(AbortSignal)), { timeout: 3000 });
   await waitFor(() => expect(screen.getByTestId("route")).toHaveTextContent("/playlist/mdpl_two"));
 });
 
@@ -331,7 +387,7 @@ test("shows live track progress and reopens a minimized import", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Run in Background" }));
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(screen.getByText("Importing playlist in the background...")).toHaveAttribute("role", "status");
-  await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-live"), { timeout: 3000 });
+  await waitFor(() => expect(getSpotifyPlaylistImport).toHaveBeenCalledWith("job-live", expect.any(AbortSignal)), { timeout: 3000 });
   fireEvent.click(screen.getByRole("button", { name: "Show playlist import progress" }));
   expect(screen.getByRole("dialog", { name: "Importing Playlist..." })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Close playlist dialog" }));

@@ -73,8 +73,11 @@
 .track-header-sort span { color: var(--accent-text, var(--accent)); }
 .track .track-date-added { color: var(--text-secondary); font-size: .8125rem; white-space: nowrap; }
 @media (min-width: 48.001rem) {
-  .track-list.playlist-track-list { --track-grid-columns: 2.5rem minmax(0, 4fr) minmax(0, 3fr) 7rem 3.5rem 4.5rem; }
-  .playlist-track-list .track-date-added:nth-child(4) { display: block; }
+  .track-list.playlist-track-list {
+    --track-number-column: 2.5rem;
+    --track-duration-column: 3.5rem;
+    --track-grid-columns: var(--track-number-column) minmax(0, 4fr) minmax(0, 3fr) 7rem var(--track-duration-column) 4.5rem;
+  }
 }
 @media (max-width: 48rem) {
   .playlist-track-tools:has(.playlist-track-search) { flex: 1 1 100%; }
