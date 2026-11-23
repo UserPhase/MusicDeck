@@ -21,7 +21,7 @@ A system archive is a `.tar.gz` file containing:
 
 Raw music, acquisition temporary files, transcoded playback caches, browser IndexedDB downloads, browser-only state, installed extension packages, OS tools and the upstream Navidrome/Jellyfin databases are outside this archive. Back those up separately where required. Restoring MusicDeck never deletes or replaces raw audio files.
 
-Creation calls [`better-sqlite3`'s online backup API](https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#backupdestination-options---promise), which uses [SQLite's Online Backup API](https://www.sqlite.org/backup.html). It does not copy the live database file or its WAL. The snapshot is checked before publication, files are hashed, and compression streams to a private temporary archive. Only a completed, flushed archive is renamed into the backup directory. The archive and configuration files use mode `0600`; new recovery directories use `0700` on POSIX.
+The Rust server creates a consistent SQLite snapshot with `VACUUM INTO`. The snapshot is checked before publication, files are hashed, and compression streams to a private temporary archive. Only a completed, flushed archive is renamed into the backup directory. On POSIX, the archive and configuration files use mode `0600` and new recovery directories use `0700`.
 
 Archives contain credentials and personal account data and are not encrypted. Download a private copy to another machine or backup store; a backup on the same volume does not protect against loss of that volume.
 

@@ -11,8 +11,9 @@
     "test": "cargo test --manifest-path server-rust/Cargo.toml && npm test --prefix webapp",
     "db:init": "cargo run --release --manifest-path server-rust/Cargo.toml --bin init_db --",
     "library:shrink": "cargo run --release --manifest-path server-rust/Cargo.toml --bin shrink_library --",
+    "pretest:acceptance": "cargo build --locked --manifest-path server-rust/Cargo.toml --bin musicdeck-server --bin init_db",
     "test:acceptance": "playwright test",
-    "test:acceptance:types": "node server/node_modules/typescript/bin/tsc -p tests/acceptance/tsconfig.json"
+    "test:acceptance:types": "node webapp/node_modules/typescript/bin/tsc -p tests/acceptance/tsconfig.json"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",

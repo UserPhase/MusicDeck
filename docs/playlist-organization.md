@@ -4,7 +4,7 @@ Migration 41 adds personal nested folders, personal playlist placements/pins, a 
 
 Playlist deletion moves the MusicDeck record to Trash. Entries, artwork and organization survive until restoration or expiry. Normal lists, searches, exports and resume checkpoints exclude Trash. The server purges expired records in bounded batches at startup and hourly while running. Recovery is available for 30 rolling days; an expired record cannot be restored even before the maintenance job reaches it. Provider tombstones prevent permanently removed playlists from being silently imported again. Trashing does not delete provider media or destroy the upstream playlist needed for recovery.
 
-`server/src/domain/playlist-organization.ts` stores forward/inverse commands in SQLite. Reordering records exact occurrence IDs; removal retains only removed rows; batch addition records the new entry IDs. Undo therefore preserves duplicate occurrences and temporarily unavailable entries. Details edits and Trash/restore are reversible too. History retains up to 50 commands per user. The browser stack is session-scoped and clears on account changes or reload; Trash recovery survives app/server restarts.
+`server-rust/src/playlists/collaboration.rs` stores forward/inverse commands in SQLite. Reordering records exact occurrence IDs; removal retains only removed rows; batch addition records the new entry IDs. Undo therefore preserves duplicate occurrences and temporarily unavailable entries. Details edits and Trash/restore are reversible too. History retains up to 50 commands per user. The browser stack is session-scoped and clears on account changes or reload; Trash recovery survives app/server restarts.
 
 Every command uses an expected revision and server-owned state fingerprints. SQLite triggers also advance revisions for legacy edit routes and background imports. Undo/redo rejects conflicting changes instead of replacing another tab's edits. Client requests include the expected account identity and abort on account changes. An uncertain network outcome clears affected client history and asks the listener to reload before retrying. Provider synchronization is coalesced, best effort, and does not hold the command response open; shutdown drains active synchronization before closing SQLite.
 
@@ -21,6 +21,5 @@ Validation includes service tests for nesting, ownership, ordering, duplicate-sa
 npm run test:acceptance:types
 npm run test:acceptance -- --grep "Scenario 9"
 
-# server/
-npx vitest run test/playlist-organization.test.ts test/playlist-service.test.ts --maxWorkers=1
+cargo test --manifest-path server-rust/Cargo.toml --lib playlists::
 ```

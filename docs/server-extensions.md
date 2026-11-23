@@ -70,8 +70,8 @@ deploying replacement code; the fingerprint is not a package signature.
 
 ## Version 1 hook contract
 
-The complete TypeScript API is exported by
-[`ExtensionManager.ts`](../server/src/services/ExtensionManager.ts):
+The Rust server loads the version 1 hook contract through
+[its extension manager](../server-rust/src/plugins/extensions.rs):
 
 - `default`: a **synchronous factory** returning `ExtensionHooks`. A fresh hooks
   object is created on each enable; importing the module may happen only once
@@ -154,8 +154,8 @@ The existing admin task API can enqueue:
 }
 ```
 
-Every extension route goes through the fixed Fastify gateway and normal live
-session/admin guard; a module is never handed the raw Fastify instance or
+Every extension route goes through the fixed Rust gateway and normal live
+session/admin guard; a module is never handed the raw server instance or
 permission to register arbitrary unauthenticated routes. Request bodies retain
 the server's usual size/parser limits. Route handlers receive an AbortSignal and
 must cooperate with it; do not hijack the raw socket or start untracked work.
@@ -182,7 +182,7 @@ A disable operation does not report success until cleanup finishes. Failed
 cleanup retains an unavailable error-state runtime; use **Finish cleanup** to
 retry. Non-cooperative code may keep disable/shutdown pending indefinitely.
 MusicDeck will not pretend that it unloaded such code. Shutdown aborts extension
-work in `preClose`, before Fastify waits for in-flight requests. Shutdown itself
+work before waiting for in-flight requests. Shutdown itself
 does not clear persisted enabled intent.
 
 Extensions must use `context.network.fetch` for outbound HTTP so Local-Only and

@@ -12,8 +12,10 @@ const statusLabels = {
 type ServerJob = {
   id: string;
   status: keyof typeof statusLabels;
+  sourceProvider?: string;
   stage?: string;
   downloadedCount?: number;
+  importedCount?: number;
   expectedCount?: number;
   trackErrors?: { position: number; title?: string; message: string }[];
   requestedTitle?: string;
@@ -32,6 +34,7 @@ function ServerDownloadRow({ job, online, onUpdate }: { job: ServerJob; online: 
   const [actionError, setActionError] = useState("");
   const title = job.requestedTitle || job.files?.[0]?.title || (job.requestedAlbumId ? "Album download" : "Server download");
   const artist = job.requestedArtist || job.files?.[0]?.artist;
+  const downloader = job.sourceProvider === "deezer-ytdlp" ? "Deezer / yt-dlp" : job.sourceProvider === "spotdl" ? "spotDL" : undefined;
   const progress = job.progress;
   const received = progress?.bytesDownloaded ?? 0;
   const total = progress?.totalBytes ?? 0;
@@ -57,6 +60,9 @@ function ServerDownloadRow({ job, online, onUpdate }: { job: ServerJob; online: 
   return <li className="server-download-row">
     <div className="server-download-heading"><strong>{title}</strong><span>{(active && phaseLabels[job.stage ?? ""]) || statusLabels[job.status]}</span></div>
     {artist && <p>{artist}</p>}
+    {downloader && job.status !== "queued" && <p>{downloader}</p>}
+    {(job.status === "completed" || job.status === "partial") && Boolean(job.importedCount) &&
+      <p>{job.importedCount} {job.importedCount === 1 ? "track" : "tracks"} indexed in the library</p>}
     {job.status === "downloading" && !waiting && <>
       <progress max={100} value={value} aria-label={`${title} download progress`} />
       <p className="server-download-transfer">

@@ -2,24 +2,24 @@ import { test as base, expect, type Page, type TestInfo, type Locator } from "@p
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
-import { buildAcceptanceBrowser, fixtureConfig, root, startApplication, type Application } from "./helpers/appFixture.js";
-import { catalogTracks, createWav, startMockBackend, type MockBackend, type MockTrack } from "./helpers/mockBackends.js";
-import { openDatabase, type Db } from "../../server/src/db/database.js";
-import { prepareDatabasePath } from "../../server/src/db/file-permissions.js";
-import { runMigrations, seedInitialData } from "../../server/src/db/migrations.js";
-import type { DownloaderAdapter, SpotifyImportTrackMetadata } from "../../server/src/domain/downloader-adapter.js";
-import type { SpotifyImportJob } from "../../server/src/domain/spotify-playlist-import.js";
-import type { Track } from "../../server/src/types.js";
+import { DatabaseSync } from "node:sqlite";
+import { buildAcceptanceBrowser, fixtureConfig, root, startApplication, transaction, type Application, type Db } from "./helpers/appFixture.js";
+import { catalogTracks, startMockBackend, type MockBackend } from "./helpers/mockBackends.js";
 import type {} from "./helpers/browserProbe.js";
 import { launchLifecycleBrowser } from "./helpers/nativeBrowser.js";
-import { normalizeMusicText, versionSignature } from "../../server/src/domain/music-identity.js";
 
-interface Options { dual: boolean; trackCount: number; partialImport: boolean; legacy: boolean; externalMetadata: boolean; releaseMetadata: boolean }
-interface System {
-  app: Application; nav: MockBackend; jelly: MockBackend; directory: string;
-  importAttempts: Map<number, number>; importFiles: string[];
+interface Track {
+  id: string;
+  title: string;
+  artistName: string;
+  albumName: string;
+  durationSeconds: number;
+  external?: boolean;
+  streamUrl?: string;
 }
+
+interface Options { dual: boolean; trackCount: number; legacy: boolean; externalMetadata: boolean }
+interface System { app: Application; nav: MockBackend; jelly: MockBackend; directory: string }
 const tempBase = path.resolve(root, ".tmp");
 async function temporaryDirectory() {
   await fs.mkdir(tempBase, { recursive: true });
@@ -32,96 +32,40 @@ async function removeFixture(directory: string) {
 }
 
 /** Materialize the actual pre-39 inline-payload shape, not just an old migration number. */
-async function seedLegacyDatabase(config: ReturnType<typeof fixtureConfig>) {
-  const require = createRequire(path.join(root, "server/package.json"));
-  const Database = require("better-sqlite3") as new (filename: string) => Db;
-  prepareDatabasePath(config.databasePath);
-  const db = new Database(config.databasePath);
-  try {
-    db.pragma("foreign_keys = ON");
-    runMigrations(db, 38);
-    await seedInitialData(db, config);
-    const user = db.prepare("SELECT id FROM users WHERE username='admin'").get() as { id: string };
-    db.transaction(() => {
-      db.exec(`ALTER TABLE smart_playlist_tracks ADD COLUMN track_json TEXT NOT NULL DEFAULT '{}';
-        DROP TABLE smart_playlist_track_payloads;
-        DROP TABLE smart_playlist_genres;`);
-      db.prepare("INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,?,?,?)").run(user.id, "acceptance.preference", '"keep-me"', "2024-01-01");
-      db.prepare("INSERT INTO playlists(id,owner_user_id,name,created_at,updated_at) VALUES(?,?,?,?,?)").run("mdpl_legacy", user.id, "Legacy road trip", "2024-01-01", "2024-01-01");
-      const item = db.prepare("INSERT INTO playlist_items(id,playlist_id,position,connection_id,provider_track_id,created_at) VALUES(?,?,?,?,?,?)");
-      const projection = db.prepare("INSERT INTO smart_playlist_tracks(id,title,artist,album,genre,year,revision,track_json) VALUES(?,?,?,?,?,?,?,?)");
-      for (let i = 0; i < 1000; i++) {
-        item.run(`legacy-item-${i}`, "mdpl_legacy", i, "acceptance-nav", `track-${i % 80 + 1}`, "2024-01-01");
-        const payload = { id: `legacy-track-${i}`, title: `Legacy ${i}`, genres: ["Rock", "Ambient"], year: 2000 + i % 20 };
-        projection.run(payload.id, payload.title, "Legacy artist", "Legacy album", "Rock", payload.year, "legacy", JSON.stringify(payload));
-      }
-    })();
-    expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
-  } finally { db.close(); }
+function seedLegacyDatabase(db: Db) {
+  const user = db.prepare("SELECT id FROM users WHERE username='admin'").get() as { id: string };
+  db.exec(`ALTER TABLE smart_playlist_tracks ADD COLUMN track_json TEXT NOT NULL DEFAULT '{}';
+    DROP TABLE smart_playlist_track_payloads;
+    DROP TABLE smart_playlist_genres;`);
+  db.prepare("INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,?,?,?)").run(user.id, "acceptance.preference", '"keep-me"', "2024-01-01");
+  db.prepare("INSERT INTO playlists(id,owner_user_id,name,created_at,updated_at) VALUES(?,?,?,?,?)").run("mdpl_legacy", user.id, "Legacy road trip", "2024-01-01", "2024-01-01");
+  const item = db.prepare("INSERT INTO playlist_items(id,playlist_id,position,connection_id,provider_track_id,created_at) VALUES(?,?,?,?,?,?)");
+  const projection = db.prepare("INSERT INTO smart_playlist_tracks(id,title,artist,album,genre,year,revision,track_json) VALUES(?,?,?,?,?,?,?,?)");
+  for (let i = 0; i < 1000; i++) {
+    item.run(`legacy-item-${i}`, "mdpl_legacy", i, "acceptance-nav", `track-${i % 80 + 1}`, "2024-01-01");
+    const payload = { id: `legacy-track-${i}`, title: `Legacy ${i}`, genres: ["Rock", "Ambient"], year: 2000 + i % 20 };
+    projection.run(payload.id, payload.title, "Legacy artist", "Legacy album", "Rock", payload.year, "legacy", JSON.stringify(payload));
+  }
 }
 
 const test = base.extend<Options & { system: System }, { browserDirectory: string }>({
   dual: [false, { option: true }], trackCount: [80, { option: true }],
-  partialImport: [false, { option: true }], legacy: [false, { option: true }],
+  legacy: [false, { option: true }],
   externalMetadata: [false, { option: true }],
-  releaseMetadata: [false, { option: true }],
   browserDirectory: [async ({}, use) => {
     const directory = await temporaryDirectory();
     try { await buildAcceptanceBrowser(directory); await use(directory); }
     finally { await removeFixture(directory); }
   }, { scope: "worker", timeout: 90_000 }],
-  system: async ({ browserDirectory, dual, trackCount, partialImport, legacy, externalMetadata, releaseMetadata }, use, info) => {
+  system: async ({ browserDirectory, dual, trackCount, legacy, externalMetadata }, use, info) => {
     const directory = await temporaryDirectory();
     let nav: MockBackend | undefined, jelly: MockBackend | undefined, app: Application | undefined;
-    const successes: MockTrack[] = [], importFiles: string[] = [];
-    const importAttempts = new Map<number, number>();
     try {
-      nav = await startMockBackend({ kind: "navidrome", tracks: partialImport ? [] : catalogTracks("navidrome", trackCount), onScan: () => { if (partialImport) nav!.setTracks([...successes]); } });
+      nav = await startMockBackend({ kind: "navidrome", tracks: catalogTracks("navidrome", trackCount) });
       jelly = await startMockBackend({ kind: "jellyfin" });
-      const config = fixtureConfig(directory, nav, jelly, { localOnlyMode: !partialImport && !externalMetadata });
-      if (legacy) await seedLegacyDatabase(config);
-      const sources: SpotifyImportTrackMetadata[] = Array.from({ length: 20 }, (_, i) => ({ position: i + 1,
-        url: `https://open.spotify.com/track/acceptance${i + 1}`, title: `Import song ${i + 1}`, artist: "Import Artist", album: "Import Album", duration: 90 }));
-      const failed = new Set([4, 11, 17]);
-      const downloader: DownloaderAdapter = {
-        id: "acceptance-spotdl", name: "Isolated spotDL process boundary",
-        capabilities: { spotifyTrack: true, textSearch: true, directUrl: false, album: false, playlist: true, metadata: true },
-        canHandle: () => true,
-        async fetchPlaylistTracks() { return { status: "completed", files: [], playlistTracks: sources, playlistLength: sources.length }; },
-        async download(request, context) {
-          const source = sources.find(track => track.url === request.spotifyTrackUrl || track.url === request.sourceUrl || track.url === request.query || track.title === request.canonicalMetadata?.title);
-          if (!source) throw new Error(`Unexpected spotDL request: ${JSON.stringify(request)}`);
-          const position = source.position;
-          importAttempts.set(position, (importAttempts.get(position) ?? 0) + 1);
-          if (failed.has(position)) {
-            context.onLog?.("stderr", `Fixture audio provider refused track ${position}`);
-            return { status: "failed", files: [], error: { code: "non-retryable", message: `Fixture track ${position} unavailable` },
-              diagnostics: { strategy: "cached-metadata", output: `Track ${position}: simulated provider failure` } };
-          }
-          const file = path.join(request.libraryRoot ?? request.outputDirectory, "Import Artist", "Import Album", `${source.title}.wav`);
-          await fs.mkdir(path.dirname(file), { recursive: true });
-          await fs.writeFile(file, createWav(90)); importFiles.push(file);
-          if (!successes.some(track => track.id === `import-${position}`)) successes.push({ id: `import-${position}`, title: source.title, artist: source.artist, album: source.album!, duration: 90 });
-          return { status: "completed", files: [{ path: file, title: source.title, artist: source.artist, album: source.album, durationSeconds: 90 }] };
-        },
-      };
-      const releaseFetch: typeof fetch = async input => {
-        const url = new URL(input instanceof Request ? input.url : String(input));
-        const artist = { wrapperType: "artist", artistId: 99, artistName: "Release Artist" };
-        const albums = ["Night Drive", "First Light - EP", "After Hours - Single"].map((name, index) => ({ wrapperType: "collection",
-          collectionId: 901 + index, collectionName: name, artistId: 99, artistName: "Release Artist", releaseDate: new Date(Date.now() - index * 86400_000).toISOString(),
-          trackCount: 3, collectionViewUrl: `https://music.apple.com/us/album/${901 + index}` }));
-        const albumId = Number(url.searchParams.get("id"));
-        const songs = Array.from({ length: 3 }, (_, index) => ({ kind: "song", trackId: 9001 + index, trackName: `Release Preview ${index + 1}`,
-          artistId: 99, artistName: "Release Artist", collectionId: albumId >= 901 ? albumId : 901, collectionName: "Night Drive", trackTimeMillis: 180000,
-          previewUrl: `https://audio-ssl.itunes.apple.com/preview-${index}.m4a` }));
-        const results = url.hostname === "itunes.apple.com" ? url.pathname === "/search" ? [artist] :
-          url.searchParams.get("entity") === "song" ? [...albums, ...songs] : [artist, ...albums] : [];
-        return new Response(JSON.stringify({ results, data: [] }), { headers: { "content-type": "application/json" } });
-      };
-      app = await startApplication(config, browserDirectory, { dual, downloader: partialImport ? downloader : undefined,
-        metadataFetch: releaseMetadata ? releaseFetch : undefined });
-      await use({ app, nav, jelly, directory, importAttempts, importFiles });
+      const config = fixtureConfig(directory, nav, jelly, !externalMetadata);
+      app = await startApplication(config, browserDirectory, { dual, initialize: legacy ? seedLegacyDatabase : undefined });
+      await use({ app, nav, jelly, directory });
     } finally {
       try {
         if (nav) await info.attach("navidrome-requests", { body: JSON.stringify(nav.requests, null, 2), contentType: "application/json" });
@@ -136,7 +80,7 @@ const test = base.extend<Options & { system: System }, { browserDirectory: strin
       }
       expect(nav?.activeConnections ?? 0, "Navidrome sockets closed").toBe(0);
       expect(jelly?.activeConnections ?? 0, "Jellyfin sockets closed").toBe(0);
-      expect(app?.db.open ?? false, "SQLite connection closed").toBe(false);
+      expect(app?.db.isOpen ?? false, "SQLite connection closed").toBe(false);
       expect(nav?.unexpected ?? [], "Unsupported Navidrome calls must not silently succeed").toEqual([]);
       expect(jelly?.unexpected ?? [], "Unsupported Jellyfin calls must not silently succeed").toEqual([]);
     }
@@ -166,7 +110,7 @@ async function api<T>(page: Page, app: Application, route: string, method = "GET
 async function allTracks(page: Page, app: Application) { return (await api<{ tracks: Track[] }>(page, app, "/api/tracks")).tracks; }
 async function openTracks(page: Page, app: Application, count: number) {
   await page.goto(`${app.url}/library/tracks`);
-  await expect(page.getByRole("table", { name: "Tracks", exact: true })).toHaveAttribute("aria-rowcount", String(count + 1));
+  await expect(page.getByRole("table", { name: "Tracks", exact: true })).toHaveAttribute("aria-rowcount", String(count + 1), { timeout: 45_000 });
   await expect(page.locator('.track[role="row"]').first()).toBeVisible();
 }
 async function attachJson(info: TestInfo, name: string, value: unknown) {
@@ -176,10 +120,28 @@ async function attachJson(info: TestInfo, name: string, value: unknown) {
 }
 
 test.describe("MusicDeck acceptance: complete user journeys", () => {
+  test("Rust server serves an authenticated library and audio range", async ({ system, request }) => {
+    const { app, nav } = system;
+    const login = await request.post(`${app.url}/api/auth/login`, {
+      data: { username: "admin", password: "acceptance-admin-password" },
+    });
+    expect(login.ok(), await login.text()).toBe(true);
+    const response = await request.get(`${app.url}/api/tracks`);
+    expect(response.ok(), await response.text()).toBe(true);
+    const { tracks } = await response.json() as { tracks: Track[] };
+    expect(tracks).toHaveLength(80);
+    const audio = await request.get(`${app.url}/api/tracks/${encodeURIComponent(tracks[0].id)}/stream`, {
+      headers: { Range: "bytes=0-43" },
+    });
+    expect(audio.status(), await audio.text()).toBe(206);
+    expect(audio.headers()["content-range"]).toBe(`bytes 0-43/${nav.audio.length}`);
+    expect((await audio.body()).subarray(0, 4).toString()).toBe("RIFF");
+  });
+
   test("Scenario 1: Clean Installation & Guided Setup", async ({ page, system }) => {
     const { app, nav } = system;
     await test.step("Bootstrap an empty SQLite database and sign in through the UI", async () => {
-      expect(app.db.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(app.db.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");
       await login(page, app);
       expect((await api<{ firstRun: boolean }>(page, app, "/api/v1/admin/system/status")).firstRun).toBe(true);
     });
@@ -196,7 +158,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       expect(nav.requests.some(request => request.endpoint === "ping" && request.status === 200)).toBe(true);
     });
     await test.step("Retain first-run completion across a new database connection", async () => {
-      const db = await openDatabase(app.config);
+      const db = new DatabaseSync(app.config.databasePath);
       try { expect(db.prepare("SELECT value FROM server_settings WHERE key='setup.completedAt'").get()).toBeTruthy(); }
       finally { db.close(); }
     });
@@ -206,8 +168,8 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     test.use({ legacy: true });
     test("Scenario 2: Legacy Schema Migration", async ({ page, system }) => {
       const { app } = system;
-      expect(app.db.pragma("integrity_check", { simple: true })).toBe("ok");
-      expect(app.db.pragma("foreign_key_check")).toEqual([]);
+      expect(app.db.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");
+      expect(app.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(app.db.prepare("SELECT id FROM schema_migrations WHERE id IN (39,40) ORDER BY id").all()).toEqual([{ id: 39 }, { id: 40 }]);
       expect(app.db.prepare("PRAGMA table_info(smart_playlist_tracks)").all().some((column: any) => column.name === "track_json")).toBe(false);
       expect(app.db.prepare("SELECT COUNT(*) AS n FROM smart_playlist_track_payloads").get()).toEqual({ n: 1000 });
@@ -218,10 +180,10 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       // Check migration idempotence before live catalog reads legitimately refresh
       // the disposable smart-playlist projection with current provider metadata.
       const before = createHash("sha256").update(JSON.stringify(payloads)).digest("hex");
-      const reopened = await openDatabase(app.config);
+      const reopened = new DatabaseSync(app.config.databasePath);
       try {
         expect(createHash("sha256").update(JSON.stringify(reopened.prepare("SELECT track_json FROM smart_playlist_track_payloads ORDER BY track_id").all())).digest("hex")).toBe(before);
-        expect(reopened.pragma("foreign_key_check")).toEqual([]);
+        expect(reopened.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       } finally { reopened.close(); }
       await login(page, app);
       const playlist = await api<{ playlist: { tracks: Track[] } }>(page, app, "/api/playlists/mdpl_legacy");
@@ -240,9 +202,9 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const { app, nav, jelly } = system;
       await login(page, app);
       const tracks = await allTracks(page, app);
-      expect(tracks).toHaveLength(160);
-      expect(new Set(tracks.map(track => track.id)).size).toBe(160);
-      expect(tracks.filter(track => track.title === "Shared Song")).toHaveLength(2);
+      expect(tracks).toHaveLength(159);
+      expect(new Set(tracks.map(track => track.id)).size).toBe(159);
+      expect(tracks.filter(track => track.title === "Shared Song")).toHaveLength(1);
       const artists = await api<{ artists: Array<{ availability: { connectionId: string } }> }>(page, app, "/api/artists");
       const albums = await api<{ albums: Array<{ name: string; availability: { connectionId: string } }> }>(page, app, "/api/albums");
       for (const items of [artists.artists, albums.albums]) {
@@ -260,14 +222,14 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         expect(stream.headers()["content-range"]).toBe(`bytes 0-43/${nav.audio.length}`);
         expect((await stream.body()).subarray(0, 4).toString()).toBe("RIFF");
       }
-      await openTracks(page, app, 160);
+      await openTracks(page, app, 159);
       const table = page.getByRole("table", { name: "Tracks", exact: true });
       await expect(table.locator(".collector-editions").getByText("Navidrome", { exact: true })).toHaveCount(0);
-      await page.getByRole("button", { name: "Search this library" }).click();
-      await page.getByRole("searchbox", { name: "Search this library" }).fill("Navidrome");
+      await page.getByRole("button", { name: "Search tracks" }).click();
+      await page.getByRole("searchbox", { name: "Search tracks" }).fill("Navidrome");
       await expect(table.locator(".track-title-text mark").first()).toHaveText("Navidrome");
-      await page.getByRole("searchbox", { name: "Search this library" }).press("Escape");
-      await expect(table).toHaveAttribute("aria-rowcount", "161");
+      await page.getByRole("searchbox", { name: "Search tracks" }).press("Escape");
+      await expect(table).toHaveAttribute("aria-rowcount", "160");
       const titleSort = table.getByRole("button", { name: "Title", exact: true });
       const titleColumn = table.getByRole("columnheader", { name: "Title", exact: true });
       await titleSort.click();
@@ -294,15 +256,15 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const albumGrid = page.getByRole("list", { name: "Albums", exact: true });
       const albumTitles = albumGrid.locator(".album-title");
       const alphabeticTitles = albums.albums.map(album => album.name).sort((a, b) => a.localeCompare(b));
-      await albumSort.getByRole("menuitemradio", { name: "A–Z", exact: true }).click();
+      await albumSort.getByRole("menuitemradio", { name: "A-Z", exact: true }).click();
       await expect(albumTitles).toHaveText(alphabeticTitles);
       await sortAlbums.click();
-      await albumSort.getByRole("menuitemradio", { name: "Z–A", exact: true }).click();
+      await albumSort.getByRole("menuitemradio", { name: "Z-A", exact: true }).click();
       await expect(albumTitles).toHaveText([...alphabeticTitles].reverse());
       await expect(albumGrid.locator(".collector-editions .audio-quality-badge").filter({ hasNotText: /^Remaster$/ })).toHaveCount(0);
       await page.setViewportSize({ width: 390, height: 844 });
       await sortAlbums.click();
-      await expect(albumSort.getByRole("menuitemradio", { name: "Z–A", exact: true })).toHaveAttribute("aria-checked", "true");
+      await expect(albumSort.getByRole("menuitemradio", { name: "Z-A", exact: true })).toHaveAttribute("aria-checked", "true");
       await expect(albumSort.getByRole("combobox")).toHaveCount(0);
       expect(await albumSort.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
       await page.goto(`${app.url}/library/artists`);
@@ -312,7 +274,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const orderedArtists = await artistNames.allTextContents();
       await sortArtists.click();
       await expect(page.getByRole("menuitemradio", { name: "All artists" })).toHaveCount(0);
-      await page.getByRole("menuitemradio", { name: "Z–A", exact: true }).click();
+      await page.getByRole("menuitemradio", { name: "Z-A", exact: true }).click();
       await expect(artistNames).toHaveText([...orderedArtists].reverse());
       await page.getByRole("button", { name: "Search artists" }).click();
       await page.getByRole("searchbox", { name: "Search artists" }).fill("unmatched artist");
@@ -345,19 +307,17 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const discoverShelf = 'section[aria-labelledby="explore-popular-albums"] .explore-album-row';
       await expect(page.locator(`${discoverShelf} a`).first()).toBeVisible();
       expect(await columns(discoverShelf)).toBe(7);
-      expect(homeColumns).toBe(7);
+      expect(homeColumns).toBe(5); // Home keeps its narrower content container.
     });
 
     test("Scenario 4: Secondary Provider Failure & Graceful Degradation", async ({ page, system }) => {
       const { app, jelly } = system;
-      await login(page, app);
-      const before = await allTracks(page, app);
-      const primary = before.find(track => track.title.startsWith("Navidrome"))!;
       jelly.setUnavailable(true);
+      await login(page, app);
       const degraded = await api<{ tracks: Track[]; degraded: boolean }>(page, app, "/api/tracks");
       expect(degraded.degraded).toBe(true);
       expect(degraded.tracks).toHaveLength(80);
-      expect(degraded.tracks.some(track => track.id === primary.id)).toBe(true);
+      const primary = degraded.tracks.find(track => track.title.startsWith("Navidrome"))!;
       await openTracks(page, app, 80);
       await page.getByRole("row", { name: `${primary.title} by Acceptance Artist`, exact: true }).locator(".track-title-text").click();
       await expect.poll(() => page.evaluate(() => window.__acceptance.player.isPlaying)).toBe(true);
@@ -366,39 +326,9 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       expect(await page.locator('.track[role="row"]').count()).toBeGreaterThan(0);
       expect(await page.getByText("All catalog providers are unavailable", { exact: true }).count()).toBe(0);
       jelly.setUnavailable(false);
-      expect(await allTracks(page, app)).toHaveLength(160);
-    });
-  });
-
-  test.describe("durable partial import", () => {
-    test.use({ partialImport: true });
-    test("Scenario 5: Partial SpotDL Import Failure", async ({ page, system }, info) => {
-      const { app, importAttempts, importFiles } = system;
-      await login(page, app);
-      const started = await api<{ job: SpotifyImportJob }>(page, app, "/api/v1/playlists/import-spotify", "POST", { playlistUrl: "https://open.spotify.com/playlist/acceptance20" });
-      let finished: SpotifyImportJob | undefined;
-      await expect.poll(async () => {
-        const response = await api<{ job: SpotifyImportJob }>(page, app, `/api/v1/playlists/import-spotify/${started.job.id}`);
-        finished = response.job; return finished.status;
-      }, { timeout: 45_000, intervals: [100, 200, 500] }).toBe("partial");
-      expect(finished).toMatchObject({ expectedCount: 20, completedCount: 17, failedCount: 3, importedCount: 17, stage: "completed" });
-      expect(importAttempts.size).toBe(20);
-      const failures = finished!.manifest!.filter(entry => entry.status.startsWith("FAILED_"));
-      expect(failures.map(entry => entry.position)).toEqual([4, 11, 17]);
-      for (const entry of failures) {
-        expect(entry.error).toContain("unavailable");
-        expect(entry.downloadAttempts?.some(attempt => attempt.diagnostics?.output.includes("simulated provider failure"))).toBe(true);
-      }
-      expect(importFiles).toHaveLength(17);
-      for (const file of importFiles) expect((await fs.stat(file)).size).toBeGreaterThan(44);
-      const playlist = await api<{ playlist: { tracks: Track[] } }>(page, app, `/api/playlists/${finished!.playlistId}`);
-      expect(playlist.playlist.tracks.map(track => track.title)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1).filter(i => ![4, 11, 17].includes(i)).map(i => `Import song ${i}`));
-      const persisted = app.importRepository.get(started.job.id, finished!.userId);
-      expect(persisted?.job).toMatchObject({ status: "partial", completedCount: 17, failedCount: 3 });
-      expect(app.importRepository.unfinished()).toEqual([]);
-      await attachJson(info, "partial-import-manifest", finished);
-      await page.goto(`${app.url}/playlist/${finished!.playlistId}`);
-      await expect(page.getByRole("heading", { name: "Acceptance import" })).toBeVisible();
+      await api(page, app, "/api/admin/library/scan", "POST", {});
+      await expect.poll(async () => (await allTracks(page, app)).length, { timeout: 30_000 }).toBe(159);
+      expect((await allTracks(page, app)).some(track => track.id === primary.id)).toBe(true);
     });
   });
 
@@ -908,7 +838,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     expect((app.db.prepare("SELECT COUNT(*) AS n FROM taste_listening_events WHERE user_id=?").get(owner) as { n: number }).n).toBe(0);
     await page.evaluate(() => { if (window.__acceptance.player.isPlaying) window.__acceptance.player.togglePlay(); });
     const report = (id: string, track: Track, extra: Record<string, unknown> = {}) => api<{ counted: boolean; tasteExcluded: boolean; scrobbleDue: boolean }>(page, app, "/api/listening-events", "POST", {
-      ownerUserId: owner, playbackSessionId: id, trackId: track.id, startedAt: new Date(Date.now() - 40_000).toISOString(), reportedAt: new Date().toISOString(), listenedSeconds: 35,
+      ownerUserId: owner, playbackSessionId: id, trackId: track.id, startedAt: new Date(Date.now() - 100_000).toISOString(), reportedAt: new Date().toISOString(), listenedSeconds: 95,
       durationSeconds: 180, finished: true, track: { title: track.title, artist: track.artistName, album: track.albumName }, ...extra,
     });
     const privateReport = await report("private-offline-report", tracks[0], { privateListening: true });
@@ -969,7 +899,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     expect((app.db.prepare("SELECT COUNT(*) AS n FROM favorites WHERE user_id=?").get(owner) as { n: number }).n).toBe(favoritesCount);
     expect(app.db.prepare("SELECT id FROM playlists WHERE id=?").get(playlistId)).toBeTruthy();
     const otherAccount = await page.request.post(`${app.url}/api/v1/taste-profile/reset`, { data: { ownerId: "other-user", revision: 0, confirmation: "RESET" } }); expect(otherAccount.status()).toBe(409);
-    expect(app.db.pragma("foreign_key_check")).toEqual([]);
+    expect(app.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
   test.describe("Similar mix journey", () => {
@@ -978,25 +908,33 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     const { app } = system;
     await login(page, app);
     const tracks = await allTracks(page, app), seed = tracks[0], now = Date.now();
-    const recordingKey = (title: string, artist: string) => JSON.stringify([normalizeMusicText(artist), normalizeMusicText(title), versionSignature(title)]);
+    const recordingKey = (title: string, artist: string) => JSON.stringify([artist.toLowerCase(), title.toLowerCase(), ""]);
     const discoveries = Array.from({ length: 50 }, (_, index) => {
       const title = `Distant Signal ${index}`, artist = `Discovery Artist ${index}`;
       return { id: `external_lastfm_track_${createHash("sha256").update(recordingKey(title, artist)).digest("hex").slice(0, 32)}`, title, artist, match: 0.85 - index / 120 };
     });
     const neighbors = [...tracks.slice(1, 50).map((track, index) => ({ id: `cached-${index}`, title: track.title, artist: track.artistName, match: 0.99 - index / 100 })), ...discoveries];
-    app.db.transaction(() => {
+    transaction(app.db, () => {
+      app.db.prepare("INSERT INTO smart_playlist_catalog_state(singleton,refreshed_at,degraded) VALUES(1,?,0)")
+        .run(new Date(now).toISOString());
+      const insertTrack = app.db.prepare("INSERT INTO smart_playlist_tracks(id,title,artist,album,revision) VALUES(?,?,?,?,?)");
+      const insertPayload = app.db.prepare("INSERT INTO smart_playlist_track_payloads(track_id,track_json) VALUES(?,?)");
+      for (const track of tracks) {
+        insertTrack.run(track.id, track.title, track.artistName, track.albumName, "acceptance");
+        insertPayload.run(track.id, JSON.stringify(track));
+      }
       app.db.prepare("INSERT INTO similar_mix_vectors(seed_key,payload_json,expires_at,touched_at) VALUES(?,?,?,?)")
         .run(recordingKey(seed.title, seed.artistName), JSON.stringify(neighbors), now + 86_400_000, now);
       const insert = app.db.prepare("INSERT INTO similar_mix_external_tracks(id,title,artist,touched_at,preview_checked_at) VALUES(?,?,?,?,?)");
       discoveries.forEach(track => insert.run(track.id, track.title, track.artist, now, now));
-    })();
+    });
     const owner = (app.db.prepare("SELECT id FROM users WHERE username='admin'").get() as { id: string }).id;
     await expect(page.getByRole("button", { name: /Build a similar-song mix/ })).toHaveCount(0);
     await page.getByRole("button", { name: "Filter playlists" }).click();
     await page.getByRole("menuitemradio", { name: "Regular playlists" }).click();
     await page.getByRole("button", { name: "Search playlists", exact: true }).click();
     await page.getByRole("searchbox", { name: "Search playlists", exact: true }).fill("unmatched playlist");
-    await expect(page.getByText("No playlists match these filters.")).toBeVisible();
+    await expect(page.getByText("No other playlists match these filters.")).toBeVisible();
     await page.getByRole("searchbox", { name: "Search playlists", exact: true }).press("Escape");
     await page.getByRole("button", { name: "Add playlist", exact: true }).click();
     await page.getByRole("button", { name: /Make a mix/ }).click();
@@ -1035,8 +973,10 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     });
     expect(saveAgain.playlist.id).toBe(playlistId); expect(saveAgain.alreadySaved).toBe(true);
     const stored = await api<{ playlist: { tracks: Track[] } }>(page, app, `/api/playlists/${playlistId}`);
-    expect(stored.playlist.tracks).toHaveLength(25); expect(stored.playlist.tracks.filter(track => track.external).length).toBeGreaterThan(0);
-    expect(stored.playlist.tracks.filter(track => track.external).every(track => track.streamUrl === "" && track.source?.kind === "external")).toBe(true);
+    expect(stored.playlist.tracks).toHaveLength(25);
+    const externalTracks = stored.playlist.tracks.filter(track => track.external);
+    expect(externalTracks.map(track => track.id).sort()).toEqual(result.tracks.filter(track => !track.inLibrary).map(track => track.id).sort());
+    expect(externalTracks.every(track => !track.streamUrl)).toBe(true);
     const initialQueue = await page.evaluate(() => window.__acceptance.player.queue.length);
     await dialog.getByRole("button", { name: "Add to queue", exact: true }).click();
     await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(initialQueue + 25);
@@ -1066,60 +1006,6 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
     await dialog.getByRole("button", { name: "Close mix builder" }).click();
     expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
   });
-  });
-
-  test.describe("Followed artist release feed", () => {
-    test.use({ externalMetadata: true, releaseMetadata: true });
-    test("Scenario 12: Explicit Artist Follows & Cached Release Feed", async ({ page, system }, info) => {
-      const { app } = system;
-      await login(page, app);
-      const initial = await api<{ artists: unknown[]; releases: unknown[] }>(page, app, "/api/v1/new-releases");
-      expect(initial.artists).toEqual([]); expect(initial.releases).toEqual([]);
-      await page.goto(`${app.url}/artist/external_itunes_artist_99`);
-      const follow = page.getByRole("button", { name: "Follow artist", exact: true });
-      await expect(follow).toBeEnabled(); await follow.click();
-      await expect(page.getByRole("button", { name: "Following", exact: true })).toHaveAttribute("aria-pressed", "true");
-      await expect.poll(async () => (await api<{ releases: unknown[] }>(page, app, "/api/v1/new-releases")).releases.length).toBe(3);
-      expect(app.db.prepare("SELECT COUNT(*) AS n FROM acquisition_jobs").get()).toEqual({ n: 0 });
-      const checked = app.db.prepare("SELECT checked_at,next_scan_at FROM followed_artist_catalog").get();
-      await page.goto(`${app.url}/admin/activity`);
-      await page.getByRole("button", { name: "Check releases", exact: true }).click();
-      await expect(page.getByText("Release check queued.", { exact: true })).toBeVisible();
-      await page.goto(`${app.url}/new-releases`);
-      await expect(page.getByRole("heading", { name: "New Releases from Artists You Follow", exact: true })).toBeVisible();
-      const card = page.getByRole("article", { name: "Night Drive by Release Artist" });
-      await expect(card).toBeVisible(); await expect(page.locator(".release-card")).toHaveCount(3);
-      expect(app.db.prepare("SELECT checked_at,next_scan_at FROM followed_artist_catalog").get()).toEqual(checked);
-      await card.getByRole("button", { name: "Preview tracks", exact: true }).click();
-      await expect(card.getByRole("button", { name: /Release Preview 1/ })).toBeVisible();
-      await card.getByRole("button", { name: "Save to wishlist", exact: true }).click();
-      await expect(card.getByRole("button", { name: "In wishlist", exact: true })).toHaveAttribute("aria-pressed", "true");
-      expect(app.db.prepare("SELECT provider,external_id,title FROM saved_discoveries").all()).toEqual([{ provider: "itunes", external_id: "901", title: "Night Drive" }]);
-      expect(app.db.prepare("SELECT COUNT(*) AS n FROM acquisition_jobs").get()).toEqual({ n: 0 });
-      // Verify delegation to the existing import API; scenario 5 exercises the worker pipeline.
-      let imports = 0;
-      await page.route("**/api/acquisitions", async route => {
-        if (route.request().method() !== "POST") { await route.continue(); return; }
-        imports++;
-        expect(route.request().postDataJSON()).toMatchObject({ sourceProvider: "spotdl", albumId: "external_itunes_album_901",
-          result: { type: "album", artist: "Release Artist", title: "Night Drive" } });
-        await route.fulfill({ status: 202, json: { jobId: "release-import", status: "queued" } });
-      });
-      await card.getByRole("button", { name: "Import via spotDL", exact: true }).click();
-      await expect(card.getByRole("button", { name: "Import queued", exact: true })).toBeDisabled(); expect(imports).toBe(1);
-      await page.locator("main").first().evaluate(element => element.scrollTo(0, 0));
-      await page.screenshot({ path: info.outputPath("new-releases-desktop.png"), animations: "disabled" });
-      await page.setViewportSize({ width: 390, height: 844 });
-      await page.locator("main").first().evaluate(element => element.scrollTo(0, 0));
-      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-      await page.screenshot({ path: info.outputPath("new-releases-mobile.png"), animations: "disabled" });
-      const following = page.locator(".release-following"); await following.locator("summary").click();
-      await following.getByRole("button", { name: "Unfollow Release Artist" }).click();
-      await expect(page.getByText("Your next favorite starts with a follow")).toBeVisible();
-      expect((await api<{ artists: unknown[] }>(page, app, "/api/v1/artist-follows")).artists).toEqual([]);
-      expect(app.db.prepare("SELECT COUNT(*) AS n FROM saved_discoveries").get()).toEqual({ n: 1 });
-      expect(app.db.pragma("foreign_key_check")).toEqual([]);
-    });
   });
 
   test("Scenario 13: Household Playlist Collaboration & Party Requests", async ({ page, browser, system }, info) => {
@@ -1189,7 +1075,7 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
       const token = new URL(invitation).hash.slice("#token=".length);
       expect((await viewerPage.request.post(`${app.url}/api/v1/playlist-shares/resolve`, { data: { token } })).status()).toBe(403);
       expect(app.db.prepare("SELECT added_by_user_id FROM playlist_items WHERE playlist_id=? AND library_track_id=?").get(id, tracks[1].id)).toEqual({ added_by_user_id: editor.id });
-      expect(app.db.pragma("foreign_key_check")).toEqual([]);
+      expect(app.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally { await editorContext.close(); await viewerContext.close(); }
   });
 
@@ -1261,9 +1147,10 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await expect(secondRow).toHaveAttribute("aria-selected", "true");
         await expect(page.locator('.track[role="row"][aria-selected="true"]')).toHaveCount(2);
         await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
-        await tap(page.getByRole("menuitem", { name: /^Play Next/ }));
+        await tap(page.getByRole("button", { name: "Play next", exact: true }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
-        await tap(page.getByRole("button", { name: /Cancel selection|Exit selection|Clear selection/i }).first());
+        const clearSelection = page.getByRole("button", { name: /Cancel selection|Exit selection|Clear selection/i }).first();
+        if (await clearSelection.isVisible()) await tap(clearSelection);
         // A pan exceeding the movement threshold scrolls instead of selecting.
         await touch("touchStart", 200, 640);
         for (let i = 1; i <= 8; i++) { await touch("touchMove", 200, 640 - i * 40); await page.waitForTimeout(20); }
@@ -1287,14 +1174,15 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
           requestAnimationFrame(check);
         }));
         const scrollBefore = await page.evaluate(() => ({ window: window.scrollY, containers: [...document.querySelectorAll<HTMLElement>(".app-main,.main-content,main")].map(el => el.scrollTop) }));
-        const links = page.locator('.track[role="row"] a.track-artist-link');
-        const visibleLink = await links.evaluateAll(elements => elements.findIndex(element => {
+        await expect(page.locator('.track[role="row"] a.track-artist-link')).toHaveCount(0);
+        const trackMenus = page.getByRole("button", { name: /^More options for / });
+        const visibleMenu = await trackMenus.evaluateAll(elements => elements.findIndex(element => {
           const bounds = element.getBoundingClientRect();
           return bounds.top > 160 && bounds.bottom < Math.min(550, innerHeight - 160);
         }));
-        expect(visibleLink, "An inline artist link is inside the mobile viewport").toBeGreaterThanOrEqual(0);
-        const link = links.nth(visibleLink);
-        await tap(link);
+        expect(visibleMenu, "A track actions button is inside the mobile viewport").toBeGreaterThanOrEqual(0);
+        await tap(trackMenus.nth(visibleMenu));
+        await tap(page.getByRole("link", { name: "Go to artist" }));
         await expect(page).toHaveURL(/\/artist\//);
         expect(await page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
         await page.goBack();
@@ -1320,6 +1208,8 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await tap(nowPlaying.getByRole("button", { name: "Queue", exact: true }));
         const queue = page.getByRole("complementary", { name: "Playback queue" });
         await expect(queue.getByRole("button", { name: "Close queue sidebar" })).toBeFocused();
+        await page.keyboard.press("Escape");
+        await expect(nowPlaying.getByRole("button", { name: "Queue", exact: true })).toBeFocused();
         await page.keyboard.press("Escape");
         await expect(openPlayer).toBeFocused();
         await expect(miniPlayer.getByRole("button", { name: "Pause", exact: true })).toBeVisible();

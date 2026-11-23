@@ -21,6 +21,9 @@ export default defineConfig({
     viewport: { width: 1280, height: 900 },
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    launchOptions: { args: ["--autoplay-policy=no-user-gesture-required"] },
+    launchOptions: {
+      executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH,
+      args: ["--autoplay-policy=no-user-gesture-required"],
+    },
   },
 });

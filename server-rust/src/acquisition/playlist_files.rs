@@ -605,6 +605,13 @@ fn create_album_directory(root: &Path, relative: &Path) -> io::Result<PathBuf> {
             ));
         }
         if created {
+            // The container's private umask also applies to directory creation.
+            // Navidrome may traverse the shared library under another UID.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&canonical, fs::Permissions::from_mode(0o755))?;
+            }
             sync_directory(&parent)?;
         }
         parent = canonical;
@@ -645,11 +652,6 @@ fn copy_track(
     }
     let mut builder = tempfile::Builder::new();
     builder.prefix(".musicdeck-").suffix(".part");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o644));
-    }
     let mut temp = builder.tempfile_in(&parent)?;
     let mut input = fs::File::open(source)?;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -665,6 +667,12 @@ fn copy_track(
     }
     if copied != meta.len() {
         return Err(io::Error::other("Downloaded audio changed during the copy"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
     }
     temp.as_file().sync_all()?;
     check_cancelled()?;
@@ -764,5 +772,37 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.join("Artist")).unwrap();
         assert!(create_album_directory(&root, Path::new("Artist/Album")).is_err());
         assert!(!outside.path().join("Album").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publishes_readable_audio_under_private_umask() {
+        const CHILD: &str = "MUSICDECK_TEST_PRIVATE_PUBLICATION_UMASK";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let test_name = format!("{module}::publishes_readable_audio_under_private_umask");
+            let output = std::process::Command::new("sh")
+                .args(["-c", "umask 077\nexec \"$@\"", "musicdeck-test"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let music = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        fs::write(source.path(), b"audio bytes").unwrap();
+        let root = fs::canonicalize(music.path()).unwrap();
+        let relative = Path::new("Artist/Album/Track.m4a");
+        copy_track(&root, relative, source.path(), &Default::default()).unwrap();
+        let mode = |path| fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("Artist"), 0o755);
+        assert_eq!(mode("Artist/Album"), 0o755);
+        assert_eq!(mode("Artist/Album/Track.m4a"), 0o644);
     }
 }

@@ -494,7 +494,11 @@ impl<'a> CatalogAudio<'a> {
                 converter.to_string_lossy().into_owned(),
             ]);
         }
-        if let Some(deno) = local_spotdl_tool(&tool_name("deno")) {
+        let deno_name = tool_name("deno");
+        let deno_on_path = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join(&deno_name).is_file())
+        });
+        if !deno_on_path && let Some(deno) = local_spotdl_tool(&deno_name) {
             args.extend(["--js-runtimes".into(), format!("deno:{}", deno.display())]);
         }
         args.extend([
@@ -567,6 +571,7 @@ impl<'a> CatalogAudio<'a> {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 match self.search("album", artist, album, "").await? {
                     Ok(candidates) => entry.insert(candidates),
+                    Err("catalog-unavailable") => entry.insert(Candidates::default()),
                     Err(code) => return Ok(Err(code)),
                 }
             }
@@ -581,18 +586,26 @@ impl<'a> CatalogAudio<'a> {
             .filter(|candidate| !edition_matches(item, candidate))
             .filter_map(|candidate| candidate.video_id.as_deref())
             .collect();
-        Ok(self
-            .search("song", &source.artist, album, &source.title)
-            .await?
-            .and_then(|mut candidates| {
-                candidates.tracks.retain(|candidate| {
-                    candidate
-                        .video_id
-                        .as_deref()
-                        .is_none_or(|id| !conflicts.contains(id))
+        // Search without the album text as a second query. A song result must
+        // still identify the requested album and pass all recording checks.
+        for album_query in [album, ""] {
+            let result = self
+                .search("song", &source.artist, album_query, &source.title)
+                .await?
+                .and_then(|mut candidates| {
+                    candidates.tracks.retain(|candidate| {
+                        candidate
+                            .video_id
+                            .as_deref()
+                            .is_none_or(|id| !conflicts.contains(id))
+                    });
+                    choose_video(item, &candidates)
                 });
-                choose_video(item, &candidates)
-            }))
+            if result != Err("catalog-no-match") {
+                return Ok(result);
+            }
+        }
+        Ok(Err("catalog-no-match"))
     }
 
     async fn retry<F>(
@@ -946,14 +959,21 @@ mod tests {
                 let info: Value = serde_json::from_str(&args[4]).unwrap();
                 let tags = json!({"sourceUrl": info["url"], "duration": 215.0, "title": info["title"], "hasArtwork": false});
                 fs::write(path, tags.to_string()).await.unwrap();
-            } else {
-                assert_eq!(args[2], "album");
+            } else if args[2] == "album" {
                 stdout = json!({"tracks":[
                     candidate("fixture0001", "Ellipse", 214, "2016"),
-                    candidate("fixture0002", "SVU", 215, "2016"),
                     candidate("fixture0003", "Monolith", 215, "2016"),
                 ]})
                 .to_string();
+            } else {
+                assert_eq!(args[2], "song");
+                assert_eq!(args[5], "SVU");
+                let track = if args[4].is_empty() {
+                    candidate("fixture0002", "SVU", 215, "2016")
+                } else {
+                    candidate("fixture0004", "SVU (Live)", 215, "2016")
+                };
+                stdout = json!({"tracks":[track]}).to_string();
             }
             Ok(ProcessExecutionResult {
                 exit_code,

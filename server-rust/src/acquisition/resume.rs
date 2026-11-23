@@ -520,11 +520,13 @@ pub(super) async fn prepare_existing(
                         valid
                     }
                 };
+                // A surviving file can have a different Navidrome ID after a rescan
+                // or database rebuild. Reconcile it with the current batch.
+                entry.provider_track_id = None;
                 if valid {
                     continue;
                 }
                 entry.library_path = None;
-                entry.provider_track_id = None;
             }
             if !entry.source.url.is_empty() && !library_paths.contains_key(&entry.source.url) {
                 let found = cancel

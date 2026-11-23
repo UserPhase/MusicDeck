@@ -39,7 +39,6 @@ data/
 *.mkv
 /music/*
 !/music/.gitkeep
-/server/music/
 /server-rust/music/
 /extensions/
 /server-rust/extensions/

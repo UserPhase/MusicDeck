@@ -44,8 +44,7 @@ The modal traps focus, restores focus/scroll on close, supports 390 px layouts a
 npm run test:acceptance:types
 npm run test:acceptance -- --grep "Scenario 10"
 
-# server/
-npx vitest run test/similar-mix-engine.test.ts --maxWorkers=1
+cargo test --manifest-path server-rust/Cargo.toml --lib similar_mix
 
 # webapp/
 npm test -- --watch=false --runInBand --runTestsByPath src/components/discovery/MixBuilderModal.test.tsx

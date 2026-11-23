@@ -17,9 +17,9 @@ export async function launchLifecycleBrowser(directory: string) {
   // A closed browser leaves its old port file behind; a restart must wait for the new one.
   await fs.unlink(path.join(profile, "DevToolsActivePort")).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
   // This fixture uses trusted local pages. Match Playwright's default launch
-  // on GitHub's Linux runner, where Chromium's own sandbox may not initialize.
-  const noSandbox = process.platform !== "win32" && (process.getuid?.() === 0 ||
-    (process.platform === "linux" && process.env.GITHUB_ACTIONS === "true"));
+  // when the test host's sandbox cannot start another Chromium sandbox.
+  const noSandbox = process.platform === "win32" || process.getuid?.() === 0 ||
+    (process.platform === "linux" && process.env.GITHUB_ACTIONS === "true");
   const child = spawn(executable, ["--headless=new", "--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
     `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
     "--disable-component-update", "--disable-sync", "--autoplay-policy=no-user-gesture-required",

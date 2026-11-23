@@ -53,8 +53,7 @@ jobs:
       - name: Run Rust tests
         run: cargo test --locked
 
-  # The legacy Playwright fixtures instantiate Fastify directly. They are excluded
-  # from release gating until their backend fixtures are migrated to Rust.
+  # The browser acceptance suite runs separately from the image publishing checks.
 
   test-server-image:
     runs-on: ubuntu-24.04

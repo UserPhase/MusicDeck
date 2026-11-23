@@ -43,6 +43,6 @@ Run the native Chromium touch check from `webapp`:
 npm run test:touch
 ```
 
-Set `CHROME_PATH` if Chromium/Edge is not installed at a detected location. This check bundles the real components with isolated account/player fixtures, starts a localhost-only server, and uses a fresh headless browser profile. It exercises a 390 × 844 viewport with native touch events, draggable rows, long-press selection, batch Play Next order, scrolling, inline artist navigation, and exact return-scroll restoration. Temporary browser files are removed afterward. Set `MUSICDECK_TOUCH_SCREENSHOT_PATH` to save a screenshot.
+Set `CHROME_PATH` if Chromium/Edge is not installed at a detected location. This check bundles the real components with isolated account/player fixtures, starts a localhost-only server, and uses a fresh headless browser profile. It exercises a 390 × 844 viewport with native touch events, draggable rows, long-press selection, batch Play Next order, scrolling, artist navigation through the mobile action sheet, and exact return-scroll restoration. Temporary browser files are removed afterward. Set `MUSICDECK_TOUCH_SCREENSHOT_PATH` to save a screenshot.
 
-No new runtime packages are required; the check uses the repository's existing esbuild and WebSocket dependencies.
+The check uses the webapp's esbuild and WebSocket development dependencies.

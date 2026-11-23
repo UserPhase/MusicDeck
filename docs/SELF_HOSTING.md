@@ -543,6 +543,9 @@ MusicDeck Server container also uses:
 - `MUSICDECK_PORT=4534`
 - `MUSICDECK_DB_PATH=/app/data/musicdeck.sqlite`
 - `MUSICDECK_MUSIC_ROOT`: folder where acquired/downloaded music is written. Must match the backend's scanned music folder (see "Persistent Volumes" above).
+- `MUSICDECK_DEEZER_YTDLP=true` enables the alternative downloader for eligible Deezer tracks and albums. The default Compose pin `sha-3e82c75` predates the downloader. Set `MUSICDECK_VERSION` to a newer published tag that includes it, then run `docker compose pull` and `docker compose up -d`. Check the selected tag with `docker compose config --images`.
+
+For a missing download, open **Downloads → Server downloads** and check the downloader, indexed count, and any track errors. Both MusicDeck and Navidrome must see the same files under `/music`, and Navidrome needs permission to traverse their parent directories and read the audio. Keep Navidrome's **Report Real Path** enabled for MusicDeck's Subsonic connection. The bundled Compose configuration sets its default with `ND_SUBSONIC_DEFAULTREPORTREALPATH=true`. For older files, confirm the exact path before fixing its permissions and running a Navidrome scan.
 
 Navidrome backend connection (required when `MUSIC_BACKEND=navidrome`):
 
@@ -614,7 +617,7 @@ shared rate limiting; also apply coarse network/edge limits for volumetric
 traffic. Account budgets can temporarily deny a legitimate login during a
 targeted attack; operators should tune for expected users behind shared IPs,
 not disable protections. Global login concurrency bounds bcrypt work but does
-not bound all Fastify sockets or traffic.
+not bound all HTTP sockets or traffic.
 
 ## Credential Storage
 
@@ -626,10 +629,10 @@ Database-stored backend credentials remain a development fallback for older data
 
 MusicDeck supports multiple independent user accounts on one server:
 
-- The first account is created automatically from `MUSICDECK_ADMIN_USERNAME`/`MUSICDECK_ADMIN_PASSWORD` the first time the database has zero users (see `seedInitialData` in `server/src/db/migrations.ts`). This only runs once — it does not reset an existing admin's password.
+- The first account is created automatically from `MUSICDECK_ADMIN_USERNAME`/`MUSICDECK_ADMIN_PASSWORD` the first time the database has zero users (see `seed_initial_data` in `server-rust/src/db/migrations.rs`). This only runs once — it does not reset an existing admin's password.
 - Additional accounts (admin or standard `user` role) are created by an admin from the Admin > Users page, or via `POST /api/users`.
 - Each user has their own session, settings (`/api/settings/user`), favorites, recently played history, and playlists — all scoped by `user_id` in SQLite. Non-admin users cannot read or modify another user's data or admin-only server settings (`403 Forbidden`).
-- See `server/test/multi-user-isolation.test.ts` for regression coverage confirming two accounts on the same server never see each other's settings, favorites, or history, and that logging out one account does not affect another's session.
+- The Rust tests cover account-scoped queue sessions, listening history, playback checkpoints, and session revocation.
 
 ## Health Checks
 

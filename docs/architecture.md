@@ -28,10 +28,10 @@ It is not a feature roadmap.
 MusicDeck/
 ├── webapp/
 │   └── React web client
-├── android/
+├── Android App/
 │   └── Android client
-├── server/
-│   └── MusicDeck API/server
+├── server-rust/
+│   └── MusicDeck API and background workers
 ├── docs/
 │   └── Architecture and project documentation
 └── .github/
@@ -112,7 +112,7 @@ tactile hover and press transitions.
 
 The application name is a global setting stored in the `server_settings`
 table under the `branding.appName` key. It is exposed by two endpoints in
-`server/src/routes/config-routes.ts`:
+`server-rust/src/routes/config.rs`:
 
 - `GET /api/public/config` needs no login (the login page is branded too) and
   returns `{ appName }`, falling back to `"MusicDeck"`.
@@ -470,13 +470,13 @@ player queue, independently of the browsing cache.
 
 ### Admin server log viewer
 
-`server/src/utils/logger.ts` keeps the last 1,000 server log entries in an
+`server-rust/src/logger/mod.rs` keeps the last 1,000 server log entries in an
 in-memory ring buffer that is also capped at about 2 MB. It evicts the oldest
 entries first and truncates oversized messages, stacks and metadata.
 
 The buffer is fed from five places:
 
-- Fastify/pino output, through a capture stream passed as the logger `stream`.
+- Rust server events from the tracing subscriber.
   Lines still print to stdout.
 - `console.*` calls, which are patched but still print.
 - `unhandledRejection` events. The handler records them and keeps the process
@@ -675,12 +675,11 @@ inside the unchanged layout/player shell.
 
 ### Library scan scheduler
 
-`server/src/services/scannerScheduler.ts` owns one in-memory `node-cron` job
-that triggers `CatalogService.scanLibrary()` on every connected provider.
+`server-rust/src/tasks/scheduler.rs` manages the library scan schedule.
 
 - The schedule is the `library.scanSchedule` server setting: a standard
   5-field cron expression (`0 3 * * *` daily, `0 3 * * 0` weekly), or `""`
-  for no automatic scans. `buildServer` reads it on startup and stops the job
+  for no automatic scans. The Rust server reads it on startup and stops the job
   on close.
 - `PATCH /api/admin/settings/server` validates the value (5 fields only;
   legacy aliases such as `disabled` normalize to `""`), saves it, and re-arms
@@ -846,7 +845,7 @@ explicitly approximate and based on observed progress, never fabricated.
 Smart playlist previews/evaluation are synchronous indexed queries, not
 TaskManager jobs, so the center does not invent entries or pause controls for them.
 
-`server/src/services/TaskManager.ts` provides a persistent coordinator for
+`server-rust/src/tasks/manager.rs` provides a persistent coordinator for
 cooperative `SPOTDL_IMPORT` (`SPOTDL_DOWNLOAD` compatibility alias),
 `LIBRARY_SCAN` and `AUDIO_ANALYSIS` runners.
 Tasks and five-field cron schedules are stored in SQLite; after a process
@@ -891,7 +890,7 @@ runner registers. Settled history is bounded to 1,000 tasks.
 catalog/provider plugin registry. It discovers strict `extension.json` manifests
 under `MUSICDECK_EXTENSIONS_DIR` without importing disabled code, persists enabled
 intent in SQLite and serializes live activation/disable. A fixed admin-only
-Fastify gateway dispatches exact module routes, so hot toggles never mutate a
+Rust gateway dispatches exact module routes, so hot toggles never mutate a
 started router. Optional audio-analysis runners/interceptors use TaskManager;
 core download and scan runners bypass extension middleware.
 
@@ -987,7 +986,7 @@ fans reads out across them and the source resolver picks a playable source.
 
 ### Outbound privacy policy
 
-`server/src/services/PrivacyManager.ts` owns a global SQLite-backed policy,
+`server-rust/src/services/privacy.rs` owns a global SQLite-backed policy,
 installed before providers, plugins and background services start. Requests use
 an AsyncLocalStorage scope; background work uses the same runtime policy.
 Managed HTTP transports (including injected catalog/plugin bridges) are checked

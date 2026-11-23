@@ -2,34 +2,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { createServer } from "node:net";
-import type { FastifyInstance } from "../../../server/node_modules/fastify/fastify.js";
-import { loadConfig, type AppConfig } from "../../../server/src/config.js";
-import { openDatabase, type Db } from "../../../server/src/db/database.js";
-import { createProviderRegistry } from "../../../server/src/backends/factory.js";
-import { withLocalUserDataSync } from "../../../server/src/backends/local-user-data-sync.js";
-import { buildServer } from "../../../server/src/server.js";
-import { LibraryService } from "../../../server/src/domain/library.js";
-import { CatalogService } from "../../../server/src/domain/catalog.js";
-import { PlaylistService } from "../../../server/src/domain/playlist-service.js";
-import { SourceResolver } from "../../../server/src/domain/source-resolver.js";
-import { SearchProviderRegistry } from "../../../server/src/domain/search-provider-registry.js";
-import { SourceProviderRegistry } from "../../../server/src/domain/source-provider-registry.js";
-import { SourcePipelineRegistry } from "../../../server/src/domain/source-discovery.js";
-import { ExternalCatalogRegistry } from "../../../server/src/domain/external-catalog.js";
-import { RecommendationRegistry, RecommendationService } from "../../../server/src/domain/recommendations.js";
-import { LibraryInsightsService } from "../../../server/src/domain/library-insights.js";
-import { AcquisitionProviderRegistry, AcquisitionService } from "../../../server/src/domain/acquisition.js";
-import { PluginRegistry } from "../../../server/src/plugins/plugin-registry.js";
-import { createPrivacyManager, setRuntimePrivacyManager } from "../../../server/src/services/PrivacyManager.js";
-import { SpotifyPlaylistImportService } from "../../../server/src/domain/spotify-playlist-import.js";
-import type { DownloaderAdapter } from "../../../server/src/domain/downloader-adapter.js";
-import { SqliteImportJobRepository } from "../../../server/src/infrastructure/persistence/sqliteImportJobRepository.js";
+import { execFile, spawn } from "node:child_process";
+import { createServer, request } from "node:http";
+import { connect, type Socket } from "node:net";
+import { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 import type { MockBackend } from "./mockBackends.js";
 
 export const root = fileURLToPath(new URL("../../../", import.meta.url));
-const require = createRequire(path.join(root, "server/package.json"));
-const esbuild: typeof import("../../../server/node_modules/esbuild/lib/main.js") = require("esbuild");
+const require = createRequire(path.join(root, "webapp/package.json"));
+const esbuild: typeof import("../../../webapp/node_modules/esbuild/lib/main.js") = require("esbuild");
 
 /** Build current source, never a possibly stale webapp/build directory. */
 export async function buildAcceptanceBrowser(directory: string) {
@@ -54,97 +37,193 @@ export async function buildAcceptanceBrowser(directory: string) {
   await fs.writeFile(path.join(directory, "asset-manifest.json"), JSON.stringify({ files: { main: "/app.js", css: "/app.css" }, entrypoints: ["app.js", "app.css"] }));
 }
 
-export function fixtureConfig(directory: string, nav: MockBackend, jelly: MockBackend, overrides: Partial<AppConfig> = {}): AppConfig {
-  return loadConfig({
-    databasePath: path.join(directory, "data/musicdeck.sqlite"), musicRoot: path.join(directory, "music"),
-    acquisitionTmpDir: path.join(directory, "staging"), extensionsDir: path.join(directory, "extensions"),
-    sessionSecret: "acceptance-session-secret-at-least-32-characters", firstAdmin: { username: "admin", password: "acceptance-admin-password" },
-    host: "127.0.0.1", port: 0, publicUrl: "http://127.0.0.1", corsOrigin: "http://127.0.0.1",
-    backend: "navidrome", navidrome: { url: nav.url, username: nav.credentials.username, password: nav.credentials.password },
-    jellyfin: { url: jelly.url, apiKey: jelly.credentials.apiKey }, localOnlyMode: true,
-    isProduction: false, secureCookies: false, trustedProxies: [], ...overrides,
-  });
-}
+export type Db = DatabaseSync;
 
-export async function startApplication(config: AppConfig, browserDirectory: string, options: { dual?: boolean; downloader?: DownloaderAdapter; metadataFetch?: typeof fetch } = {}) {
-  let app: FastifyInstance | undefined;
-  let db: Db | undefined;
-  // Refuse all non-loopback outbound traffic, including accidental metadata calls.
-  const nativeFetch = globalThis.fetch;
-  globalThis.fetch = ((input, init) => {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    if (url.hostname !== "127.0.0.1") return Promise.reject(new Error(`Acceptance blocked non-loopback network: ${url.origin}`));
-    return nativeFetch(input, init);
-  }) as typeof fetch;
-  const shutdown = async () => {
-    try {
-      if (app) {
-        const closing = app.close();
-        app.server.closeAllConnections();
-        await closing;
-      }
-    } finally {
-      if (db?.open) db.close();
-      globalThis.fetch = nativeFetch;
-    }
-  };
+export function transaction(db: Db, work: () => void) {
+  db.exec("BEGIN");
   try {
-    const reservation = createServer();
-    await new Promise<void>((resolve, reject) => { reservation.once("error", reject); reservation.listen(0, "127.0.0.1", resolve); });
-    const address = reservation.address();
-    if (!address || typeof address === "string") throw new Error("Could not allocate an application port");
-    config.port = address.port;
-    config.publicUrl = config.corsOrigin = `http://127.0.0.1:${config.port}`;
-    await new Promise<void>((resolve, reject) => reservation.close(error => error ? reject(error) : resolve()));
-    db = await openDatabase(config);
-    // File-backed WAL is representative of a live SQLite deployment. NORMAL
-    // keeps thousands of fixture catalog writes from measuring host fsync speed.
-    db.pragma("journal_mode = WAL");
-    db.pragma("synchronous = NORMAL");
-    // Exercise factory loading of durable connection records, including native-ID collisions.
-    db.prepare("UPDATE backend_connections SET enabled=0").run();
-    const insert = db.prepare("INSERT OR REPLACE INTO backend_connections(id,type,name,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,1,?,?)");
-    insert.run("acceptance-nav", "navidrome", "Acceptance Navidrome", JSON.stringify({ url: config.navidrome.url }), "2024-01-01", "2024-01-01");
-    if (options.dual) insert.run("acceptance-jelly", "jellyfin", "Acceptance Jellyfin", JSON.stringify({ url: config.jellyfin.url }), "2024-01-02", "2024-01-02");
-    const privacy = createPrivacyManager(db, config);
-    setRuntimePrivacyManager(privacy);
-    const registry = createProviderRegistry(db, config);
-    const backend = withLocalUserDataSync(registry.getPrimary().provider);
-    const library = new LibraryService(db, { musicRoot: config.musicRoot });
-    const catalog = new CatalogService(registry, library);
-    const sourceResolver = new SourceResolver(registry, library);
-    const playlists = new PlaylistService(db, backend, catalog, library, sourceResolver);
-    const externalCatalog = new ExternalCatalogRegistry(options.metadataFetch, db);
-    const searchProviders = new SearchProviderRegistry(db, catalog, playlists, undefined, externalCatalog.artwork);
-    const sourcePipeline = new SourcePipelineRegistry(db);
-    const sourceProviders = new SourceProviderRegistry(db, library, registry, sourceResolver, undefined, sourcePipeline);
-    const recommendations = new RecommendationRegistry(new RecommendationService(db, catalog));
-    const libraryInsights = new LibraryInsightsService(db, catalog);
-    const acquisitionProviders = new AcquisitionProviderRegistry();
-    const plugins = new PluginRegistry(db, { catalog, libraryInsights, sources: sourceProviders, sourcePipeline,
-      acquisition: acquisitionProviders, recommendations,
-      playlists: { create: async (name, userId) => playlists.create(name, { id: userId, role: "user" } as never), addTrack: (id, track) => playlists.addTrack(id, track) } });
-    const acquisition = new AcquisitionService(db, acquisitionProviders, library, catalog, plugins, {
-      musicRoot: config.musicRoot, tmpDir: config.acquisitionTmpDir, limits: config.acquisitionLimits,
-      maxConcurrentDownloads: 1, autoScan: true, sourcePipeline,
-    });
-    const importRepository = new SqliteImportJobRepository(db);
-    const importer = options.downloader ? new SpotifyPlaylistImportService(backend, playlists, options.downloader, config.musicRoot,
-      async () => new Response(JSON.stringify({ title: "Acceptance import" }), { headers: { "content-type": "application/json" } }),
-      config.spotifyImportSubdir, undefined, importRepository) : undefined;
-    app = await buildServer({ config, db, privacy, backend, catalog, playlists, library, sourceResolver, searchProviders, sourceProviders,
-      externalCatalog, recommendations, libraryInsights, plugins, acquisition, spotifyPlaylistImport: importer, logger: false });
-    const mime: Record<string, string> = { ".js": "application/javascript", ".css": "text/css", ".html": "text/html", ".json": "application/json" };
-    app.get("/*", async (request, reply) => {
-      const pathname = new URL(request.url, "http://127.0.0.1").pathname;
-      if (pathname.startsWith("/api/")) return reply.code(404).send({ error: "Unknown API route" });
-      const name = ["/app.js", "/app.css", "/service-worker.js", "/asset-manifest.json"].includes(pathname) ? pathname.slice(1) : "index.html";
-      return reply.type(mime[path.extname(name)]).header("Cache-Control", "no-cache").send(await fs.readFile(path.join(browserDirectory, name)));
-    });
-    const url = await app.listen({ port: config.port, host: "127.0.0.1" });
-    return { url, app, db, config, registry, catalog, library, importer, importRepository, close: shutdown };
+    work();
+    db.exec("COMMIT");
   } catch (error) {
-    await shutdown(); throw error;
+    db.exec("ROLLBACK");
+    throw error;
   }
 }
+
+export function fixtureConfig(directory: string, nav: MockBackend, jelly: MockBackend, localOnlyMode: boolean) {
+  return {
+    directory, nav, jelly, localOnlyMode,
+    databasePath: path.join(directory, "data", "musicdeck.sqlite"),
+    musicRoot: path.join(directory, "music"),
+    acquisitionTmpDir: path.join(directory, "staging"),
+  };
+}
+
+type FixtureConfig = ReturnType<typeof fixtureConfig>;
+const binaryDirectory = path.resolve(process.env.CARGO_TARGET_DIR || path.join(root, "server-rust", "target"), "debug");
+const binary = (name: string) => path.join(binaryDirectory, process.platform === "win32" ? `${name}.exe` : name);
+
+function fixtureEnv(config: FixtureConfig, publicUrl = "http://127.0.0.1", port = 4534) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !/^(MUSICDECK_|NAVIDROME_|JELLYFIN_|SPOTDL_|LOCAL_ONLY_MODE$)/i.test(key)
+  ));
+  return {
+    ...env,
+    MUSICDECK_ENV: "development",
+    MUSICDECK_BIND_ADDR: `127.0.0.1:${port}`,
+    MUSICDECK_PUBLIC_URL: publicUrl,
+    MUSICDECK_CORS_ORIGIN: publicUrl,
+    MUSICDECK_SECURE_COOKIES: "false",
+    MUSICDECK_DB_PATH: config.databasePath,
+    MUSICDECK_MUSIC_ROOT: config.musicRoot,
+    MUSICDECK_ACQUISITION_TMP_DIR: config.acquisitionTmpDir,
+    MUSICDECK_EXTENSIONS_DIR: path.join(config.directory, "extensions"),
+    MUSICDECK_SESSION_SECRET: "acceptance-session-secret-at-least-32-characters",
+    MUSICDECK_ADMIN_USERNAME: "admin",
+    MUSICDECK_ADMIN_PASSWORD: "acceptance-admin-password",
+    MUSIC_BACKEND: "navidrome",
+    NAVIDROME_URL: config.nav.url,
+    NAVIDROME_USERNAME: config.nav.credentials.username,
+    NAVIDROME_PASSWORD: config.nav.credentials.password,
+    JELLYFIN_URL: config.jelly.url,
+    JELLYFIN_API_KEY: config.jelly.credentials.apiKey,
+    LOCAL_ONLY_MODE: String(config.localOnlyMode),
+    HTTP_PROXY: "http://127.0.0.1:1",
+    HTTPS_PROXY: "http://127.0.0.1:1",
+    ALL_PROXY: "http://127.0.0.1:1",
+    NO_PROXY: "127.0.0.1,localhost",
+  };
+}
+
+async function listen(server: ReturnType<typeof createServer>) {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Fixture did not bind TCP");
+  return address.port;
+}
+
+async function reservePort() {
+  const server = createServer();
+  const port = await listen(server);
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
+}
+
+export async function startApplication(config: FixtureConfig, browserDirectory: string, options: {
+  dual?: boolean; initialize?: (db: Db) => void;
+} = {}) {
+  // Keep dotenv from searching parent directories for the developer's settings.
+  await fs.writeFile(path.join(config.directory, ".env"), "");
+  await fs.mkdir(config.musicRoot, { recursive: true });
+  await fs.mkdir(config.acquisitionTmpDir, { recursive: true });
+  const port = await reservePort();
+  const backend = { hostname: "127.0.0.1", port };
+  const sockets = new Set<Socket>();
+  const trackSocket = (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  };
+  const types: Record<string, string> = {
+    "/app.js": "application/javascript", "/app.css": "text/css",
+    "/service-worker.js": "application/javascript", "/asset-manifest.json": "application/json",
+  };
+  const gateway = createServer((req, res) => {
+    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (pathname.startsWith("/api/")) {
+      const upstream = request({ ...backend, path: req.url, method: req.method, headers: req.headers }, incoming => {
+        res.writeHead(incoming.statusCode ?? 502, incoming.headers);
+        incoming.on("error", () => res.destroy());
+        res.on("close", () => incoming.destroy());
+        incoming.pipe(res);
+      });
+      upstream.on("error", () => {
+        if (res.headersSent) res.destroy();
+        else res.writeHead(502).end();
+      });
+      res.on("close", () => upstream.destroy());
+      req.pipe(upstream);
+      return;
+    }
+    const filename = types[pathname] ? pathname.slice(1) : "index.html";
+    void fs.readFile(path.join(browserDirectory, filename)).then(data => {
+      res.writeHead(200, { "content-type": types[pathname] ?? "text/html", "cache-control": "no-cache" }).end(data);
+    }, () => res.writeHead(404).end());
+  });
+  gateway.on("connection", trackSocket);
+  gateway.on("upgrade", (req, socket, head) => {
+    const upstream = connect({ host: backend.hostname, port }, () => {
+      const headers = [];
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        headers.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+      }
+      upstream.write(`${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${headers.join("\r\n")}\r\n\r\n`);
+      if (head.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
+    });
+    trackSocket(upstream);
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+    socket.on("close", () => upstream.destroy());
+    upstream.on("close", () => socket.destroy());
+  });
+  const url = `http://127.0.0.1:${await listen(gateway)}`;
+  const env = fixtureEnv(config, url, port);
+  let db: Db | undefined;
+  let child: ReturnType<typeof spawn> | undefined;
+  let terminated: Promise<void> | undefined;
+  const close = async () => {
+    const gatewayClosed = new Promise<void>(resolve => gateway.close(() => resolve()));
+    for (const socket of sockets) socket.destroy();
+    if (db?.isOpen) db.close();
+    if (child && terminated && child.exitCode === null && child.signalCode === null) {
+      child.kill();
+      const deadline = new AbortController();
+      try {
+        const exited = await Promise.race([terminated.then(() => true), delay(5000, false, { signal: deadline.signal })]);
+        if (!exited) child.kill("SIGKILL");
+      } finally {
+        deadline.abort();
+      }
+    }
+    await terminated;
+    await gatewayClosed;
+  };
+  try {
+    await promisify(execFile)(binary("init_db"), options.initialize ? ["--target-version", "38"] : [],
+      { cwd: config.directory, env, windowsHide: true, timeout: 20_000 });
+    db = new DatabaseSync(config.databasePath);
+    db.exec("PRAGMA busy_timeout = 5000");
+    const insert = db.prepare("INSERT OR REPLACE INTO backend_connections(id,type,name,config_json,enabled,created_at,updated_at) VALUES(?,?,?,?,1,?,?)");
+    transaction(db, () => {
+      db!.exec("UPDATE backend_connections SET enabled=0");
+      insert.run("acceptance-nav", "navidrome", "Acceptance Navidrome", JSON.stringify({ url: config.nav.url }), "2024-01-01", "2024-01-01");
+      if (options.dual) insert.run("acceptance-jelly", "jellyfin", "Acceptance Jellyfin", JSON.stringify({ url: config.jelly.url }), "2024-01-01", "2024-01-01");
+      options.initialize?.(db!);
+    });
+    child = spawn(binary("musicdeck-server"), [], { cwd: config.directory, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let logs = "", startupError: Error | undefined;
+    const remember = (chunk: Buffer) => { logs = (logs + chunk.toString()).slice(-16000); };
+    child.stdout?.on("data", remember);
+    child.stderr?.on("data", remember);
+    child.once("error", error => { startupError = error; });
+    terminated = new Promise<void>(resolve => child!.once("close", () => resolve()));
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !startupError && child.exitCode === null) {
+      const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1000) }).catch(() => null);
+      if (response?.ok) return { url, db, config, close };
+      await delay(100);
+    }
+    throw new Error(`Rust acceptance server did not start: ${startupError?.message ?? logs}`);
+  } catch (error) {
+    await close();
+    throw error;
+  }
+}
+
 export type Application = Awaited<ReturnType<typeof startApplication>>;

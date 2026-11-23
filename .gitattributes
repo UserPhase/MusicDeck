@@ -1,2 +1,2 @@
-server/docker-entrypoint.sh text eol=lf
+server-rust/docker-entrypoint.sh text eol=lf
 scripts/*.sh text eol=lf

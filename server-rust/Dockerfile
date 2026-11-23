@@ -75,9 +75,12 @@ RUN groupadd --system musicdeck \
   && chown -R musicdeck:musicdeck /app /extensions \
   && chmod 0700 /app/data /app/home /app/cache/runtime
 
-# Pre-install Deno under `musicdeck`'s HOME for yt-dlp YouTube challenge solving
-# and optional JS extension execution.
+# Put the bundled Deno on PATH so it is available even when Compose mounts an
+# existing home volume over /app/home.
 RUN gosu musicdeck spotdl --download-deno \
+  && deno_path="$(gosu musicdeck python3 -c 'from spotdl.utils.deno import get_local_deno; print(get_local_deno())')" \
+  && install -m 0755 "$deno_path" /usr/local/bin/deno \
+  && gosu musicdeck deno --version \
   && gosu musicdeck python3 -c "from spotdl.utils.deno import is_deno_installed; assert is_deno_installed()" \
   && ffmpeg -version > /dev/null
 

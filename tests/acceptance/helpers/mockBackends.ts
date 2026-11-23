@@ -145,7 +145,9 @@ export async function startMockBackend(options: MockBackendOptions) {
           case "getCoverArt": res.writeHead(200, { "content-type": "image/png" }); res.end(png); return;
         }
       } else {
-        if (req.headers["x-emby-token"] !== credentials.apiKey) { json(res, 401, { error: "Invalid API key" }); return; }
+        const authorization = req.headers.authorization ?? "";
+        const token = /^MediaBrowser\s/i.test(authorization) ? /(?:^|,\s*)Token="([^"]+)"/i.exec(authorization)?.[1] : undefined;
+        if (token !== encodeURIComponent(credentials.apiKey)) { json(res, 401, { error: "Invalid API key" }); return; }
         if (url.pathname === "/System/Info") { json(res, 200, { Id: "acceptance-jellyfin", ServerName: "Acceptance Jellyfin", Version: "10.10.0" }); return; }
         if (url.pathname === "/Library/Refresh") { await options.onScan?.(); json(res, 204, null); return; }
         if (/^\/Audio\/[^/]+\/stream$/.test(url.pathname)) { stream(req, res); return; }

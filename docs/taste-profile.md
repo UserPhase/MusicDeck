@@ -49,8 +49,7 @@ Acceptance Scenario 11 exercises actual browser playback, the global player swit
 npm run test:acceptance:types
 npm run test:acceptance -- --grep "Scenario 11"
 
-# server/
-npx vitest run test/taste-profile.test.ts test/listening-activity.test.ts --maxWorkers=1
+cargo test --manifest-path server-rust/Cargo.toml --lib taste
 
 # webapp/
 npm test -- --watch=false --runInBand --runTestsByPath src/services/TasteProfileStore.test.ts src/views/settings/TasteProfileView.test.tsx src/utils/listeningTracker.test.js

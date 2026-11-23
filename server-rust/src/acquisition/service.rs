@@ -279,6 +279,7 @@ pub struct AcquisitionService {
     db: Option<DbPool>,
     events_tx: broadcast::Sender<AcquisitionEvent>,
     library: Option<AcquisitionLibrary>,
+    catalog_snapshots: Option<Arc<crate::catalog::snapshot::CatalogSnapshots>>,
 }
 
 impl std::fmt::Debug for AcquisitionService {
@@ -296,6 +297,7 @@ impl AcquisitionService {
             db,
             events_tx,
             library: None,
+            catalog_snapshots: None,
         }
     }
 
@@ -305,6 +307,14 @@ impl AcquisitionService {
         providers: BackendRegistry,
     ) -> Self {
         self.library = Some(AcquisitionLibrary { config, providers });
+        self
+    }
+
+    pub(crate) fn with_catalog_snapshots(
+        mut self,
+        snapshots: Arc<crate::catalog::snapshot::CatalogSnapshots>,
+    ) -> Self {
+        self.catalog_snapshots = Some(snapshots);
         self
     }
 
@@ -1045,6 +1055,13 @@ impl AcquisitionService {
             return Err(TaskError::ExecutionFailed(
                 "No downloaded tracks were indexed".into(),
             ));
+        }
+        if let Some(snapshots) = &self.catalog_snapshots {
+            within_phase(context, scan_deadline, "catalog refresh", async {
+                snapshots.invalidate().await;
+                Ok(())
+            })
+            .await?;
         }
         context.checkpoint().await?;
         let count = files.len();

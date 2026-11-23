@@ -351,7 +351,7 @@ pub mod state {
         pub sessions: Option<SessionStore>,
         /// Dynamic registry of enabled upstream media providers (`Navidrome`, `Jellyfin`).
         pub providers: BackendRegistry,
-        catalog_snapshots: crate::catalog::snapshot::CatalogSnapshots,
+        catalog_snapshots: Arc<crate::catalog::snapshot::CatalogSnapshots>,
         /// Zero-copy binary stream header and throughput inspector.
         pub inspector: AudioMetadataInspector,
         /// Real-time WebSocket broadcast hub for live collaborative playlist party sessions.
@@ -513,7 +513,8 @@ pub mod state {
                     Arc::new(SonicAnalysisRunner::new(inner.sonic.clone())),
                 );
                 let acquisitions = AcquisitionService::new(Some(db.clone()))
-                    .with_library(inner.runtime_config.clone(), inner.providers.clone());
+                    .with_library(inner.runtime_config.clone(), inner.providers.clone())
+                    .with_catalog_snapshots(inner.catalog_snapshots.clone());
                 let spotify_imports = SpotifyPlaylistImportService::new(Some(db.clone()))
                     .with_library(inner.runtime_config.clone(), inner.providers.clone());
                 let spotdl_runner: Arc<dyn crate::tasks::TaskDefinition> = Arc::new(

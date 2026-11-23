@@ -49,7 +49,8 @@ def candidates(mode, artist, album, title):
                 for song in release.get("tracks") or []
             )
     else:
-        matches = yt.search(f"{artist} {title} {album}", filter="songs", limit=8)
+        query = " ".join(value for value in (artist, title, album) if value)
+        matches = yt.search(query, filter="songs", limit=8)
         rows = [(item, (item.get("album") or {}).get("name"), None) for item in matches[:8]]
     return {"tracks": [
         {
