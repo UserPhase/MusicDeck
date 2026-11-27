@@ -32,6 +32,24 @@ function Harness() {
     {tracks.map((song, index) => <TrackRow key={song.id} song={song} index={index} onPlay={() => {}} />)}
   </TrackActionScope></MemoryRouter>;
 }
+
+test("three-dot actions open for the clicked track without selecting it or replacing an existing selection", () => {
+  render(<Harness />);
+  const first = screen.getByRole("row", { name: "First by Artist" });
+  const second = screen.getByRole("row", { name: "Second by Artist" });
+  fireEvent.click(screen.getByRole("button", { name: "More options for First" }));
+  expect(screen.getByRole("menu", { name: "Actions for First" })).toBeInTheDocument();
+  expect(first).toHaveAttribute("aria-selected", "false");
+  expect(screen.queryByRole("button", { name: "Actions for selected tracks" })).not.toBeInTheDocument();
+
+  fireEvent.click(second, { ctrlKey: true });
+  fireEvent.click(screen.getByRole("button", { name: "More options for First" }));
+  fireEvent.click(screen.getByRole("button", { name: "More options for First" }));
+  expect(screen.getByRole("menu", { name: "Actions for First" })).toBeInTheDocument();
+  expect(first).toHaveAttribute("aria-selected", "false");
+  expect(second).toHaveAttribute("aria-selected", "true");
+});
+
 test("batch errors remain visible in the collection when a successful first mutation removes its invoking row", async () => {
   sendRecommendationFeedback.mockClear(); render(<Harness />);
   const first = screen.getByRole("row", { name: "First by Artist" });

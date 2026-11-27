@@ -127,10 +127,12 @@ function Sidebar({ id }) {
   const [cancelPending, setCancelPending] = useState(false);
   const { job: importJob, statusRetrying, openProgressToken, startImport, cancelImport, minimize } = useImport();
   const importStage = importJob?.stage;
+  const discovering = importStage === "discovering";
   const isScanStage = importStage === "scan" || importStage === "scanning";
   const waiting = importStage === "provider_cooldown" || importStage === "retry_wait";
-  const trackTotal = (waiting || ["download", "downloading", "conversion"].includes(importStage)) ? importJob?.expectedCount : undefined;
+  const trackTotal = (discovering || waiting || ["download", "downloading", "conversion"].includes(importStage)) ? importJob?.expectedCount : undefined;
   const tracksDownloaded = Math.min(importJob?.downloadedCount || 0, trackTotal || 0);
+  const progressCount = discovering ? Math.min(importJob?.discoveredCount || 0, trackTotal || 0) : tracksDownloaded;
 
   const [playlists, setPlaylists] = useState([]);
 
@@ -494,7 +496,7 @@ function Sidebar({ id }) {
                 <div className="playlist-modal-fields">
                   <p className="playlist-modal-intro">{importJob?.playlistName || "Your Spotify playlist"}</p>
                   <div className="playlist-import-counter">
-                    {waiting ? downloadPhaseLabels[importStage]
+                    {discovering || waiting ? downloadPhaseLabels[importStage]
                       : isScanStage ? "Scanning your music library..."
                       : importStage === "playlist_creation" ? "Creating your playlist..."
                       : importStage === "conversion" ? "Converting audio..."
@@ -504,13 +506,14 @@ function Sidebar({ id }) {
                   </div>
                   {statusRetrying && <p role="status">Could not refresh playlist import status. Reconnecting…</p>}
                   <div className="playlist-import-track">
-                    {importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}`
+                    {discovering ? trackTotal ? `${progressCount} of ${trackTotal} tracks discovered` : "Reading the Spotify playlist..."
+                      : importJob?.currentTrackName ? `Fetching: ${importJob.currentTrackName}`
                       : trackTotal ? `${tracksDownloaded} of ${trackTotal} tracks downloaded`
                       : isScanStage ? importJob?.importedCount ? `${importJob.importedCount} tracks indexed` : "Matching the audio files in Navidrome."
                       : importStage === "playlist_creation" ? "Saving tracks in playlist order." : "Preparing tracks..."}
                   </div>
-                  <div className={`playlist-import-bar${!trackTotal ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={trackTotal || undefined} aria-valuenow={trackTotal ? tracksDownloaded : undefined}>
-                    <span style={{ width: trackTotal ? `${100 * tracksDownloaded / trackTotal}%` : "35%" }} />
+                  <div className={`playlist-import-bar${!trackTotal ? " is-indeterminate" : ""}`} role="progressbar" aria-label="Playlist import progress" aria-valuemin={0} aria-valuemax={trackTotal || undefined} aria-valuenow={trackTotal ? progressCount : undefined}>
+                    <span style={{ width: trackTotal ? `${100 * progressCount / trackTotal}%` : "35%" }} />
                   </div>
                   {formError && <p className="playlist-modal-error" role="alert">{formError}</p>}
                 </div>
@@ -535,7 +538,7 @@ function Sidebar({ id }) {
                     {timeoutMode === "auto"
                       ? "Adapts to playlist size and progress, up to 6 hours."
                       : "Choose a limit from 1 to 120 minutes."}
-                    {" A stalled download stops within 15 minutes. Scanning and playlist creation have separate limits."}
+                    {" Playlist discovery can take up to 20 minutes within that limit. A stalled download stops within 15 minutes. Scanning and playlist creation have separate limits."}
                   </p>
                   {timeoutMode === "manual" && <>
                     <label htmlFor="spotify-import-timeout-minutes">Maximum download time (minutes)</label>

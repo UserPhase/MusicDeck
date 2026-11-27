@@ -873,7 +873,12 @@ runner registers. Settled history is bounded to 1,000 tasks.
   signal reaches each spotDL process. Cancellation sends SIGTERM, escalates
   after three seconds, and waits for process close before temporary-file cleanup.
   Acquisition restart recovery retains its explicit failed/retry behavior;
-  playlist imports resume from their persisted manifests after registration.
+  Spotify playlist imports save each ordered source page in their job staging
+  directory before reporting discovery progress. A restart resumes from the last
+  saved position, checking the playlist revision when Spotify provides it and
+  rechecking the previous page's last entry. Provider cooldowns survive restart.
+  Once discovery completes, the importer verifies reusable library files first
+  and submits only missing recordings in `.spotdl` batches of up to 48.
 - Library scans trigger Navidrome/Jellyfin scans sequentially and refresh
   MusicDeck's stable track-ID index in batches of 50, yielding between batches.
   Providers own filesystem traversal; an already accepted remote scan cannot

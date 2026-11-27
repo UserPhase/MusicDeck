@@ -420,10 +420,10 @@ Runs the compiled Rust MusicDeck API server (`musicdeck-server`).
 - Reads the selected backend's credentials from environment variables
 - Bundles the full acquisition runtime so the host needs nothing installed:
   Rust release binaries (`musicdeck-server`, `init_db`, `shrink_library`),
-  Python 3, FFmpeg/ffprobe, Deno, and spotDL (in a dedicated virtualenv at
-  `/opt/venv` aliased at `/opt/spotdl`). Automatic spotDL/yt-dlp/ytmusicapi updates are
-  opt-in (`SPOTDL_AUTO_UPDATE=1`). The default (`0`) keeps startup reproducible
-  by using the image-pinned versions unless you explicitly request a refresh.
+  Python 3.13, FFmpeg/ffprobe, Deno, and spotDL (in a dedicated virtualenv at
+  `/opt/venv` aliased at `/opt/spotdl`). The spotDL version comes from `requirements.txt`.
+  Startup refreshes of its dependencies are opt-in (`SPOTDL_AUTO_UPDATE=1`) and
+  respect the constraints in the image. The default (`0`) uses the build-time dependencies.
 
 ### navidrome
 
@@ -501,6 +501,9 @@ the corresponding variable in `.env` and restart the stack —
 When running `npm run dev` directly instead of Docker Compose, MusicDeck Server and Navidrome may live on different machines or filesystems with no shared folder by default. In that case, downloaded tracks will report as "completed"/"imported" in MusicDeck but never appear in your library, because Navidrome scans a folder your local MusicDeck process never wrote to.
 
 Set `MUSICDECK_MUSIC_ROOT` in `.env` (or the server's environment) to a path that Navidrome's music folder also resolves to — for example a shared network path, or by running Navidrome locally against the same folder. See `.env.example` for details.
+On Windows, use forward slashes in double-quoted `.env` paths, for example
+`MUSICDECK_MUSIC_ROOT="D:/Music"`. For a native Navidrome installation, use its
+configured `MusicFolder`.
 
 ## Environment Variables
 
@@ -528,10 +531,9 @@ MusicDeck:
 
 Image selection:
 
-- `MUSICDECK_VERSION` — image tag to run; defaults to the published commit tag
-  `sha-3e82c75` in the provided compose file. Use a tag published for both the web
+- `MUSICDECK_VERSION` — image tag to run. The provided Compose file defaults to
+  `latest`. To pin or roll back, use a tag published for both the web
   and server images; the package version does not imply a published image release.
-  Keep this pinned to an explicit release or commit tag for controlled rollback.
 - `MUSICDECK_IMAGE_SERVER`, `MUSICDECK_IMAGE_WEB` — override only if you
   publish your own image builds.
 - `NAVIDROME_IMAGE`, `JELLYFIN_IMAGE` — optional backend image references;
@@ -543,7 +545,7 @@ MusicDeck Server container also uses:
 - `MUSICDECK_PORT=4534`
 - `MUSICDECK_DB_PATH=/app/data/musicdeck.sqlite`
 - `MUSICDECK_MUSIC_ROOT`: folder where acquired/downloaded music is written. Must match the backend's scanned music folder (see "Persistent Volumes" above).
-- `MUSICDECK_DEEZER_YTDLP=true` enables the alternative downloader for eligible Deezer tracks and albums. The default Compose pin `sha-3e82c75` predates the downloader. Set `MUSICDECK_VERSION` to a newer published tag that includes it, then run `docker compose pull` and `docker compose up -d`. Check the selected tag with `docker compose config --images`.
+- `MUSICDECK_DEEZER_YTDLP=true` enables the alternative downloader for eligible Deezer tracks and albums. If you pin MusicDeck to a commit, use a tag that includes the downloader. Check the selected tag with `docker compose config --images`.
 
 For a missing download, open **Downloads → Server downloads** and check the downloader, indexed count, and any track errors. Both MusicDeck and Navidrome must see the same files under `/music`, and Navidrome needs permission to traverse their parent directories and read the audio. Keep Navidrome's **Report Real Path** enabled for MusicDeck's Subsonic connection. The bundled Compose configuration sets its default with `ND_SUBSONIC_DEFAULTREPORTREALPATH=true`. For older files, confirm the exact path before fixing its permissions and running a Navidrome scan.
 
@@ -736,16 +738,21 @@ Production pulls prebuilt GHCR images. Keep the existing Compose project name,
 deployment directory, and `.env` so the same database volumes and library mount
 are used. Back up the deployment data before applying an upgrade.
 
-For a deployment that is also a Git checkout, run `git pull --ff-only origin main`
-in the checkout. Wait for **Publish Docker images** to finish for the commit you
-want to deploy. Set `MUSICDECK_VERSION` in `.env` to that commit's published
-`sha-<7-character-commit>` tag. A Git pull updates the deployment files and the
-image tag selects the code that actually runs.
+Wait for **Publish Docker images** to succeed on `main`. The `latest` tag then
+points to the new web and server images. If your existing Compose file defaults
+to an older tag, set `MUSICDECK_VERSION=latest` in `.env` once. To deploy a
+specific build, set `MUSICDECK_VERSION` to its published
+`sha-<7-character-commit>` tag instead.
+
+Compose pulls images. To update a copy of `docker-compose.yml`, run
+`git pull --ff-only origin main` in a Git checkout or review and download the
+new Compose file separately for a standalone install. Keep your existing `.env`.
 
 From the existing deployment directory, update the two MusicDeck services:
 
 ```bash
 docker compose config --quiet
+docker compose config --images
 docker compose pull musicdeck-web musicdeck-server
 docker compose up -d --wait --pull never musicdeck-server musicdeck-web
 docker compose ps
@@ -770,6 +777,15 @@ docker compose -f docker-compose.dev.yml up -d --build
 
 ## Development Workflow
 
+From the repository root, install the launcher and web app dependencies, then
+start both services in the same terminal.
+
+```powershell
+npm ci --include=dev
+npm ci --prefix webapp --include=dev
+npm run dev
+```
+
 Run services directly while developing:
 
 ```powershell
@@ -785,11 +801,25 @@ npm start
 
 React development uses `http://localhost:3000` and proxies `/api/*` to `http://localhost:4534`.
 
-Note: the Docker image bundles Python, FFmpeg, Deno, and spotDL, but a bare
-`cargo run` on the host does not. To exercise the acquisition/downloader
-pipeline locally you must install `python3`, `ffmpeg`, `deno`, and `spotdl` yourself,
-or develop against the containerized stack
-(`docker compose -f docker-compose.dev.yml up -d --build`).
+For native acquisition development, install Python 3.11 or newer, Deno 2.3.0 or
+newer, and a matched pair of `ffmpeg` and `ffprobe` binaries on the server's `PATH`.
+Create a virtualenv with `python -m venv .tmp/musicdeck-downloader` from the repo
+root, activate it in the shell that starts the server, and install the same
+Python requirements as the Docker image.
+
+```shell
+python -m pip install -r server-rust/requirements.txt
+python -m pip check
+spotdl --version
+yt-dlp --version
+deno --version
+ffmpeg -version
+ffprobe -version
+```
+
+If the native server was using a copy of FFmpeg from spotDL's home directory,
+set `FFMPEG_PATH` and `FFPROBE_PATH` to the new binaries before starting it. To
+use the bundled toolchain, run `docker compose -f docker-compose.dev.yml up -d --build`.
 
 ### Developing locally against a remote/production Navidrome
 
@@ -941,12 +971,13 @@ Common startup issues:
 - `MusicDeck cannot write to /music`: Create the default folder with `mkdir -p ./music` as your normal user before starting Compose. If it already exists, check its ownership or the permissions of your custom `MUSIC_ROOT` against `PUID` and `PGID`.
 - Cannot find music: check the `MUSIC_ROOT` host path in `.env` and host file/folder permissions.
 - Downloads via On-Demand Library/spotDL complete successfully but tracks never appear in the library or play: MusicDeck Server and the backend are not sharing the same music folder. In Docker Compose both containers already mount `$MUSIC_ROOT`; for local/manual development, set `MUSICDECK_MUSIC_ROOT` to a path the backend's music folder also resolves to.
-- `spotdl: not found`, missing Deno, or FFmpeg errors during acquisition:
-  expected only for local `npm run dev` runs. The Docker image bundles all
-  three; verify inside the container with `docker exec musicdeck-server
-  spotdl --version`, `docker exec musicdeck-server ffmpeg -version`, and
-  `docker exec musicdeck-server python -c "from spotdl.utils.deno import
-  is_deno_installed; print(is_deno_installed())"`.
+- For downloader errors, verify the tools under the service account with
+  `docker exec musicdeck-server gosu musicdeck sh -ec 'spotdl --version;
+  yt-dlp --version; deno --version; ffmpeg -version; ffprobe -version'`.
+  If spotDL still uses an outdated Deno from a persistent home, run
+  `docker exec musicdeck-server gosu musicdeck python3 -c 'from spotdl.utils.deno
+  import get_local_deno; print(get_local_deno())'` to locate it. Move that binary
+  aside so spotDL uses the image's Deno on `PATH`.
 
 MusicDeck does not log Navidrome passwords, session secrets, tokens, or authenticated URLs.
 

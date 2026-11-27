@@ -53,6 +53,43 @@ impl ProcessRunner for SuccessfulProcessRunner {
         args: &[String],
         options: ProcessOptions,
     ) -> Result<ProcessExecutionResult, ProcessError> {
+        if args == ["--version"] {
+            return Ok(ProcessExecutionResult {
+                exit_code: Some(0),
+                stdout: "4.6.0".into(),
+                stderr: String::new(),
+                signal: None,
+            });
+        }
+        if args
+            .get(2)
+            .is_some_and(|arg| arg == "spotify-playlist-page")
+        {
+            let alternate = args[3].ends_with(ALTERNATE_RECORDING);
+            let items: Vec<_> = ["Second", "First", "Second"]
+                .into_iter()
+                .enumerate()
+                .map(|(position, title)| {
+                    let id = fixture_recording(title, alternate);
+                    json!({"key": position.to_string(), "song": {
+                        "name": title, "artist": "Fixture Artist", "album_name": "Fixture Album",
+                        "song_id": id, "url": format!("https://open.spotify.com/track/{id}"),
+                        "duration": 180.0, "download_url": null,
+                    }})
+                })
+                .collect();
+            let response =
+                json!({"page": {"offset": 0, "total": 3, "name": FIXTURE_NAME, "items": items}});
+            tokio::fs::write(&args[6], response.to_string())
+                .await
+                .unwrap();
+            return Ok(ProcessExecutionResult {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                signal: None,
+            });
+        }
         if args.first().is_some_and(|arg| arg == "-c") {
             let file = tokio::fs::read(args.last().expect("tag inspection filename"))
                 .await
@@ -875,10 +912,17 @@ struct EmptyAudioRunner;
 impl ProcessRunner for EmptyAudioRunner {
     async fn run(
         &self,
-        _: &str,
-        _: &[String],
+        command: &str,
+        args: &[String],
         options: ProcessOptions,
     ) -> Result<ProcessExecutionResult, ProcessError> {
+        if args == ["--version"]
+            || args
+                .get(2)
+                .is_some_and(|arg| arg == "spotify-playlist-page")
+        {
+            return SuccessfulProcessRunner.run(command, args, options).await;
+        }
         tokio::fs::write(options.cwd.unwrap().join("empty.wav"), [])
             .await
             .unwrap();
@@ -896,6 +940,7 @@ async fn zero_byte_audio_fails_even_if_spotdl_exits_zero() {
     assert_failed_downloads(
         SpotDLDownloaderAdapter::with_runner(Arc::new(EmptyAudioRunner)),
         "spotDL failed (no-match): The downloader could not match this recording to an audio source.",
+        None,
         false,
         false,
     )
@@ -994,6 +1039,7 @@ impl ProcessRunner for NoOutputRunner {
 async fn assert_failed_downloads(
     downloader: SpotDLDownloaderAdapter,
     expected_error: &str,
+    discovery_error: Option<&str>,
     include_manifest: bool,
     production_defaults: bool,
 ) {
@@ -1022,6 +1068,11 @@ async fn assert_failed_downloads(
         vec!["acquisition", "playlist"]
     };
     for kind in kinds {
+        let expected_error = if kind == "playlist" {
+            discovery_error.unwrap_or(expected_error)
+        } else {
+            expected_error
+        };
         let job_id = if kind == "acquisition" {
             acquisitions
                 .create_job(
@@ -1117,12 +1168,14 @@ async fn assert_failed_downloads(
                 );
             }
         }
-        assert!(
-            !output.path().join(&job_id).exists(),
-            "failed staging must be removed"
+        let keep_playlist_pages =
+            kind == "playlist" && expected_error.starts_with("spotDL failed (no-match)");
+        assert_eq!(
+            output.path().join(&job_id).exists(),
+            keep_playlist_pages,
+            "{kind}"
         );
     }
-    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
     manager.close();
     pool.close().await;
 }
@@ -1143,6 +1196,7 @@ async fn missing_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
     assert_failed_downloads(
         SpotDLDownloaderAdapter::new().with_spotdl_path(executable),
         MISSING_SPOTDL,
+        None,
         true,
         false,
     )
@@ -1165,6 +1219,7 @@ async fn invalid_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
     assert_failed_downloads(
         SpotDLDownloaderAdapter::new().with_spotdl_path(path),
         MISSING_SPOTDL,
+        None,
         true,
         false,
     )
@@ -1175,7 +1230,7 @@ async fn invalid_spotdl_executable_fails_tasks_and_jobs_in_sqlite() {
 async fn injected_spawn_failure_hides_process_details_and_aborts_partial_playlist() {
     let downloader = SpotDLDownloaderAdapter::with_runner(Arc::new(SpawnFailureRunner))
         .with_spotdl_path("configured-spotdl");
-    assert_failed_downloads(downloader, MISSING_SPOTDL, true, false).await;
+    assert_failed_downloads(downloader, MISSING_SPOTDL, None, true, false).await;
 }
 
 #[tokio::test]
@@ -1183,6 +1238,7 @@ async fn successful_exit_without_audio_fails_instead_of_inventing_imported_files
     assert_failed_downloads(
         SpotDLDownloaderAdapter::with_runner(Arc::new(NoOutputRunner)),
         "spotDL did not return source track details. Check the playlist URL and server credentials.",
+        Some("Could not decode the Spotify playlist page"),
         false,
         false,
     )
@@ -1199,8 +1255,14 @@ fn unconfigured_spotdl_without_path_binary_fails_using_production_defaults() {
                 .await
                 .expect_err("spotdl must be absent from isolated PATH");
             assert!(matches!(error, ProcessError::SpawnFailed { .. }));
-            assert_failed_downloads(SpotDLDownloaderAdapter::new(), MISSING_SPOTDL, true, true)
-                .await;
+            assert_failed_downloads(
+                SpotDLDownloaderAdapter::new(),
+                MISSING_SPOTDL,
+                None,
+                true,
+                true,
+            )
+            .await;
         });
         return;
     }

@@ -344,6 +344,20 @@ test("restores a saved import after a transient failure and shows its provider c
   }
 });
 
+test("shows discovered tracks before any playlist audio has downloaded", async () => {
+  startSpotifyPlaylistImport.mockResolvedValue({
+    id: "job-discovery", status: "running", stage: "discovering", expectedCount: 760,
+    discoveredCount: 400, downloadedCount: 0,
+  });
+  renderSidebar([]);
+  fireEvent.click(screen.getByRole("button", { name: /add playlist/i }));
+  fireEvent.click(screen.getByRole("button", { name: /import spotify playlist/i }));
+  fireEvent.change(screen.getByLabelText("Spotify playlist URL"), { target: { value: "https://open.spotify.com/playlist/abc123" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import & Download" }));
+  expect(await screen.findByText("400 of 760 tracks discovered")).toBeInTheDocument();
+  expect(screen.getByRole("progressbar", { name: "Playlist import progress" })).toHaveAttribute("aria-valuenow", "400");
+});
+
 test("cancels an active playlist import from the progress dialog", async () => {
   startSpotifyPlaylistImport.mockResolvedValue({ id: "job-cancel", status: "running", stage: "scan" });
   cancelSpotifyPlaylistImport.mockResolvedValue({ id: "job-cancel", status: "cancelled", error: "Playlist import cancelled" });

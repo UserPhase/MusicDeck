@@ -67,9 +67,10 @@ createRoot(document.getElementById('root')).render(<MemoryRouter initialEntries=
     rpc=(method,params={})=>new Promise((resolve,reject)=>{const key=++id;const timer=setTimeout(()=>{pending.delete(key);reject(new Error(`CDP timeout: ${method}`))},15000);pending.set(key,{resolve,reject,timer});socket.send(JSON.stringify({id:key,method,params}));});
     const evaluate=async(expression)=>{const result=await rpc('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(result.exceptionDetails)throw new Error(JSON.stringify(result.exceptionDetails));return result.result.value};
     const wait=async(expression)=>{for(let i=0;i<60;i++){if(await evaluate(`Boolean(${expression})`))return;await delay(50)}throw new Error('UI condition did not settle: '+expression)};
-    const clearSelection=()=>evaluate(`[...document.querySelectorAll('.universal-track-toolbar button')].find(button=>button.textContent==='Clear selection')?.click()`);
     const box=async(selector)=>evaluate(`(()=>{const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}})()`);
     const tap=async(selector,hold=50)=>{const p=await box(selector);await rpc('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{...p,id:1}]});await delay(hold);await rpc('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await delay(100)};
+    const firstMenu='[aria-label="More options for Night Signals 0"]';
+    const clearSelection=async()=>{await tap(firstMenu);await tap('.track-action-sheet [data-done-selecting]');};
     await rpc('Runtime.enable');await rpc('Page.enable');
     await rpc('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
     await rpc('Emulation.setTouchEmulationEnabled',{enabled:true,maxTouchPoints:5});
@@ -82,7 +83,7 @@ createRoot(document.getElementById('root')).render(<MemoryRouter initialEntries=
     assert.equal(await evaluate('window.actions.length'),1,'Long press must not play');
     await tap('[aria-label="Night Signals 1 by The Midnight"] .track-title-text');
     assert.equal(await evaluate('document.querySelectorAll(".track-selection-checkbox:checked").length'),2,'Second tap should extend selection');
-    await tap('.universal-track-toolbar button:last-of-type');
+    await tap(firstMenu);
     await wait('document.querySelector(".track-action-sheet[open]")');
     const bounds=await evaluate('(()=>{const r=document.querySelector(".track-action-sheet").getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:innerWidth}})()');
     assert(bounds.left>=0&&bounds.right<=390&&bounds.top>=0&&bounds.bottom<=844,'Menu must fit the mobile viewport');

@@ -22,7 +22,7 @@
 
 services:
   musicdeck-web:
-    image: ${MUSICDECK_IMAGE_WEB:-ghcr.io/userphase/musicdeck-web}:${MUSICDECK_VERSION:-sha-3e82c75}
+    image: ${MUSICDECK_IMAGE_WEB:-ghcr.io/userphase/musicdeck-web}:${MUSICDECK_VERSION:-latest}
     container_name: musicdeck-web
     depends_on:
       musicdeck-server:
@@ -40,7 +40,7 @@ services:
       start_period: 10s
 
   musicdeck-server:
-    image: ${MUSICDECK_IMAGE_SERVER:-ghcr.io/userphase/musicdeck-server}:${MUSICDECK_VERSION:-sha-3e82c75}
+    image: ${MUSICDECK_IMAGE_SERVER:-ghcr.io/userphase/musicdeck-server}:${MUSICDECK_VERSION:-latest}
     container_name: musicdeck-server
     init: true
     environment:
@@ -108,7 +108,7 @@ services:
       - musicdeck-data:/app/data
       - musicdeck-config:/app/config
       - musicdeck-cache:/app/cache
-      # Persist spotDL configuration, local Deno, and credentials owned by the service account.
+      # Persist spotDL configuration and credentials owned by the service account.
       - musicdeck-runtime:/app/home
       # Read-write: downloaded tracks land exactly where the backend scans.
       - ${MUSIC_ROOT:-./music}:/music

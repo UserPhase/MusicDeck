@@ -16,6 +16,7 @@ mod resume;
 mod retention;
 pub mod service;
 pub mod spotdl;
+mod spotify_playlist;
 pub use input::{AcquisitionKind, AcquisitionResult};
 pub use playlist_timeout::PlaylistImportTimeout;
 pub use progress::TrackIssue;
@@ -161,6 +162,7 @@ mod tests {
                 playlist_description: None,
                 playlist_artwork_url: None,
                 expected_count: Some(10),
+                discovered_count: None,
                 downloaded_count: Some(0),
                 current_track: None,
                 current_track_name: None,

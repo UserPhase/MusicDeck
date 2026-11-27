@@ -181,6 +181,23 @@ test("selection distinguishes duplicate occurrences and queues the selected grou
   await waitFor(() => expect(queueTracks).toHaveBeenCalledWith([editablePlaylist.entry[0], editablePlaylist.entry[2]]));
 });
 
+test("removing an unselected row from its three-dot menu leaves the selected tracks alone", async () => {
+  renderPlaylist(editablePlaylist);
+  fireEvent.click(await screen.findByRole("row", { name: "First by Artist" }));
+  fireEvent.click(screen.getByRole("row", { name: "Third by Artist" }), { ctrlKey: true });
+  editPlaylistTracks.mockResolvedValueOnce({
+    ...editablePlaylist, itemIds: ["first", "missing", "third"], songCount: 3,
+    entry: editablePlaylist.entry.filter((track) => track.playlistItemId !== "second"),
+  });
+  fireEvent.click(screen.getByRole("button", { name: "More options for Second" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Remove from Playlist" }));
+  await waitFor(() => expect(editPlaylistTracks).toHaveBeenCalledWith("mdpl_1", {
+    action: "remove", itemIds: ["second"], expectedItemIds: editablePlaylist.itemIds,
+  }));
+  expect(screen.getByRole("row", { name: "First by Artist" })).toBeInTheDocument();
+  expect(screen.getByRole("row", { name: "Third by Artist" })).toBeInTheDocument();
+});
+
 test("Ctrl/Cmd+A selects the entire playlist without row focus and background clicks clear it", async () => {
   renderPlaylist(editablePlaylist);
   await screen.findByRole("row", { name: "First by Artist" });

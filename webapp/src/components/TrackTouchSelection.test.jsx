@@ -7,7 +7,10 @@ jest.mock("../context/PlayerContext", () => ({ usePlayer: () => ({}) }));
 jest.mock("../services/storage/OfflineAuditor", () => ({ useOfflineAudit: () => ({ status: "missing" }), offlineDisplayStatus: () => "not-downloaded" }));
 jest.mock("../utils/downloadManager", () => ({ isDeviceDownloadPending: () => false, subscribeDeviceDownload: () => () => {} }));
 jest.mock("./TrackDownloadButton", () => () => null);
-jest.mock("./UniversalTrackContextMenu", () => ({ song }) => <div role="menu" data-track-selection-menu="">{song.title}</div>);
+jest.mock("./UniversalTrackContextMenu", () => ({ song, onDoneSelecting, onRequestClose }) => <div role="menu" data-track-selection-menu="">
+  {song.title}
+  {onDoneSelecting && <button onClick={() => { onDoneSelecting(); onRequestClose(); }}>Done selecting</button>}
+</div>);
 const tracks = [
   { id: "a", title: "First", artist: "Artist", artistId: "artist", album: "Album", albumId: "album", source: { kind: "library" } },
   { id: "b", title: "Second", artist: "Artist", album: "Album", source: { kind: "library" } },
@@ -16,9 +19,9 @@ const point = (x = 20, y = 20, identifier = 1) => ({ clientX: x, clientY: y, ide
 const start = (element, touches = [point()]) => fireEvent.touchStart(element, { touches });
 const advance = (ms) => act(() => jest.advanceTimersByTime(ms));
 const row = () => screen.getByRole("row", { name: "First by Artist" });
-function Harness({ onPlay = jest.fn(), dataKey = "collection", items = tracks }) {
+function Harness({ onPlay = jest.fn(), dataKey = "collection", items = tracks, compactTile = false }) {
   return <MemoryRouter><TrackActionScope tracks={items} dataKey={dataKey}>
-    <div role="grid">{items.map((song, index) => <TrackRow key={index} song={song} index={index} onPlay={onPlay} />)}</div>
+    <div role="grid">{items.map((song, index) => <TrackRow key={index} song={song} index={index} onPlay={onPlay} compactTile={compactTile} />)}</div>
   </TrackActionScope></MemoryRouter>;
 }
 beforeEach(() => { jest.useFakeTimers(); Object.defineProperty(window, "innerWidth", { value: 390, configurable: true }); });
@@ -33,7 +36,7 @@ test("a 500 ms hold enters selection mode, selects once, and suppresses the trai
   expect(screen.getByLabelText("Select First")).toBeChecked(); expect(play).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("row", { name: "Second by Artist" }));
   expect(screen.getByLabelText("Select Second")).toBeChecked();
-  expect(screen.getByText("2 selected")).toBeInTheDocument();
+  expect(screen.queryByText("2 selected")).not.toBeInTheDocument();
 });
 test("ordinary taps play and scrolling or moving more than ten pixels cancels a hold", () => {
   const play = jest.fn(); render(<Harness onPlay={play} />);
@@ -67,8 +70,20 @@ test("selection mode stays active after the last checkbox clears, and Done retur
   fireEvent.touchEnd(row(), { touches: [] });
   fireEvent.click(screen.getByLabelText("Select First"));
   expect(screen.getByLabelText("Select First")).not.toBeChecked();
+  fireEvent.click(screen.getByRole("button", { name: "More options for First" }));
   fireEvent.click(screen.getByRole("button", { name: "Done selecting" }));
   expect(screen.queryByRole("checkbox")).not.toBeInTheDocument(); fireEvent.click(row()); expect(play).toHaveBeenCalledTimes(1);
+});
+test("a compact track shows its menu button during touch selection", () => {
+  render(<Harness compactTile />);
+  const moreOptions = { name: "More options for First" };
+  expect(screen.queryByRole("button", moreOptions)).not.toBeInTheDocument();
+  start(row()); advance(500);
+  fireEvent.touchEnd(row(), { touches: [] });
+  fireEvent.click(screen.getByRole("button", moreOptions));
+  fireEvent.click(screen.getByRole("button", { name: "Done selecting" }));
+  expect(screen.queryByRole("button", moreOptions)).not.toBeInTheDocument();
+  expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
 });
 test("recycled rows, collection changes and unmounts cancel pending holds", () => {
   const view = render(<Harness />); start(row()); advance(300);
@@ -94,9 +109,9 @@ test("a keyboard or assistive click on an inline link is never consumed as a tou
 test("Ctrl+A and Escape operate on a focused collection row without requiring playlist-specific handlers", () => {
   render(<Harness />);
   fireEvent.keyDown(row(), { key: "a", ctrlKey: true });
-  expect(screen.getByText("2 selected")).toBeInTheDocument();
+  screen.getAllByRole("row").forEach((track) => expect(track).toHaveAttribute("aria-selected", "true"));
   fireEvent.keyDown(row(), { key: "Escape" });
-  expect(screen.queryByText("2 selected")).not.toBeInTheDocument();
+  screen.getAllByRole("row").forEach((track) => expect(track).toHaveAttribute("aria-selected", "false"));
 });
 test("removing another row preserves the selected track's identity", () => {
   const view = render(<Harness />);

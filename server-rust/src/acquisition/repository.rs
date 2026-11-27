@@ -135,6 +135,8 @@ pub struct ImportJob {
     pub playlist_artwork_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downloaded_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,10 +354,12 @@ impl SqliteImportJobRepository {
         let result = sqlx::query(
             "UPDATE import_jobs SET total_tracks=COALESCE(?1,total_tracks), updated_at=?2,
                manifest_json=json_set(manifest_json,'$.job.stage',?3,'$.job.expectedCount',COALESCE(?1,json_extract(manifest_json,'$.job.expectedCount')),
-                 '$.job.downloadedCount',?4,'$.job.currentTrack',?5)
+                 '$.job.downloadedCount',?4,'$.job.currentTrack',?5,
+                 '$.job.discoveredCount',COALESCE(?8,json_extract(manifest_json,'$.job.discoveredCount')))
              WHERE id=?6 AND status='PROCESSING' AND EXISTS(SELECT 1 FROM background_tasks WHERE id=?7 AND state IN ('PROCESSING','PAUSED'))",
         ).bind(expected.map(|count| count as i64)).bind(Utc::now().to_rfc3339()).bind(update.stage)
-          .bind(downloaded as i64).bind(current.map(|index| index as i64)).bind(id).bind(task_id).execute(self.db.inner()).await;
+          .bind(downloaded as i64).bind(current.map(|index| index as i64)).bind(id).bind(task_id)
+          .bind(update.discovered.map(|count| count as i64)).execute(self.db.inner()).await;
         if let Err(error) = result {
             tracing::warn!(%error, "Could not update playlist download progress");
         }
@@ -487,6 +491,7 @@ impl SqliteImportJobRepository {
                 playlist_description: None,
                 playlist_artwork_url: None,
                 expected_count: None,
+                discovered_count: None,
                 downloaded_count: None,
                 current_track: None,
                 current_track_name: None,
@@ -786,6 +791,7 @@ impl SpotifyPlaylistImportService {
             playlist_description: None,
             playlist_artwork_url: None,
             expected_count: None,
+            discovered_count: None,
             downloaded_count: Some(0),
             current_track: None,
             current_track_name: None,
@@ -1045,6 +1051,7 @@ impl SpotifyPlaylistImportService {
                 }
                 record.job.stage = current.job.stage;
                 record.job.downloaded_count = current.job.downloaded_count;
+                record.job.discovered_count = current.job.discovered_count;
                 record.job.expected_count =
                     record.job.expected_count.or(current.job.expected_count);
             }
@@ -1079,6 +1086,7 @@ impl SpotifyPlaylistImportService {
             tracing::warn!(job_id, error = %err, "Spotify playlist import failed");
             // Keep any unpublished audio available for recovery.
             if !keep_intent
+                && !super::spotify_playlist::has_checkpoint(&staging_dir).await
                 && scan_downloaded_audio_files(&staging_dir)
                     .await
                     .is_ok_and(|files| files.is_empty())
@@ -1199,6 +1207,7 @@ impl SpotifyPlaylistImportService {
             },
         };
         record.job.expected_count = Some(manifest.expected_count);
+        record.job.discovered_count = Some(manifest.expected_count);
         record.job.playlist_name.get_or_insert_with(|| {
             manifest.name.clone().unwrap_or_else(|| {
                 format!(

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 IMAGE="${MUSICDECK_TEST_IMAGE:-musicdeck-server:music-root-test}"
+SERVER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../server-rust" && pwd)"
 PUID="${TEST_PUID:-$(id -u)}"
 PGID="${TEST_PGID:-$(id -g)}"
 WORK_DIR="$(mktemp -d)"
@@ -41,19 +42,36 @@ docker run --rm \
   --mount "type=volume,src=${VOLUME_PREFIX}-data,dst=/app/data" \
   --mount "type=volume,src=${VOLUME_PREFIX}-config,dst=/app/config" \
   --mount "type=volume,src=${VOLUME_PREFIX}-cache,dst=/app/cache" \
+  --mount "type=bind,src=$SERVER_DIR/tests,dst=/bridge/tests,readonly" \
+  --mount "type=bind,src=$SERVER_DIR/src/acquisition,dst=/bridge/src/acquisition,readonly" \
   "$IMAGE" \
-  sh -c '
+  sh -ec '
     test "$(id -u)" = "$PUID"
     test "$(id -g)" = "$PGID"
     test -w "$HOME"
     mkdir -p "$HOME/.cache"
-    spotdl --version >/dev/null
+    python3 --version
+    spotdl --version
+    yt-dlp --version
+    python3 -m pip check
+    ffmpeg -version
+    ffprobe -version
+    deno_version=$(deno --version)
+    printf "%s\n" "$deno_version"
+    dpkg --compare-versions "$(printf "%s\n" "$deno_version" | awk "NR == 1 {print \$2}")" ge 2.3.0
+    deno eval "if (2 + 2 !== 4) Deno.exit(1)"
+    python3 -B -m unittest discover -s /bridge/tests -p "test_*.py" -v
     mkdir -p "/music/Lana Del Rey/Born to Die_ The Paradise Edition"
     ffmpeg -loglevel error -f lavfi -i anullsrc=r=44100:cl=stereo -t 0.2 \
       -codec:a libmp3lame \
       "/music/Lana Del Rey/Born to Die_ The Paradise Edition/Imported Track.mp3"
     ffprobe -v error \
       "/music/Lana Del Rey/Born to Die_ The Paradise Edition/Imported Track.mp3"
+    ffmpeg -v error -f lavfi -i anullsrc=r=44100:cl=stereo -t 1 -c:a aac \
+      -movflags +empty_moov+frag_keyframe /tmp/fragmented.m4a
+    duration=$(ffprobe -v error -select_streams a:0 -show_entries stream=duration \
+      -of default=nw=1:nk=1 /tmp/fragmented.m4a)
+    python3 -c "import sys; assert float(sys.argv[1]) > 0" "$duration"
     printf data > /app/data/write-test
     printf config > /app/config/write-test
     printf cache > /app/cache/write-test

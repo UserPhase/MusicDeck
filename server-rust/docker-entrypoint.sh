@@ -43,7 +43,7 @@ if [ -d /data ]; then
   chmod 0700 /data
 fi
 
-# Refresh spotDL / yt-dlp / ytmusicapi at most once per 24h when SPOTDL_AUTO_UPDATE=1
+# Refresh downloader dependencies at most once per 24h when SPOTDL_AUTO_UPDATE=1.
 if [ "${SPOTDL_AUTO_UPDATE:-0}" = "1" ]; then
   # The virtualenv is image-owned. A recreated container needs its own update marker.
   update_stamp="${SPOTDL_HOME:-/opt/venv}/.musicdeck-last-update"
@@ -56,7 +56,7 @@ if [ "${SPOTDL_AUTO_UPDATE:-0}" = "1" ]; then
     esac
   fi
   if [ "$now" -lt "$last_update" ] || [ "$((now - last_update))" -ge 86400 ]; then
-    echo "Updating spotDL, yt-dlp and ytmusicapi (up to 60 seconds)..."
+    echo "Updating spotDL dependencies within requirements.txt constraints (up to 60 seconds)..."
     if timeout -k 5s 60s "${SPOTDL_HOME:-/opt/venv}/bin/pip" install \
       --disable-pip-version-check --no-cache-dir --upgrade -r /app/requirements.txt; then
       echo "spotDL runtime update complete."
@@ -71,16 +71,12 @@ fi
 
 # Verify external media utilities under the target non-root identity
 if ! timeout -k 1s 5s gosu musicdeck spotdl --version > /dev/null \
-  || ! timeout -k 1s 5s gosu musicdeck python3 -c 'import yt_dlp, ytmusicapi, mutagen' \
-  || ! timeout -k 1s 5s gosu musicdeck ffmpeg -version > /dev/null 2>&1; then
-  echo "Degraded downloader capability: spotDL, yt-dlp, ytmusicapi, mutagen, or FFmpeg is unavailable." >&2
+  || ! timeout -k 1s 5s gosu musicdeck python3 -c 'import yt_dlp, yt_dlp_ejs, ytmusicapi, mutagen' \
+  || ! timeout -k 1s 5s gosu musicdeck deno --version > /dev/null \
+  || ! timeout -k 1s 5s gosu musicdeck ffmpeg -version > /dev/null \
+  || ! timeout -k 1s 5s gosu musicdeck ffprobe -version > /dev/null; then
+  echo "Degraded downloader capability: check spotDL, yt-dlp/EJS, ytmusicapi, Mutagen, Deno, FFmpeg and ffprobe." >&2
   export MUSICDECK_DOWNLOADER_HEALTH=degraded
-elif ! timeout -k 1s 5s gosu musicdeck python3 -c 'from spotdl.utils.deno import is_deno_installed; raise SystemExit(0 if is_deno_installed() else 1)'; then
-  echo "Deno is missing; restoring spotDL's local Deno runtime..."
-  if ! timeout -k 5s 60s gosu musicdeck spotdl --download-deno; then
-    echo "Degraded downloader capability: Deno could not be installed for YouTube downloads." >&2
-    export MUSICDECK_DOWNLOADER_HEALTH=degraded
-  fi
 fi
 
 if ! gosu musicdeck test -d "$MUSIC_ROOT" || ! gosu musicdeck test -w "$MUSIC_ROOT"; then

@@ -154,9 +154,24 @@ impl<'a> LibraryRecordingLookup<'a> {
         if url.is_none() && source.isrc.is_none() {
             return Ok(None);
         }
-        let album = library_album(source);
+        // Playlist pages may omit the album. Reuse an exact source URL from the
+        // artist's other album directories before requesting network enrichment.
+        let artist_only = !catalog
+            && source
+                .album
+                .as_deref()
+                .is_none_or(|album| album.trim().is_empty());
+        let album = if artist_only {
+            PathBuf::from(sanitize_segment(&source.artist, "Unknown Artist"))
+        } else {
+            library_album(source)
+        };
         if !self.albums.contains_key(&album) {
-            let titles = album_titles(root, &album).await?;
+            let titles = if artist_only {
+                artist_titles(root, &album).await?
+            } else {
+                album_titles(root, &album).await?
+            };
             self.albums.insert(album.clone(), titles);
         }
         let title = sanitize_segment(&source.title, "Unknown Track").to_lowercase();
@@ -214,6 +229,25 @@ impl<'a> LibraryRecordingLookup<'a> {
         }
         Ok(matched.flatten())
     }
+}
+
+async fn artist_titles(root: &Path, artist: &Path) -> io::Result<AlbumTitles> {
+    let mut titles = album_titles(root, artist).await?;
+    let Ok(directory) = tokio::fs::canonicalize(root.join(artist)).await else {
+        return Ok(titles);
+    };
+    if !directory.starts_with(root) || !directory.is_dir() {
+        return Ok(titles);
+    }
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            for (title, paths) in album_titles(root, &artist.join(entry.file_name())).await? {
+                titles.entry(title).or_default().extend(paths);
+            }
+        }
+    }
+    Ok(titles)
 }
 
 async fn album_titles(root: &Path, album: &Path) -> io::Result<AlbumTitles> {
@@ -789,7 +823,10 @@ mod tests {
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}"
+            );
             return;
         }
 

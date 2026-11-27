@@ -580,8 +580,8 @@ function Playlist() {
     }
   }
 
-  function menuSongs(song) {
-    return selectedSongs.length ? selectedSongs : [song];
+  function menuSongs(song, index) {
+    return selection.selectedIds.has(occurrenceIds[index]) ? selectedSongs : [song];
   }
 
 
@@ -1080,7 +1080,7 @@ async function handleRemoveSong(
               renderMenu={(song, index) => canEditTracks && menuSongId === occurrenceIds[index] ? (
                 <div className="playlist-menu">
                   <button type="button" role="menuitem" className="playlist-menu-item playlist-track-remove" disabled={editingBusy || batchBusy} onClick={() => { void runTrackAction(async () => {
-                      const tracks = menuSongs(song);
+                      const tracks = menuSongs(song, index);
                       if (tracks.length > 1 && !window.confirm(`Remove ${tracks.length} tracks from this playlist?`)) return;
                       if (canEditEntries) await removeEntries(tracks.map((track) => track.playlistItemId));
                       else await handleRemoveSong(song, index);

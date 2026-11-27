@@ -747,6 +747,7 @@ impl AcquisitionService {
                 if resume::load(stage)
                     .await
                     .is_ok_and(|checkpoint| checkpoint.is_none())
+                    && !super::spotify_playlist::has_checkpoint(stage).await
                     && scan_downloaded_audio_files(stage)
                         .await
                         .is_ok_and(|files| files.is_empty())

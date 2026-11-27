@@ -1146,11 +1146,12 @@ test.describe("MusicDeck acceptance: complete user journeys", () => {
         await tap(secondRow);
         await expect(secondRow).toHaveAttribute("aria-selected", "true");
         await expect(page.locator('.track[role="row"][aria-selected="true"]')).toHaveCount(2);
-        await tap(page.getByRole("button", { name: "Actions for selected tracks" }));
+        const selectedMenu = rows.first().getByRole("button", { name: /^More options for / });
+        await tap(selectedMenu);
         await tap(page.getByRole("button", { name: "Play next", exact: true }));
         await expect.poll(() => page.evaluate(() => window.__acceptance.player.queue.length)).toBe(2);
-        const clearSelection = page.getByRole("button", { name: /Cancel selection|Exit selection|Clear selection/i }).first();
-        if (await clearSelection.isVisible()) await tap(clearSelection);
+        await tap(selectedMenu);
+        await tap(page.getByRole("button", { name: "Done selecting", exact: true }));
         // A pan exceeding the movement threshold scrolls instead of selecting.
         await touch("touchStart", 200, 640);
         for (let i = 1; i <= 8; i++) { await touch("touchMove", 200, 640 - i * 40); await page.waitForTimeout(20); }

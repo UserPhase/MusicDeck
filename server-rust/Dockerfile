@@ -30,9 +30,14 @@ RUN touch src/lib.rs src/main.rs src/bin/init_db.rs src/bin/shrink_library.rs \
   && cargo build --release --locked --bins
 
 # ==============================================================================
-# Stage 2: Minimal Production Runtime (`debian:bookworm-slim`)
+# Stage 2: Deno for yt-dlp's YouTube JavaScript challenges
 # ==============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM denoland/deno:bin-2.9.8 AS deno
+
+# ==============================================================================
+# Stage 3: Minimal Production Runtime (`debian:trixie-slim`)
+# ==============================================================================
+FROM debian:trixie-slim AS runtime
 WORKDIR /app
 
 # Virtual environment & runtime paths:
@@ -50,6 +55,7 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 COPY requirements.txt ./requirements.txt
+COPY --from=deno /deno /usr/local/bin/deno
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -65,6 +71,7 @@ RUN apt-get update \
   && ln -s /opt/venv /opt/spotdl \
   && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
+  && /opt/venv/bin/pip check \
   && apt-get purge -y --auto-remove python3-pip \
   && rm -rf /var/lib/apt/lists/*
 
@@ -75,14 +82,14 @@ RUN groupadd --system musicdeck \
   && chown -R musicdeck:musicdeck /app /extensions \
   && chmod 0700 /app/data /app/home /app/cache/runtime
 
-# Put the bundled Deno on PATH so it is available even when Compose mounts an
-# existing home volume over /app/home.
-RUN gosu musicdeck spotdl --download-deno \
-  && deno_path="$(gosu musicdeck python3 -c 'from spotdl.utils.deno import get_local_deno; print(get_local_deno())')" \
-  && install -m 0755 "$deno_path" /usr/local/bin/deno \
+# Verify the downloader toolchain under the same identity and PATH as the server.
+RUN gosu musicdeck python3 --version \
+  && gosu musicdeck spotdl --version \
+  && gosu musicdeck yt-dlp --version \
+  && gosu musicdeck python3 -c 'import yt_dlp_ejs' \
   && gosu musicdeck deno --version \
-  && gosu musicdeck python3 -c "from spotdl.utils.deno import is_deno_installed; assert is_deno_installed()" \
-  && ffmpeg -version > /dev/null
+  && gosu musicdeck ffmpeg -version \
+  && gosu musicdeck ffprobe -version
 
 # Copy compiled release binaries from the builder stage.
 COPY --from=builder /build/target/release/musicdeck-server /usr/local/bin/musicdeck-server

@@ -1,6 +1,9 @@
-# Keep the downloader and its fast-moving YouTube/YouTube Music integrations
+# Requires Python 3.11+. Keep the downloader and its YouTube/YouTube Music integrations
 # explicit. yt-dlp[default] includes its external JavaScript challenge solver.
-spotdl>=4.5,<5
+spotdl==4.6.0
+# The Spotify playlist bridge uses the public playlist paging client used by spotDL.
+spotapi>=1.2.8,<2
 mutagen>=1.47,<2
-yt-dlp[default]>=2026.07.04,<2027
-ytmusicapi>=1.12.1,<2
+yt-dlp[default]>=2026.11.23,<2027
+# spotDL 4.6.0 excludes these two releases because they break localized search.
+ytmusicapi>=1.12.1,!=1.12.2,!=1.12.3,<2

@@ -17,7 +17,7 @@ import "../styles/track-actions.css";
 export interface UniversalTrackContextMenuProps {
   song: Track; targets?: readonly Track[]; targetCount?: number; resolveTargets?(): Promise<Track[]>;
   triggerRef?: RefObject<HTMLElement | null>; anchorPoint?: { x: number; y: number } | null;
-  onRequestClose?(): void; actionsDisabled?: boolean; children?: ReactNode;
+  onRequestClose?(): void; onDoneSelecting?(): void; actionsDisabled?: boolean; children?: ReactNode;
   onActionError?(message: string): void;
   downloadQuality?: string; isServerSynced?: boolean; offlineStatus?: string; offlineError?: string | null;
   onOfflineDownload?(event: MouseEvent<HTMLButtonElement>): void | Promise<void>;
@@ -25,7 +25,7 @@ export interface UniversalTrackContextMenuProps {
   onAddToQueue?(song: Track): void | Promise<void>;
 }
 export default function UniversalTrackContextMenu({ song, targets, targetCount, resolveTargets, triggerRef, anchorPoint,
-  onRequestClose, actionsDisabled = false, children, downloadQuality = "320kbps", offlineStatus, offlineError,
+  onRequestClose, onDoneSelecting, actionsDisabled = false, children, downloadQuality = "320kbps", offlineStatus, offlineError,
   onOfflineDownload, onAddToQueue, onSpotdlDownload, onActionError }: UniversalTrackContextMenuProps) {
   const actions = useTrackActions(targets || song);
   const mobile = useMediaQuery(MOBILE_LAYOUT_QUERY);
@@ -168,6 +168,12 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
   </>;
   const saveForLater = item("saveForLater", "Save for Later", "◷", "Library tracks go to Saved for Later; discoveries stay in Saved");
 
+  function doneSelecting() {
+    onDoneSelecting?.();
+    close.current?.();
+    triggerRef?.current?.focus({ preventScroll: true });
+  }
+
   if (mobile) {
     const artist = toArtistRouteIdFromApiId(song.artistCredits?.find(({ id }) => id)?.id || song.artistId || song.metadata?.artistId);
     const album = toTrackAlbumRouteId(song);
@@ -196,6 +202,7 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
           {secondary}
         </div>
       </details>
+      {onDoneSelecting && <button type="button" className="track-sheet-action" data-done-selecting="" disabled={disabled} onClick={doneSelecting}>Done selecting</button>}
     </MobileTrackActionSheet>;
   }
 
@@ -225,6 +232,7 @@ export default function UniversalTrackContextMenu({ song, targets, targetCount, 
       <span className="track-context-menu-icon" aria-hidden="true">{actions.allFavorite ? "♥" : "♡"}</span>
       <span className="track-context-menu-copy"><span>{batch || unresolved ? "Toggle Favorites" : actions.allFavorite ? "Remove from Liked Songs" : "Save to Liked Songs"}</span><small>{libraryOnly ? "Like tracks" : "Available after the track is in your library"}</small></span></button>
     {secondary}
+    {onDoneSelecting && <button type="button" role="menuitem" className="playlist-menu-item" disabled={disabled} onClick={doneSelecting}>Done selecting</button>}
     {messages}
   </div>, document.body);
 }

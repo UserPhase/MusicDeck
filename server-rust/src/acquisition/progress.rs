@@ -36,6 +36,7 @@ pub(super) fn safe_title(value: &str) -> String {
 pub(super) struct DownloadTelemetry {
     pub stage: &'static str,
     pub expected: Option<usize>,
+    pub discovered: Option<usize>,
     pub downloaded: usize,
     pub finished: usize,
     pub percent: Option<f64>,

@@ -1081,7 +1081,9 @@ impl SpotDLDownloaderAdapter {
             String::from("--output"),
             output_template,
         ]);
-        let format = self.output_format().map_err(|_| AcquisitionValidationError)?;
+        let format = self
+            .output_format()
+            .map_err(|_| AcquisitionValidationError)?;
         args.extend(spotdl_format_args(format));
         args.extend([
             String::from("--detect-formats"),
@@ -1256,6 +1258,107 @@ impl SpotDLDownloaderAdapter {
         self.download_checked(request, on_progress)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    pub(super) async fn check_playlist_downloader(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<(), crate::tasks::TaskError> {
+        use crate::tasks::TaskError;
+
+        if let Some(error) = &self.startup_error {
+            return Err(TaskError::ExecutionFailed(error.clone()));
+        }
+        match self
+            .runner
+            .run(
+                &self.spotdl_path,
+                &["--version".into()],
+                ProcessOptions {
+                    timeout_ms: Some(5_000),
+                    cancel_token: Some(cancel),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) if result.exit_code == Some(0) => Ok(()),
+            Err(ProcessError::Cancelled) => Err(TaskError::Cancelled),
+            _ => Err(TaskError::ExecutionFailed(
+                SpotDLDownloadError::classified("missing-downloader").to_string(),
+            )),
+        }
+    }
+
+    pub(super) async fn spotify_playlist_page(
+        &self,
+        stage: &Path,
+        playlist_id: &str,
+        offset: usize,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<super::spotify_playlist::PageResponse, crate::tasks::TaskError> {
+        use super::spotify_playlist::{BRIDGE, PageResponse};
+        use crate::tasks::TaskError;
+
+        let fail = |message: &str| TaskError::ExecutionFailed(message.into());
+        if let Some(error) = &self.startup_error {
+            return Err(fail(error));
+        }
+        let output = tempfile::Builder::new()
+            .prefix("spotify-page-")
+            .tempfile_in(stage)
+            .map_err(|_| fail("Could not create the Spotify page output file"))?
+            .into_temp_path();
+        let python = std::env::var("PYTHON_PATH")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        let args = [
+            "-c".into(),
+            BRIDGE.into(),
+            "spotify-playlist-page".into(),
+            playlist_id.into(),
+            offset.to_string(),
+            limit.to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let run = self.runner.run(
+            &python,
+            &args,
+            ProcessOptions {
+                cwd: Some(stage.to_path_buf()),
+                cancel_token: Some(cancel),
+                timeout_ms: Some(45_000),
+                ..Default::default()
+            },
+        );
+        let result = if let Some(privacy) = &self.privacy {
+            privacy
+                .run_external(PrivacyCategory::Imports, run)
+                .await
+                .map_err(|err| TaskError::ExecutionFailed(err.to_string()))?
+        } else {
+            run.await
+        };
+        match result {
+            Ok(result) if result.exit_code == Some(0) => {
+                let json = super::playlist_files::read_playlist_artifact(&output)
+                    .await
+                    .map_err(|_| fail("Could not read the Spotify playlist page"))?;
+                serde_json::from_str(&json)
+                    .map_err(|_| fail("Could not decode the Spotify playlist page"))
+            }
+            Err(ProcessError::TimedOut(_)) => Ok(PageResponse::Failed {
+                error: "provider-timeout".into(),
+                retry_after: None,
+            }),
+            Err(ProcessError::Cancelled) => Err(TaskError::Cancelled),
+            Err(ProcessError::SpawnFailed { .. }) => Err(fail(
+                "Could not launch the Python playlist bridge. Check PYTHON_PATH.",
+            )),
+            _ => Err(fail(
+                "The Python playlist bridge failed. Check that PYTHON_PATH uses the environment with MusicDeck's downloader dependencies.",
+            )),
+        }
     }
 
     /// Resolves source metadata before any audio work starts.
@@ -1557,8 +1660,8 @@ mod settings_tests {
             ("opus", "opus", "opus"),
             ("wav", "wav", "wav"),
         ] {
-            let format = SpotDLOutputFormat::from_plugin_config(&json!({"outputFormat": setting}))
-                .unwrap();
+            let format =
+                SpotDLOutputFormat::from_plugin_config(&json!({"outputFormat": setting})).unwrap();
             assert_eq!(format.container_arg(), extension);
             assert_eq!(spotdl_format_args(format)[1], extension);
             assert_eq!(format.ytdlp_format_arg(), ytdlp_format);

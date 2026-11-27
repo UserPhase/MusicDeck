@@ -9,9 +9,9 @@ Library Tracks, Search, Artist, Album, Playlists, Explore, Home, Liked Songs, li
 - A single tap plays a track outside selection mode. Artist/album links and controls retain their normal behavior.
 - A one-finger, 500 ms hold on the row body enters selection mode and selects that occurrence. The compatibility click generated after the hold is consumed once, including when a checkbox appears beneath the finger.
 - Moving more than 10 CSS pixels, scrolling, another finger anywhere in the view, cancellation, loss of visibility/focus, a recycled row, or a collection change cancels the pending hold. Touch listeners do not prevent scrolling or pinch zoom. Links retain their native context menus and touch callouts.
-- Select tracks enters the same mode explicitly. Checkboxes and row taps toggle individual occurrences; Done selecting and Clear selection return to ordinary playback. The mode remains active if the final checkbox is cleared, so another track can still be selected.
+- Checkboxes and row taps toggle individual occurrences. Open a selected row's three-dot menu to act on the selection. Done selecting in the track menu returns to ordinary playback, even after the final checkbox is cleared.
 - Desktop playlist click/range/reorder behavior is retained. Other collections support Ctrl/Cmd-click and Shift-click; Ctrl/Cmd+A on a focused row selects that collection. Space selects, and Enter toggles in selection mode. Escape clears a focused collection selection or closes an open menu.
-- Only one track menu opens at a time. Arrow keys, Home/End, Escape, and Tab work in the menu; disabled actions are skipped. Menu focus and focus restoration use `preventScroll`. Menus and the selection toolbar are portaled to the document body and do not lock page scrolling.
+- Only one track menu opens at a time. The three-dot button keeps the current selection, and a menu opened from an unselected row acts on that row. Arrow keys, Home/End, Escape, and Tab work in the desktop menu. Menu focus and focus restoration use `preventScroll`.
 
 ## Action semantics
 

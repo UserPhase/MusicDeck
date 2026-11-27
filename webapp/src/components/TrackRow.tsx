@@ -287,7 +287,9 @@ function TrackRow({
   }
 
   function openContextMenu(event?: MouseEvent) {
-    if ((!mobileRow || selectionMode) && onSelect && !selected && !editingDisabled) onSelect(index, {});
+    if (event && (!mobileRow || selectionMode) && onSelect && !selected && !editingDisabled) {
+      onSelect(index, {});
+    }
     setContextPoint(event ? { x: event.clientX, y: event.clientY } : null);
     if (legacyMenu && (onToggleMenu || onToggleEntryMenu)) {
       if (!menu) {
@@ -449,8 +451,8 @@ function TrackRow({
         )}
       </div>)}
 
-      {!compactTile && <>
-        {showDuration && <div className="track-duration" role="cell">
+      {(!compactTile || selectionMode) && <>
+        {!compactTile && showDuration && <div className="track-duration" role="cell">
           {formatDuration(resolvedDuration)}
         </div>}
 
@@ -461,9 +463,9 @@ function TrackRow({
           onClick={(event) => event.stopPropagation()}
           onMouseDown={(event) => event.stopPropagation()}
         >
-          {action}
-          {!mobile && showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
-          {!mobile && isExternalTrack && showImportAction && (
+          {!compactTile && action}
+          {!mobileRow && showDateAdded && !isExternalTrack && !isServerSynced && <TrackDownloadButton song={song} completedPlaceholder />}
+          {!mobileRow && isExternalTrack && showImportAction && (
             <TrackDownloadButton
               song={song}
               className="track-row-import"
@@ -476,7 +478,7 @@ function TrackRow({
             className="track-menu"
             ref={menuTriggerRef}
             aria-label={`More options for ${song.title || "track"}`}
-            aria-haspopup={mobile ? "dialog" : "menu"}
+            aria-haspopup={mobileRow ? "dialog" : "menu"}
             aria-expanded={menuOpen}
             onClick={(event) => {
               event.stopPropagation();
@@ -506,6 +508,7 @@ function TrackRow({
           onAddToQueue={onQueue}
           actionsDisabled={editingDisabled}
           onRequestClose={closeMenu}
+          onDoneSelecting={selectionMode ? scope?.exit : undefined}
           onActionError={scope?.reportActionError}
         >
           {menuAction?.(closeMenu)}

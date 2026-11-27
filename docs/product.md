@@ -144,12 +144,12 @@ library; adding to the playlist remains a separate action after indexing.
 Local-only policy keeps library suggestions available and suppresses external
 lookups. Recommendation loading never delays the playlist itself.
 
-A floating selection toolbar offers Select All/Deselect All, Add to Playlist,
-Play Next, Queue All, Download Selected and Remove from Playlist. Adding follows
-existing playlist deduplication rules; queue actions retain selected duplicates.
+Open a selected track's three-dot menu for Add to Playlist, Play Next, Add to
+Queue, Download Selected, or Remove from Playlist. Adding follows existing
+playlist deduplication rules. Queue actions retain selected duplicates.
 Download Selected downloads each distinct song once and reports partial failures.
-Drag a selected track's grip to move the whole group; Alt+Up/Down or toolbar
-Move Up/Down provide keyboard and touch alternatives. Reordering is immediate
+Drag a selected track to move the whole group, or use Alt+Up/Down on the
+keyboard. Reordering is immediate
 while saving. Network failures restore the old order; edits made elsewhere show
 a conflict and a Reload playlist action instead of overwriting another edit.
 Unavailable library entries remain in the saved playlist. Batch removal asks
