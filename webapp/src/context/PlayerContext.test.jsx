@@ -410,6 +410,7 @@ function PlayerHarness() {
 
 
 function renderPlayer({
+  userId = "user-1",
   recentHistory = [],
   userSettings = [],
   silenceAnalysis = null,
@@ -423,7 +424,7 @@ function renderPlayer({
   getCurrentSession.mockResolvedValue({
     authenticated: true,
     user: {
-      id: "user-1",
+      id: userId,
       username: "test-user",
       displayName: "Test User",
       role: "user",
@@ -3236,7 +3237,8 @@ test("the active device resolves a 1,205-track library reference and retains the
   });
   const tracks = Array.from({ length: 1205 }, (_, index) => ({ id: `large-${index}`, title: `Track ${index}` }));
   getTrackCollection.mockResolvedValue(tracks);
-  const view = renderPlayer();
+  // A large queue can finish saving after the fixture unmounts.
+  const view = renderPlayer({ userId: "large-library-user" });
   try {
     await playerReady();
     const controller = new AbortController();
@@ -3270,7 +3272,7 @@ test.each([999, 1000, 1001])("resolves a %i-entry playlist with duplicate tracks
     id: `playlist-track-${index % (count - 1)}`, playlistItemId: `playlist-occurrence-${index}`, title: `Song ${index}`,
   }));
   const playlist = { id: "remote-playlist", name: "Remote set", entry };
-  const view = renderPlayer();
+  const view = renderPlayer({ userId: `playlist-order-${count}` });
   getPlaylist.mockResolvedValue(playlist);
   try {
     await playerReady();
@@ -3288,6 +3290,7 @@ test.each([999, 1000, 1001])("resolves a %i-entry playlist with duplicate tracks
     await act(async () => { await result; });
     expect(getPlaylist).toHaveBeenCalledWith(playlist.id, controller.signal, { cache: "no-store" });
     const queue = adapter.queue();
+    expect(queue.shuffle).toBe(false);
     expect(queue.entries.map(row => [row.trackId, row.resume.occurrenceId]))
       .toEqual(entry.map(track => [track.id, track.playlistItemId]));
     expect(new Set(queue.entries.map(row => row.occurrenceId)).size).toBe(count);
